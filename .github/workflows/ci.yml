@@ -23,8 +23,10 @@ jobs:
   check:
     name: just check
     runs-on: ubuntu-latest
-    # Bound a hung run; `just check` from a warm cache is a few minutes.
-    timeout-minutes: 45
+    # Bound a hung run; `just check` from a warm cache is a few minutes. The cap
+    # has to cover the main-only `just test-all` step below too, since a step
+    # timeout can only be shorter than the job's, not longer.
+    timeout-minutes: 105
 
     steps:
       - name: Checkout
@@ -75,5 +77,41 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      - name: Cache public test data
+        # `scripts/fetch-test-data.sh` fills test-roms/ from pinned URLs and
+        # records a SHA-256 stamp per suite there, so the whole directory is the
+        # cache: a hit means the fetch step below prints "up to date" and makes
+        # no request at all. Keyed on the script itself, because the manifest --
+        # every pinned URL and hash -- lives at the top of it: bump a pin and the
+        # key changes and the data is refetched. Latest major as of 2026-11-06
+        # (v6.1.0), same action as the cargo cache above (the ticket suggested
+        # v4; this repo already runs v6).
+        uses: actions/cache@v6
+        with:
+          path: test-roms
+          key: ${{ runner.os }}-testroms-${{ hashFiles('scripts/fetch-test-data.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-testroms-
+
+      - name: Fetch public test data
+        # Before `just check`, so the data-driven tests run against real data
+        # instead of printing SKIPPED. Failing here is deliberate: if a pinned
+        # URL dies, every run from then on should say so loudly rather than
+        # quietly skip the suites that need it. Nothing copyrighted is ever
+        # fetched: see docs/test-roms.md for the sources and docs/TESTING.md
+        # section 7 for the pins.
+        run: nix develop -c scripts/fetch-test-data.sh
+
       - name: just check
         run: nix develop -c just check
+
+      - name: just test-all (main only)
+        # The slow #[ignore] suites (full SingleStepTests, long ROM runs) run on
+        # main, where a late failure is information, and not on PRs, where they
+        # would just make every merge wait. Same runner as `just check`, so it
+        # reuses the nix store, the cargo artifacts, and the test-roms/ this job
+        # already fetched: the extra cost is the test time, not another setup.
+        # Commercial ROM tests stay local: they find nothing here and skip.
+        if: github.event_name == 'push'
+        timeout-minutes: 60
+        run: nix develop -c just test-all
