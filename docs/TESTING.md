@@ -35,6 +35,8 @@ Nothing copyrighted gets committed. Test data is fetched or found at test time.
 - `RUSTSEGA_TEST_ROM_DIR` (default `./test-roms`, gitignored): downloaded
   conformance suites and homebrew test ROMs. Fetched by
   `scripts/fetch-test-data.sh`, which pins every download by SHA-256.
+  `docs/test-roms.md` documents every hardware test ROM: what it checks, how it
+  reports, its licence, and the ones that have to be placed by hand.
 - `RUSTSEGA_ROM_DIR` (default `~/games/roms/genesis`): the owner's commercial
   ROM set. Note: files there use the `.md` extension (Mega Drive), they are
   raw binary ROMs, not markdown. A few are `.bin`. Some may be interleaved
@@ -44,15 +46,23 @@ Nothing copyrighted gets committed. Test data is fetched or found at test time.
 
 `just fetch` (or `scripts/fetch-test-data.sh`, optionally with suite names to
 fetch only some, e.g. `scripts/fetch-test-data.sh z80`) downloads these into
-`test-roms/`. Each entry is pinned by commit SHA in the URL and by the SHA-256
-of the downloaded tarball, so CI and local runs always see identical bytes.
-The tarball is kept in `test-roms/.cache/` and the verified hash in
-`test-roms/.stamp-<name>`; a matching stamp means no network access at all.
+`test-roms/`. Each entry is pinned by commit SHA (or a fixed archive URL) in
+the URL and by the SHA-256 of the downloaded archive, so CI and local runs
+always see identical bytes. The archive is kept in `test-roms/.cache/` and the
+verified hash in `test-roms/.stamp-<name>`; a matching stamp means no network
+access at all.
 
 | Suite | Repo | Pinned commit | Tarball SHA-256 | Lands in | Files |
 |---|---|---|---|---|---|
 | `680x0` | [SingleStepTests/680x0](https://github.com/SingleStepTests/680x0) | `e0d5ece9670205cc84a0101081837deb446f86a3` | `f90dab5ba7519c6d9e20143be12e433403b6db6586f6bae3e5d3bf0123f01b50` | `test-roms/680x0/68000/v1/` | 125 |
 | `z80` | [SingleStepTests/z80](https://github.com/SingleStepTests/z80) | `ebe1875d48f374bcfd4b505d8eb8ee751568b5f7` | `f44683f0edf1c1c37f98861ccd1bfda3b9bce65b5b258d4817a0f1d2012076a7` | `test-roms/z80/v1/` | 1604 |
+| `md-test-pack` | Eke's Gens hardware test pack, via [Wayback](https://web.archive.org/web/20150610093059if_/http://genplus-gx.googlecode.com/files/md_test.zip) | 2015 capture | `1b37dd77e81f5bfd8e3dc09adc69609f07a30135ea611782a850e8c7336a33ba` | `test-roms/genesis/md-test-pack/` | 15 |
+| `overdrive2` | TiTAN, Overdrive 2, [archive.org mirror](https://archive.org/details/pouet_69648) | 2017 release | `877d3244102531052d2ffc39e0e7390c7b1ca65a7323b49cf28d49ffb3ef6110` | `test-roms/genesis/overdrive2/` | 2 |
+| `zexall-cpm` | [mdfs.net](https://mdfs.net/Software/Z80/Exerciser/), Frank D. Cringle | 2003 build | `e0f4e6af6c88764a615e0d9fa27b9bf9a2162bd77ac7492fd1f2d4fa9cdfb3bb` | `test-roms/z80/zexall-cpm/` | 6 |
+
+What each ROM is good for, and the ROMs that have to be downloaded by hand
+(240p Test Suite, Nemesis's VDP FIFO tests, the YM2612 tests, Sega's own
+factory diagnostic), are in [`test-roms.md`](test-roms.md).
 
 To bump a pin: get the new commit SHA, download
 `https://github.com/<org>/<repo>/archive/<sha>.tar.gz` once and `sha256sum` it,
@@ -68,18 +78,15 @@ CI fetches the public test data; commercial ROM tests only run locally.
 Heavy suites (full SingleStepTests, long ROM runs) are `#[ignore]` by default
 and run with `cargo nextest run --run-ignored all` or `just test-all`.
 
-## Known public test data (verify each before pinning)
+## Known public test data
 
-- SingleStepTests 68000: https://github.com/SingleStepTests/680x0 (68000 JSON,
-  one file per instruction, with cycle counts and bus transactions).
-- SingleStepTests Z80: https://github.com/SingleStepTests/z80
-- zexdoc / zexall (Z80 instruction exerciser, CP/M .com files).
-- 240p Test Suite (Genesis build) by Artemio Urbina.
-- Nemesis's VDP test ROMs (VDPFIFOTesting and friends, SpritesMind).
-- TiTAN "Overdrive" and "Overdrive 2" demos (stress tests, very timing sensitive).
-- Search for more (e.g. "genesis test rom", "mega drive hardware test",
-  "ym2612 test rom", "md vdp test rom") and add anything useful to
-  `docs/test-roms.md` with URL, SHA-256, license, and what it tests.
+Pinned and fetched: SingleStepTests 680x0 and z80, Eke's Mega Drive hardware
+test pack, Overdrive 2, and ZEXDOC/ZEXALL. Documented but fetched by hand:
+the 240p Test Suite, Nemesis's VDP FIFO / sprite masking / YM2612 ROMs,
+r57shell's VDP and pad-timing tests, MoD's Z80 bus tests, and Sega's MD Soft
+Checker. All of it, with URLs, hashes, licences and what each one is fit to
+judge, is in [`test-roms.md`](test-roms.md). Add a row there before a test
+starts reading a new ROM.
 
 ## Golden files
 
