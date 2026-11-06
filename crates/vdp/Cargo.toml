@@ -1,0 +1,11 @@
+[package]
+name = "vdp"
+description = "Sega Genesis VDP (video display processor)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "m68k"
+description = "Motorola 68000 CPU core"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

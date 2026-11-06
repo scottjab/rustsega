@@ -1,0 +1,11 @@
+[package]
+name = "server"
+description = "Single-binary web server that embeds the frontend"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
