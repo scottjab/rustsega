@@ -8,6 +8,12 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+mod tmp;
+
+pub mod golden;
+pub use golden::{Golden, assert_golden, dump_png, frame_hash};
+
 /// Public test suites and homebrew test ROMs, fetched by
 /// `scripts/fetch-test-data.sh`.
 const TEST_ROM_DIR_ENV: &str = "RUSTSEGA_TEST_ROM_DIR";
@@ -152,51 +158,15 @@ macro_rules! require_data {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmp::TempDir;
     use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::path::Path;
 
     /// Smoke test so `cargo nextest run --workspace` has something to run
     /// before any real code lands (ticket M0-00).
     #[test]
     fn workspace_builds() {
         assert_eq!(1 + 1, 2);
-    }
-
-    /// A fresh temp directory that deletes itself when the test ends, so
-    /// repeated runs don't litter `/tmp`.
-    ///
-    /// `std::env::set_var` is `unsafe` in edition 2024 and this workspace
-    /// forbids `unsafe`, so the env-var-backed public functions are tested
-    /// through their `*_in(base, ..)` counterparts instead.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let path = std::env::temp_dir().join(format!(
-                "rustsega-testkit-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
-            fs::create_dir_all(&path).expect("create temp dir");
-            Self(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-
-    impl std::ops::Deref for TempDir {
-        type Target = Path;
-        fn deref(&self) -> &Path {
-            &self.0
-        }
     }
 
     fn write_stub(path: &Path, bytes: &[u8]) {

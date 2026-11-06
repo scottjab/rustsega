@@ -83,9 +83,27 @@ and run with `cargo nextest run --run-ignored all` or `just test-all`.
 
 ## Golden files
 
-- Frame hashes: `testkit::frame_hash(&FrameBuffer) -> u64` (xxhash or FNV of
-  the pixel bytes). Goldens live in `crates/*/tests/golden/*.toml`.
+- Frame hashes: `testkit::frame_hash(pixels, width, height) -> u64`, FNV-1a 64
+  over the size and then the pixel bytes, so a wrong geometry can't hash the
+  same as a right one. Pixels are `&[u32]` `0xAABBGGRR`; testkit takes raw
+  slices so it never has to depend on a chip crate. Goldens live in
+  `crates/*/tests/golden/*.toml`.
+- Golden files are a flat, key-sorted TOML table of
+  `key = "0x0123456789abcdef"`, so a diff shows only the value that moved.
+  Read and write them with `testkit::Golden`, compare with
+  `testkit::assert_golden(path, key, actual)`.
+- A mismatch panics with the key, the expected value, the actual value, and a
+  pointer to bless. To record or update a value:
+
+  ```sh
+  RUSTSEGA_BLESS=1 nix develop -c cargo nextest run -p <crate> <test_name>
+  ```
+
+  Blessing is per run, so bless one test by name, never the whole workspace at
+  once, or every golden gets rewritten by whatever the code currently does.
 - Updating a golden needs a human-visible reason in the commit message. Dump a
-  PNG with `headless --dump-png` and look at it before accepting a new hash.
+  PNG with `testkit::dump_png` and look at it before accepting a new hash. A
+  golden that matches garbage is worse than none. (`headless --dump-png` is the
+  same thing from the CLI, once the headless ticket adds the flag.)
 - Never "fix" a failing golden by regenerating it unless the ticket says the
   old one was wrong.
