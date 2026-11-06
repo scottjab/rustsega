@@ -40,6 +40,26 @@ Nothing copyrighted gets committed. Test data is fetched or found at test time.
   raw binary ROMs, not markdown. A few are `.bin`. Some may be interleaved
   `.smd` format, detect that by content, not by name.
 
+### Pinned by `scripts/fetch-test-data.sh`
+
+`just fetch` (or `scripts/fetch-test-data.sh`, optionally with suite names to
+fetch only some, e.g. `scripts/fetch-test-data.sh z80`) downloads these into
+`test-roms/`. Each entry is pinned by commit SHA in the URL and by the SHA-256
+of the downloaded tarball, so CI and local runs always see identical bytes.
+The tarball is kept in `test-roms/.cache/` and the verified hash in
+`test-roms/.stamp-<name>`; a matching stamp means no network access at all.
+
+| Suite | Repo | Pinned commit | Tarball SHA-256 | Lands in | Files |
+|---|---|---|---|---|---|
+| `680x0` | [SingleStepTests/680x0](https://github.com/SingleStepTests/680x0) | `e0d5ece9670205cc84a0101081837deb446f86a3` | `f90dab5ba7519c6d9e20143be12e433403b6db6586f6bae3e5d3bf0123f01b50` | `test-roms/680x0/68000/v1/` | 125 |
+| `z80` | [SingleStepTests/z80](https://github.com/SingleStepTests/z80) | `ebe1875d48f374bcfd4b505d8eb8ee751568b5f7` | `f44683f0edf1c1c37f98861ccd1bfda3b9bce65b5b258d4817a0f1d2012076a7` | `test-roms/z80/v1/` | 1604 |
+
+To bump a pin: get the new commit SHA, download
+`https://github.com/<org>/<repo>/archive/<sha>.tar.gz` once and `sha256sum` it,
+then update both the URL and the hash in the `MANIFEST` at the top of the
+script. Delete `test-roms/.stamp-<name>` (or the whole `test-roms/` directory)
+and rerun `just fetch`.
+
 Tests that need external data must not fail when the data is missing. Use the
 `testkit` helpers (`testkit::test_rom("...")` / `testkit::commercial_rom("...")`)
 which return `None` when the file is absent, and print a `SKIPPED:` line.
