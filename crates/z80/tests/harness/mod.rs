@@ -460,6 +460,18 @@ fn mismatch(field: &str, expected: String, got: String) -> Mismatch {
     }
 }
 
+/// The message out of a caught panic, for cases where the core panicked instead
+/// of producing a wrong value.
+fn panic_text(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else {
+        "panic with no message".to_string()
+    }
+}
+
 /// How a file went: how many cases ran, and the first failure if there was one.
 ///
 /// A failing file only ran up to its first bad case, so `passed + failed` is how
@@ -473,6 +485,12 @@ struct FileReport {
 }
 
 /// Run one file, stopping at its first failing case so the log stays readable.
+///
+/// `run_case` is caught rather than allowed to unwind, because an unimplemented
+/// opcode panics on purpose (that is how the decode skeleton reports a missing
+/// instruction) and the sweep has to keep going past it to the other 1500 files.
+/// The panic message becomes the mismatch line, so it reads the same in either
+/// case. The default panic hook still writes the message to stderr.
 fn run_one_file(cases: &[TestCase]) -> FileReport {
     let mut report = FileReport {
         passed: 0,
@@ -480,7 +498,15 @@ fn run_one_file(cases: &[TestCase]) -> FileReport {
         first_failure: None,
     };
     for case in cases {
-        let mismatches = run_case(case);
+        let mismatches =
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(case))) {
+                Ok(mismatches) => mismatches,
+                Err(payload) => vec![mismatch(
+                    "panic",
+                    "no panic".to_string(),
+                    panic_text(&payload),
+                )],
+            };
         if mismatches.is_empty() {
             report.passed += 1;
             continue;
@@ -554,13 +580,44 @@ pub fn run_files(names: &[&str]) {
     );
 }
 
+/// Silence the default panic hook while the sweep walks into ~1600 unimplemented
+/// opcodes on purpose. The message is already in the report line, and 1600
+/// copies of it on stderr bury the rest of the log.
+///
+/// The hook is process-global, which is why only the sweep uses this and not
+/// [`run_files`]: a test panicking in another thread while it is installed would
+/// lose its message.
+type PanicHook = Box<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+struct QuietPanicHook(Option<PanicHook>);
+
+impl QuietPanicHook {
+    fn install() -> Self {
+        let previous = std::panic::take_hook();
+        // Replacing rather than just removing: with no hook at all, std falls
+        // back to printing the panic itself.
+        std::panic::set_hook(Box::new(|_| {}));
+        Self(Some(previous))
+    }
+}
+
+impl Drop for QuietPanicHook {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            std::panic::set_hook(previous);
+        }
+    }
+}
+
 /// Run every file in the suite and print one pass/fail line per file, plus a
 /// grand total. Never asserts.
 ///
 /// This is the shape M2-17 (#60) turns into a gate. Until the instructions are
 /// implemented most files fail, so asserting here would only measure how much
-/// work is left.
+/// work is left. A file whose opcode is not implemented yet counts as failed
+/// with the panic's text as the reason, not as an error.
 pub fn run_all_files() {
+    let _quiet = QuietPanicHook::install();
     let Some(names) = all_files() else {
         eprintln!("SKIPPED: missing test data: Z80 SingleStepTests ({SUITE_DIR})");
         return;

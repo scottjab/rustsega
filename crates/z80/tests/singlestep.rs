@@ -81,6 +81,15 @@ fn nop_passes() {
 }
 
 #[test]
+fn rotted_prefixes_pass() {
+    // A `DD`/`FD` in front of an instruction that never mentions `HL` is a
+    // 4 T-state NOP, so `DD 00` is 8 T-states of nothing. These two are the
+    // only prefixed files the decode skeleton gets through (M2-03, #46), and
+    // they are what pin the prefix R and PC accounting against hardware.
+    harness::run_files(&["dd 00", "fd 00"]);
+}
+
+#[test]
 fn harness_detects_mismatch() {
     let mut case = base_case();
     case.final_state.a = 0x22;
