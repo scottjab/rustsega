@@ -131,10 +131,19 @@ impl Vdp {
     pub fn write_control(&mut self, value: u16);
     pub fn read_status(&mut self) -> u16;
     pub fn hv_counter(&self) -> u16;
-    /// Render one visible line into the frame buffer and advance line state.
+    /// After every control port write the bus glue calls this to run any DMA
+    /// the write requested (write_control only flags it).
+    pub fn run_dma(&mut self, bus: &mut impl DmaBus);
+    /// Advance the VDP by master clocks. Renders lines and raises IRQs as it goes.
+    pub fn advance(&mut self, mclk: u32);
+    pub fn pending_irq(&self) -> Option<u8>; // 6 = VINT, 4 = HINT
+    pub fn ack_irq(&mut self, level: u8);
+    pub fn z80_int_line(&self) -> bool;
+    pub fn frame_done(&mut self) -> bool;    // true once per frame, at VBlank start
+    pub fn dma_68k_stall_mclk(&mut self) -> u32;
+    /// Render one line directly. Public for tests; the scheduler uses advance().
     pub fn render_line(&mut self, line: u16);
     pub fn frame(&self) -> &FrameBuffer;
-    pub fn take_irq(&mut self) -> Option<u8>; // 6 = VINT, 4 = HINT
 }
 
 pub struct FrameBuffer {
