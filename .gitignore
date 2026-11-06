@@ -1,0 +1,14 @@
+/target
+/dist
+/crates/web/dist
+/test-roms/
+*.srm
+*.state
+.direnv/
+result
+result-*
+# Never commit ROMs.
+*.md.rom
+*.gen
+*.smd
+*.bin
