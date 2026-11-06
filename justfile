@@ -23,6 +23,10 @@ test:
 test-all:
     cargo nextest run --workspace --no-tests=pass --run-ignored all
 
+# Public CPU conformance suites -> test-roms/ (pinned, idempotent).
+fetch:
+    scripts/fetch-test-data.sh
+
 # Core crates must always build for the browser.
 wasm-core:
     cargo build --target wasm32-unknown-unknown {{core}}
