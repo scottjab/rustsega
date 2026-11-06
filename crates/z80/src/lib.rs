@@ -10,8 +10,10 @@
 //! and its final state, so a core that does not model them cannot pass, no
 //! matter how correct its instruction semantics are.
 
+mod decode;
 mod regs;
 
+pub use decode::IndexMode;
 pub use regs::{
     FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_SZ, FLAG_SZXY, FLAG_X, FLAG_Y, FLAG_Z, IntMode,
     SZXY_PARITY, incremented_r, parity, szxy_flags,
@@ -144,25 +146,14 @@ impl Z80 {
 
     /// Run one instruction and return the T-states it took.
     ///
-    /// Only `NOP` is here so far, and it is here because the conformance harness
-    /// needs at least one real instruction to prove it compares state at all
-    /// (M2-02, #45). Every other opcode falls through to the same `NOP` shape,
-    /// which is why the suite fails everywhere except `00.json`.
+    /// Only `NOP` and the prefix fallbacks are real instructions so far; every
+    /// other opcode panics as unimplemented, which is what makes a missing
+    /// instruction show up as a named opcode rather than a field mismatch.
     ///
-    /// The side effects are taken from the suite rather than from a theory about
-    /// them: across all 1000 randomised `NOP` cases the register `R` counts once
-    /// (bit 7 preserved), and `q`, `p` and the EI latch all end clear whatever
-    /// they started as. Notably `NOP` does *not* apply the EI latch to `IFF1`,
-    /// even in the 261 cases that start with the latch set and `IFF1` clear, so
-    /// whoever wires interrupt acceptance (M2-14, #57) owns that step.
+    /// The fetch and the dispatch tree live in [`decode`](crate::decode);
+    /// `R` is counted there, by the opcode fetch, not here.
     pub fn step(&mut self, bus: &mut impl Z80Bus) -> u32 {
-        let _opcode = bus.read(self.pc);
-        self.pc = self.pc.wrapping_add(1);
-        self.inc_r();
-        self.q = false;
-        self.p = false;
-        self.ei_pending = false;
-        4
+        self.exec(bus)
     }
 
     /// The `AF` pair, flags and accumulator together.
