@@ -11,6 +11,7 @@
 //! matter how correct its instruction semantics are.
 
 mod decode;
+mod ld16;
 mod ld8;
 mod regs;
 #[cfg(test)]
@@ -481,6 +482,20 @@ impl Z80 {
     /// Load `WZ`, for the conformance harness and save states.
     pub fn set_wz(&mut self, value: u16) {
         self.wz = value;
+    }
+
+    /// What an instruction that computes no flags does on the way out: `F` stays
+    /// exactly as it was and every latch ends clear.
+    ///
+    /// The suite shows `final.q == 0`, `final.p == 0` and `final.ei == 0` for all
+    /// 1000 cases of every LD (#47) and every 16-bit LD, `PUSH`/`POP` and `EX`
+    /// file (#48) - including `POP AF`, which does write `F`, straight out of
+    /// memory. So `q` records the flags an instruction *computed*, not every
+    /// write to `F`.
+    pub(crate) fn clear_latches(&mut self) {
+        self.q = 0;
+        self.p = false;
+        self.ei_pending = false;
     }
 
     /// The internal X/Y source byte (undocumented `q`).
