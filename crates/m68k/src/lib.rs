@@ -14,6 +14,10 @@ mod bus;
 mod cpu;
 mod sr;
 
+/// Always compiled, not `#[cfg(test)]`: integration tests under
+/// `crates/m68k/tests/` and other crates need `m68k::testbus::TestBus` too.
+pub mod testbus;
+
 pub use bus::{ADDR_MASK, Bus};
 pub use cpu::{M68k, RESET_CYCLES};
 pub use sr::{CCR_MASK, SR_C, SR_INT_MASK, SR_MASK, SR_N, SR_RESET, SR_S, SR_T, SR_V, SR_X, SR_Z};
