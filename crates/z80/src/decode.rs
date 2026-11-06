@@ -178,6 +178,20 @@ impl Z80 {
             // `y(op)` is which register gets the byte. `36` (`LD (HL),n`) is the
             // eighth of these and is matched above.
             0x06 | 0x0E | 0x16 | 0x1E | 0x26 | 0x2E | 0x3E => self.ld_r_n(bus, op),
+            // The 16-bit loads, the stack and the exchanges (M2-05, #48). Bits
+            // 5-4 of `LD rr,nn`, `PUSH qq` and `POP qq` pick the pair; see
+            // `Z80::set_pair_y` for the mapping, which differs between the
+            // groups (`11` is `SP` for the load, `AF` for the stack).
+            0x01 | 0x11 | 0x21 | 0x31 => self.ld_rr_nn(bus, op),
+            0xC1 | 0xD1 | 0xE1 | 0xF1 => self.pop_qq(bus, op),
+            0xC5 | 0xD5 | 0xE5 | 0xF5 => self.push_qq(bus, op),
+            0x22 => self.ld_ind_nn_hl(bus),
+            0x2A => self.ld_hl_ind_nn(bus),
+            0xF9 => self.ld_sp_hl(),
+            0x08 => self.ex_af_af(),
+            0xD9 => self.exx(),
+            0xEB => self.ex_de_hl(),
+            0xE3 => self.ex_sp_index(bus, IndexMode::Hl),
             _ => self.unimplemented(&format!("main {op:02X} (x{} y{} z{})", x(op), y(op), z(op))),
         }
     }
@@ -213,15 +227,22 @@ impl Z80 {
 
     /// Dispatch the `ED` space.
     ///
-    /// Defined-but-not-yet-implemented opcodes panic. Undefined ones are not an
-    /// error at all: they behave as an 8 T-state NOP, and the byte after `ED` is
-    /// still fetched, which is why `R` counts 2.
+    /// The 16-bit pair loads (M2-05, #48) are dispatched here. Anything else
+    /// that is defined but not implemented yet panics. Undefined opcodes are
+    /// not an error at all: they behave as an 8 T-state NOP, and the byte after
+    /// `ED` is still fetched, which is why `R` counts 2.
     fn exec_ed(&mut self, bus: &mut impl Z80Bus) -> u32 {
         let op = self.fetch_opcode(bus);
-        if ed_is_defined(op) {
-            self.unimplemented(&format!("ED {op:02X} (x{} y{} z{})", x(op), y(op), z(op)))
-        } else {
-            T_M1 + self.nop()
+        match op {
+            // `LD rr,(nn)` and `LD (nn),rr` for the four main pairs
+            // (M2-05, #48). These return the whole 20 T-states, this fetch of
+            // `ED` included, so the timing is checkable against the suite.
+            0x4B | 0x5B | 0x6B | 0x7B => self.ld_rr_ind_nn(bus, op),
+            0x43 | 0x53 | 0x63 | 0x73 => self.ld_ind_nn_rr(bus, op),
+            _ if ed_is_defined(op) => {
+                self.unimplemented(&format!("ED {op:02X} (x{} y{} z{})", x(op), y(op), z(op)))
+            }
+            _ => T_M1 + self.nop(),
         }
     }
 
@@ -259,6 +280,20 @@ impl Z80 {
             // a real HALT, not `LD (IX+d),(HL)`. So it falls through to the
             // prefix fallback and HALT (M2-13, #56) picks it up there.
             0x70..=0x75 | 0x77 => self.ld_index_ind_r(bus, mode, op),
+            // The 16-bit loads, stack and exchanges in this space (M2-05, #48).
+            // `22`/`2A` move the index pair through memory rather than `HL`; see
+            // `Z80::ld_index_ind_nn` for the traces that settled that.
+            0x21 => self.ld_index_nn(bus, mode),
+            0x22 => self.ld_ind_nn_index(bus, mode),
+            0x2A => self.ld_index_ind_nn(bus, mode),
+            0xE1 => self.pop_index(bus, mode),
+            0xE3 => self.ex_sp_index(bus, mode),
+            0xE5 => self.push_index(bus, mode),
+            0xF9 => self.ld_sp_index(mode),
+            // `EXX` and `EX DE,HL` have nothing for the prefix to index, so it
+            // rots into a NOP and the instruction runs (`dd d9` / `dd eb`: 8
+            // T-states, `PC + 2`, in all 1000 cases of each).
+            0xD9 | 0xEB => T_M1 + self.exec_main(bus, op),
             _ => self.unimplemented(&format!(
                 "{} {op:02X} (x{} y{} z{})",
                 mode.prefix(),
@@ -431,14 +466,16 @@ mod tests {
         assert_eq!(cpu.step(&mut bus), 12);
         assert_eq!((cpu.pc(), cpu.r()), (3, 3));
 
-        // Last prefix wins, in both orders: `DD FD 21` is `LD IY,nn` and
-        // `FD DD 21` is `LD IX,nn`, whichever way the prefixes are stacked.
+        // Last prefix wins, in both orders: `DD FD 09` is `ADD HL,BC` in the
+        // `IY` space (`ADDD HL,BC`) and `FD DD 09` is the `IX` one, whichever way
+        // the prefixes are stacked. `09` is used because 16-bit arithmetic is a
+        // later ticket (#50), so the panic still names the winning prefix.
         for (first, second, winner) in [(0xDD, 0xFD, "FD"), (0xFD, 0xDD, "DD")] {
             let mut cpu = Z80::new();
-            let mut bus = Program::new(&[first, second, 0x21]);
+            let mut bus = Program::new(&[first, second, 0x09]);
             let message =
-                caught(|| cpu.step(&mut bus)).expect_err("{second:02X} 21 is not implemented");
-            assert!(message.contains(&format!("{winner} 21")), "{message}");
+                caught(|| cpu.step(&mut bus)).expect_err("{second:02X} 09 is not implemented");
+            assert!(message.contains(&format!("{winner} 09")), "{message}");
         }
     }
 
@@ -475,10 +512,10 @@ mod tests {
     #[test]
     fn main_space_gives_a_useful_panic() {
         let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0x01]); // LD BC,nn
-        let message = caught(|| cpu.step(&mut bus)).expect_err("LD BC,nn is not implemented");
+        let mut bus = Program::new(&[0x09]); // ADD HL,BC, which is M2-07 (#50)
+        let message = caught(|| cpu.step(&mut bus)).expect_err("ADD HL,BC is not implemented");
         assert!(
-            message.contains("main 01 (x0 y0 z1)"),
+            message.contains("main 09 (x0 y1 z1)"),
             "unhelpful message: {message}"
         );
     }

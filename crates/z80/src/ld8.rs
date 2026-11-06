@@ -3,7 +3,7 @@
 //!
 //! None of them touch the flags, and every one of them leaves `q`, `p` and the
 //! EI latch clear - that is what all 1000 cases of every LD file in the
-//! conformance suite show, so it is done in one place ([`Z80::finish_ld`]).
+//! conformance suite show, so it is done in one place ([`Z80::clear_latches`]).
 //!
 //! The undocumented part of this ticket is `wz`. The Z80 leaves a near miss of
 //! the address it last touched there, and the suite compares it, so each form
@@ -43,15 +43,6 @@ impl Z80 {
         }
     }
 
-    /// What an LD does on the way out: the flags stay exactly as they were, and
-    /// `q`, `p` and the EI latch all end clear. Verified on every LD file in the
-    /// suite (all 1000 cases of each).
-    pub(crate) fn finish_ld(&mut self) {
-        self.q = 0;
-        self.p = false;
-        self.ei_pending = false;
-    }
-
     /// Fetch an `(IX+d)` / `(IY+d)` displacement and return the address.
     ///
     /// Leaves `wz` at that address: every indexed access in the suite ends with
@@ -85,7 +76,7 @@ impl Z80 {
         } else {
             self.set_reg_slot(dst, value);
         }
-        self.finish_ld();
+        self.clear_latches();
         // A register-to-register move is 4 T-states; routing one side through
         // the memory at HL costs a memory access on top (`46`, `70`: 7 each).
         if src == 6 || dst == 6 { 7 } else { 4 }
@@ -95,7 +86,7 @@ impl Z80 {
     pub(crate) fn ld_r_n(&mut self, bus: &mut impl Z80Bus, op: u8) -> u32 {
         let value = self.fetch_byte(bus);
         self.set_reg_slot(y(op), value);
-        self.finish_ld();
+        self.clear_latches();
         7
     }
 
@@ -104,7 +95,7 @@ impl Z80 {
         let value = self.fetch_byte(bus);
         let addr = self.hl();
         bus.write(addr, value);
-        self.finish_ld();
+        self.clear_latches();
         10
     }
 
@@ -114,7 +105,7 @@ impl Z80 {
         let value = bus.read(addr);
         self.set_a(value);
         self.set_wz(addr.wrapping_add(1));
-        self.finish_ld();
+        self.clear_latches();
         7
     }
 
@@ -124,7 +115,7 @@ impl Z80 {
         let value = self.a();
         bus.write(addr, value);
         self.set_wz((u16::from(value) << 8) | (addr.wrapping_add(1) & 0x00FF));
-        self.finish_ld();
+        self.clear_latches();
         7
     }
 
@@ -134,7 +125,7 @@ impl Z80 {
         let value = bus.read(addr);
         self.set_a(value);
         self.set_wz(addr.wrapping_add(1));
-        self.finish_ld();
+        self.clear_latches();
         13
     }
 
@@ -144,7 +135,7 @@ impl Z80 {
         let value = self.a();
         bus.write(addr, value);
         self.set_wz((u16::from(value) << 8) | (addr.wrapping_add(1) & 0x00FF));
-        self.finish_ld();
+        self.clear_latches();
         13
     }
 
@@ -155,7 +146,7 @@ impl Z80 {
         let addr = self.index_address(bus, mode);
         let value = bus.read(addr);
         self.set_reg_slot(y(op), value);
-        self.finish_ld();
+        self.clear_latches();
         19
     }
 
@@ -166,7 +157,7 @@ impl Z80 {
         let addr = self.index_address(bus, mode);
         let value = self.reg_slot(z(op));
         bus.write(addr, value);
-        self.finish_ld();
+        self.clear_latches();
         19
     }
 
@@ -175,7 +166,7 @@ impl Z80 {
         let addr = self.index_address(bus, mode);
         let value = self.fetch_byte(bus);
         bus.write(addr, value);
-        self.finish_ld();
+        self.clear_latches();
         19
     }
 }
