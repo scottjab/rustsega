@@ -144,12 +144,24 @@ impl Z80 {
 
     /// Run one instruction and return the T-states it took.
     ///
-    /// This is a placeholder that behaves like `NOP`: fetch the opcode at `PC`,
-    /// advance past it, charge 4 T-states. Instruction tickets replace it, and
-    /// until one does nothing here is a real instruction.
+    /// Only `NOP` is here so far, and it is here because the conformance harness
+    /// needs at least one real instruction to prove it compares state at all
+    /// (M2-02, #45). Every other opcode falls through to the same `NOP` shape,
+    /// which is why the suite fails everywhere except `00.json`.
+    ///
+    /// The side effects are taken from the suite rather than from a theory about
+    /// them: across all 1000 randomised `NOP` cases the register `R` counts once
+    /// (bit 7 preserved), and `q`, `p` and the EI latch all end clear whatever
+    /// they started as. Notably `NOP` does *not* apply the EI latch to `IFF1`,
+    /// even in the 261 cases that start with the latch set and `IFF1` clear, so
+    /// whoever wires interrupt acceptance (M2-14, #57) owns that step.
     pub fn step(&mut self, bus: &mut impl Z80Bus) -> u32 {
         let _opcode = bus.read(self.pc);
         self.pc = self.pc.wrapping_add(1);
+        self.inc_r();
+        self.q = false;
+        self.p = false;
+        self.ei_pending = false;
         4
     }
 
@@ -797,6 +809,11 @@ mod tests {
         let mut cpu = Z80::new();
         let mut bus = FlatBus::new();
         cpu.set_pc(0x0100);
+        cpu.set_r(0x8F);
+        cpu.set_q(true);
+        cpu.set_p(true);
+        cpu.set_ei_pending(true);
+        cpu.set_wz(0x2345);
         bus.ram[0x0100] = 0x00;
 
         assert_eq!(cpu.step(&mut bus), 4);
@@ -805,5 +822,14 @@ mod tests {
         // A stub must not smuggle in side effects the instruction tickets will
         // have to reproduce.
         assert!(bus.writes.is_empty());
+
+        // What the suite demands of NOP itself: R counts once, the latches are
+        // consumed, and nothing else moves.
+        assert_eq!(cpu.r(), 0x90);
+        assert!(!cpu.q());
+        assert!(!cpu.p());
+        assert!(!cpu.ei_pending());
+        assert_eq!(cpu.wz(), 0x2345);
+        assert_eq!(cpu.f(), 0xFF, "NOP leaves the flags alone");
     }
 }

@@ -33,6 +33,14 @@ Firefox and geckodriver and exports `GECKODRIVER` for
 `wasm-bindgen-test-runner`, which runs headless unless you set `NO_HEADLESS`.
 There is nothing to install per machine: both are pinned in `flake.nix`.
 
+CPU conformance runs against the fetched SingleStepTests suites and skips (does
+not fail) when the data is absent, so `just check` is green with or without
+`just fetch`. Coverage is per opcode file: implementing a group means adding a
+test that names its files, e.g. `harness::run_files(&["40", "41"])` in
+`crates/z80/tests/`. The whole-suite runs (`all_opcodes` for the Z80) are
+`#[ignore]`d and report per file instead of asserting, so they are useful before
+the instructions exist; `just test-all`, which runs on `main`, includes them.
+
 ## External test data
 
 Nothing copyrighted gets committed. Test data is fetched or found at test time.
