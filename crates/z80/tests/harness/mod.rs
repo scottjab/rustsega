@@ -329,7 +329,7 @@ fn apply(state: &CpuState, cpu: &mut Z80) {
     cpu.set_im(IntMode::from_u8(state.im));
     cpu.set_ei_pending(state.ei != 0);
     cpu.set_p(state.p != 0);
-    cpu.set_q(state.q != 0);
+    cpu.set_q(state.q);
 }
 
 /// Compare every register, visible and hidden.
@@ -357,7 +357,7 @@ fn compare_state(cpu: &Z80, want: &CpuState, out: &mut Vec<Mismatch>) {
     check_bit(out, "iff2", want.iff2, cpu.iff2());
     check_bit(out, "ei", want.ei, cpu.ei_pending());
     check_bit(out, "p", want.p, cpu.p());
-    check_bit(out, "q", want.q, cpu.q());
+    check_byte(out, "q", want.q, cpu.q());
     check_number(out, "im", u64::from(want.im), u64::from(cpu.im().as_u8()));
 }
 

@@ -18,6 +18,9 @@ use crate::{Z80, Z80Bus};
 /// Prefix bytes: they switch opcode space instead of executing.
 const OP_CB: u8 = 0xCB;
 const OP_ED: u8 = 0xED;
+/// `HALT`, which sits in the middle of the `LD r,r'` block. M2-13 (#56)
+/// implements it; until then it must panic rather than be read as a load.
+const OP_HALT: u8 = 0x76;
 const OP_DD: u8 = 0xDD;
 const OP_FD: u8 = 0xFD;
 
@@ -145,6 +148,36 @@ impl Z80 {
             OP_ED => self.exec_ed(bus),
             OP_DD => self.exec_index(bus, IndexMode::Ix),
             OP_FD => self.exec_index(bus, IndexMode::Iy),
+            // The 8-bit loads (M2-04, #47). `02`/`12` store A into the pair's
+            // address, `0A`/`1A` read it back.
+            0x02 => {
+                let addr = self.bc();
+                self.ld_ind_rr_a(bus, addr)
+            }
+            0x12 => {
+                let addr = self.de();
+                self.ld_ind_rr_a(bus, addr)
+            }
+            0x0A => {
+                let addr = self.bc();
+                self.ld_a_ind_rr(bus, addr)
+            }
+            0x1A => {
+                let addr = self.de();
+                self.ld_a_ind_rr(bus, addr)
+            }
+            0x32 => self.ld_ind_nn_a(bus),
+            0x3A => self.ld_a_ind_nn(bus),
+            0x36 => self.ld_hl_ind_n(bus),
+            // `LD r,r'` is the whole `40`-`7F` block except `76`, which is HALT
+            // and belongs to M2-13 (#56).
+            OP_HALT => self.unimplemented(&format!("main {op:02X} (HALT)")),
+            0x40..=0x7F => self.ld_rr(bus, op),
+            // `LD r,n`: the immediate loads, named out rather than derived from
+            // `x`/`z` so the arm does not depend on what is matched above it.
+            // `y(op)` is which register gets the byte. `36` (`LD (HL),n`) is the
+            // eighth of these and is matched above.
+            0x06 | 0x0E | 0x16 | 0x1E | 0x26 | 0x2E | 0x3E => self.ld_r_n(bus, op),
             _ => self.unimplemented(&format!("main {op:02X} (x{} y{} z{})", x(op), y(op), z(op))),
         }
     }
@@ -158,7 +191,7 @@ impl Z80 {
     /// even in the 261 cases that start with the latch set and `IFF1` clear, so
     /// whoever wires interrupt acceptance (M2-14, #57) owns that step.
     fn nop(&mut self) -> u32 {
-        self.q = false;
+        self.q = 0;
         self.p = false;
         self.ei_pending = false;
         T_M1
@@ -215,6 +248,17 @@ impl Z80 {
             // Same reasoning: `NOP` does not mention `HL`, so the prefix is
             // wasted and the `NOP` runs.
             OP_NOP => T_M1 + self.nop(),
+            // The 8-bit indexed loads (M2-04, #47). The rest of this space is
+            // either a later ticket or the undocumented IXH/IXL forms
+            // (M2-15, #58), which stay a panic.
+            0x36 => self.ld_index_ind_n(bus, mode),
+            0x46 | 0x4E | 0x56 | 0x5E | 0x66 | 0x6E | 0x7E => self.ld_r_ind_index(bus, mode, op),
+            // `70`-`77` in this space is `LD (IX+d),r` - except `76`, which the
+            // suite insists is still HALT: `dd 76` takes 8 T-states with `PC` up
+            // by 2 and no displacement fetched, i.e. a rotted prefix followed by
+            // a real HALT, not `LD (IX+d),(HL)`. So it falls through to the
+            // prefix fallback and HALT (M2-13, #56) picks it up there.
+            0x70..=0x75 | 0x77 => self.ld_index_ind_r(bus, mode, op),
             _ => self.unimplemented(&format!(
                 "{} {op:02X} (x{} y{} z{})",
                 mode.prefix(),
