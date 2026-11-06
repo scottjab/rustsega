@@ -33,12 +33,31 @@ This reads the tracking issue (label `tracking`) and prints the first open
 ticket whose dependencies are all closed and that nobody has claimed. If it
 prints nothing ready, stop and report that.
 
-Claim it right away so other agents skip it:
+Claim it right away so other agents skip it. Several agents may share one
+GitHub account, so sign your claim with your own agent ID. Use `$AGENT_ID` if
+it's set. Otherwise make one at the start of your session and reuse the same
+value for the whole session:
+
+```sh
+echo "${AGENT_ID:-agent-$(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')}"
+```
 
 ```sh
 gh issue edit <N> --add-label in-progress
-gh issue comment <N> --body "Claimed. Starting work."
+gh issue comment <N> --body "Claimed by <your-agent-id>"
 ```
+
+Then check that you actually won the claim. Two agents can grab the same
+ticket at the same moment, and the earliest claim comment wins:
+
+```sh
+gh issue view <N> --json comments \
+  --jq '[.comments[] | select(.body | startswith("Claimed by "))][0].body'
+```
+
+- If it prints `Claimed by <your-agent-id>`, the ticket is yours. Carry on.
+- If it prints a different ID, you lost. Don't remove the label (the winner
+  needs it). Go back to the start of step 2 and run `next-ticket.sh` again.
 
 ## 3. Do the work (TDD, always)
 
@@ -70,18 +89,43 @@ Rules:
 
 ## 4. Ship it
 
+Other agents are merging at the same time, so rebase on the latest main right
+before you push, and re-run the full check after the rebase:
+
 ```sh
-git push -u origin HEAD
+git fetch origin
+git rebase origin/main        # fix conflicts if any (Cargo.toml and mod lists are common)
+nix develop -c just check     # must pass AFTER the rebase, not just before
+git push -u origin HEAD --force-with-lease
 gh pr create --fill --body "Closes #<N>
 
 <what you did, what tests you added, anything surprising>"
-gh pr checks --watch          # wait for CI
+```
+
+Then wait for CI:
+
+```sh
+gh pr checks --watch
+```
+
+- If it says `no checks reported`, the repo has no CI yet (it gets added in
+  ticket M0-01). In that case, `just check` passing locally after the rebase is
+  enough. Go ahead and merge.
+- If checks run and any fail, fix them on the same branch. Do not merge red.
+
+Merge and clean up:
+
+```sh
 gh pr merge --squash --delete-branch
+```
+
+If the merge fails because main moved (conflict or "not up to date"), go back
+to the rebase step above, then try the merge again.
+
+```sh
 git checkout main && git pull
 nix develop -c scripts/tick-tracking.sh
 ```
-
-If CI fails, fix it on the same branch. Do not merge red.
 
 ## 5. When you get stuck
 
