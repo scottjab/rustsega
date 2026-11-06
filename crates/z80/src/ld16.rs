@@ -137,9 +137,22 @@ impl Z80 {
         }
     }
 
+    /// `HL`, `IX` or `IY`: which pair `HL` means in the space being decoded.
+    ///
+    /// Paired with [`Z80::set_index`] so the mode-to-register mapping lives in
+    /// one place; the 16-bit arithmetic group (#50) reads and writes the same
+    /// three pairs.
+    pub(crate) fn index(&self, mode: IndexMode) -> u16 {
+        match mode {
+            IndexMode::Hl => self.hl(),
+            IndexMode::Ix => self.ix(),
+            IndexMode::Iy => self.iy(),
+        }
+    }
+
     /// Load `IX` or `IY`. `Hl` means the prefix has already rotted off, so the
     /// `HL` form is what runs.
-    fn set_index(&mut self, mode: IndexMode, value: u16) {
+    pub(crate) fn set_index(&mut self, mode: IndexMode, value: u16) {
         match mode {
             IndexMode::Ix => self.set_ix(value),
             IndexMode::Iy => self.set_iy(value),

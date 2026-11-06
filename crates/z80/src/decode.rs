@@ -188,6 +188,12 @@ impl Z80 {
             0x22 => self.ld_ind_nn_hl(bus),
             0x2A => self.ld_hl_ind_nn(bus),
             0xF9 => self.ld_sp_hl(),
+            // The 16-bit arithmetic (M2-07, #50). Bits 5-4 pick the operand
+            // pair in `ADD HL,rr` and the pair to bump in `INC`/`DEC rr`, so
+            // one helper each covers all four opcodes.
+            0x09 | 0x19 | 0x29 | 0x39 => self.add_hl_rr(op, IndexMode::Hl),
+            0x03 | 0x13 | 0x23 | 0x33 => self.inc_rr(op, IndexMode::Hl),
+            0x0b | 0x1b | 0x2b | 0x3b => self.dec_rr(op, IndexMode::Hl),
             // The 8-bit ALU (M2-06, #49). `y` is the operation in the ALU's own
             // order (ADD, ADC, SUB, SBC, AND, XOR, OR, CP) and `z` the operand
             // slot, so `80`-`BF` and the eight immediates share one helper.
@@ -250,6 +256,10 @@ impl Z80 {
             // `ED` included, so the timing is checkable against the suite.
             0x4B | 0x5B | 0x6B | 0x7B => self.ld_rr_ind_nn(bus, op),
             0x43 | 0x53 | 0x63 | 0x73 => self.ld_ind_nn_rr(bus, op),
+            // `ADC HL,rr` and `SBC HL,rr` (M2-07, #50): 15 T-states, this fetch
+            // of `ED` included. Bit 3 says which way round they are, `0` being
+            // `SBC`; `ed 42` is `SBC HL,BC` and `ed 4a` is `ADC HL,BC`.
+            0x42 | 0x4a | 0x52 | 0x5a | 0x62 | 0x6a | 0x72 | 0x7a => self.adc_sbc_hl_rr(op),
             _ if ed_is_defined(op) => {
                 self.unimplemented(&format!("ED {op:02X} (x{} y{} z{})", x(op), y(op), z(op)))
             }
@@ -310,6 +320,17 @@ impl Z80 {
             0xE3 => self.ex_sp_index(bus, mode),
             0xE5 => self.push_index(bus, mode),
             0xF9 => self.ld_sp_index(mode),
+            // The 16-bit arithmetic that mentions `HL` (M2-07, #50). Pair field
+            // `2` is the index register here, so `DD 29` is `ADD IX,IX` and the
+            // `INC`/`DEC` that reach it are `23`/`2B`.
+            0x09 | 0x19 | 0x29 | 0x39 => self.add_hl_rr(op, mode),
+            0x23 => self.inc_rr(op, mode),
+            0x2b => self.dec_rr(op, mode),
+            // `INC BC` and friends never mention `HL`, so the prefix has
+            // nothing to index and rots into a `NOP` in front of the unprefixed
+            // instruction (`dd 03`: 10 T-states, `PC + 2`, `R + 2`, `BC`
+            // incremented, in all 1000 cases).
+            0x03 | 0x13 | 0x33 | 0x0b | 0x1b | 0x3b => T_M1 + self.exec_main(bus, op),
             // `EXX` and `EX DE,HL` have nothing for the prefix to index, so it
             // rots into a NOP and the instruction runs (`dd d9` / `dd eb`: 8
             // T-states, `PC + 2`, in all 1000 cases of each).
@@ -486,16 +507,16 @@ mod tests {
         assert_eq!(cpu.step(&mut bus), 12);
         assert_eq!((cpu.pc(), cpu.r()), (3, 3));
 
-        // Last prefix wins, in both orders: `DD FD 09` is `ADD HL,BC` in the
-        // `IY` space (`ADDD HL,BC`) and `FD DD 09` is the `IX` one, whichever way
-        // the prefixes are stacked. `09` is used because 16-bit arithmetic is a
-        // later ticket (#50), so the panic still names the winning prefix.
+        // Last prefix wins, in both orders: `DD FD 24` is `INC IYH` and `FD DD 24`
+        // is `INC IXH`, whichever way the prefixes are stacked. `24` is used
+        // because the `IXH`/`IXL` half of this space is a later ticket (M2-15,
+        // #58), so the panic still names the winning prefix.
         for (first, second, winner) in [(0xDD, 0xFD, "FD"), (0xFD, 0xDD, "DD")] {
             let mut cpu = Z80::new();
-            let mut bus = Program::new(&[first, second, 0x09]);
+            let mut bus = Program::new(&[first, second, 0x24]);
             let message =
-                caught(|| cpu.step(&mut bus)).expect_err("{second:02X} 09 is not implemented");
-            assert!(message.contains(&format!("{winner} 09")), "{message}");
+                caught(|| cpu.step(&mut bus)).expect_err("{second:02X} 24 is not implemented");
+            assert!(message.contains(&format!("{winner} 24")), "{message}");
         }
     }
 
@@ -532,10 +553,10 @@ mod tests {
     #[test]
     fn main_space_gives_a_useful_panic() {
         let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0x09]); // ADD HL,BC, which is M2-07 (#50)
-        let message = caught(|| cpu.step(&mut bus)).expect_err("ADD HL,BC is not implemented");
+        let mut bus = Program::new(&[0x2F]); // CPL, which is M2-13 (#56)
+        let message = caught(|| cpu.step(&mut bus)).expect_err("CPL is not implemented");
         assert!(
-            message.contains("main 09 (x0 y1 z1)"),
+            message.contains("main 2F (x0 y5 z7)"),
             "unhelpful message: {message}"
         );
     }
