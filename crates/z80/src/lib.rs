@@ -11,7 +11,10 @@
 //! matter how correct its instruction semantics are.
 
 mod decode;
+mod ld8;
 mod regs;
+#[cfg(test)]
+mod testutil;
 
 pub use decode::IndexMode;
 pub use regs::{
@@ -68,9 +71,14 @@ pub struct Z80 {
     /// records the last address the ALU or a memory access generated and is
     /// readable through the undocumented X/Y flags of `BIT n,(HL)`.
     wz: u16,
-    /// Set when the last instruction left the flags alone, so the next one can
-    /// still see them; drives the undocumented X/Y of `SCF`/`CCF`.
-    q: bool,
+    /// The byte that feeds the undocumented X/Y flags when an instruction does
+    /// not compute them itself. Instructions that write the flags store the new
+    /// flag byte here; instructions that leave the flags alone store zero. The
+    /// suite proves it: in every flag-touching opcode file `final.q` equals
+    /// `final.f` in all 1000 cases, and in every LD and NOP file it is zero in
+    /// all of them. It is a byte and not a bit - `INC B` ends with `q` at 160
+    /// in case `04 0001`, for example - so it is not a `bool`.
+    q: u8,
     /// Set when the last instruction was `LD A,I` or `LD A,R`; decides the
     /// `P/V` bit an interrupt accepted right after those instructions forces.
     p: bool,
@@ -102,7 +110,7 @@ impl Z80 {
             im: IntMode::Mode0,
             halted: false,
             wz: 0,
-            q: false,
+            q: 0,
             p: false,
             ei_pending: false,
         };
@@ -139,7 +147,7 @@ impl Z80 {
         self.im = IntMode::Mode0;
         self.halted = false;
         self.wz = 0;
-        self.q = false;
+        self.q = 0;
         self.p = false;
         self.ei_pending = false;
     }
@@ -475,15 +483,14 @@ impl Z80 {
         self.wz = value;
     }
 
-    /// The `q` flag: whether the last instruction left the flags alone.
-    pub fn q(&self) -> bool {
+    /// The internal X/Y source byte (undocumented `q`).
+    pub fn q(&self) -> u8 {
         self.q
     }
 
-    /// Set `q`. An instruction that writes the flags clears it; one that leaves
-    /// them untouched sets it.
-    pub fn set_q(&mut self, set: bool) {
-        self.q = set;
+    /// Set the internal X/Y source byte (undocumented `q`).
+    pub fn set_q(&mut self, value: u8) {
+        self.q = value;
     }
 
     /// The `p` flag: whether the last instruction was `LD A,I` or `LD A,R`.
@@ -617,7 +624,7 @@ mod tests {
         cpu.set_im(IntMode::Mode2);
         cpu.set_halted(true);
         cpu.set_wz(0x7777);
-        cpu.set_q(true);
+        cpu.set_q(0xC5);
         cpu.set_p(true);
         cpu.set_ei_pending(true);
 
@@ -642,7 +649,7 @@ mod tests {
         assert_eq!(cpu.im(), IntMode::Mode0);
         assert!(!cpu.halted());
         assert_eq!(cpu.wz(), 0);
-        assert!(!cpu.q());
+        assert_eq!(cpu.q(), 0);
         assert!(!cpu.p());
         assert!(!cpu.ei_pending());
     }
@@ -766,17 +773,17 @@ mod tests {
     fn hidden_state_accessors() {
         let mut cpu = Z80::new();
         assert_eq!(cpu.wz(), 0);
-        assert!(!cpu.q());
+        assert_eq!(cpu.q(), 0);
         assert!(!cpu.p());
         assert!(!cpu.ei_pending());
 
         cpu.set_wz(0x1A2B);
-        cpu.set_q(true);
+        cpu.set_q(0xC5);
         cpu.set_p(true);
         cpu.set_ei_pending(true);
 
         assert_eq!(cpu.wz(), 0x1A2B);
-        assert!(cpu.q());
+        assert_eq!(cpu.q(), 0xC5);
         assert!(cpu.p());
         assert!(cpu.ei_pending());
     }
@@ -801,7 +808,7 @@ mod tests {
         let mut bus = FlatBus::new();
         cpu.set_pc(0x0100);
         cpu.set_r(0x8F);
-        cpu.set_q(true);
+        cpu.set_q(0xC5);
         cpu.set_p(true);
         cpu.set_ei_pending(true);
         cpu.set_wz(0x2345);
@@ -817,7 +824,7 @@ mod tests {
         // What the suite demands of NOP itself: R counts once, the latches are
         // consumed, and nothing else moves.
         assert_eq!(cpu.r(), 0x90);
-        assert!(!cpu.q());
+        assert_eq!(cpu.q(), 0);
         assert!(!cpu.p());
         assert!(!cpu.ei_pending());
         assert_eq!(cpu.wz(), 0x2345);

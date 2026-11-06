@@ -114,7 +114,7 @@ fn harness_detects_hidden_state_mismatch() {
         run(&case),
         vec![
             "wz: expected 0x1234, got 0x1000",
-            "q: expected true, got false"
+            "q: expected 0x01, got 0x00"
         ]
     );
 }
