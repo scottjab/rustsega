@@ -28,6 +28,11 @@ of the core crates.
 | Commercial smoke | `crates/genesis/tests/commercial.rs` | Boot real games N frames, assert no panic, non-blank output, golden frame hash. |
 | Frontend | `crates/web` with `wasm-bindgen-test` | Input mapping, settings, pure logic. Keep logic out of components so it is testable natively. |
 
+`wasm-bindgen-test` runs the wasm tests in a real browser: the dev shell pins
+Firefox and geckodriver and exports `GECKODRIVER` for
+`wasm-bindgen-test-runner`, which runs headless unless you set `NO_HEADLESS`.
+There is nothing to install per machine: both are pinned in `flake.nix`.
+
 ## External test data
 
 Nothing copyrighted gets committed. Test data is fetched or found at test time.
