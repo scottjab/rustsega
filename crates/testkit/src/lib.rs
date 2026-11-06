@@ -9,3 +9,4 @@ mod tests {
         assert_eq!(1 + 1, 2);
     }
 }
+pub   fn  ci_can_fail(  ) -> u32 { let   x=2 ; x }
