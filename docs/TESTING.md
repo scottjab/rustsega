@@ -73,10 +73,19 @@ and rerun `just fetch`.
 Tests that need external data must not fail when the data is missing. Use the
 `testkit` helpers (`testkit::test_rom("...")` / `testkit::commercial_rom("...")`)
 which return `None` when the file is absent, and print a `SKIPPED:` line.
-CI fetches the public test data; commercial ROM tests only run locally.
+Commercial ROM tests only ever run locally.
+
+CI (`.github/workflows/ci.yml`) runs `scripts/fetch-test-data.sh` before
+`just check`, and caches `test-roms/` under a key derived from
+`hashFiles('scripts/fetch-test-data.sh')`. So the first run after a pin bump
+downloads and every later run prints `up to date` and touches no network. A
+fetch failure fails the job on purpose: a dead pinned URL should be loud, not a
+wall of `SKIPPED`.
 
 Heavy suites (full SingleStepTests, long ROM runs) are `#[ignore]` by default
-and run with `cargo nextest run --run-ignored all` or `just test-all`.
+and run with `cargo nextest run --run-ignored all` or `just test-all`. CI runs
+`just test-all` as an extra step on pushes to `main`, so the slow suites report
+on main without making every PR wait for them.
 
 ## Known public test data
 
