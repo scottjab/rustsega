@@ -1,5 +1,7 @@
 # rustsega
 
+[![CI](https://github.com/scottjab/rustsega/actions/workflows/ci.yml/badge.svg)](https://github.com/scottjab/rustsega/actions/workflows/ci.yml)
+
 A Sega Genesis / Mega Drive emulator written in Rust. It runs in the browser
 through WebAssembly and deploys as one binary: the server embeds the whole web
 app, so you copy one file and run it.

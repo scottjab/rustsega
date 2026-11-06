@@ -1,0 +1,79 @@
+# Every push to main and every PR runs the exact gate agents run locally
+# (AGENTS.md section 4): `nix develop -c just check`. CI must evaluate the same
+# nix dev shell, so the toolchain and the wasm32 target come from
+# rust-toolchain.toml via flake.nix -- never from a hand-rolled apt/rustup setup.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One lane per ref (branch or PR): pushing again cancels the previous, now
+# meaningless run instead of burning minutes of a private repo's allowance on a
+# commit nobody is going to merge.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: just check
+    runs-on: ubuntu-latest
+    # Bound a hung run; `just check` from a warm cache is a few minutes.
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        # Latest major as of 2026-11-05 (v7.0.1). Checked against the action's
+        # README, not guessed. v7 is Node 24 based; ubuntu-latest's hosted runner
+        # is new enough. Its new fork-PR hardening only affects
+        # pull_request_target/workflow_run, which this workflow does not use.
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        # Latest major as of 2026-11-05 (v31.11.3). Enables the nix-command and
+        # flakes experimental features this flake needs and makes the CI user a
+        # trusted user, which is what lets the store cache below work.
+        uses: cachix/install-nix-action@v31
+        with:
+          # Built-in token, not a repository secret: avoids anonymous GitHub
+          # rate limits while Nix fetches the flake inputs.
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nix store cache
+        # Latest major as of 2026-11-05 (v15). Chosen over
+        # nix-community/cache-nix-action because it needs zero config and zero
+        # secrets: it caches whatever this run builds into the GitHub Actions
+        # cache, which every run of this repo can read. A Cachix cache would
+        # need a write token this repo does not have, and the repo is private so
+        # the public Determinate/NixOS caches are not an option for our own work.
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          # FlakeHub needs an account plus OIDC trust; this repo has neither and
+          # this keeps the action from trying. Everything stays in the free,
+          # private GitHub Actions cache.
+          use-flakehub: false
+          use-gha-cache: enabled
+          # No telemetry out of a private repo.
+          diagnostic-endpoint: ""
+
+      - name: Cache cargo registry and target dir
+        # Latest major as of 2026-11-05 (v6.1.0). Keyed on the three inputs that
+        # can invalidate cargo artifacts: the dependency graph, the rustc
+        # version, and the nixpkgs revision the toolchain is built from.
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'flake.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: just check
+        run: nix develop -c just check
