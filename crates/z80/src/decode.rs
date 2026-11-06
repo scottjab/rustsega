@@ -188,6 +188,17 @@ impl Z80 {
             0x22 => self.ld_ind_nn_hl(bus),
             0x2A => self.ld_hl_ind_nn(bus),
             0xF9 => self.ld_sp_hl(),
+            // The 8-bit ALU (M2-06, #49). `y` is the operation in the ALU's own
+            // order (ADD, ADC, SUB, SBC, AND, XOR, OR, CP) and `z` the operand
+            // slot, so `80`-`BF` and the eight immediates share one helper.
+            0x80..=0xBF => self.alu_a_r(bus, op),
+            0xC6 | 0xCE | 0xD6 | 0xDE | 0xE6 | 0xEE | 0xF6 | 0xFE => self.alu_a_n(bus, op),
+            // 8-bit `INC`/`DEC`: `y` is again the register slot, with `z` 4 for
+            // `INC` and 5 for `DEC`.
+            0x04 | 0x0C | 0x14 | 0x1C | 0x24 | 0x2C | 0x3C => self.inc_reg(op),
+            0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x3D => self.dec_reg(op),
+            0x34 => self.inc_hl_ind(bus),
+            0x35 => self.dec_hl_ind(bus),
             0x08 => self.ex_af_af(),
             0xD9 => self.exx(),
             0xEB => self.ex_de_hl(),
@@ -283,6 +294,15 @@ impl Z80 {
             // The 16-bit loads, stack and exchanges in this space (M2-05, #48).
             // `22`/`2A` move the index pair through memory rather than `HL`; see
             // `Z80::ld_index_ind_nn` for the traces that settled that.
+            // The 8-bit ALU and `INC`/`DEC` against `(IX+d)` (M2-06, #49). The
+            // ALU needs `z = 6`, which is the only indexed ALU encoding; the
+            // rest of `DD 80`-`DD BF` is the undocumented `IXH`/`IXL` set
+            // (M2-15, #58) and stays a panic.
+            0x86 | 0x8E | 0x96 | 0x9E | 0xA6 | 0xAE | 0xB6 | 0xBE => {
+                self.alu_a_index(bus, mode, op)
+            }
+            0x34 => self.inc_index_ind(bus, mode),
+            0x35 => self.dec_index_ind(bus, mode),
             0x21 => self.ld_index_nn(bus, mode),
             0x22 => self.ld_ind_nn_index(bus, mode),
             0x2A => self.ld_index_ind_nn(bus, mode),

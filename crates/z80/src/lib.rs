@@ -10,6 +10,7 @@
 //! and its final state, so a core that does not model them cannot pass, no
 //! matter how correct its instruction semantics are.
 
+mod alu8;
 mod decode;
 mod ld16;
 mod ld8;
@@ -494,6 +495,21 @@ impl Z80 {
     /// write to `F`.
     pub(crate) fn clear_latches(&mut self) {
         self.q = 0;
+        self.p = false;
+        self.ei_pending = false;
+    }
+
+    /// What an instruction that recomputes the flags does on the way out: `q`
+    /// records the flag byte it just wrote, and the other two latches clear.
+    ///
+    /// The counterpart to [`Z80::clear_latches`], and the suite says the split
+    /// is exact: in all 1000 cases of every ALU and `INC`/`DEC` opcode file
+    /// (`80`-`BF`, `C6 CE D6 DE E6 EE F6 FE`, `04`-`3D`, `34`/`35` and the
+    /// `DD`/`FD` forms) `final.q == final.f`, `final.p == 0` and `final.ei == 0`.
+    /// That includes `INC`/`DEC`, whose `q` therefore carries the unchanged `C`
+    /// bit along with the flags they did establish.
+    pub(crate) fn latch_flags(&mut self) {
+        self.q = self.f();
         self.p = false;
         self.ei_pending = false;
     }

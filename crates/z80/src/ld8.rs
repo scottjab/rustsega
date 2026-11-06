@@ -48,7 +48,7 @@ impl Z80 {
     /// Leaves `wz` at that address: every indexed access in the suite ends with
     /// `wz == base + d` (`dd 46`, `fd 77`, `dd 36`: 1000 cases each). The
     /// displacement is signed, so `d = 0xFE` reaches two bytes below the base.
-    fn index_address(&mut self, bus: &mut impl Z80Bus, mode: IndexMode) -> u16 {
+    pub(crate) fn index_address(&mut self, bus: &mut impl Z80Bus, mode: IndexMode) -> u16 {
         let disp = i16::from(self.fetch_byte(bus) as i8);
         let base = match mode {
             IndexMode::Hl => self.hl(),
