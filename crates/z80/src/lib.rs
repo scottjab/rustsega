@@ -10,6 +10,7 @@
 //! and its final state, so a core that does not model them cannot pass, no
 //! matter how correct its instruction semantics are.
 
+mod alu16;
 mod alu8;
 mod decode;
 mod ld16;
