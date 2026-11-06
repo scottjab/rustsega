@@ -1,0 +1,11 @@
+[package]
+name = "web"
+description = "Browser frontend (Leptos, built with trunk)"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

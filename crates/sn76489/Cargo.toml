@@ -1,0 +1,11 @@
+[package]
+name = "sn76489"
+description = "SN76489 PSG"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "ym2612"
+description = "Yamaha YM2612 FM synthesizer"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "genesis"
+description = "Genesis system: bus, memory map, cartridge, I/O, scheduler, save states"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
