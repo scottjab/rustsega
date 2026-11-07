@@ -92,6 +92,14 @@ impl M68k {
             Op::Subx => self.op_subx(bus, opcode),
             Op::Subi => self.op_subi(bus, opcode),
             Op::Subq => self.op_subq(bus, opcode),
+            // The compare and test class (`1011`, `0000 1100` and `0100 1010`):
+            // the same arithmetic again for the flags only, so it lives with the
+            // subtract side in [`arith`] and shares `sub_flags_no_x`.
+            Op::Cmp => self.op_cmp(bus, opcode),
+            Op::Cmpa => self.op_cmpa(bus, opcode),
+            Op::Cmpm => self.op_cmpm(bus, opcode),
+            Op::Cmpi => self.op_cmpi(bus, opcode),
+            Op::Tst => self.op_tst(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming
