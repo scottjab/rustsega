@@ -23,6 +23,13 @@ pub const RESET_CYCLES: u32 = 132;
 /// one bus cycle, so 4 clocks; a long is two word accesses, so 8.
 const BUS_CYCLE_CLOCKS: u64 = 4;
 
+/// How far ahead of [`M68k::pc`] the prefetch queue has already read, in bytes.
+///
+/// The queue holds two words ([`M68k::prefetch`]), `pc` is the address of the
+/// front one, so the next word the CPU has *not* yet fetched is at
+/// `pc + FETCH_AHEAD` and every queue refill reads from there.
+const FETCH_AHEAD: u32 = 4;
+
 /// The 68000 register file and CPU state.
 ///
 /// Fields are plain data (no `Box<dyn _>`, no references) so the save-state
@@ -41,13 +48,64 @@ pub struct M68k {
     /// Supervisor stack pointer. Holds the SSP while it is not the active
     /// pointer (i.e. while S = 0); see [`M68k::set_sr`].
     pub ssp: u32,
-    /// Program counter. Always even.
+    /// Program counter: the address of the word the CPU is working on — the
+    /// address of `prefetch[0]`, the opcode now being executed. Always even and
+    /// always 24 bit.
+    ///
+    /// # The prefetch convention
+    ///
+    /// [`M68k::prefetch`] is a two-word window onto the instruction stream that
+    /// always satisfies `prefetch == [word(pc), word(pc + 2)]`, so the next word
+    /// the CPU has not yet fetched is at `pc + 4`. The core uses exactly the
+    /// suite's convention so the SingleStepTests harness can copy `pc` and
+    /// `prefetch` straight across (see `tests/harness/mod.rs`: `apply` and
+    /// `snapshot` are 1:1, with no adapter to drift out of step).
+    ///
+    /// Derived from the suite, not assumed. In
+    /// `test-roms/680x0/68000/v1/NOP.json.gz`, case `4e71 [NOP] 1`: `initial`
+    /// is `pc = 0x000C00`, `prefetch = [0x4E71, 0x2A53]`, and `initial.ram`
+    /// lists exactly one word — `0x000C04 = 06 79`. `0x4E71` is the `NOP`
+    /// opcode the case name quotes, so the opcode word sits *at* `pc`, not
+    /// below it. The case's own bus trace has exactly one read, `$000C04` (the
+    /// word $0679), and `final` is `pc = 0x000C02`,
+    /// `prefetch = [0x2A53, 0x0679]`: the freshly fetched word became
+    /// `prefetch[1]` at `final.pc + 2`, while `prefetch[0]` is the
+    /// already-queued word at the new `pc` and was never re-read. Same shape in
+    /// `UNLINK.json.gz` case `4e58 [UNLINK A0] 1`: `final.pc` is
+    /// `initial.pc + 2`, `final.prefetch[0]` is `initial.prefetch[1]`, and of
+    /// that case's three reads the one from the instruction stream is again
+    /// `initial.pc + 4` (`$000C04`), supplying `final.prefetch[1]`.
+    ///
+    /// Measured over the whole pinned suite (124 files, 1 000 060 cases): every
+    /// case whose `ram` lists the bytes at `pc` and `pc + 2` — 986 556 of them,
+    /// in both `initial` and `final` — satisfies the invariant, with no
+    /// counterexample, and instruction-stream reads cluster at
+    /// `pc + 4` (910 000), `pc + 6` (236 825), `pc + 8` (19 527) and `pc + 10`
+    /// (1 257) — the queue refill ladder. Nothing fetches from `pc` or `pc + 2`,
+    /// because the queue already has those two words.
+    ///
+    /// One trap worth naming: M68000UM's prose ("Programming Model", Program
+    /// Counter) says the program counter "always points to the memory location
+    /// containing the next byte or word to be accessed", which is `pc + 4` here,
+    /// because the next access is the queue refill. This field deliberately uses
+    /// the suite's numbering — the address of the opcode being executed — not
+    /// that one. PC-relative addressing and exception frames therefore use
+    /// `pc + <words already consumed>`, never `pc` raw.
     pub pc: u32,
     /// Status register. Only the bits in [`SR_MASK`] exist; write it through
     /// [`M68k::set_sr`] so the mask and the stack pointer swap happen.
     pub sr: u16,
-    /// Prefetch queue, the IRC/IRD model the SingleStepTests expect. Filled by
-    /// M1-04 (#12); unused until then.
+    /// Prefetch queue: `[word(pc), word(pc + 2)]`, the pair the SingleStepTests
+    /// model and the core has to reproduce.
+    ///
+    /// Index 0 is IR/IRD, the opcode being executed; index 1 is IRC, the next
+    /// word, already fetched (M68000UM, "Programming Model" and "Instruction
+    /// Processing": operands and the following instruction are fetched into the
+    /// instruction registers while the instruction in IR is executing, so the
+    /// CPU is always a word or two ahead of itself). Both words are always the
+    /// ones at `pc` and `pc + 2` — see [`M68k::pc`] for the evidence — and the
+    /// only way to move the window is `pop_word`, so nothing can break the
+    /// invariant.
     pub prefetch: [u16; 2],
     /// Interrupt level currently asserted on the IPL pins, 0..=7. 0 = none.
     pub ipl: u8,
@@ -114,7 +172,11 @@ impl M68k {
         self.ssp = ssp;
         // SR.S is already 1, so `a[7]` is the active SSP.
         self.a[7] = ssp;
-        self.pc = pc;
+        // The vector fetch is over, so the CPU starts fetching instructions at
+        // the new PC: the queue is full before the first instruction executes
+        // (M68000UM section 5 "Reset", which ends with the processor fetching
+        // from the loaded PC). `jump_to` is exactly that — two word fetches.
+        self.jump_to(bus, pc);
 
         self.cycles += u64::from(RESET_CYCLES);
     }
@@ -269,12 +331,110 @@ impl M68k {
         self.write_w(bus, addr, (value >> 16) as u16);
         self.write_w(bus, (addr + 2) & ADDR_MASK, value as u16);
     }
+
+    // ---- Prefetch queue: the only way words enter and leave it (M1-04, #12) ----
+    //
+    // Because `pc` is defined as the address of the queue front, taking a word
+    // out of the front is the same rotation whether that word is an extension
+    // word of the instruction being executed or the opcode of an instruction
+    // that has just finished. `pop_word` is the one implementation of it, so the
+    // `prefetch == [word(pc), word(pc + 2)]` invariant cannot be broken by one
+    // of the callers below getting the bookkeeping wrong.
+
+    /// Take the front word out of the queue and refill the vacated slot: the
+    /// back word moves to the front, the word at `pc + 4` is fetched into the
+    /// back, and `pc` moves up one word to keep pointing at the front. Returns
+    /// the word that came out of the front.
+    ///
+    /// The returned word was fetched earlier, so this costs one bus cycle, not
+    /// two: 4 clocks for the refill read. That is why a `NOP` is 4 clocks and
+    /// why a write to the word already sitting in the queue does not reach the
+    /// CPU until the queue has moved on (self-modifying code).
+    ///
+    /// TODO(M1-29): an instruction fetch from an odd address is an address error
+    /// — vector 2, the long at $000008 (M68000UM, "Exception Vector Memory
+    /// Map"). Every instruction fetch in the core goes through here, so that
+    /// check belongs here rather than in its callers.
+    fn pop_word(&mut self, bus: &mut impl Bus) -> u16 {
+        let word = self.prefetch[1];
+        // The refill address is computed before `pc` moves: the queue's next
+        // unread word is 4 bytes ahead of the *old* front.
+        let next = (self.pc + FETCH_AHEAD) & ADDR_MASK;
+        self.prefetch[0] = word;
+        self.pc = (self.pc + 2) & ADDR_MASK;
+        self.prefetch[1] = self.read_w(bus, next);
+        word
+    }
+
+    /// The instruction's extension word: immediate data, a displacement, an
+    /// absolute address — whatever follows the opcode in the instruction stream.
+    ///
+    /// Hands over the word already sitting at the back of the queue (it was
+    /// fetched while the CPU was still decoding) and charges only the refill,
+    /// 4 clocks. See `pop_word`.
+    #[allow(
+        dead_code,
+        reason = "called by the instruction tickets from M1-05 (#13) onward; only the tests use it today"
+    )]
+    pub(crate) fn fetch_ext_word(&mut self, bus: &mut impl Bus) -> u16 {
+        self.pop_word(bus)
+    }
+
+    /// A long extension word: two queue words, high word first, so 8 clocks and
+    /// `pc` advances by 4.
+    #[allow(
+        dead_code,
+        reason = "called by the instruction tickets from M1-05 (#13) onward; only the tests use it today"
+    )]
+    pub(crate) fn fetch_ext_long(&mut self, bus: &mut impl Bus) -> u32 {
+        let high = u32::from(self.fetch_ext_word(bus));
+        let low = u32::from(self.fetch_ext_word(bus));
+        (high << 16) | low
+    }
+
+    /// End of an instruction: `IRC` (the next opcode, already fetched) becomes
+    /// the queue front and a new word is fetched into `IRC`.
+    ///
+    /// Called once at the end of every instruction, which is what leaves `pc`
+    /// and `prefetch` in exactly the state a SingleStepTests case starts a case
+    /// with: `pc` on the next opcode, the queue two words wide from there.
+    #[allow(
+        dead_code,
+        reason = "called by the instruction tickets from M1-05 (#13) onward; only the tests use it today"
+    )]
+    pub(crate) fn advance_opcode(&mut self, bus: &mut impl Bus) {
+        self.pop_word(bus);
+    }
+
+    /// Throw the queue away and refill it with two fresh word fetches from
+    /// `addr`: afterwards `pc == addr` and
+    /// `prefetch == [word(addr), word(addr + 2)]`. Costs 8 clocks.
+    ///
+    /// Branches, jumps, `RTE`/`RTS`/`RTR` and exception entry all leave the CPU
+    /// with a queue full of words from a stream it is no longer executing, so
+    /// they refill instead of sliding the window with `pop_word` — that
+    /// is also why a taken branch costs more than a not-taken one here
+    /// (M68000UM, "Instruction Processing": the branch processor loads the new
+    /// PC and instruction fetching restarts there, so the words the queue had
+    /// already fetched are thrown away).
+    pub(crate) fn jump_to(&mut self, bus: &mut impl Bus, addr: u32) {
+        let addr = addr & ADDR_MASK;
+        self.pc = addr;
+        self.prefetch[0] = self.read_w(bus, addr);
+        self.prefetch[1] = self.read_w(bus, (addr + 2) & ADDR_MASK);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sr::{SR_C, SR_INT_MASK, SR_N, SR_T, SR_V, SR_X};
+    use crate::testbus::cpu_with_program;
+
+    /// Where [`cpu_with_program`] loads its program words (its own
+    /// `PROGRAM_ADDR`, which is private to `testbus`), so the queue tests can
+    /// name the addresses the queue is reading.
+    const PROGRAM_BASE: u32 = 0x0000_1000;
 
     /// Minimal 64 KB RAM bus for these unit tests. M1-02 (#10) adds the real
     /// `TestBus` with bus-transaction recording for the conformance suites;
@@ -365,10 +525,19 @@ mod tests {
         assert_eq!(cpu.sr, 0x2700, "S=1, T=0, interrupt mask 7");
         assert!(cpu.is_supervisor());
         assert_eq!(cpu.int_mask(), 7);
-        // The reset vector fetches are two long accesses, high word first.
+        // The reset vector fetches are two long accesses, high word first, and
+        // then the queue is filled with two word fetches from the PC that was
+        // just loaded (M1-04, #12).
         assert_eq!(
             bus.accesses,
-            [0x0000_0000, 0x0000_0002, 0x0000_0004, 0x0000_0006]
+            [
+                0x0000_0000, // SSP high
+                0x0000_0002, // SSP low
+                0x0000_0004, // PC high
+                0x0000_0006, // PC low
+                0x0000_0200, // prefetch[0], at the new PC
+                0x0000_0202, // prefetch[1]
+            ]
         );
     }
 
@@ -496,14 +665,157 @@ mod tests {
         assert_eq!(cpu.cycles, 32, "a long is two bus cycles");
     }
 
+    /// Reset charges the fixed 132-clock reset sequence *plus* every bus cycle
+    /// the sequence performs: four word reads for the two long vector fetches
+    /// and two word reads to fill the prefetch queue from the new PC, so
+    /// 132 + 16 + 8 = 156 clocks.
+    ///
+    /// The `+ 16` this test asserted before M1-04 (#12) was deliberately changed
+    /// to `+ 24`: the queue did not exist then, and "reset leaves the queue full"
+    /// is two bus cycles the model did not previously pay for. `RESET_CYCLES`
+    /// still means the reset sequence alone, which is what the 132 in the name
+    /// refers to.
     #[test]
-    fn reset_charges_132_clocks() {
+    fn reset_charges_132_clocks_plus_the_vector_and_queue_fetches() {
         let mut bus = bus_with_reset_vector();
         let mut cpu = M68k::new();
 
         cpu.reset(&mut bus);
 
-        // The reset sequence itself, plus the two long vector fetches.
-        assert_eq!(cpu.cycles, u64::from(RESET_CYCLES) + 16);
+        assert_eq!(bus.accesses.len(), 6, "four vector words, two queue words");
+        assert_eq!(
+            cpu.cycles,
+            u64::from(RESET_CYCLES) + 16 + 8,
+            "the 132-clock sequence, 16 clocks of vector fetch, 8 clocks of prefetch"
+        );
+    }
+
+    // ---- M1-04 (#12): the prefetch queue and the instruction fetch ----
+
+    #[test]
+    fn reset_fills_prefetch() {
+        let (cpu, _bus) = cpu_with_program(&[0x4E71, 0x1234]); // NOP, then a data word
+
+        assert_eq!(
+            cpu.pc, PROGRAM_BASE,
+            "pc is the address of the queued opcode"
+        );
+        assert_eq!(
+            cpu.prefetch,
+            [0x4E71, 0x1234],
+            "reset fills the queue with two word fetches from the new PC"
+        );
+    }
+
+    #[test]
+    fn fetch_extension_word_refills() {
+        let (mut cpu, mut bus) = cpu_with_program(&[0x4E71, 0x2A53, 0x0679, 0xB50C]);
+        let cycles = cpu.cycles;
+
+        assert_eq!(
+            cpu.fetch_ext_word(&mut bus),
+            0x2A53,
+            "the extension word comes out of the queue, already fetched"
+        );
+        assert_eq!(
+            cpu.prefetch,
+            [0x2A53, 0x0679],
+            "the queue slid one word and refilled with the word at pc + 4"
+        );
+        assert_eq!(
+            cpu.pc,
+            PROGRAM_BASE + 2,
+            "pc is the address of the queue front"
+        );
+        assert_eq!(
+            cpu.cycles - cycles,
+            4,
+            "one word read only: the extension itself cost no bus access"
+        );
+
+        assert_eq!(cpu.fetch_ext_word(&mut bus), 0x0679, "and again");
+        assert_eq!(cpu.prefetch, [0x0679, 0xB50C]);
+        assert_eq!(cpu.pc, PROGRAM_BASE + 4);
+        assert_eq!(cpu.cycles - cycles, 8, "one more word read");
+    }
+
+    #[test]
+    fn fetch_extension_long_is_high_word_first() {
+        let (mut cpu, mut bus) = cpu_with_program(&[0x4E71, 0x1234, 0x5678, 0x9ABC]);
+        let cycles = cpu.cycles;
+
+        assert_eq!(
+            cpu.fetch_ext_long(&mut bus),
+            0x1234_5678,
+            "a long extension is two queue words, high first"
+        );
+        assert_eq!(cpu.pc, PROGRAM_BASE + 4);
+        assert_eq!(cpu.prefetch, [0x5678, 0x9ABC]);
+        assert_eq!(cpu.cycles - cycles, 8, "two word reads");
+    }
+
+    /// The end-of-instruction rotation, checked against the exact numbers
+    /// `NOP.json.gz` case `4e71 [NOP] 1` records: `pc` $000C00 → $000C02 and the
+    /// queue `[4E71, 2A53]` → `[2A53, 0679]`, from one word read at the old
+    /// `pc + 4` — which is the whole of what a `NOP` is billed for (4 clocks).
+    #[test]
+    fn advance_opcode_finishes_the_instruction() {
+        let (mut cpu, mut bus) = cpu_with_program(&[0x4E71, 0x2A53, 0x0679]);
+        let cycles = cpu.cycles;
+
+        cpu.advance_opcode(&mut bus);
+
+        assert_eq!(cpu.pc, PROGRAM_BASE + 2, "pc is on the next opcode");
+        assert_eq!(
+            cpu.prefetch,
+            [0x2A53, 0x0679],
+            "the next opcode moved to the front of the queue and one new word was fetched"
+        );
+        assert_eq!(
+            cpu.cycles - cycles,
+            4,
+            "one word read, the fetch a NOP pays for"
+        );
+    }
+
+    #[test]
+    fn refill_after_jump() {
+        let (mut cpu, mut bus) = cpu_with_program(&[0x4E71, 0x2A53]);
+        bus.load_words(0x0000_2000, &[0x4EB9, 0x1234, 0x5678]); // JSR abs.l ...
+        let cycles = cpu.cycles;
+
+        cpu.jump_to(&mut bus, 0x0000_2000);
+
+        assert_eq!(cpu.pc, 0x0000_2000);
+        assert_eq!(
+            cpu.prefetch,
+            [0x4EB9, 0x1234],
+            "the jump throws the queue away and refetches two words from the target"
+        );
+        assert_eq!(cpu.cycles - cycles, 8, "two word fetches");
+    }
+
+    #[test]
+    fn self_modifying_code_runs_old_word() {
+        let (mut cpu, mut bus) = cpu_with_program(&[0x4E71, 0x2A53]);
+
+        // The word at pc + 2 is already sitting in the queue, so rewriting it
+        // in memory cannot reach the CPU before the queue does.
+        bus.write_word(cpu.pc + 2, 0x1234);
+        assert_eq!(
+            bus.read_word(cpu.pc + 2),
+            0x1234,
+            "memory itself did change"
+        );
+
+        assert_eq!(
+            cpu.fetch_ext_word(&mut bus),
+            0x2A53,
+            "the queue returns the word it fetched before the write"
+        );
+        assert_eq!(
+            cpu.prefetch[0], 0x2A53,
+            "and that word is now the queue front"
+        );
     }
 }

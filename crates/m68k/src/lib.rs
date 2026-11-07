@@ -7,8 +7,13 @@
 //! pointer and program counter from the reset vector table like real hardware
 //! does.
 //!
-//! Not implemented yet: the prefetch queue (M1-04, #12), addressing modes,
-//! instructions, exceptions and interrupts. [`M68k::step`] is a stub.
+//! Instructions are fetched through a two-word prefetch queue (M1-04, #12):
+//! `pc` is the address of the queued opcode and `prefetch[1]` the following
+//! word, which is the convention the SingleStepTests suite uses — see
+//! [`M68k::pc`].
+//!
+//! Not implemented yet: addressing modes, instructions, exceptions and
+//! interrupts. [`M68k::step`] is a stub.
 
 mod bus;
 mod cpu;

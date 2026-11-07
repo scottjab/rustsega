@@ -151,15 +151,17 @@ impl Bus for TestBus {
 /// Writes the reset vector table (SSP = [`STACK_TOP`] at $000000, PC =
 /// [`PROGRAM_ADDR`] at $000004), loads `program` at [`PROGRAM_ADDR`], then
 /// calls [`M68k::reset`] — a real reset, so the CPU comes back in supervisor
-/// mode with interrupts masked and `cycles` already charged for the reset
-/// sequence and the two long vector fetches
-/// (`RESET_CYCLES + 16`, i.e. 148).
+/// mode with interrupts masked, with the prefetch queue already holding
+/// `program`'s first two words, and with `cycles` charged for the reset
+/// sequence, the two long vector fetches and the two prefetch fetches
+/// (`RESET_CYCLES + 24`, i.e. 156).
 ///
 /// ```
 /// use m68k::testbus::cpu_with_program;
 ///
-/// let (cpu, _bus) = cpu_with_program(&[0x4E71]); // NOP
+/// let (cpu, _bus) = cpu_with_program(&[0x4E71, 0x4E75]); // NOP, RTE
 /// assert_eq!(cpu.pc, 0x0000_1000);
+/// assert_eq!(cpu.prefetch, [0x4E71, 0x4E75]);
 /// ```
 pub fn cpu_with_program(program: &[u16]) -> (M68k, TestBus) {
     let mut bus = TestBus::new();
@@ -253,7 +255,13 @@ mod tests {
         assert_eq!(bus.read_word(cpu.pc), 0x4E71, "program is at PC");
         assert_eq!(bus.read_word(cpu.pc + 2), 0x4E75);
         // The helper runs a real `M68k::reset`, not a register poke: the 132
-        // clock reset sequence plus the two long vector fetches.
-        assert_eq!(cpu.cycles, u64::from(RESET_CYCLES) + 16);
+        // clock reset sequence, the two long vector fetches, and the two word
+        // fetches that fill the prefetch queue (M1-04, #12).
+        assert_eq!(cpu.cycles, u64::from(RESET_CYCLES) + 16 + 8);
+        assert_eq!(
+            cpu.prefetch,
+            [0x4E71, 0x4E75],
+            "reset leaves the queue holding the first two words of the program"
+        );
     }
 }
