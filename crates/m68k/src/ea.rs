@@ -1,9 +1,11 @@
-//! Effective address (EA) calculation and operand access (M1-05, #13).
+//! Effective address (EA) calculation and operand access (M1-05 #13, M1-06 #14).
 //!
 //! The EA field of an opcode is 6 bits: mode in bits 5..3, register in bits
 //! 2..0 (M68000UM, section 3 "Effective Address Computation"). This module
-//! covers the five register-based modes — `000` Dn, `001` An, `010` (An),
-//! `011` (An)+, `100` -(An) — and leaves `101`–`111` to M1-06 (#14).
+//! covers all of them — `000` Dn, `001` An, `010` (An), `011` (An)+, `100`
+//! -(An), `101` d16(An), `110` d8(An,Xn), and `111` abs.W, abs.L, d16(PC),
+//! d8(PC,Xn), #imm — except mode `111` with register `101`–`111`, which is not
+//! an addressing mode at all and becomes an illegal instruction in M1-07 (#15).
 //!
 //! The three entry points are used in this order, and the order matters for
 //! read-modify-write instructions:
@@ -14,10 +16,23 @@
 //!    `ADD.W #x, (A0)+`-style instruction reads and writes the same `Ea`;
 //!    resolving twice would increment A0 twice.
 //!
-//! No EA calculation here reads memory, so none of them take a bus: extension
-//! words (displacements, absolute addresses, immediate data) come from the
-//! prefetch queue via [`M68k::fetch_ext_word`], never from `bus.read_word(pc)`
-//! — see [`M68k::pc`] for why. The bus only appears in the accessors.
+//! Modes `000`–`100` read no memory at all. The rest take a bus for exactly
+//! one reason: pulling their extension words out of the prefetch queue, which
+//! refills itself from `pc + 4` on every pop. Extension words — displacements,
+//! absolute addresses, immediate data — therefore come from
+//! [`M68k::fetch_ext_word`] / [`M68k::fetch_ext_long`], never from
+//! `bus.read_word(pc)`; see [`M68k::pc`] for the queue convention and
+//! [`M68k::ext_addr`] for the address an extension word has while it is still
+//! queued. PC-relative modes measure from that address.
+//!
+//! The 24-bit rule: an [`Ea::Mem`] carries the address already masked with
+//! [`ADDR_MASK`], which is the address the bus is asked about. Masking there is
+//! the same address as masking late at the bus, because addition commutes with
+//! the modulo — pinned by `tests::masking_wraps_at_24_bits` — but it is not the
+//! address an address-*as-data* instruction wants: `LEA` keeps the unmasked
+//! 32-bit sum in its destination register (`LEA.json.gz` case
+//! `41fa [LEA (d16, PC), A0] 59` ends with `a0 = 0xFFFFAFEB`), so those
+//! instructions need the sum itself rather than an [`Ea::Mem`] — see #193.
 
 use crate::bus::{ADDR_MASK, Bus};
 use crate::cpu::M68k;
@@ -88,6 +103,10 @@ pub enum Ea {
     AddrReg(u8),
     /// Memory, at an address already computed and masked to 24 bits.
     Mem(u32),
+    /// Immediate data (`#imm`), already fetched from the prefetch queue at the
+    /// operand's width: a byte immediate is the low byte of one extension word,
+    /// a long immediate is two. Source only — [`M68k::write_ea`] refuses it.
+    Imm(u32),
 }
 
 impl Ea {
@@ -103,6 +122,29 @@ impl Ea {
     pub fn accepts_size(self, size: Size) -> bool {
         !matches!(self, Ea::AddrReg(_) if size == Size::Byte)
     }
+}
+
+/// Extra internal clocks charged by the `d8(An,Xn)` / `d8(PC,Xn)` address
+/// calculation.
+///
+/// M68000UM, Appendix C "Instruction Timing": the indexed forms carry 2
+/// internal clock cycles beyond the access itself, because the index register
+/// has to be read and added before the bus cycle can start. TODO(M1-31a, #39):
+/// confirm against the SingleStepTests cycle counts.
+const INDEX_CALC_CLOCKS: u64 = 2;
+
+/// Sign extend a 16-bit value to 32 bits (`0x8000` -> `0xFFFF_8000`).
+///
+/// Written with `as` rather than `i32::from` because `From` is not a const
+/// trait, so `#[rustfmt::skip]`-style `const fn` helpers cannot use it.
+const fn sign_extend_word(value: u16) -> u32 {
+    (value as i16) as u32
+}
+
+/// Sign extend an 8-bit value to 32 bits (`0xFE` -> `0xFFFF_FFFE`). `as` for
+/// the same const-fn reason as [`sign_extend_word`].
+const fn sign_extend_byte(value: u8) -> u32 {
+    (value as i8) as u32
 }
 
 /// Extra internal clocks charged by the `-(An)` address calculation.
@@ -130,16 +172,23 @@ const fn ea_step(reg: u8, size: Size) -> u32 {
 }
 
 impl M68k {
-    /// Resolve addressing modes 000–100 to an [`Ea`], applying the `(An)+` /
-    /// `-(An)` register update as a side effect.
+    /// Resolve an EA to an [`Ea`], applying the `(An)+` / `-(An)` register
+    /// update as a side effect and consuming the mode's extension words.
     ///
     /// `mode` is bits 5..3 of the EA field and `reg` bits 2..0 (for MOVE's
-    /// destination field the two are swapped — handled by M1-09, #17).
+    /// destination field the two are swapped — handled by M1-09, #17). In mode
+    /// `111` the `reg` field *is* the sub-mode, which is why it is matched
+    /// against here instead of used as a register number.
     ///
-    /// Returns `None` for a mode this layer cannot resolve: `101`–`111`, which
-    /// land in M1-06 (#14), and byte size with An direct, which no instruction
-    /// encodes (see [`Ea::accepts_size`]). Callers turn `None` into an illegal
-    /// instruction or an unimplemented-mode path; it never panics.
+    /// `bus` is only there to feed the prefetch queue (see the module docs):
+    /// no addressing mode reads memory for its operand here, and none writes.
+    ///
+    /// Returns `None` for a mode this layer cannot resolve — mode `111` with
+    /// register `101`–`111`, an illegal instruction that M1-07 (#15) decodes,
+    /// and byte size with An direct, which no instruction encodes (see
+    /// [`Ea::accepts_size`]). Callers turn `None` into an illegal instruction or
+    /// an unimplemented-mode path; it never panics, and it consumes nothing when
+    /// it declines, so the instruction stream stays where it was.
     ///
     /// The address registers stay full 32-bit values — the suite keeps nonzero
     /// upper bytes in them (`MOVEA.w.json.gz` case `364a [MOVEA.w A2, A3] 3`
@@ -149,7 +198,13 @@ impl M68k {
         dead_code,
         reason = "called by the instruction tickets from M1-09 (#17) onward; only the tests use it today"
     )]
-    pub(crate) fn resolve_ea(&mut self, mode: u8, reg: u8, size: Size) -> Option<Ea> {
+    pub(crate) fn resolve_ea(
+        &mut self,
+        bus: &mut impl Bus,
+        mode: u8,
+        reg: u8,
+        size: Size,
+    ) -> Option<Ea> {
         let r = usize::from(reg);
         match mode {
             0b000 => Some(Ea::DataReg(reg)),
@@ -171,10 +226,108 @@ impl M68k {
                 self.cycles += PREDEC_CALC_CLOCKS;
                 Some(Ea::Mem(self.a[r] & ADDR_MASK))
             }
-            // 101 d16(An), 110 d8/d16(An,Xi) and the PC forms, 111 absolute and
-            // immediate: M1-06 (#14).
+            // 101 d16(An): one extension word, sign extended, added to An
+            // (M68000UM, "Address Register Displacement Addressing Mode").
+            0b101 => {
+                let disp = sign_extend_word(self.fetch_ext_word(bus));
+                Some(Ea::Mem(self.a[r].wrapping_add(disp) & ADDR_MASK))
+            }
+            // 110 d8(An,Xn): one brief extension word, An + Xn + d8.
+            0b110 => self.indexed_ea(bus, self.a[r]),
+            // 111: the sub-mode comes from the register field of the EA
+            // (M68000UM, "Effective Address Calculation", mode 111).
+            0b111 => match reg {
+                // abs.W: one extension word, sign extended to 32 bits, so
+                // 0x8000 is 0xFFFF_8000 and reaches the bus as 0x00FF_8000.
+                0b000 => {
+                    let addr = sign_extend_word(self.fetch_ext_word(bus));
+                    Some(Ea::Mem(addr & ADDR_MASK))
+                }
+                // abs.L: two extension words, high word first.
+                0b001 => {
+                    let addr = self.fetch_ext_long(bus);
+                    Some(Ea::Mem(addr & ADDR_MASK))
+                }
+                // d16(PC): measured from the extension word's own address, not
+                // from `pc` — see [`M68k::ext_addr`] and
+                // `tests::pc_relative_uses_ext_word_address` for the evidence.
+                0b010 => {
+                    let base = self.ext_addr();
+                    let disp = sign_extend_word(self.fetch_ext_word(bus));
+                    Some(Ea::Mem(base.wrapping_add(disp) & ADDR_MASK))
+                }
+                // d8(PC,Xn): the indexed form, same base.
+                0b011 => {
+                    let base = self.ext_addr();
+                    self.indexed_ea(bus, base)
+                }
+                // #imm: the operand *is* the extension word(s). A byte
+                // immediate occupies the low byte of one word, with the high
+                // byte unused (M68000UM, "Immediate Addressing Mode").
+                0b100 => Some(Ea::Imm(match size {
+                    Size::Byte => u32::from(self.fetch_ext_word(bus) as u8),
+                    Size::Word => u32::from(self.fetch_ext_word(bus)),
+                    Size::Long => self.fetch_ext_long(bus),
+                })),
+                // 101, 110, 111 are not addressing modes: illegal instruction,
+                // which M1-07 (#15) decodes. Decline without touching anything.
+                _ => None,
+            },
+            // `mode` is 3 bits, so this is unreachable; naming it beats a
+            // `todo!()` on a path an instruction could one day reach.
             _ => None,
         }
+    }
+
+    /// The `d8(An,Xn)` / `d8(PC,Xn)` brief extension word: `An` (or the PC
+    /// relative base) + index register + 8-bit displacement, plus the 2 internal
+    /// clocks the index calculation costs (M68000UM, "Index Displacement
+    /// Addressing Mode").
+    ///
+    /// Bit layout of the brief extension word (M68000UM, "Index Registers"):
+    /// bit 15 index register type (0 = Dn, 1 = An), bits 14..12 index register
+    /// number, bit 11 index size (0 = sign-extended low word, 1 = full long),
+    /// bits 7..0 signed displacement. Bits 10..8 are the scale field of the
+    /// 68020 and later and are ignored here — silently, because the 68000 reads
+    /// them as part of the word and acts on nothing: 2339 of the 2729
+    /// `d8(...,Xn)` cases in `LEA.json.gz` carry nonzero bits there and all of
+    /// them still match the sum with the bits dropped.
+    fn indexed_ea(&mut self, bus: &mut impl Bus, base: u32) -> Option<Ea> {
+        let brief = self.fetch_ext_word(bus);
+        self.cycles += INDEX_CALC_CLOCKS;
+
+        let index_reg = ((brief >> 12) & 0b111) as usize;
+        let raw = if brief & 0x8000 != 0 {
+            self.a[index_reg]
+        } else {
+            self.d[index_reg]
+        };
+        // Bit 11 selects the size of the index, including for an An index: the
+        // suite's An-index cases with bit 11 = 0 use the low word only
+        // (`4dfb [LEA (d8, PC, Xn), A6] 14` adds 0x56BE, A0's low word).
+        let index = if brief & 0x0800 != 0 {
+            raw
+        } else {
+            sign_extend_word(raw as u16)
+        };
+        let disp = sign_extend_byte(brief as u8);
+
+        Some(Ea::Mem(
+            base.wrapping_add(index).wrapping_add(disp) & ADDR_MASK,
+        ))
+    }
+
+    /// Address of the extension word that the next [`M68k::fetch_ext_word`] will
+    /// hand over, for the modes whose operand address is measured from it.
+    ///
+    /// `prefetch == [word(pc), word(pc + 2)]` (see [`M68k::pc`]), so the word at
+    /// the back of the queue — the first extension word of the instruction — is
+    /// the one at `pc + 2`. Call this *before* popping, or it names the wrong
+    /// word; that is the whole reason it is a helper instead of a `+ 2` at each
+    /// call site.
+    #[inline]
+    pub(crate) fn ext_addr(&self) -> u32 {
+        (self.pc + 2) & ADDR_MASK
     }
 
     /// Read the operand at `ea`: `size` bits, zero extended into the returned
@@ -200,6 +353,10 @@ impl M68k {
                 Size::Word => u32::from(self.read_w(bus, addr)),
                 Size::Long => self.read_l(bus, addr),
             },
+            // Already fetched, at the right width, by `resolve_ea`; costs no bus
+            // time, which is why an immediate operand is 4 clocks cheaper than
+            // a memory one.
+            Ea::Imm(value) => value & size.mask(),
         }
     }
 
@@ -222,6 +379,10 @@ impl M68k {
         debug_assert!(
             ea.accepts_size(size),
             "illegal {size:?} access to {ea:?}: resolve_ea is the gate"
+        );
+        debug_assert!(
+            !matches!(ea, Ea::Imm(_)),
+            "immediates are source-only operands: nothing can be written to {ea:?}"
         );
         match ea {
             Ea::DataReg(r) => {
@@ -247,6 +408,10 @@ impl M68k {
                 Size::Word => self.write_w(bus, addr, value as u16),
                 Size::Long => self.write_l(bus, addr, value),
             },
+            // Unreachable in a debug build (the debug_assert above). No 68000
+            // instruction encodes a write to an immediate, and a release build
+            // must not panic inside an instruction, so the value is dropped.
+            Ea::Imm(_) => {}
         }
     }
 }
@@ -254,6 +419,7 @@ impl M68k {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testbus::cpu_with_program;
 
     /// Addressing mode numbers (M68000UM, "Effective Address Calculation").
     const DN: u8 = 0b000;
@@ -261,13 +427,31 @@ mod tests {
     const AN_IND: u8 = 0b010;
     const AN_POST: u8 = 0b011;
     const AN_PRE: u8 = 0b100;
+    const D16_AN: u8 = 0b101;
+    const D8_AN_XN: u8 = 0b110;
+    /// Mode 111 selects its sub-mode from the *register* field of the EA.
+    const ABSOLUTE: u8 = 0b111;
+    const ABS_W: u8 = 0b000;
+    const ABS_L: u8 = 0b001;
+    const D16_PC: u8 = 0b010;
+    const D8_PC_XN: u8 = 0b011;
+    const IMMEDIATE: u8 = 0b100;
 
     const SIZES: [Size; 3] = [Size::Byte, Size::Word, Size::Long];
+
+    /// Where [`crate::testbus::cpu_with_program`] and [`ram_with_program`] load
+    /// their program words (its `PROGRAM_ADDR`, which is private to `testbus`).
+    const PROGRAM_BASE: u32 = 0x0000_1000;
 
     /// Test-LOCAL RAM that records every address it was asked about, copied
     /// from the pattern in `cpu.rs`'s test module: `testbus::TestBus`'s public
     /// shape is deliberately fixed (no access recorder, see #10 / #183), so the
     /// EA tests that need to count bus accesses keep their own.
+    ///
+    /// It covers the whole 24 bit space, unlike the 64 KB one in `cpu.rs`,
+    /// because the M1-06 modes deliberately reach the top of it: `abs.W` of
+    /// 0x8000 sign extends to 0xFFFF_8000 and must arrive at the bus as
+    /// 0x00FF_8000, which a 64 KB RAM cannot tell apart from a wrong address.
     struct Ram {
         mem: Vec<u8>,
         reads: Vec<u32>,
@@ -277,9 +461,27 @@ mod tests {
     impl Ram {
         fn new() -> Self {
             Self {
-                mem: vec![0; 1 << 16],
+                mem: vec![0; 1 << 24],
                 reads: Vec::new(),
                 writes: Vec::new(),
+            }
+        }
+
+        /// Forget the accesses recorded so far, so `reads` / `writes` describe
+        /// only what the test does next and not the reset sequence that set the
+        /// CPU up (see [`ram_with_program`]).
+        fn clear_log(&mut self) {
+            self.reads.clear();
+            self.writes.clear();
+        }
+
+        fn poke_byte(&mut self, addr: u32, value: u8) {
+            self.mem[addr as usize] = value;
+        }
+
+        fn poke_words(&mut self, addr: u32, words: &[u16]) {
+            for (i, &word) in words.iter().enumerate() {
+                self.poke_word(addr + 2 * u32::try_from(i).unwrap(), word);
             }
         }
 
@@ -311,6 +513,23 @@ mod tests {
             let i = addr as usize;
             self.mem[i..i + 4].copy_from_slice(&value.to_be_bytes());
         }
+    }
+
+    /// A CPU reset onto `words`, on the recording [`Ram`]: the same setup as
+    /// [`crate::testbus::cpu_with_program`] (reset vector table, then a real
+    /// [`M68k::reset`], so the queue already holds `words[0..2]` and every
+    /// extension word has to come out of it), but with the access log cleared
+    /// so assertions describe only what the test itself does.
+    fn ram_with_program(words: &[u16]) -> (M68k, Ram) {
+        let mut bus = Ram::new();
+        bus.poke_long(0x0000_0000, 0x0001_0000); // SSP
+        bus.poke_long(0x0000_0004, PROGRAM_BASE); // PC
+        bus.poke_words(PROGRAM_BASE, words);
+
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        bus.clear_log();
+        (cpu, bus)
     }
 
     impl Bus for Ram {
@@ -347,7 +566,9 @@ mod tests {
 
         let want = [0x78u32, 0x5678, 0x1234_5678];
         for (size, want) in SIZES.iter().zip(want) {
-            let ea = cpu.resolve_ea(DN, 0, *size).expect("Dn always resolves");
+            let ea = cpu
+                .resolve_ea(&mut bus, DN, 0, *size)
+                .expect("Dn always resolves");
             assert_eq!(ea, Ea::DataReg(0));
             assert_eq!(
                 cpu.read_ea(&mut bus, ea, *size),
@@ -368,15 +589,15 @@ mod tests {
         let mut bus = Ram::new();
         cpu.d[0] = 0xFFFF_FFFF;
 
-        let ea = cpu.resolve_ea(DN, 0, Size::Byte).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, DN, 0, Size::Byte).unwrap();
         cpu.write_ea(&mut bus, ea, Size::Byte, 0x00);
         assert_eq!(cpu.d[0], 0xFFFF_FF00, "byte write replaces only bit 7..0");
 
-        let ea = cpu.resolve_ea(DN, 0, Size::Word).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, DN, 0, Size::Word).unwrap();
         cpu.write_ea(&mut bus, ea, Size::Word, 0x1234_0000);
         assert_eq!(cpu.d[0], 0xFFFF_0000, "word write replaces only bit 15..0");
 
-        let ea = cpu.resolve_ea(DN, 0, Size::Long).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, DN, 0, Size::Long).unwrap();
         cpu.write_ea(&mut bus, ea, Size::Long, 0xA5A5_5A5A);
         assert_eq!(cpu.d[0], 0xA5A5_5A5A, "long write replaces all 32 bits");
         assert!(bus.writes.is_empty());
@@ -394,7 +615,7 @@ mod tests {
         // see `byte_addr_reg_direct_is_rejected`.
         let want = [(Size::Word, 0x5678u32), (Size::Long, 0x1234_5678)];
         for (size, want) in want {
-            let ea = cpu.resolve_ea(AN, 2, size).expect("An resolves");
+            let ea = cpu.resolve_ea(&mut bus, AN, 2, size).expect("An resolves");
             assert_eq!(ea, Ea::AddrReg(2));
             assert_eq!(cpu.read_ea(&mut bus, ea, size), want, "{size:?} read");
         }
@@ -405,29 +626,30 @@ mod tests {
         let mut cpu = M68k::new();
         let mut bus = Ram::new();
 
-        let ea = cpu.resolve_ea(AN, 3, Size::Word).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN, 3, Size::Word).unwrap();
         cpu.write_ea(&mut bus, ea, Size::Word, 0xFFFF_FFFE);
         assert_eq!(cpu.a[3], 0xFFFF_FFFE, "a negative word fills the top");
 
-        let ea = cpu.resolve_ea(AN, 3, Size::Word).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN, 3, Size::Word).unwrap();
         cpu.write_ea(&mut bus, ea, Size::Word, 0x0000_1000);
         assert_eq!(cpu.a[3], 0x0000_1000, "a positive word zeroes the top");
 
         // A long write is the register value verbatim, top byte included: the
         // suite keeps nonzero upper bytes in An (`MOVEA.w.json.gz` case
         // `3062 [MOVEA.w -(A2), A0] 8` ends with `a2 = 0x9DB1_C21F`).
-        let ea = cpu.resolve_ea(AN, 3, Size::Long).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN, 3, Size::Long).unwrap();
         cpu.write_ea(&mut bus, ea, Size::Long, 0x9DB1_C221);
         assert_eq!(cpu.a[3], 0x9DB1_C221);
     }
 
     #[test]
     fn byte_addr_reg_direct_is_rejected() {
+        let mut bus = Ram::new();
         let mut cpu = M68k::new();
         cpu.a[3] = 0x1000;
 
         assert_eq!(
-            cpu.resolve_ea(AN, 3, Size::Byte),
+            cpu.resolve_ea(&mut bus, AN, 3, Size::Byte),
             None,
             "no 68000 instruction encodes byte size with An direct"
         );
@@ -454,7 +676,7 @@ mod tests {
         let mut cpu = M68k::new();
         cpu.a[0] = 0x1000;
 
-        let ea = cpu.resolve_ea(AN_IND, 0, Size::Long).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN_IND, 0, Size::Long).unwrap();
         assert_eq!(ea, Ea::Mem(0x1000));
         assert_eq!(cpu.read_ea(&mut bus, ea, Size::Long), 0xDEAD_BEEF);
         assert_eq!(bus.reads, [0x1000, 0x1002], "a long is two words");
@@ -480,7 +702,7 @@ mod tests {
             cpu.a[0] = 0x1000;
 
             let want = [0xDEu32, 0xDEAD, 0xDEAD_BEEF][i];
-            let ea = cpu.resolve_ea(AN_POST, 0, size).unwrap();
+            let ea = cpu.resolve_ea(&mut bus, AN_POST, 0, size).unwrap();
             assert_eq!(ea, Ea::Mem(0x1000), "the old value is the address");
             assert_eq!(
                 cpu.read_ea(&mut bus, ea, size),
@@ -503,7 +725,7 @@ mod tests {
         let mut cpu = M68k::new();
         cpu.a[7] = 0x1000;
 
-        let ea = cpu.resolve_ea(AN_POST, 7, Size::Byte).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN_POST, 7, Size::Byte).unwrap();
         assert_eq!(ea, Ea::Mem(0x1000));
         assert_eq!(cpu.read_ea(&mut bus, ea, Size::Byte), 0xDE);
         assert_eq!(
@@ -513,7 +735,7 @@ mod tests {
 
         // It is the byte step that is special, not A7 always stepping by 2.
         cpu.a[7] = 0x1000;
-        let ea = cpu.resolve_ea(AN_POST, 7, Size::Long).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN_POST, 7, Size::Long).unwrap();
         cpu.read_ea(&mut bus, ea, Size::Long);
         assert_eq!(cpu.a[7], 0x1004);
     }
@@ -527,7 +749,7 @@ mod tests {
         let mut cpu = M68k::new();
         cpu.a[1] = 0x2004;
 
-        let ea = cpu.resolve_ea(AN_PRE, 1, Size::Long).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN_PRE, 1, Size::Long).unwrap();
         assert_eq!(ea, Ea::Mem(0x2000), "the decremented value is the address");
         assert_eq!(cpu.a[1], 0x2000, "A1 = 0x2004 - 4");
         assert_eq!(cpu.read_ea(&mut bus, ea, Size::Long), 0xDEAD_BEEF);
@@ -541,7 +763,7 @@ mod tests {
         let mut cpu = M68k::new();
         cpu.a[7] = 0x2004;
 
-        let ea = cpu.resolve_ea(AN_PRE, 7, Size::Byte).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN_PRE, 7, Size::Byte).unwrap();
         assert_eq!(ea, Ea::Mem(0x2002));
         assert_eq!(
             cpu.a[7], 0x2002,
@@ -551,7 +773,7 @@ mod tests {
 
         // A0 is not special: a byte predecrement steps by 1.
         cpu.a[0] = 0x2004;
-        let ea = cpu.resolve_ea(AN_PRE, 0, Size::Byte).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN_PRE, 0, Size::Byte).unwrap();
         assert_eq!(ea, Ea::Mem(0x2003));
         assert_eq!(cpu.a[0], 0x2003);
     }
@@ -561,13 +783,13 @@ mod tests {
         let mut cpu = M68k::new();
         cpu.a[1] = 0x2004;
 
-        let ea = cpu.resolve_ea(AN_PRE, 1, Size::Long).unwrap();
+        let mut bus = Ram::new();
+        let ea = cpu.resolve_ea(&mut bus, AN_PRE, 1, Size::Long).unwrap();
         assert_eq!(
             cpu.cycles, PREDEC_CALC_CLOCKS,
             "-(An) charges 2 internal clocks for the address calculation"
         );
 
-        let mut bus = Ram::new();
         cpu.read_ea(&mut bus, ea, Size::Long);
         assert_eq!(
             cpu.cycles,
@@ -576,17 +798,18 @@ mod tests {
         );
 
         cpu.cycles = 0;
-        cpu.resolve_ea(AN_POST, 1, Size::Long);
-        cpu.resolve_ea(DN, 1, Size::Long);
+        cpu.resolve_ea(&mut bus, AN_POST, 1, Size::Long);
+        cpu.resolve_ea(&mut bus, DN, 1, Size::Long);
         assert_eq!(cpu.cycles, 0, "(An)+ and Dn charge no extra clocks");
     }
 
     #[test]
     fn predec_wraps_below_zero() {
+        let mut bus = Ram::new();
         let mut cpu = M68k::new();
         cpu.a[7] = 0;
 
-        let ea = cpu.resolve_ea(AN_PRE, 7, Size::Word).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN_PRE, 7, Size::Word).unwrap();
         assert_eq!(
             cpu.a[7], 0xFFFF_FFFE,
             "the address register itself is a full 32-bit register"
@@ -605,7 +828,7 @@ mod tests {
         let mut cpu = M68k::new();
         cpu.a[0] = 0xFF00_1000;
 
-        let ea = cpu.resolve_ea(AN_IND, 0, Size::Word).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN_IND, 0, Size::Word).unwrap();
         assert_eq!(ea, Ea::Mem(0x0000_1000));
         assert_eq!(cpu.read_ea(&mut bus, ea, Size::Word), 0xABCD);
         assert_eq!(bus.reads, [0x1000]);
@@ -622,7 +845,7 @@ mod tests {
 
         // What an `ADD.W #x, (A0)+` does: resolve once, then read and write the
         // same Ea. Resolving twice would increment A0 twice.
-        let ea = cpu.resolve_ea(AN_POST, 0, Size::Word).unwrap();
+        let ea = cpu.resolve_ea(&mut bus, AN_POST, 0, Size::Word).unwrap();
         let value = cpu.read_ea(&mut bus, ea, Size::Word);
         assert_eq!(value, 0x1111, "the word at 0x1000 is the high half");
         cpu.write_ea(&mut bus, ea, Size::Word, value ^ 0xFFFF);
@@ -637,24 +860,476 @@ mod tests {
         );
     }
 
-    // ---- unimplemented modes ----
+    // ---- mode 101: d16(An) ----
 
+    /// `MOVE.L d16(A0), D0` (0x2028): one extension word, sign extended, added
+    /// to An. M68000UM, "Address Register Displacement Addressing Mode".
     #[test]
-    fn modes_101_to_111_are_not_implemented_yet() {
-        for mode in 0b101..0b1000u8 {
-            for reg in 0..8u8 {
-                for size in SIZES {
-                    let mut cpu = M68k::new();
-                    cpu.a[7] = 0x2000;
-                    let before = cpu.clone();
+    fn d16_an_negative_displacement() {
+        let (mut cpu, mut bus) = ram_with_program(&[0x2028, 0xFFFE, 0x4E71]);
+        bus.poke_word(0x1FFE, 0xC0DE);
+        cpu.a[0] = 0x2000;
+        let cycles = cpu.cycles;
 
-                    assert_eq!(
-                        cpu.resolve_ea(mode, reg, size),
-                        None,
-                        "mode {mode:b} reg {reg} is M1-06 (#14) territory"
-                    );
-                    assert_eq!(cpu, before, "and must not disturb the CPU");
-                }
+        let ea = cpu
+            .resolve_ea(&mut bus, D16_AN, 0, Size::Word)
+            .expect("d16(An) resolves");
+
+        assert_eq!(ea, Ea::Mem(0x1FFE), "d16 = 0xFFFE is -2");
+        assert_eq!(cpu.read_ea(&mut bus, ea, Size::Word), 0xC0DE);
+        assert_eq!(
+            bus.reads,
+            [PROGRAM_BASE + 4, 0x1FFE],
+            "the displacement came out of the queue, so the only fetch before the operand is the refill at pc + 4"
+        );
+        assert_eq!(cpu.a[0], 0x2000, "d16(An) never writes the address back");
+        assert_eq!(cpu.pc, PROGRAM_BASE + 2, "one extension word consumed");
+        assert_eq!(
+            cpu.cycles - cycles,
+            8,
+            "queue refill (4) + operand read (4): d16(An) charges no internal clocks"
+        );
+
+        // Only bit 15 of the displacement is the sign bit.
+        let (mut cpu, mut bus) = ram_with_program(&[0x2028, 0x7FFF, 0x4E71]);
+        cpu.a[0] = 0x2000;
+        let ea = cpu
+            .resolve_ea(&mut bus, D16_AN, 0, Size::Word)
+            .expect("d16(An) resolves");
+        assert_eq!(ea, Ea::Mem(0x9FFF), "0x7FFF is +32767, not negative");
+    }
+
+    // ---- mode 110: d8(An,Xn) ----
+
+    /// Bit 11 = 0 takes the index register's low word and sign extends it, so
+    /// D1 = 0xFFFF indexes -1 however wide the register is.
+    #[test]
+    fn d8_an_xn_word_index_sign_extends() {
+        // MOVE.B d8(A0,D1), D0 (0x1030); brief 0x1004 = Dn, D1, word, +4.
+        let (mut cpu, mut bus) = ram_with_program(&[0x1030, 0x1004, 0x4E71]);
+        bus.poke_byte(0x2003, 0x5A);
+        cpu.a[0] = 0x2000;
+        cpu.d[1] = 0x0000_FFFF;
+        let cycles = cpu.cycles;
+
+        let ea = cpu
+            .resolve_ea(&mut bus, D8_AN_XN, 0, Size::Byte)
+            .expect("d8(An,Xn) resolves");
+
+        assert_eq!(ea, Ea::Mem(0x2003), "A0 + index(-1) + d8(+4) = 0x2003");
+        assert_eq!(cpu.read_ea(&mut bus, ea, Size::Byte), 0x5A);
+        assert_eq!(bus.reads, [PROGRAM_BASE + 4, 0x2003]);
+        assert_eq!(
+            cpu.cycles - cycles,
+            4 + 4 + INDEX_CALC_CLOCKS,
+            "the index calculation costs 2 internal clocks on top of the two bus cycles"
+        );
+    }
+
+    /// Bit 11 = 1 uses the whole 32-bit index instead. An index whose low word
+    /// disagrees with its long is the only thing that tells the two apart.
+    #[test]
+    fn d8_an_xn_long_index() {
+        // MOVE.L d8(A0,D1), D0 (0x2030); 0x1804 is 0x1004 with bit 11 set.
+        // (brief word, expected address, word parked at that address)
+        for (brief_word, want, value) in [
+            (0x1004u16, 0x0000_2004u32, 0x1111u32),
+            (0x1804, 0x0001_2004, 0x2222),
+        ] {
+            let (mut cpu, mut bus) = ram_with_program(&[0x2030, brief_word, 0x4E71]);
+            bus.poke_word(0x0000_2004, 0x1111);
+            bus.poke_word(0x0001_2004, 0x2222);
+            cpu.a[0] = 0x2000;
+            cpu.d[1] = 0x0001_0000; // low word 0x0000, long 0x10000
+
+            let ea = cpu
+                .resolve_ea(&mut bus, D8_AN_XN, 0, Size::Word)
+                .expect("d8(An,Xn) resolves");
+
+            assert_eq!(
+                ea,
+                Ea::Mem(want),
+                "brief {brief_word:#06x} (bit 11 = {:b})",
+                (brief_word >> 11) & 1
+            );
+            assert_eq!(cpu.read_ea(&mut bus, ea, Size::Word), value);
+        }
+    }
+
+    /// Bit 15 = 1 picks an address register as the index, and bits 10..8 — the
+    /// scale field of later chips — are ignored on the 68000 (M68000UM,
+    /// "Index Registers": they are documented as unimplemented/zero). 2339 of
+    /// the 2729 `d8(...,Xn)` cases in `LEA.json.gz` carry nonzero bits there
+    /// and all of them still match the index formula with the bits dropped.
+    #[test]
+    fn d8_an_xn_an_index_and_ignored_scale_bits() {
+        // MOVE.L d8(A5,A3), D0 (0x2075); brief 0xB808 = A3, long, +8.
+        for scale_bits in [0x0000u16, 0x0300] {
+            let (mut cpu, mut bus) = ram_with_program(&[0x2075, 0xB808 | scale_bits, 0x4E71]);
+            cpu.a[5] = 0x0000_4000;
+            cpu.a[3] = 0x0002_0000; // low word 0, so a word index would give 0x4008
+
+            let ea = cpu
+                .resolve_ea(&mut bus, D8_AN_XN, 5, Size::Long)
+                .expect("d8(An,Xn) resolves");
+
+            assert_eq!(
+                ea,
+                Ea::Mem(0x0002_4008),
+                "A5 + A3 + 8, with brief bits 10..8 = {scale_bits:#x} ignored"
+            );
+        }
+    }
+
+    // ---- mode 111/000: abs.W ----
+
+    /// The sign extension of `abs.W` happens on the way in, and the address
+    /// `Ea::Mem` carries — and therefore the address the bus sees — is the
+    /// masked 24-bit one. See [`masking_wraps_at_24_bits`] for why masking
+    /// here and masking at the bus are the same address.
+    #[test]
+    fn abs_w_sign_extends() {
+        // MOVE.L abs.W, D0 (0x2038).
+        let (mut cpu, mut bus) = ram_with_program(&[0x2038, 0x8000, 0x4E71]);
+        bus.poke_word(0x00FF_8000, 0xBEEF);
+
+        assert_eq!(
+            sign_extend_word(0x8000),
+            0xFFFF_8000,
+            "0x8000 sign extends to 0xFFFF8000 as a 32-bit value"
+        );
+
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, ABS_W, Size::Word)
+            .expect("abs.W resolves");
+        assert_eq!(ea, Ea::Mem(0x00FF_8000));
+        assert_eq!(cpu.read_ea(&mut bus, ea, Size::Word), 0xBEEF);
+        assert_eq!(
+            bus.reads,
+            [PROGRAM_BASE + 4, 0x00FF_8000],
+            "the bus is asked about 0xFF8000, never 0xFFFF8000"
+        );
+
+        let (mut cpu, mut bus) = ram_with_program(&[0x2038, 0x2345, 0x4E71]);
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, ABS_W, Size::Word)
+            .expect("abs.W resolves");
+        assert_eq!(ea, Ea::Mem(0x2345), "a positive abs.W is unchanged");
+    }
+
+    // ---- mode 111/001: abs.L ----
+
+    /// Two extension words, high word first — the same order as every long in
+    /// the core (M68000UM, "Absolute Addressing Mode" and "Data Organization").
+    #[test]
+    fn abs_l() {
+        // MOVE.L abs.L, D0 (0x2039) with the long $00012345.
+        let (mut cpu, mut bus) = cpu_with_program(&[0x2039, 0x0001, 0x2345, 0x4E71]);
+        bus.write_long(0x0001_2345, 0xDEAD_BEEF);
+
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, ABS_L, Size::Long)
+            .expect("abs.L resolves");
+
+        assert_eq!(ea, Ea::Mem(0x0001_2345));
+        assert_eq!(cpu.read_ea(&mut bus, ea, Size::Long), 0xDEAD_BEEF);
+        assert_eq!(cpu.pc, PROGRAM_BASE + 4, "both extension words consumed");
+        assert_eq!(
+            cpu.prefetch,
+            [0x2345, 0x4E71],
+            "the queue slid two words past them, so the next instruction still starts in the right place"
+        );
+    }
+
+    // ---- modes 111/010 and 111/011: PC relative ----
+
+    /// The PC-relative base is the address of the extension word itself, which
+    /// in this core's convention ([`M68k::pc`] is the queued opcode) is
+    /// `pc + 2`, captured before the word is popped — [`M68k::ext_addr`].
+    ///
+    /// Measured off the pinned suite, not off the manual. `LEA.json.gz` case
+    /// `41fa [LEA (d16, PC), A0] 59`: `initial.pc = 0x000C00`,
+    /// `prefetch = [0x41FA, 0xA3E9]` — so the extension word 0xA3E9 is already
+    /// in the queue, at 0x000C02, and the case's only instruction-stream reads
+    /// are the refills at 0x000C04 / 0x000C06 — and `final.a0 = 0xFFFFAFEB`,
+    /// which is `0x000C02 + 0xFFFFA3E9`. Neither `pc` (0xFFFFA3E9) nor the
+    /// manual's "next word to be accessed", `pc + 4` (0xFFFFAFED), reproduces
+    /// it. All 286 `d16(PC)` and 287 `d8(PC,Xn)` cases in that file agree with
+    /// the `pc + 2` base and with nothing else.
+    #[test]
+    fn pc_relative_uses_ext_word_address() {
+        // MOVE.L d16(PC), D0 (0x203A) with a forward displacement of +6.
+        let (mut cpu, mut bus) = cpu_with_program(&[0x203A, 0x0006, 0x4E71]);
+        assert_eq!(
+            cpu.ext_addr(),
+            PROGRAM_BASE + 2,
+            "the extension word about to be popped sits at pc + 2"
+        );
+
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, D16_PC, Size::Long)
+            .expect("d16(PC) resolves");
+        assert_eq!(
+            ea,
+            Ea::Mem(PROGRAM_BASE + 8),
+            "0x1002 + 6, the extension word's own address plus the displacement"
+        );
+        assert_eq!(cpu.pc, PROGRAM_BASE + 2, "one extension word consumed");
+
+        // Backwards: -2 from the extension word is the opcode word itself.
+        let (mut cpu, mut bus) = cpu_with_program(&[0x203A, 0xFFFE, 0x4E71]);
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, D16_PC, Size::Long)
+            .expect("d16(PC) resolves");
+        assert_eq!(ea, Ea::Mem(PROGRAM_BASE), "0x1002 - 2 is the opcode");
+    }
+
+    /// `d8(PC,Xn)` uses the same base as `d16(PC)` — the brief word's own
+    /// address — and pays the same 2 index clocks as `d8(An,Xn)`.
+    #[test]
+    fn pc_indexed_uses_ext_word_address() {
+        // MOVE.L d8(PC,D1), D0 (0x203B); brief 0x1104 = Dn, D1, word, +4.
+        let (mut cpu, mut bus) = ram_with_program(&[0x203B, 0x1104, 0x4E71]);
+        cpu.d[1] = 0x0000_0010;
+        let cycles = cpu.cycles;
+
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, D8_PC_XN, Size::Long)
+            .expect("d8(PC,Xn) resolves");
+
+        assert_eq!(
+            ea,
+            Ea::Mem(PROGRAM_BASE + 2 + 0x10 + 4),
+            "the brief word's own address, plus the index, plus d8"
+        );
+        assert_eq!(cpu.cycles - cycles, INDEX_CALC_CLOCKS + 4);
+    }
+
+    // ---- mode 111/100: #imm ----
+
+    /// Byte immediate occupies the LOW byte of one extension word, word
+    /// immediate is one whole word, long immediate two words high first
+    /// (M68000UM, "Immediate Addressing Mode").
+    #[test]
+    fn immediate_byte_word_long() {
+        // MOVE.B #imm, D0 (0x003C).
+        let (mut cpu, mut bus) = cpu_with_program(&[0x003C, 0x1234, 0x4E71]);
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, IMMEDIATE, Size::Byte)
+            .expect("#imm resolves");
+        assert_eq!(ea, Ea::Imm(0x34), "the low byte of 0x1234, not the high");
+        assert_eq!(cpu.read_ea(&mut bus, ea, Size::Byte), 0x34);
+        assert_eq!(cpu.pc, PROGRAM_BASE + 2, "one extension word");
+
+        // MOVE.W #imm, D0 (0x303C). No sign extension: like every other mode,
+        // the operand comes back zero extended at its own width.
+        let (mut cpu, mut bus) = cpu_with_program(&[0x303C, 0x1234, 0x4E71]);
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, IMMEDIATE, Size::Word)
+            .expect("#imm resolves");
+        assert_eq!(ea, Ea::Imm(0x1234));
+        assert_eq!(cpu.read_ea(&mut bus, ea, Size::Word), 0x1234);
+        assert_eq!(cpu.pc, PROGRAM_BASE + 2);
+
+        // MOVE.L #imm, D0 (0x203C).
+        let (mut cpu, mut bus) = cpu_with_program(&[0x203C, 0x1234, 0x5678, 0x4E71]);
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, IMMEDIATE, Size::Long)
+            .expect("#imm resolves");
+        assert_eq!(ea, Ea::Imm(0x1234_5678), "two words, high first");
+        assert_eq!(cpu.read_ea(&mut bus, ea, Size::Long), 0x1234_5678);
+        assert_eq!(cpu.pc, PROGRAM_BASE + 4, "two extension words");
+    }
+
+    /// An immediate is a source operand: no 68000 instruction encodes a write
+    /// to one, so a caller that tries has a decode bug. Debug builds say so;
+    /// release builds must stay defined (no panic inside an instruction).
+    #[test]
+    #[should_panic(expected = "immediates are source-only")]
+    fn write_to_immediate_is_a_bug() {
+        let (mut cpu, mut bus) = cpu_with_program(&[0x303C, 0x1234, 0x4E71]);
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, IMMEDIATE, Size::Word)
+            .unwrap();
+        cpu.write_ea(&mut bus, ea, Size::Word, 0xFFFF);
+    }
+
+    // ---- masking ----
+
+    /// Masking inside [`M68k::resolve_ea`] (what [`Ea::Mem`] carries) and
+    /// masking late, at the bus, give the same address for every mode here,
+    /// because masking is a ring homomorphism for addition:
+    /// `(a + b) mod 2^24 == (a mod 2^24 + b mod 2^24) mod 2^24`. Pinned at the
+    /// wrap points, where any other rule would show up.
+    #[test]
+    fn masking_wraps_at_24_bits() {
+        // (An, d16, expected masked address)
+        let cases = [
+            (0x00FF_FFFCu32, 0x0006u16, 0x0000_0002u32), // off the top, wraps to 2
+            (0x0000_0000, 0xFFFE, 0x00FF_FFFE),          // below 0, wraps to the top
+            (0xFFFF_FFFF, 0x0003, 0x0000_0002),          // An itself above 24 bits
+        ];
+        for (an, disp, want) in cases {
+            let (mut cpu, mut bus) = ram_with_program(&[0x2028, disp, 0x4E71]);
+            cpu.a[0] = an;
+
+            let ea = cpu
+                .resolve_ea(&mut bus, D16_AN, 0, Size::Long)
+                .expect("d16(An) resolves");
+
+            assert_eq!(
+                ea,
+                Ea::Mem(want),
+                "0x{an:x} + d16 {disp:#x} wraps to 0x{want:x}"
+            );
+            assert_eq!(
+                ea,
+                Ea::Mem(an.wrapping_add(sign_extend_word(disp)) & ADDR_MASK),
+                "early masking is the same address as masking the full 32-bit sum at the bus"
+            );
+        }
+
+        // abs.L is truncated the same way: there is no 25th address line.
+        let (mut cpu, mut bus) = ram_with_program(&[0x2039, 0xFF80, 0x0000, 0x4E71]);
+        let ea = cpu
+            .resolve_ea(&mut bus, ABSOLUTE, ABS_L, Size::Long)
+            .expect("abs.L resolves");
+        assert_eq!(ea, Ea::Mem(0x0080_0000), "0xFF800000 -> 0x800000");
+    }
+
+    // ---- the extension-word ladder ----
+
+    /// How many extension words each mode consumes, i.e. how far `pc` moves
+    /// past the opcode word. Every mode's count matters because it decides
+    /// where the *next* instruction starts: a mode that consumes one word too
+    /// few or too many corrupts the whole instruction stream after it
+    /// (M68000UM, "Effective Address Calculation", the per-mode word counts).
+    #[test]
+    fn ext_words_consumed() {
+        // One row: (label, program holding its extension words, mode, reg,
+        // size, extension words it must consume). Named as a type because the
+        // bare tuple is dense enough for clippy to object.
+        type Row = (&'static str, &'static [u16], u8, u8, Size, u32);
+        let cases: &[Row] = &[
+            ("Dn", &[0x2007, 0x4E71], DN, 7, Size::Long, 0),
+            ("An", &[0x2009, 0x4E71], AN, 1, Size::Long, 0),
+            ("(A6)", &[0x2026, 0x4E71], AN_IND, 6, Size::Long, 0),
+            ("(A6)+", &[0x2036, 0x4E71], AN_POST, 6, Size::Long, 0),
+            ("-(A6)", &[0x2046, 0x4E71], AN_PRE, 6, Size::Long, 0),
+            (
+                "d16(A0)",
+                &[0x2028, 0x0000, 0x4E71],
+                D16_AN,
+                0,
+                Size::Long,
+                1,
+            ),
+            (
+                "d8(A0,Xn)",
+                &[0x2030, 0x0000, 0x4E71],
+                D8_AN_XN,
+                0,
+                Size::Long,
+                1,
+            ),
+            (
+                "abs.W",
+                &[0x2038, 0x1000, 0x4E71],
+                ABSOLUTE,
+                ABS_W,
+                Size::Long,
+                1,
+            ),
+            (
+                "abs.L",
+                &[0x2039, 0x0000, 0x1000, 0x4E71],
+                ABSOLUTE,
+                ABS_L,
+                Size::Long,
+                2,
+            ),
+            (
+                "d16(PC)",
+                &[0x203A, 0x0000, 0x4E71],
+                ABSOLUTE,
+                D16_PC,
+                Size::Long,
+                1,
+            ),
+            (
+                "d8(PC,Xn)",
+                &[0x203B, 0x0000, 0x4E71],
+                ABSOLUTE,
+                D8_PC_XN,
+                Size::Long,
+                1,
+            ),
+            (
+                "#imm byte",
+                &[0x003C, 0x0000, 0x4E71],
+                ABSOLUTE,
+                IMMEDIATE,
+                Size::Byte,
+                1,
+            ),
+            (
+                "#imm word",
+                &[0x303C, 0x0000, 0x4E71],
+                ABSOLUTE,
+                IMMEDIATE,
+                Size::Word,
+                1,
+            ),
+            (
+                "#imm long",
+                &[0x203C, 0x0000, 0x1000, 0x4E71],
+                ABSOLUTE,
+                IMMEDIATE,
+                Size::Long,
+                2,
+            ),
+        ];
+
+        for (label, program, mode, reg, size, words) in cases {
+            let (mut cpu, mut bus) = cpu_with_program(program);
+            cpu.a[6] = 0x0000_2000;
+
+            cpu.resolve_ea(&mut bus, *mode, *reg, *size)
+                .unwrap_or_else(|| panic!("{label} must resolve"));
+
+            assert_eq!(
+                cpu.pc,
+                PROGRAM_BASE + 2 * words,
+                "{label}: {words} extension word(s) on top of the queued opcode"
+            );
+        }
+    }
+
+    // ---- invalid modes ----
+
+    /// Mode `111` with register field `101`, `110` or `111` is not an
+    /// addressing mode at all: it is an illegal instruction (M68000UM,
+    /// "Effective Address Calculation" mode 111, and "Illegal Instruction
+    /// Format"). Turning it into the illegal-instruction exception is M1-07
+    /// (#15), so this layer only has to decline cleanly — `None`, and no side
+    /// effect whatsoever: no queue word popped, no cycle charged. (Modes 101,
+    /// 110 and the rest of 111 were this test's territory until M1-06 (#14)
+    /// implemented them; they are covered by the tests above.)
+    #[test]
+    fn invalid_111_101_to_111_resolves_to_none() {
+        for reg in 0b101..0b1000u8 {
+            for size in SIZES {
+                let (mut cpu, mut bus) = ram_with_program(&[0x4E71, 0x1234, 0x5678]);
+                cpu.a[7] = 0x2000;
+                let before = cpu.clone();
+
+                assert_eq!(
+                    cpu.resolve_ea(&mut bus, ABSOLUTE, reg, size),
+                    None,
+                    "111/{reg:b} is illegal and decoded by M1-07 (#15)"
+                );
+                assert_eq!(cpu, before, "and must not disturb the CPU");
+                assert!(bus.reads.is_empty(), "nor touch the bus");
             }
         }
     }
