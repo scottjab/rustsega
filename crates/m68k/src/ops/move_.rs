@@ -453,12 +453,14 @@ mod tests {
         assert_eq!(cpu.ssp, cpu.a[7], "the stored SSP follows a[7]");
 
         // MOVE.L (A7)+,D1: an increment of the stack pointer moves it the same
-        // way, from the source side this time.
-        let (mut cpu, mut bus) = run(0x222F, &[0x4E71]);
+        // way, from the source side this time. Size `10` long, destination reg
+        // bits 11..9 = `001` (D1) with destination mode `000` (Dn), source mode
+        // bits 5..3 = `011` ((An)+) with source reg `111` (A7).
+        let (mut cpu, mut bus) = run(0x221F, &[0x4E71]);
         let sp = cpu.a[7];
         bus.write_long(sp, 0xDEAD_BEEF);
         cpu.step(&mut bus);
-        assert_eq!(cpu.d[0], 0xDEAD_BEEF, "the operand is at the old SP");
+        assert_eq!(cpu.d[1], 0xDEAD_BEEF, "the operand is at the old SP");
         assert_eq!(cpu.a[7], sp + 4, "post-increment steps by the size");
         assert_eq!(cpu.ssp, cpu.a[7], "the stored SSP follows a[7]");
     }
