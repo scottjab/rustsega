@@ -188,6 +188,37 @@ pub enum Op {
     /// Test", #20). Sets N and Z from the operand, clears V and C, leaves `X`
     /// alone, and writes nothing back.
     Tst,
+    /// `AND <ea>,Dn` and `AND Dn,<ea>`: the `1100` group's operation modes
+    /// `000`/`001`/`010` and `100`/`101`/`110` (M68000UM AND, #21). Re-reads the
+    /// size, direction, register and EA from the opcode bits exactly as
+    /// [`Op::Add`] does; see [`crate::ops::logic`].
+    And,
+    /// `OR <ea>,Dn` and `OR Dn,<ea>`: the `1000` group's operation modes
+    /// `000`/`001`/`010` and `100`/`101`/`110` (M68000UM OR, #21). [`Op::And`]
+    /// in every respect but the operation.
+    Or,
+    /// `EOR Dn,<ea>`: `1011 RRR 1ss eeeeee`, the half of the `1011` group that
+    /// is not [`Op::Cmpm`] (M68000UM EOR, #21). EOR is read-modify-write into
+    /// the EA and has no `EOR <ea>,Dn` form, which is why the group splits on
+    /// bit 8 rather than on a destination register.
+    Eor,
+    /// `NOT <ea>`, `$4600 + ss<<6 + <ea>` with `ss` != `11` (M68000UM NOT, #21).
+    /// It reads, inverts and writes back one operand; `ss` = `11` is MOVE to
+    /// CCR/SR's half of `$46xx` (#34).
+    Not,
+    /// `ANDI #imm,<ea>`, `$0200 + ss<<6 + <ea>` (M68000UM ANDI, #21). The
+    /// immediate is the operand encoded in the EA field as mode `111` register
+    /// `100` and is fetched before the destination's own extension words, as in
+    /// [`Op::Addi`]. `ss` = `11` and mode `111` register `100` are the to-SR and
+    /// to-CCR forms (#34).
+    Andi,
+    /// `ORI #imm,<ea>`, `$0000 + ss<<6 + <ea>` (M68000UM ORI, #21). [`Op::Andi`]
+    /// with a different operation and base opcode; `ddd` != `000` in this range
+    /// is nothing at all, because `BTST D0,<ea>` has no encoding.
+    Ori,
+    /// `EORI #imm,<ea>`, `$0A00 + ss<<6 + <ea>` (M68000UM EORI, #21).
+    /// [`Op::Andi`] with a different operation and base opcode.
+    Eori,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -292,13 +323,27 @@ fn classify(opcode: u16) -> Op {
         0xD000..=0xDFFF => classify_add(opcode),
         // `1001 ddd ooo eeeeee`: SUB, SUBA and SUBX.
         0x9000..=0x9FFF => classify_sub(opcode),
-        // `1011 ddd ooo eeeeee`: CMP, CMPA and CMPM. The rest of the group is
-        // EOR, which is #21's and stays unimplemented.
+        // `1011 ddd ooo eeeeee`: CMP, CMPA, CMPM and EOR.
         0xB000..=0xBFFF => classify_cmp(opcode),
         // `0100 1010 ss eeeeee`: TST. `ss` = `11` is the top sixth of `$4Axx`,
         // `$4AC0..=$4AFF`, which is TAS's (M1-27) and `ILLEGAL` at `$4AFC`, so
         // the range stops dead at `$4ABF` rather than running to `$4AFF`.
         0x4A00..=0x4ABF => classify_tst(opcode),
+        // `0100 0110 ss eeeeee`: NOT. `ss` = `11` — `$46C0..=$46FF` — is MOVE to
+        // CCR and MOVE to SR (#34), so the range stops dead at `$46BF`, exactly
+        // as TST's stops before TAS.
+        0x4600..=0x46BF => classify_not(opcode),
+        // `0000 0000 ss eeeeee`, `0000 0010 ss eeeeee` and `0000 1010 ss eeeeee`:
+        // ORI, ANDI and EORI, the three `#imm,<ea>` logic operations. Bit 8 is
+        // clear throughout all three ranges, which is what keeps them apart from
+        // the bit operations (`0000 ddd 1oo eeeeee` with `ddd` != `000`).
+        0x0000..=0x00FF => classify_logic_imm(opcode, Op::Ori),
+        0x0200..=0x02FF => classify_logic_imm(opcode, Op::Andi),
+        0x0A00..=0x0AFF => classify_logic_imm(opcode, Op::Eori),
+        // `1000 ddd ooo eeeeee`: OR, and DIV/SBCD's space.
+        0x8000..=0x8FFF => classify_or(opcode),
+        // `1100 ddd ooo eeeeee`: AND, and MUL/ABCD/EXG's space.
+        0xC000..=0xCFFF => classify_and(opcode),
         // Every other group is a real instruction whose handler has not been
         // written yet; the tickets that write them split these groups up.
         _ => Op::Unimplemented,
@@ -576,8 +621,8 @@ fn classify_addq(opcode: u16) -> Op {
     Op::Addq
 }
 
-/// One opcode of the `1011` group: [`Op::Cmp`], [`Op::Cmpa`] or [`Op::Cmpm`],
-/// with [`Op::Unimplemented`] for the part of the group EOR owns.
+/// One opcode of the `1011` group: [`Op::Cmp`], [`Op::Cmpa`], [`Op::Cmpm`] or
+/// [`Op::Eor`].
 ///
 /// The group has three shapes sharing one operation-mode field in bits 8..6
 /// (M68000UM, "Instruction Formats", Format III and the operation-code-map
@@ -587,7 +632,7 @@ fn classify_addq(opcode: u16) -> Op {
 /// CMP    1011 RRR 0ss eeeeee    operation 000 / 001 / 010
 /// CMPA   1011 RRR 011 eeeeee    and 1011 RRR 111 eeeeee
 /// CMPM   1011 xxx 1ss 001 yyy   forced mode 001 inside EOR's half
-/// EOR    1011 RRR 1ss eeeeee    operation 100 / 101 / 110, M1-13's
+/// EOR    1011 RRR 1ss eeeeee    operation 100 / 101 / 110
 /// ```
 ///
 /// CMPA is taken first because its long form has bit 8 set: testing EOR's half
@@ -631,8 +676,139 @@ fn classify_cmp(opcode: u16) -> Op {
     if mode == AN_DIRECT_MODE {
         return Op::Cmpm;
     }
-    // The rest is EOR (`1011 RRR 1ss eeeeee`), which #21 owns.
-    Op::Unimplemented
+    // What is left is EOR (`1011 RRR 1ss eeeeee`): `Dn ^ <ea> → <ea>`, so the EA
+    // names a read-modify-write destination and has to be data-alterable — the
+    // one property that made mode `001` free for CMPM above (M68000UM EOR,
+    // destination "data alterable", #21).
+    if is_data_alterable(mode, reg) {
+        Op::Eor
+    } else {
+        Op::Illegal
+    }
+}
+
+/// One opcode of the `1100` group: [`Op::And`], or [`Op::Unimplemented`] for the
+/// four corners of the group that MULU, MULS, ABCD and EXG own.
+///
+/// AND is `1100 ddd ooo eeeeee` with `ooo` = `000`/`001`/`010` for
+/// `AND <ea>,Dn` and `100`/`101`/`110` for `AND Dn,<ea>` (M68000UM AND, #21).
+/// Everything else in the group is claimed:
+///
+/// ```text
+/// MULU   1100 ddd 011 eeeeee    M1-14
+/// MULS   1100 ddd 111 eeeeee    M1-14
+/// ABCD   1100 ddd 100 00 m yyy  M1-16
+/// EXG    1100 xxx 101 000 yyy   M1-17, and 101 001 and 110 001
+/// ```
+///
+/// So the operation-mode test comes first, then the corners of the `1ss` half.
+/// EXG's three forms, read off `EXG.json.gz` — its opcodes are exactly
+/// `$Cx40`..`$xC4F` and `$Cx88`..`$C8F` for every destination — occupy operation
+/// `101` at modes `000` and `001` **and** operation `110` at mode `001`.
+/// Everything else in the `1ss` half is AND, including operation `110` mode
+/// `000`, which is `AND.L Dn,Dn` and is not EXG.
+fn classify_and(opcode: u16) -> Op {
+    let op_mode = ((opcode >> 6) & 0b111) as u8;
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let mul = matches!(op_mode, 0b011 | 0b111);
+    let abcd = op_mode == 0b100 && mode <= AN_DIRECT_MODE;
+    let exg = (op_mode == 0b101 && mode <= AN_DIRECT_MODE)
+        || (op_mode == 0b110 && mode == AN_DIRECT_MODE);
+    if mul || abcd || exg {
+        return Op::Unimplemented;
+    }
+    classify_and_or(opcode, op_mode, Op::And)
+}
+
+/// One opcode of the `1000` group: [`Op::Or`], or [`Op::Unimplemented`] for
+/// DIVU, DIVS and SBCD's corner of it.
+///
+/// ```text
+/// OR     1000 ddd ooo eeeeee    operation 000 / 001 / 010 and 100 / 101 / 110
+/// DIVU   1000 ddd 011 eeeeee    M1-15
+/// DIVS   1000 ddd 111 eeeeee    M1-15
+/// SBCD   1000 ddd 100 00 m yyy  M1-16
+/// ```
+///
+/// Unlike [`classify_and`], only operation `100` loses its mode-`000` case: OR
+/// has no EXG in its group, so `OR.W D0,D1` — `1000 ddd 101 000 yyy` — is a
+/// plain read-modify-write into a data register (M68000UM OR, destination "data
+/// alterable", #21).
+fn classify_or(opcode: u16) -> Op {
+    let op_mode = ((opcode >> 6) & 0b111) as u8;
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let div = matches!(op_mode, 0b011 | 0b111);
+    let sbcd = op_mode == 0b100 && mode <= AN_DIRECT_MODE;
+    if div || sbcd {
+        return Op::Unimplemented;
+    }
+    classify_and_or(opcode, op_mode, Op::Or)
+}
+
+/// The operand rules `AND` and `OR` share (M68000UM AND, OR, #21): the `0ss`
+/// half reads an EA into a data register, the `1ss` half writes the result back
+/// to a data-alterable EA.
+fn classify_and_or(opcode: u16, op_mode: u8, op: Op) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    let Some(size) = Size::from_bits(u16::from(op_mode & 0b11)) else {
+        // `011` and `111` — MUL, DIV — were taken by the caller.
+        return Op::Illegal;
+    };
+    if op_mode < 0b100 {
+        // `AND <ea>,Dn`/`OR <ea>,Dn`: the destination is a data register by
+        // construction, so only the source can be illegal, and a byte read of an
+        // address register is the rejection `MOVE`, `ADD` and `SUB` make.
+        if !is_data(mode, reg) || (size == Size::Byte && mode == AN_DIRECT_MODE) {
+            return Op::Illegal;
+        }
+    } else if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    op
+}
+
+/// `$4600 + ss<<6 + <ea>`: `NOT <ea>` (M68000UM NOT, #21).
+///
+/// `classify` only routes `$4600..=$46BF` here, so `ss` is never `11` and MOVE to
+/// CCR/SR is out of reach. NOT's operand is read and written back, so it is
+/// [`is_data_alterable`]'s set, exactly as `classify_tst` found for the
+/// read-only case: `NOT.b/w/l` use Dn, the four indirect modes and the two
+/// absolutes and nothing else.
+fn classify_not(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    Op::Not
+}
+
+/// One opcode of the `$0000`/`$0200`/`$0A00` groups: [`Op::Ori`], [`Op::Andi`] or
+/// [`Op::Eori`] — the three `#imm,<ea>` logic operations, which are `ORI`'s
+/// pattern `0000 ddd 0 ss eeeeee` with `ddd` = `000`, `001` and `101` and differ
+/// from each other in nothing but the base opcode (M68000UM ORI, ANDI, EORI,
+/// #21).
+///
+/// `op` says which of the three the caller's range is. The rules are
+/// [`classify_subi`]'s — the EA field names the destination, which must be
+/// data-alterable, and the immediate itself lives in the extension words — plus
+/// the two forms #34 owns: mode `111` register `100` is `ORI #imm,CCR`/`ANDI
+/// #imm,SRC`/`EORI #imm,SR`-style (`$003C`, `$023C`, `$0A3C`), and `ss` = `11`
+/// with that EA is MOVE to SR (`$00FC`, `$02FC`, `$0AFC`).
+fn classify_logic_imm(opcode: u16, op: Op) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if mode == 0b111 && reg == 0b100 {
+        return Op::Unimplemented;
+    }
+    if Size::from_bits((opcode >> 6) & 0b11).is_none() {
+        return Op::Unimplemented;
+    }
+    if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    op
 }
 
 /// `$0C00 + ss<<6 + <ea>`: `CMPI #imm,<ea>` (M68000UM "CMPI — Compare
@@ -704,13 +880,16 @@ mod tests {
         assert_range_decodes_to(0xA000..=0xAFFF, Op::LineA);
         assert_range_decodes_to(0xF000..=0xFFFF, Op::LineF);
         // The groups either side of them are not. `1001` was the anchor here
-        // until #19 implemented SUB/SUBA/SUBX, so it is now `1000` — OR, DIV and
-        // SBCD, still unimplemented — and `1011`. `1011`'s anchor moved to
-        // `$B100` with #20, which implemented CMP/CMPA/CMPM there; `$B100` is
-        // `EOR.B D0,D0`, the part of the group M1-13 owns, so the assertion kept
-        // its meaning (see `cmpm_decodes_before_eor`).
-        assert_eq!(decode(0x8FFF), Op::Unimplemented);
-        assert_eq!(decode(0xB100), Op::Unimplemented, "EOR.B D0,D0");
+        // until #19 implemented SUB/SUBA/SUBX, so it was `1000` and `1011`.
+        // #20 moved `1011`'s anchor to `$B100` (`EOR.B D0,D0`), the part of the
+        // group CMP could not take, and #21 implemented EOR itself — so `1011`
+        // has no unimplemented opcode left and this anchor moves to `1110`'s
+        // shifts (M1-30, #38), the other group next door that is still loud.
+        // `0x8FFF` is `DIVS`-shaped (`op_mode 111`), which #21 deliberately left
+        // out of the `1000` group; `0xC0C0` is `MULU`, likewise.
+        assert_eq!(decode(0x8FFF), Op::Unimplemented, "DIVS");
+        assert_eq!(decode(0xC0C0), Op::Unimplemented, "MULU");
+        assert_eq!(decode(0xE0C0), Op::Unimplemented, "ASR.W D0");
     }
 
     /// `$4AFC` is `ILLEGAL` (M68000PM/AD section 8).
@@ -741,7 +920,10 @@ mod tests {
         assert_range_decodes_to(0x4E40..=0x4E4F, Op::Trap);
         assert_eq!(decode(0x4E3F), Op::Unimplemented, "just below the traps");
         assert_eq!(decode(0x4E50), Op::Unimplemented, "just above the traps");
-        assert_eq!(decode(0x0000), Op::Unimplemented, "ORI.b #imm,D0");
+        // `$0000` was ORI until #21 implemented it (see
+        // `ori_andi_eori_decode_and_leave_ccr_sr_alone`); `$0100` is BTST,
+        // the bit-test half of the same `$0000` group that M1-14 (#22) owns.
+        assert_eq!(decode(0x0100), Op::Unimplemented, "BTST.B D0,D0");
         // The move groups — bits 15..12 = `0001`, `0010`, `0011` (`MOVE`,
         // `MOVEA`) and `0111` (`MOVEQ`) — left this list with #17, see
         // `move_family_is_not_unimplemented`, so the anchor is a
@@ -919,10 +1101,12 @@ mod tests {
         assert_eq!(decode(0x06C0), Op::Unimplemented, "ADDI with ss = 11");
         // Its neighbours in the `0000` group are untouched by this ticket. The
         // `$04` pattern was one of them until #19 claimed it: `$0400` is SUBI,
-        // see `subi_decodes_and_validates_its_destination`.
+        // see `subi_decodes_and_validates_its_destination`. `$00` and `$02` were
+        // neighbours too until #21 claimed them as ORI and ANDI, so the list is
+        // now the bit tests and CMPI's own size-`11` hole.
         for (opcode, name) in [
-            (0x0000u16, "ORI.B #imm,D0"),
-            (0x0200, "ANDI.B #imm,D0"),
+            (0x0100u16, "BTST.B #imm,D0"),
+            (0x0500, "BCHG.B #imm,D0"),
             (0x0700, "the pattern one size above ADDI"),
             (0x0800, "BTST #imm,D0"),
         ] {
@@ -1154,10 +1338,9 @@ mod tests {
     /// Neither bit 8 nor the size tells the two apart, so the EA mode has to be
     /// read before an opcode in `1ss` can be routed: `$B109` is
     /// `CMPM.B (A1)+,(A0)+`, comparing and stepping two pointers, while `$B101`
-    /// is `EOR.B D1,D0`, which M1-13 owns and which must stay
-    /// [`Op::Unimplemented`]. Claiming all of `1ss` for the compare would hand
-    /// EOR's whole range to `op_cmpm` and nothing would notice until M1-13
-    /// landed.
+    /// is `EOR.B D1,D0`, which M1-13 (#21) owns. Claiming all of `1ss` for the
+    /// compare would hand EOR's whole range to `op_cmpm` and nothing would notice
+    /// until M1-13 landed.
     ///
     /// Every CMPM opcode below is measured in the pinned suite (`CMP.b/w/l`,
     /// whose case names spell the mode out as `[CMP.b (A1)+, (A0)+]`); none of
@@ -1177,8 +1360,10 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), Op::Cmpm, "{name} (${opcode:04X})");
         }
-        // Bit 8 set with any other EA mode is EOR, still unimplemented (M1-13),
-        // including the data-register form CMPM's `001` is one bit away from.
+        // Bit 8 set with any other EA mode is EOR, which #21 implemented, and
+        // mode `001` still has to lose to CMPM: `$B109` and `$B101` differ by one
+        // bit and one is a compare that steps two pointers while the other is a
+        // write to D0.
         for (opcode, name) in [
             (0xB101u16, "EOR.B D1,D0"),
             (0xB110, "EOR.B D0,(A0)"),
@@ -1188,8 +1373,8 @@ mod tests {
         ] {
             assert_eq!(
                 decode(opcode),
-                Op::Unimplemented,
-                "{name} (${opcode:04X}) must stay EOR's until M1-13"
+                Op::Eor,
+                "{name} (${opcode:04X}) must stay EOR's, not CMPM's"
             );
         }
         // And operation mode `111` is CMPA.L, not a fourth CMPM size: CMPA has to
@@ -1297,5 +1482,239 @@ mod tests {
     #[test]
     fn table_is_built_once() {
         assert!(std::ptr::eq(decode_table(), decode_table()));
+    }
+
+    /// `AND` is `1100 ddd ooo mmm rrr` and `OR` is `1000 ddd ooo mmm rrr`: `ooo`
+    /// `000`..`010` is `<ea> op Dd → Dd`, whose source must be a data EA — a
+    /// *byte* address register is not one, exactly as in ADD, while a word or long
+    /// one is — and `100`..`110` is `Dd op <ea> → <ea>`, whose destination must be
+    /// data-alterable, so neither an address register nor an immediate
+    /// (M68000UM AND, OR; M1-13, #21). Every opcode in the legal list was read
+    /// out of `AND.b/w/l` and `OR.b/w/l`, which together use all of modes
+    /// `010`..`111` in the read-modify-write half and `000` and `010`..`111` in
+    /// the load half; mode `001` appears in neither, which is the same fact
+    /// `decode_does_not_steal_abcd_mulu_exg` relies on.
+    #[test]
+    fn and_or_decode_and_validate_their_eas() {
+        for (opcode, name) in [
+            (0xC001u16, "AND.B D1,D0: operation 000, source D1"),
+            (0xC041, "AND.W D1,D0"),
+            (0xC081, "AND.L D1,D0"),
+            (0xC018, "AND.B (A0)+,D0 — measured in AND.b"),
+            (0xC221, "AND.B -(A1),D1 — measured in AND.b"),
+            (0xC0A9, "AND.L d16(A1),D0 — measured in AND.l"),
+            (0xC038, "AND.B ($0000).W,D0 — measured in AND.b"),
+            (
+                0xC07C,
+                "AND.W #imm,D0: an immediate *is* a legal source — `c07c [AND.w #, D0]` in AND.w",
+            ),
+            (0xC048, "AND.W A0,D0: a word An *is* a data source"),
+            (0xC398, "AND.L D1,(A0)+ — measured in AND.l"),
+            (0xC730, "AND.B D3,d8(A0,D0): the destination is alterable"),
+            (0x8001, "OR.B D1,D0"),
+            (0x8041, "OR.W D1,D0"),
+            (0x8081, "OR.L D1,D0"),
+            (0x8318, "OR.B D1,(A0)+ — measured in OR.b"),
+            (0x8FB9, "OR.L D7,($0000).L — measured in OR.l"),
+        ] {
+            let want = if opcode >> 12 == 0xC { Op::And } else { Op::Or };
+            assert_eq!(decode(opcode), want, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0xC008u16, "AND.B (A0),D0: a byte An is not a data source"),
+            (0x8008, "OR.B (A0),D0: the same rule, one group away"),
+            (0xC13C, "AND.B D0,#imm: an immediate is not a destination"),
+            (0x8148, "OR.W D0,A0: an address register is not alterable"),
+            (0x8FBC, "OR.L D7,#imm"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// `EOR` is `1011 ddd 1ss mmm rrr`, `Dd ^ <ea> → <ea>`, so the EA names a
+    /// read-modify-write destination and has to be data-alterable — the one
+    /// property that made mode `001` free for CMPM. Operation mode `111` stays
+    /// CMPA's, which is why `$BF9F` (EOR.L D7,(A7)+) is EOR but `$BF8F`
+    /// (CMPM.L (A7)+,(A7)+, measured in CMP.l) is not, even though the two differ
+    /// only in the size bits (M68000UM EOR, CMPM, CMPA; M1-13, #21).
+    #[test]
+    fn eor_decodes_to_eor_with_a_data_alterable_destination() {
+        for (opcode, name) in [
+            (
+                0xB100u16,
+                "EOR.B D0,D0 — the CMP half's shape, taken by bit 8",
+            ),
+            (0xB140, "EOR.W D0,D0"),
+            (0xB198, "EOR.L D0,(A0)+ — measured-shaped"),
+            (0xBF9F, "EOR.L D7,(A7)+ — measured in EOR.l"),
+            (0xB36C, "EOR.W D1,d16(A4) — measured in EOR.w"),
+            (0xB132, "EOR.B D0,d8(A2,Xn) — measured in EOR.b"),
+            (0xBFA7, "EOR.L D7,-(A7)"),
+        ] {
+            assert_eq!(decode(opcode), Op::Eor, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (
+                0xB13Cu16,
+                "EOR.B D0,#imm: an immediate is not a destination",
+            ),
+            (0xBFBC, "EOR.L D7,#imm"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        // Mode `001`, one bit from `$B101`, is CMPM's; operation mode `111` is
+        // CMPA's. Both are #20's and neither is EOR.
+        assert_eq!(decode(0xB108), Op::Cmpm, "CMPM.B (A0)+,(A0)+");
+        assert_eq!(decode(0xBF8F), Op::Cmpm, "CMPM.L (A7)+,(A7)+");
+        assert_eq!(decode(0xB1C8), Op::Cmpa, "CMPA.L A0,A0");
+    }
+
+    /// `ORI` is `$0000 + ss<<6 + <ea>`, `ANDI` `$0200 + …` and `EORI` `$0A00 + …`,
+    /// the three `#imm,<ea>` operations of the `0000` group next to `SUBI`, `ADDI`
+    /// and `CMPI`. The EA names the destination, which must be data-alterable,
+    /// and the two forms that are not destinations at all — mode `111` register
+    /// `100`, the CCR, and `ss` = `11` — stay [`Op::Unimplemented`] for M1-26
+    /// (#34) rather than being called illegal from here (M68000UM ORI, ANDI,
+    /// EORI; M1-13, #21).
+    #[test]
+    fn ori_andi_eori_decode_and_leave_ccr_sr_alone() {
+        for (opcode, want, name) in [
+            (0x0000u16, Op::Ori, "ORI.B #imm,D0"),
+            (0x0040, Op::Ori, "ORI.W #imm,D0"),
+            (0x0080, Op::Ori, "ORI.L #imm,D0"),
+            (0x0010, Op::Ori, "ORI.B #imm,(A0)"),
+            (0x0098, Op::Ori, "ORI.L #imm,(A0)+"),
+            (0x00B8, Op::Ori, "ORI.L #imm,($0000).W"),
+            (0x0200, Op::Andi, "ANDI.B #imm,D0"),
+            (0x0268, Op::Andi, "ANDI.W #imm,d16(A0) — measured in AND.w"),
+            // `(xxx).L` is mode `111` register `001`; AND.b measures the same EA at
+            // byte size as `0239 [AND.b #, (xxx).l]`, so the mode is a destination.
+            (0x02B9, Op::Andi, "ANDI.L #imm,($0000).L — mode 111 reg 001"),
+            (0x0A00, Op::Eori, "EORI.B #imm,D0"),
+            (0x0A50, Op::Eori, "EORI.W #imm,(A0)"),
+            (0x0AB8, Op::Eori, "EORI.L #imm,($0000).W"),
+        ] {
+            assert_eq!(decode(opcode), want, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x003Cu16, "ORI.B #imm,CCR"),
+            (0x007C, "ORI.W #imm,CCR"),
+            (0x023C, "ANDI.B #imm,CCR"),
+            (0x0A3C, "EORI.B #imm,CCR"),
+            (0x00C0, "ORI with ss = 11: MOVE to SR's space"),
+            (0x02C0, "ANDI with ss = 11"),
+            (0x0AC0, "EORI with ss = 11"),
+            (0x02FC, "ANDI with ss = 11 at the CCR EA"),
+        ] {
+            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (
+                0x0048u16,
+                "ORI.W #imm,A0: an address register is not alterable",
+            ),
+            (
+                0x02BA,
+                "ANDI.L #imm,d16(PC): mode 111 reg 010 is PC-relative, not a destination",
+            ),
+            (
+                0x027D,
+                "ANDI.W #imm,<mode 111 reg 101>: not an EA on the 68000",
+            ),
+            (0x0ABD, "EORI.L #imm,<mode 111 reg 101>"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// `NOT` is `0100 0110 ss mmm rrr`, a one-operand read-modify-write, so its EA
+    /// must be data-alterable (M68000UM NOT; M1-13, #21). `classify` only routes
+    /// `$4600..=$46BF` to it, so `ss` = `11` — MOVE to SR (`$46C0`, `$46FC`) and
+    /// MOVE to CCR's space, which M1-26 (#34) owns — never reaches it. Every mode
+    /// in the legal list but `001` is measured in `NOT.b/w/l`, and mode `111`
+    /// register `100` (`#immediate`, `$463C`/`$46BC`) is in no file at all.
+    #[test]
+    fn not_decodes_and_validates_its_destination() {
+        for (opcode, name) in [
+            (0x4600u16, "NOT.B D0"),
+            (0x4641, "NOT.W D1"),
+            (0x4682, "NOT.L D2"),
+            // Mode `010` is `(Am)`, a memory operand: `4610 [NOT.b (A0)]` and
+            // `4617 [NOT.b (A7)]` are both measured cases in NOT.b. Only mode
+            // `001`, the address register itself, is not a destination.
+            (0x4610, "NOT.B (A0) — measured in NOT.b"),
+            (0x4617, "NOT.B (A7) — measured in NOT.b"),
+            (0x4690, "NOT.L (A0) — measured in NOT.l"),
+            (0x4698, "NOT.L (A0)+ — measured in NOT.l"),
+            (0x46A7, "NOT.L -(A7) — measured in NOT.l"),
+            (0x4669, "NOT.W d16(A1) — measured in NOT.w"),
+            (0x4674, "NOT.W d8(A4,D0) — measured in NOT.w"),
+            (0x4638, "NOT.B ($0000).W — measured in NOT.b"),
+            (0x46B9, "NOT.L ($0000).L — measured in NOT.l"),
+        ] {
+            assert_eq!(decode(opcode), Op::Not, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (
+                0x4608u16,
+                "NOT.B A0: mode 001, an address register, is not a destination",
+            ),
+            (0x468F, "NOT.L A7: not a destination either"),
+            (0x463C, "NOT.B #imm: not a destination"),
+            (0x46BC, "NOT.L #imm: mode 111 reg 100, whatever the size"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        assert_eq!(
+            decode(0x46C0),
+            Op::Unimplemented,
+            "NOT is not encoded at ss = 11"
+        );
+        assert_eq!(decode(0x46FC), Op::Unimplemented, "MOVE.L #imm,SR");
+    }
+
+    /// The `1100` and `1000` groups are not AND's and OR's alone. The corners
+    /// below were read out of the pinned suite's own opcode fields, which is how
+    /// the exclusions in [`classify_and`] and [`classify_or`] are known rather
+    /// than guessed:
+    ///
+    /// ```text
+    /// ABCD   1100 ddd 100 0m yyy   operation 100, modes 000 and 001
+    /// EXG    1100 ddd 101 0m yyy   and 1100 ddd 110 001 yyy
+    /// MULU   1100 ddd 011 eeeeee   MULS 1100 ddd 111 eeeeee
+    /// SBCD   1000 ddd 100 0m yyy   DIVU 1000 ddd 011 eeeeee   DIVS 1000 ddd 111 eeeeee
+    /// ```
+    ///
+    /// The direction bit `100` and a byte size make ABCD look like a plain
+    /// `Dn op <ea>` at a glance, and EXG's third form is one bit away from
+    /// `AND.L Dn,(An)+`, so the group split is asserted here opcode by opcode
+    /// (M68000UM ABCD, SBCD, MULU, MULS, DIVU, DIVS, EXG; M1-13, #21).
+    #[test]
+    fn decode_does_not_steal_abcd_mulu_exg() {
+        // The three the ticket names, then the rest of both groups.
+        assert_ne!(decode(0xC100), Op::And, "ABCD.B (A0)+,(A1)+");
+        assert_ne!(decode(0xC0C0), Op::And, "MULU D0,D0");
+        assert_ne!(decode(0xC141), Op::And, "EXG D0,D1");
+        assert_eq!(decode(0xC100), Op::Unimplemented, "ABCD.B (A0)+,(A1)+");
+        assert_eq!(decode(0xC108), Op::Unimplemented, "ABCD.B -(A0),-(A1)");
+        assert_eq!(decode(0xC0C0), Op::Unimplemented, "MULU D0,D0");
+        assert_eq!(decode(0xC0EE), Op::Unimplemented, "MULU d16(A0),D6");
+        assert_eq!(decode(0xCFC8), Op::Unimplemented, "MULS D0,(A0)");
+        assert_eq!(decode(0xC141), Op::Unimplemented, "EXG D0,D1");
+        assert_eq!(decode(0xC148), Op::Unimplemented, "EXG A0,A1");
+        assert_eq!(decode(0xC189), Op::Unimplemented, "EXG D0,A1");
+        assert_eq!(decode(0x8100), Op::Unimplemented, "SBCD.B (A0)+,(A1)+");
+        assert_eq!(decode(0x8108), Op::Unimplemented, "SBCD.B -(A0),-(A1)");
+        assert_eq!(decode(0x80C0), Op::Unimplemented, "DIVU D0,D0");
+        assert_eq!(decode(0x8FC8), Op::Unimplemented, "DIVS D0,(A0)");
+        // The other side of the same line: the `1000` group has no EXG, so
+        // operation `101` into a data register is an ordinary OR — and `1100`'s
+        // operation `110` with mode `010`, one bit from EXG's `001`, is an
+        // ordinary AND.
+        assert_eq!(decode(0x8141), Op::Or, "OR.W D0,D1");
+        assert_eq!(decode(0xC198), Op::And, "AND.L D0,(A0)+");
+        // EXG's other two homes are in groups AND never touches.
+        assert_ne!(decode(0x48C0), Op::And, "EXG-shaped, the $48 group");
+        assert_ne!(decode(0x4CC0), Op::And, "EXG-shaped, the $4C group");
     }
 }
