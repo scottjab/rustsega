@@ -1617,10 +1617,7 @@ mod tests {
             want.extend(mode_block(mode));
         }
         want.extend([enc(ABSOLUTE, ABS_W), enc(ABSOLUTE, ABS_L)]);
-        want.extend([
-            enc(ABSOLUTE, D16_PC),
-            enc(ABSOLUTE, D8_PC_XN),
-        ]);
+        want.extend([enc(ABSOLUTE, D16_PC), enc(ABSOLUTE, D8_PC_XN)]);
         assert_eq!(accepted(is_memory), want);
     }
 

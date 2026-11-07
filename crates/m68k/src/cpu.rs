@@ -919,14 +919,19 @@ mod tests {
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
         cpu.step(&mut bus);
         assert_eq!(
-            cpu.pending_exception, Some(EXC_ILLEGAL),
+            cpu.pending_exception,
+            Some(EXC_ILLEGAL),
             "the same route twice still records it once"
         );
 
         cpu.pending_exception = Some(99);
         cpu.prefetch[0] = 0xA000;
         cpu.step(&mut bus);
-        assert_eq!(cpu.pending_exception, Some(EXC_LINE_A), "replaced, not kept");
+        assert_eq!(
+            cpu.pending_exception,
+            Some(EXC_LINE_A),
+            "replaced, not kept"
+        );
     }
 
     /// An unimplemented instruction is a panic, not a silent no-op: a suite
@@ -935,10 +940,8 @@ mod tests {
     #[test]
     fn step_panics_loudly_on_an_unimplemented_opcode() {
         let (mut cpu, mut bus) = cpu_at_opcode(0x4E71); // NOP, until its ticket
-        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cpu.step(&mut bus)
-        }))
-        .expect_err("NOP has no handler, so step must not return");
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cpu.step(&mut bus)))
+            .expect_err("NOP has no handler, so step must not return");
         let text = error
             .downcast_ref::<String>()
             .expect("the panic payload is a formatted message");
