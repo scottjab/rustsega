@@ -37,6 +37,7 @@
 //! which route.
 
 mod arith;
+mod logic;
 mod move_;
 
 use crate::M68k;
@@ -100,6 +101,17 @@ impl M68k {
             Op::Cmpm => self.op_cmpm(bus, opcode),
             Op::Cmpi => self.op_cmpi(bus, opcode),
             Op::Tst => self.op_tst(bus, opcode),
+            // The logic class (`1100`, `1000`, EOR's half of `1011`, `0100 0110`
+            // and the `$0000`/`$0200`/`$0A00` immediates): one handler per shape
+            // rather than per instruction, so AND, OR and EOR share a body and
+            // NOT shares its flags helper (see [`logic]).
+            Op::And => self.op_and(bus, opcode),
+            Op::Or => self.op_or(bus, opcode),
+            Op::Eor => self.op_eor(bus, opcode),
+            Op::Not => self.op_not(bus, opcode),
+            Op::Andi => self.op_andi(bus, opcode),
+            Op::Ori => self.op_ori(bus, opcode),
+            Op::Eori => self.op_eori(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming
