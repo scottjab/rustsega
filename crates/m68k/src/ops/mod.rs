@@ -36,6 +36,8 @@
 //! [`crate::exceptions`] (M1-08, #16); this module only says which opcode takes
 //! which route.
 
+mod move_;
+
 use crate::M68k;
 use crate::bus::Bus;
 use crate::decode::Op;

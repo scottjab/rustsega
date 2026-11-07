@@ -213,6 +213,64 @@ mod tests {
         assert_eq!(decode(0x3280), Op::Unimplemented, "MOVE.l (A0),D1");
     }
 
+    /// MOVE, MOVEA and MOVEQ are their own variants, not `Unimplemented`
+    /// (M1-09, #17). The opcodes spell out the three things that make MOVE
+    /// unlike its neighbours: the size field is `01` byte / `11` word / `10`
+    /// long (M68000UM Format III), the *destination* is reg in bits 11..9 and
+    /// mode in bits 8..6 (swapped relative to a normal EA field), and
+    /// destination mode `001` is MOVEA rather than MOVE.
+    #[test]
+    fn move_family_is_not_unimplemented() {
+        for (opcode, name) in [
+            (0x1210u16, "MOVE.b (A0),D1"),
+            (0x3210, "MOVE.w (A0),D1"),
+            (0x2210, "MOVE.l (A0),D1"),
+            (0x1038, "MOVE.b $2000.W,D0"),
+            (0x123C, "MOVE.b #imm,D1"),
+            (0x12D8, "MOVE.b (A0)+,(A1)+"),
+            (0x3001, "MOVE.w D1,D0"),
+            (0x3510, "MOVE.w (A0),-(A2)"),
+            (0x20D8, "MOVE.l (A0)+,(A0)+"),
+            (0x3040, "MOVEA.w D0,A0"),
+            (0x2258, "MOVEA.l (A0)+,A1"),
+            (0x3440, "MOVEA.w D0,A2"),
+            (0x70FF, "MOVEQ #-1,D0"),
+            (0x7EFF, "MOVEQ #-1,D7"),
+        ] {
+            assert_ne!(
+                decode(opcode),
+                Op::Unimplemented,
+                "{name} (${opcode:04X}) must decode to its own variant"
+            );
+        }
+    }
+
+    /// The EA combinations the move class may not do are illegal instructions
+    /// (vector [`crate::exceptions::EXC_ILLEGAL`]) decided at decode, so the
+    /// handlers never have to re-check them (M68000PM/AD 2.2.12, and M68000UM
+    /// Format III/IV; #17).
+    #[test]
+    fn move_illegal_ea_combinations_decode_as_illegal() {
+        for (opcode, name) in [
+            (0x1040u16, "MOVE.B D0,A0: byte MOVEA does not exist"),
+            (0x1258, "MOVE.B (A0)+,A1: byte MOVEA does not exist"),
+            (0x1009, "MOVE.B A1,D0: byte access to An"),
+            (0x39C0, "MOVE.W D0,#imm: an immediate is not a destination"),
+            (0x35C0, "MOVE.W D0,d16(PC): PC-relative is not a destination"),
+            (0x3DC0, "MOVE.W D0,(d8,PC,Xn)68020: not a 68000 mode"),
+            (0x303E, "MOVE.W (d8,PC,Xn)68020,D0: not a 68000 mode"),
+            (0x227E, "MOVEA.l (d8,PC,Xn)68020,A1: not a 68000 mode"),
+            (0x71FF, "MOVEQ with bit 8 set: illegal on the 68000"),
+            (0x7FFF, "MOVEQ with bit 8 set, D7"),
+        ] {
+            assert_eq!(
+                decode(opcode),
+                Op::Illegal,
+                "{name} (${opcode:04X}) must take the illegal-instruction route"
+            );
+        }
+    }
+
     /// Every opcode has an entry, and the entry is what [`classify`] says it
     /// should be — the table is the pattern, applied to all 65536 of them, not
     /// a list that can silently miss one.
