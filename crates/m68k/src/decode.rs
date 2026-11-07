@@ -31,12 +31,12 @@
 //! | `0111` | `MOVEQ` |
 //! | `1000` | `OR`, `DIV`, `SBCD` |
 //! | `1001` | `SUB`, `SUBA`, `SUBX` |
-//! | `1010` | line A (`1010` emulator) — not implemented, vector [`crate::ops::EXC_LINE_A`] |
+//! | `1010` | line A (`1010` emulator) — the 68000 has no line emulator, so this is a reserved format: [`crate::ops::EXC_ILLEGAL`] |
 //! | `1011` | `CMP`, `CMPA`, `CMPM`, `EOR` |
 //! | `1100` | `AND`, `MUL`, `ABCD`, `EXG` |
 //! | `1101` | `ADD`, `ADDA`, `ADDX` |
 //! | `1110` | shifts and rotates |
-//! | `1111` | line F (`1111` emulator) — not implemented, vector [`crate::ops::EXC_LINE_F`] |
+//! | `1111` | line F (`1111` emulator) — reserved on the 68000 like `1010`: [`crate::ops::EXC_ILLEGAL`] |
 //!
 //! The whole map is documented here because every instruction ticket reads it
 //! off this table, but only the two groups the core routes today (`1010`,
@@ -75,11 +75,15 @@ pub enum Op {
     /// Not a valid instruction on the 68000: takes the illegal-instruction
     /// exception (vector [`crate::ops::EXC_ILLEGAL`]).
     Illegal,
-    /// An opcode in the `1010` group, which the 68000 hands to the line A
-    /// emulator: vector [`crate::ops::EXC_LINE_A`].
+    /// An opcode in the `1010` group (M68000UM Format I, "Line 1010 emulator
+    /// instruction"). The 68000 has no line emulator, so it takes
+    /// [`crate::ops::EXC_ILLEGAL`] like any other reserved opcode; the variant
+    /// is separate from [`Op::Illegal`] because the 68010 (M1-12, #20) does
+    /// have a line-A vector and will route the two differently.
     LineA,
-    /// An opcode in the `1111` group, which the 68000 hands to the line F
-    /// emulator: vector [`crate::ops::EXC_LINE_F`].
+    /// An opcode in the `1111` group (M68000UM Format J, "Line 1111 emulator
+    /// instruction"). [`Op::LineA`] in every respect on the 68000 — illegal
+    /// instruction — and separate for the same 68010 reason.
     LineF,
 }
 

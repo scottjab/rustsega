@@ -875,15 +875,21 @@ mod tests {
         (cpu, Ram64k::new())
     }
 
-    /// Illegal, line A and line F each record their vector — and, being stubs,
-    /// change nothing else (M1-07, #15; the frame is M1-08, #16).
+    /// Illegal, line A and line F all record the illegal-instruction vector —
+    /// the 68000 has no line emulator, so all three reserved routes take the one
+    /// exception — and, being stubs, change nothing else (M1-07, #15; the frame
+    /// is M1-08, #16, real line-A/F vectors are the 68010's, M1-12, #20).
     #[test]
     fn step_records_the_exception_vector_of_each_illegal_route() {
-        use crate::ops::{EXC_ILLEGAL, EXC_LINE_A, EXC_LINE_F};
-        for (opcode, vector, name) in [
-            (0x4AFC, EXC_ILLEGAL, "ILLEGAL"),
-            (0xA123, EXC_LINE_A, "line A"),
-            (0xF123, EXC_LINE_F, "line F"),
+        use crate::ops::EXC_ILLEGAL;
+        for (opcode, name) in [
+            (0x4AFC, "ILLEGAL"),
+            (0xA123, "line A"),
+            (0xF123, "line F"),
+            (0xA000, "line A, group start"),
+            (0xAFFF, "line A, group end"),
+            (0xF000, "line F, group start"),
+            (0xFFFF, "line F, group end"),
         ] {
             let (mut cpu, mut bus) = cpu_at_opcode(opcode);
             let mut before = cpu.clone();
@@ -897,8 +903,8 @@ mod tests {
             before.pending_exception = cpu.pending_exception;
             assert_eq!(
                 cpu.pending_exception,
-                Some(vector),
-                "{name} (${opcode:04X}) must record vector {vector}"
+                Some(EXC_ILLEGAL),
+                "{name} (${opcode:04X}) must record the illegal-instruction vector"
             );
             assert_eq!(cpu, before, "{name} must not change the CPU yet");
             assert!(
@@ -913,7 +919,7 @@ mod tests {
     /// CPU ever took.
     #[test]
     fn step_replaces_the_previous_step_s_exception_record() {
-        use crate::ops::{EXC_ILLEGAL, EXC_LINE_A};
+        use crate::ops::EXC_ILLEGAL;
         let (mut cpu, mut bus) = cpu_at_opcode(0x4AFC);
         cpu.step(&mut bus);
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
@@ -929,7 +935,7 @@ mod tests {
         cpu.step(&mut bus);
         assert_eq!(
             cpu.pending_exception,
-            Some(EXC_LINE_A),
+            Some(EXC_ILLEGAL),
             "replaced, not kept"
         );
     }
@@ -957,11 +963,11 @@ mod tests {
     /// from `pc` or decoded `prefetch[1]` would panic instead of routing.
     #[test]
     fn step_runs_the_instruction_at_the_front_of_the_queue() {
-        use crate::ops::EXC_LINE_A;
+        use crate::ops::EXC_ILLEGAL;
         let (mut cpu, mut bus) = cpu_at_opcode(0x4E71);
         cpu.prefetch = [0xA000, 0x4E71];
         assert_eq!(cpu.step(&mut bus), 0);
-        assert_eq!(cpu.pending_exception, Some(EXC_LINE_A));
+        assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
 
         // And the same opcode written into memory at `pc` is still not what it
         // runs, because the queue front is.
@@ -969,7 +975,7 @@ mod tests {
         bus.mem[PROGRAM_BASE as usize] = 0x4E;
         bus.mem[PROGRAM_BASE as usize + 1] = 0x71;
         assert_eq!(cpu.step(&mut bus), 0);
-        assert_eq!(cpu.pending_exception, Some(EXC_LINE_A));
+        assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
     }
 
     /// With HALT asserted the CPU stops accessing the bus; the clocks are a
