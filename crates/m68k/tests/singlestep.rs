@@ -7,9 +7,25 @@
 //! its comparison notices a single wrong byte.
 //!
 //! Nothing here runs a real instruction file to green, and that is deliberate.
-//! `M68k::step` is still a stub (M1-04, #12 onward), so no instruction file can
-//! pass yet; [`all_instructions`] is the `#[ignore]`d whole-suite run that
-//! reports how far the core actually is, per file and in total.
+//! No instruction is implemented yet, so no instruction file can pass; the
+//! whole-suite [`all_instructions`] run reports how far the core actually is,
+//! per file and in total.
+//!
+//! # Why the fixtures changed in #15
+//!
+//! Until M1-07 (#15), `step()` ignored the opcode and returned 0, so the `4E71`
+//! (`NOP`) control case below ran clean and a fixture expecting no mismatches
+//! meant exactly that. `step()` now decodes (see `src/decode.rs`), finds that
+//! `NOP` has no handler, and panics — loudly, which is what #15 requires, so a
+//! suite can never report a passing case for an instruction that did not run.
+//! The harness catches that panic per case and records it as one more
+//! [`harness::Mismatch`].
+//!
+//! So every fixture that used to expect an empty mismatch list now expects
+//! [`UNIMPLEMENTED_4E71`] alongside whatever difference it is really testing.
+//! `BASE` deliberately stays `4E71` rather than becoming an implemented opcode:
+//! these tests are about the comparison, not the instruction, and one identical
+//! panic line on every case cannot mask a register, RAM or cycle difference.
 //!
 //! Cases are written as JSON rather than as struct literals so they go through
 //! the same parse path as the real suite — a field the harness stopped
@@ -34,9 +50,13 @@ const USP: u32 = 16_777_216;
 /// `ssp` in [`BASE`]: 0x0000_2000, the value the real suite almost always uses.
 const SSP: u32 = 8192;
 
-/// A whole, real-shaped case for an instruction that does nothing: `final`
-/// equals `initial`, and `length` is 0, which is exactly what today's stub
-/// `M68k::step` leaves behind. It is the control for every test below.
+/// A whole, real-shaped case for an instruction that changes nothing: `final`
+/// equals `initial`, and `length` is 0. It is the control for every test below.
+///
+/// `4E71` (`NOP`) is still unimplemented, so the state comparison here passes
+/// because the fixture's `final` *is* its `initial` and `step()` touches no
+/// register on the way to the panic — not because the core can do `NOP`. See
+/// the module docs for what that means for the expectations below.
 ///
 /// Field names and layout are copied from the pinned suite
 /// (`test-roms/680x0/68000/v1/README.md`): `d0`..`d7`, `a0`..`a6`, `usp`,
@@ -69,6 +89,45 @@ const BASE: &str = r#"{
     "length": 0,
     "transactions": [["r", 4, 6, 3076, ".w", 1657]]
 }"#;
+
+/// The one mismatch every fixture below carries in addition to whatever it is
+/// testing: `step()` decodes `4E71`, finds no handler, and panics naming the
+/// opcode (`src/ops/mod.rs`), which [`harness::Machine::run`] catches per case
+/// and records as a `panic` mismatch.
+///
+/// Quoted from an actual run rather than assembled from the `unimplemented!`
+/// call, because the text is the harness's formatting as well as the panic's.
+const UNIMPLEMENTED_4E71: &str = "panic: expected none, got not implemented: m68k opcode 4E71";
+
+/// The failure line [`harness::run_cases`] keeps for a lone [`BASE`] case: the
+/// case name it quotes, then nothing but the unimplemented opcode.
+fn unimplemented_base_failure() -> String {
+    format!("case \"4e71 [does nothing] 1\": {UNIMPLEMENTED_4E71}")
+}
+
+/// The same control case with `ILLEGAL` (`$4AFC`, M68000PM/AD section 8) as the
+/// instruction under execution.
+///
+/// Where [`BASE`] panics, this one *returns*: it routes to the exception stub,
+/// which records the vector and charges no clocks (`src/ops/mod.rs`, #15; the
+/// real frame is M1-08, #16). Tests that need the clock count compared need a
+/// case that gets there, because `Machine::run` compares `length` on the
+/// `Ok(cycles)` branch and records the panic on the other — they are mutually
+/// exclusive, so a panicking case never reaches the cycle check.
+fn illegal_case() -> harness::TestCase {
+    let mut c = base();
+    c.name = "4afc [does nothing] 1".to_string();
+    // `prefetch[0]` is the word `step()` decodes. The two `pc` bytes are the
+    // same instruction, and the suite lists them because they are part of the
+    // machine state, so the fixture says `4AFC` in both places.
+    c.initial.prefetch[0] = 0x4AFC;
+    c.final_state.prefetch[0] = 0x4AFC;
+    for state in [&mut c.initial, &mut c.final_state] {
+        state.ram[0].1 = 0x4A;
+        state.ram[1].1 = 0xFC;
+    }
+    c
+}
 
 /// Parse a case from a JSON literal. The panic prints the parse error, which is
 /// the useful failure for a test whose own JSON went stale.
@@ -192,11 +251,14 @@ fn harness_parses_nop_file() {
 #[test]
 fn identical_states_compare_equal() {
     // A case whose expected state is what the CPU actually ends up in reports
-    // nothing at all. Under `StateAndCycles` this pins the cycle comparison too,
-    // since `length: 0` is what the stub `step` returns.
+    // nothing but the unimplemented instruction: every register, both stack
+    // pointers, SR, PC, both prefetch words and the listed RAM bytes matched,
+    // because the fixture's `final` is its `initial`. The panic line is the
+    // only thing left over, so it cannot be hiding a field the harness stopped
+    // comparing.
     assert_eq!(
         run(&base(), harness::Check::StateAndCycles),
-        Vec::<String>::new()
+        vec![UNIMPLEMENTED_4E71]
     );
 }
 
@@ -204,9 +266,15 @@ fn identical_states_compare_equal() {
 fn flipping_one_ram_byte_reports_exactly_that_difference() {
     let mut c = base();
     c.final_state.ram[2].1 = 0xEE; // [3076, 6] -> [3076, 0xEE]
+    // Still exactly one RAM line, naming exactly that byte and nothing else;
+    // the panic line is the same on every case, so it is noise the test names
+    // rather than something that could bury the difference.
     assert_eq!(
         run(&c, harness::Check::State),
-        vec!["ram[0x00000C04]: expected 0xEE, got 0x06"]
+        vec![
+            "ram[0x00000C04]: expected 0xEE, got 0x06",
+            UNIMPLEMENTED_4E71,
+        ]
     );
 }
 
@@ -221,13 +289,15 @@ fn one_failure_line_carries_every_difference() {
     c.final_state.sr = 0x2700;
     c.final_state.pc = 3074;
     c.final_state.prefetch[1] = 0x6789;
+    // Five differences, which is exactly the harness's per-case reporting cap,
+    // so the line is complete and carries no "+N more".
     assert_eq!(
         failure_lines(vec![c], harness::Check::State),
-        vec![
+        vec![format!(
             "case \"4e71 [does nothing] 1\": d3: expected 0x00001234, got 0x00000003; \
              sr: expected 0x2700, got 0x2701; pc: expected 0x00000C02, got 0x00000C00; \
-             prefetch[1]: expected 0x6789, got 0x2A53"
-        ]
+             prefetch[1]: expected 0x6789, got 0x2A53; {UNIMPLEMENTED_4E71}"
+        )]
     );
 }
 
@@ -237,10 +307,31 @@ fn only_state_and_cycles_checks_the_cycle_count() {
     // tables land per group later, so a group should not be blocked on them.
     let mut c = base();
     c.length = 4;
-    assert_eq!(run(&c, harness::Check::State), Vec::<String>::new());
+    // `Check::State` says nothing about clocks even when the count is wrong:
+    // the only line it reports for this case is the unimplemented opcode, not a
+    // cycle difference.
     assert_eq!(
-        run(&c, harness::Check::StateAndCycles),
-        vec!["cycles: expected 4, got 0"]
+        run(&c, harness::Check::State),
+        vec![UNIMPLEMENTED_4E71],
+        "State must not report a cycle difference"
+    );
+
+    // The cycle comparison itself needs a case that *returns*: `run` compares
+    // `length` on the `Ok(cycles)` branch and records the panic on the other,
+    // so `4E71` can never reach it. `4AFC` goes through the exception stub and
+    // comes back with 0 clocks.
+    let mut returns = illegal_case();
+    assert_eq!(
+        run(&returns, harness::Check::StateAndCycles),
+        Vec::<String>::new(),
+        "the case's `length: 0` is what the stub returns, so StateAndCycles is clean"
+    );
+    returns.length = 4;
+    assert_eq!(run(&returns, harness::Check::State), Vec::<String>::new());
+    assert_eq!(
+        run(&returns, harness::Check::StateAndCycles),
+        vec!["cycles: expected 4, got 0"],
+        "only StateAndCycles reports it"
     );
 }
 
@@ -292,17 +383,24 @@ fn exception_cases_are_detected_and_skipped() {
         "a case that ends at the $C vector is an exception case"
     );
 
-    // Skipped, not failed: unskipped the same case would be a plain failure,
-    // because the stub does not take the exception.
+    // Skipped, not failed: unskipped, the same case would add a second failure,
+    // because the stub records the vector but does not take the exception.
     let report = harness::run_cases(&[base(), exception], harness::Check::StateSkipAddressErrors);
-    assert_eq!((report.total, report.passed, report.skipped), (2, 1, 1));
-    assert!(
-        report.failures.is_empty(),
-        "a skipped case is not a failure"
+    // The control no longer passes either — it panics on the unimplemented
+    // opcode — so `passed` is 0 and the count that matters is `skipped: 1`.
+    assert_eq!((report.total, report.passed, report.skipped), (2, 0, 1));
+    // And the skip left exactly the control's failure behind, naming the opcode
+    // the core has no handler for. That is what makes `skipped: 1` mean "the
+    // exception case was left out" rather than "the exception case passed": a
+    // skipped case contributes no failure line, so its absence is the evidence.
+    assert_eq!(
+        report.failures,
+        vec![unimplemented_base_failure()],
+        "a skipped case is not a failure, and the surviving one names the opcode"
     );
 
     let report = harness::run_cases(&[base()], harness::Check::State);
-    assert_eq!((report.total, report.passed, report.skipped), (1, 1, 0));
+    assert_eq!((report.total, report.passed, report.skipped), (1, 0, 0));
 }
 
 #[test]
@@ -312,7 +410,7 @@ fn an_incomplete_vector_is_not_skipped() {
     // cases from the suite and inflate the pass count.
     //
     // The case starts at the handler address too, so it is otherwise a clean
-    // control: `(1, 1, 0)` can then only mean "run and passed", which is what
+    // control: `skipped == 0` can then only mean "it was run", which is what
     // distinguishes it from the skipped case next door.
     let mut partial = base();
     partial.initial.ram.extend_from_slice(&HANDLER_BYTES[..3]);
@@ -321,7 +419,10 @@ fn an_incomplete_vector_is_not_skipped() {
     assert!(!harness::is_address_error_case(&partial));
 
     let report = harness::run_cases(&[partial], harness::Check::StateSkipAddressErrors);
-    assert_eq!((report.total, report.passed, report.skipped), (1, 1, 0));
+    assert_eq!((report.total, report.passed, report.skipped), (1, 0, 0));
+    // It ran, and it reported: the only difference is the unimplemented opcode.
+    // A case the predicate had dropped would have contributed no line at all.
+    assert_eq!(report.failures, vec![unimplemented_base_failure()]);
 }
 
 #[test]
@@ -424,8 +525,10 @@ fn every_instruction_file_in_the_suite_is_enumerated() {
 
 /// Every file in the suite, one line each, then the grand total.
 ///
-/// `#[ignore]`d because no instruction is implemented yet (`M68k::step` is a
-/// stub until M1-04, #12, onward), so this reports instead of asserting; M1-32
+/// `#[ignore]`d because no instruction is implemented yet — `step()` decodes
+/// and dispatches (M1-07, #15), so nearly every case walks into the loud
+/// `unimplemented!` path and the harness catches it per case — so this reports
+/// instead of asserting; M1-32
 /// (#42) is where it becomes a gate. Run it with
 /// `cargo nextest run -p m68k --run-ignored all --no-capture all_instructions`;
 /// `just test-all` on `main` runs it too, but nextest hides the output of a test

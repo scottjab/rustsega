@@ -12,12 +12,20 @@
 //! word, which is the convention the SingleStepTests suite uses — see
 //! [`M68k::pc`].
 //!
-//! Not implemented yet: addressing modes, instructions, exceptions and
-//! interrupts. [`M68k::step`] is a stub.
+//! [`M68k::step`] decodes the opcode at the front of the queue through the
+//! table in [`decode`] and dispatches to the handlers in [`ops`] (M1-07, #15).
+//! No instruction is implemented yet, so every real opcode takes the loud
+//! `unimplemented!` path; what exists is the routing, the illegal / line A /
+//! line F exception stubs, and the effective-address layer the handlers will
+//! use.
+//!
+//! Not implemented yet: instructions, real exception frames, interrupts.
 
 mod bus;
 mod cpu;
+mod decode;
 mod ea;
+mod ops;
 mod sr;
 
 /// Always compiled, not `#[cfg(test)]`: integration tests under
