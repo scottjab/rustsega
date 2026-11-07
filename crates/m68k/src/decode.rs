@@ -39,10 +39,12 @@
 //! | `1111` | line F (`1111` emulator) — reserved on the 68000 like `1010`: [`crate::exceptions::EXC_ILLEGAL`] |
 //!
 //! The whole map is documented here because every instruction ticket reads it
-//! off this table, but only the two groups the core routes today (`1010`,
-//! `1111`) plus the one documented illegal opcode are acted on; every other
-//! group decodes to [`Op::Unimplemented`] and panics loudly until its ticket
-//! lands (M1-08, #16 onward).
+//! off this table, but only the groups the core routes today are acted on:
+//! `1010` and `1111` (line A / line F), the `0111` group (`MOVEQ`, #17), the
+//! three move groups `0001`/`0010`/`0011` (`MOVE` and `MOVEA`, #17), the traps
+//! in `0100`, and the one documented illegal opcode. Every other group decodes
+//! to [`Op::Unimplemented`] and panics loudly until its ticket lands (M1-08, #16
+//! onward).
 //!
 //! # EA validity is a decode-time rule
 //!
@@ -59,6 +61,7 @@
 //! as it lands — the pattern has to say which field of the opcode is the EA
 //! field, which is only knowable per instruction.
 
+use crate::ea::{Size, is_data, is_data_alterable};
 use std::sync::OnceLock;
 
 /// What a decoded opcode means: which handler runs, or why none can.
@@ -90,6 +93,19 @@ pub enum Op {
     /// the tag has no payload — [`crate::ops`] re-reads the nibble. Takes vector
     /// [`crate::exceptions::trap_vector`], which is measured in `TRAP.json.gz`.
     Trap,
+    /// `MOVE <ea>,Dn|(An)|<ea>` — the `0001`/`0010`/`0011` groups with
+    /// destination mode other than `001` (M68000PM section 8, "MOVE — Move").
+    /// [`crate::ops`] re-reads the size, the swapped destination fields and the
+    /// source EA from the opcode bits.
+    Move,
+    /// `MOVEA <ea>,An`: a `MOVE`-shaped opcode whose destination mode is `001`.
+    /// Word and long only, so no `$0001`-group opcode is a `MOVEA` — see
+    /// [`Op::Illegal`]. [`crate::ops::move_`] for the semantics.
+    Movea,
+    /// `MOVEQ #imm8,Dn`, `$7000 + d8` with the destination register in bits
+    /// 11..9 and bit 8 clear (M68000UM, "Instruction Formats", Format IV).
+    /// Bit 8 set is [`Op::Illegal`] on the 68000.
+    Moveq,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -98,6 +114,16 @@ pub enum Op {
 /// encoding that is not this one still decodes to [`Op::Unimplemented`] until
 /// the ticket that owns its group says otherwise.
 const ILLEGAL_OPCODE: u16 = 0x4AFC;
+
+/// Address register direct, the destination mode that turns a move-group opcode
+/// into `MOVEA` instead of `MOVE` (M68000UM, "Instruction Formats", Format III).
+const AN_DIRECT_MODE: u8 = 0b001;
+
+/// Bit 8 of a `MOVEQ` opcode: `0111 RRR 0 dddddddd`, so a set bit 8 is not a
+/// `MOVEQ` on the 68000 (M68000UM, "Instruction Formats", Format IV). Shared
+/// with [`crate::ops::move_`], which re-reads the opcode, so the bit is spelled
+/// once.
+pub(crate) const MOVEQ_BIT8: u16 = 0x0100;
 
 /// Every opcode's [`Op`], indexed by the opcode itself, so a decode is one load.
 ///
@@ -145,9 +171,70 @@ fn classify(opcode: u16) -> Op {
         // `4E40 + n`: sixteen traps, all of them one word. `$4E40..=$4E4F` is
         // the whole group, so no operand field has to be read to know it.
         0x4E40..=0x4E4F => Op::Trap,
+        // The three move groups: `00ss` with `ss` = `01` byte, `10` long,
+        // `11` word. `$0000..=$0FFF` is *not* a move — `ss` = `00` is the
+        // ORI/BTST/MOVEP group — so the range starts at `$1000`.
+        0x1000..=0x3FFF => classify_move(opcode),
+        // `0111 RRR 0 dddddddd`: the whole `0111` group is MOVEQ, and the
+        // encodings with bit 8 set are illegal on the 68000.
+        0x7000..=0x7FFF => classify_moveq(opcode),
         // Every other group is a real instruction whose handler has not been
         // written yet; the tickets that write them split these groups up.
         _ => Op::Unimplemented,
+    }
+}
+
+/// One opcode of the `0001`/`0010`/`0011` move groups: [`Op::Move`],
+/// [`Op::Movea`] or [`Op::Illegal`], with the EA validity rules applied here so
+/// the handler can assume its operands are legal (see the module docs).
+///
+/// This is the one pattern that reads the destination fields in the *swapped*
+/// order — register in bits 11..9, mode in bits 8..6, the reverse of the source
+/// EA field in bits 5..0 (M68000UM, "Instruction Formats", Format III, and
+/// [`crate::ops::move_`], which re-reads them the same way).
+fn classify_move(opcode: u16) -> Op {
+    let Some(size) = Size::from_move_bits(opcode >> 12) else {
+        // `00` in bits 13..12 is the `$0000` group, which `classify` routes
+        // elsewhere; naming it keeps this function total.
+        return Op::Illegal;
+    };
+    let dest_reg = ((opcode >> 9) & 0b111) as u8;
+    let dest_mode = ((opcode >> 6) & 0b111) as u8;
+    let src_mode = ((opcode >> 3) & 0b111) as u8;
+    let src_reg = (opcode & 0b111) as u8;
+
+    // Destination mode `001` is MOVEA: it writes the address register itself,
+    // it only exists for word and long, and its source may be an An.
+    if dest_mode == AN_DIRECT_MODE {
+        // A byte MOVEA would be a byte access to an address register, which no
+        // 68000 instruction encodes (M68000UM section 1 "Address Registers",
+        // which gives An a word or long operand width).
+        if size == Size::Byte || !is_data(src_mode, src_reg) {
+            return Op::Illegal;
+        }
+        return Op::Movea;
+    }
+
+    if !is_data_alterable(dest_mode, dest_reg) || !is_data(src_mode, src_reg) {
+        return Op::Illegal;
+    }
+    // The other byte-to-An case: `MOVE.B A1,D0` reads an address register a
+    // byte at a time, which the chip does not do either.
+    if size == Size::Byte && src_mode == AN_DIRECT_MODE {
+        return Op::Illegal;
+    }
+    Op::Move
+}
+
+/// `MOVEQ #imm8,Dn`: the whole `0111` group, except that bit 8 set is not a
+/// `MOVEQ` on the 68000 at all and takes the illegal-instruction exception
+/// (M68000UM, "Instruction Formats", Format IV, and M68000PM section 8
+/// "MOVEQ", which lists only the `$7000 + d8` form).
+fn classify_moveq(opcode: u16) -> Op {
+    if opcode & MOVEQ_BIT8 != 0 {
+        Op::Illegal
+    } else {
+        Op::Moveq
     }
 }
 
@@ -210,7 +297,73 @@ mod tests {
         assert_eq!(decode(0x4E3F), Op::Unimplemented, "just below the traps");
         assert_eq!(decode(0x4E50), Op::Unimplemented, "just above the traps");
         assert_eq!(decode(0x0000), Op::Unimplemented, "ORI.b #imm,D0");
-        assert_eq!(decode(0x3280), Op::Unimplemented, "MOVE.l (A0),D1");
+        // The move groups — bits 15..12 = `0001`, `0010`, `0011` (`MOVE`,
+        // `MOVEA`) and `0111` (`MOVEQ`) — left this list with #17, see
+        // `move_family_is_not_unimplemented`, so the anchor is a
+        // move-family opcode #17 deliberately left out: MOVEM is group `$48xx`
+        // and belongs to M1-10 (#19).
+        assert_eq!(decode(0x48E7), Op::Unimplemented, "MOVEM.L #(imm),(A7)-");
+    }
+
+    /// MOVE, MOVEA and MOVEQ are their own variants, not `Unimplemented`
+    /// (M1-09, #17). The opcodes spell out the three things that make MOVE
+    /// unlike its neighbours: the size field is `01` byte / `11` word / `10`
+    /// long (M68000UM Format III), the *destination* is reg in bits 11..9 and
+    /// mode in bits 8..6 (swapped relative to a normal EA field), and
+    /// destination mode `001` is MOVEA rather than MOVE.
+    #[test]
+    fn move_family_is_not_unimplemented() {
+        for (opcode, name) in [
+            (0x1210u16, "MOVE.b (A0),D1"),
+            (0x3210, "MOVE.w (A0),D1"),
+            (0x2210, "MOVE.l (A0),D1"),
+            (0x1038, "MOVE.b $2000.W,D0"),
+            (0x123C, "MOVE.b #imm,D1"),
+            (0x12D8, "MOVE.b (A0)+,(A1)+"),
+            (0x3001, "MOVE.w D1,D0"),
+            (0x3510, "MOVE.w (A0),-(A2)"),
+            (0x20D8, "MOVE.l (A0)+,(A0)+"),
+            (0x3040, "MOVEA.w D0,A0"),
+            (0x2258, "MOVEA.l (A0)+,A1"),
+            (0x3440, "MOVEA.w D0,A2"),
+            (0x70FF, "MOVEQ #-1,D0"),
+            (0x7EFF, "MOVEQ #-1,D7"),
+        ] {
+            assert_ne!(
+                decode(opcode),
+                Op::Unimplemented,
+                "{name} (${opcode:04X}) must decode to its own variant"
+            );
+        }
+    }
+
+    /// The EA combinations the move class may not do are illegal instructions
+    /// (vector [`crate::exceptions::EXC_ILLEGAL`]) decided at decode, so the
+    /// handlers never have to re-check them (M68000PM/AD 2.2.12, and M68000UM
+    /// Format III/IV; #17).
+    #[test]
+    fn move_illegal_ea_combinations_decode_as_illegal() {
+        for (opcode, name) in [
+            (0x1040u16, "MOVE.B D0,A0: byte MOVEA does not exist"),
+            (0x1258, "MOVE.B (A0)+,A1: byte MOVEA does not exist"),
+            (0x1009, "MOVE.B A1,D0: byte access to An"),
+            (0x39C0, "MOVE.W D0,#imm: an immediate is not a destination"),
+            (
+                0x35C0,
+                "MOVE.W D0,d16(PC): PC-relative is not a destination",
+            ),
+            (0x3DC0, "MOVE.W D0,(d8,PC,Xn)68020: not a 68000 mode"),
+            (0x303E, "MOVE.W (d8,PC,Xn)68020,D0: not a 68000 mode"),
+            (0x227E, "MOVEA.l (d8,PC,Xn)68020,A1: not a 68000 mode"),
+            (0x71FF, "MOVEQ with bit 8 set: illegal on the 68000"),
+            (0x7FFF, "MOVEQ with bit 8 set, D7"),
+        ] {
+            assert_eq!(
+                decode(opcode),
+                Op::Illegal,
+                "{name} (${opcode:04X}) must take the illegal-instruction route"
+            );
+        }
     }
 
     /// Every opcode has an entry, and the entry is what [`classify`] says it

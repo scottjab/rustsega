@@ -92,6 +92,24 @@ impl Size {
             _ => None,
         }
     }
+
+    /// Decode the **move class's** size field (bits 13..12 of `MOVE`, `MOVEA`
+    /// and the `00ss` groups): `01` byte, `11` word, `10` long.
+    ///
+    /// Deliberately not [`Size::from_bits`]: the move class numbers its sizes
+    /// differently (M68000UM, "Instruction Formats", Format III — `00ss RRR MMM
+    /// mmm rrr`), and `00` in bits 13..12 with bits 15..14 clear is not a MOVE
+    /// at all but the `$0000` group (`ORI`, `BTST`, `MOVEP`), so `None` means
+    /// "this opcode is not a move" rather than "byte".
+    #[inline]
+    pub const fn from_move_bits(bits: u16) -> Option<Size> {
+        match bits & 0b11 {
+            0b01 => Some(Size::Byte),
+            0b11 => Some(Size::Word),
+            0b10 => Some(Size::Long),
+            _ => None,
+        }
+    }
 }
 
 /// A resolved effective address: where an operand lives.
@@ -143,7 +161,7 @@ const fn sign_extend_word(value: u16) -> u32 {
 
 /// Sign extend an 8-bit value to 32 bits (`0xFE` -> `0xFFFF_FFFE`). `as` for
 /// the same const-fn reason as [`sign_extend_word`].
-const fn sign_extend_byte(value: u8) -> u32 {
+pub(crate) const fn sign_extend_byte(value: u8) -> u32 {
     (value as i8) as u32
 }
 
@@ -163,8 +181,13 @@ const PREDEC_CALC_CLOCKS: u64 = 2;
 /// (M68000UM, section 3 "Address Register Indirect" and "Address Register
 /// Indirect with Postdecrement": A7 used as a stack pointer steps by 2 for a
 /// byte operand, while A0–A6 step by 1).
+/// The stack pointer register: `a[7]`, the address register with the two quirks
+/// — a byte push or pop steps it by two ([`ea_step`]), and it mirrors into the
+/// stored `ssp`/`usp` slot ([`M68k::set_an`]).
+const SP_REG: u8 = 7;
+
 const fn ea_step(reg: u8, size: Size) -> u32 {
-    if reg == 7 && matches!(size, Size::Byte) {
+    if reg == SP_REG && matches!(size, Size::Byte) {
         2
     } else {
         size.bytes()
@@ -238,10 +261,6 @@ const fn ea_class(mode: u8, reg: u8) -> EaClass {
 /// False only for mode `111` with register `101`-`111`, which the manual
 /// reserves for the 68010/68020 (M68000UM, "Effective Address Calculation");
 /// an opcode carrying one is an illegal instruction (vector 3, `crate::ops`).
-#[allow(
-    dead_code,
-    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use it today"
-)]
 pub(crate) const fn ea_mode_valid(mode: u8, reg: u8) -> bool {
     !matches!(ea_class(mode, reg), EaClass::Invalid)
 }
@@ -252,10 +271,6 @@ pub(crate) const fn ea_mode_valid(mode: u8, reg: u8) -> bool {
 /// Every valid mode qualifies (M68000PM/AD 2.2.12: the Data column is marked
 /// for all of them), with one size caveat: mode `001` An is data-class for word
 /// and long only, and [`Ea::accepts_size`] rejects the byte case.
-#[allow(
-    dead_code,
-    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
-)]
 pub(crate) const fn is_data(mode: u8, reg: u8) -> bool {
     ea_mode_valid(mode, reg)
 }
@@ -267,10 +282,6 @@ pub(crate) const fn is_data(mode: u8, reg: u8) -> bool {
 /// PC-relative ones. Not Dn or An (registers), not #immediate (its value is in
 /// the instruction stream, not in memory at the EA), and not an invalid mode
 /// (M68000PM/AD 2.2.12).
-#[allow(
-    dead_code,
-    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
-)]
 pub(crate) const fn is_memory(mode: u8, reg: u8) -> bool {
     matches!(
         ea_class(mode, reg),
@@ -294,7 +305,7 @@ pub(crate) const fn is_memory(mode: u8, reg: u8) -> bool {
 /// 68010 adds `(An)+` and `-(An)` to `LEA`; this core is a 68000.
 #[allow(
     dead_code,
-    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
+    reason = "the branch and test-and-set tickets (M1-14 onward) are the callers; only the tests use it today"
 )]
 pub(crate) const fn is_control(mode: u8, reg: u8) -> bool {
     matches!(
@@ -314,10 +325,6 @@ pub(crate) const fn is_control(mode: u8, reg: u8) -> bool {
 /// the instruction stream and an immediate *is* its own value, so neither is
 /// somewhere a result can go (M68000PM/AD 2.2.12, and the "destination operand"
 /// wording of the section 8 instruction descriptions).
-#[allow(
-    dead_code,
-    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
-)]
 pub(crate) const fn is_alterable(mode: u8, reg: u8) -> bool {
     matches!(
         ea_class(mode, reg),
@@ -343,20 +350,12 @@ pub(crate) const fn is_alterable(mode: u8, reg: u8) -> bool {
 /// writes an An from data, and their destination is the address register in
 /// their extension field, not an EA field. So the set is Dn plus the writable
 /// memory modes, and An is in it neither way.
-#[allow(
-    dead_code,
-    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
-)]
 pub(crate) const fn is_data_alterable(mode: u8, reg: u8) -> bool {
     is_memory_alterable(mode, reg) || matches!(ea_class(mode, reg), EaClass::DataReg)
 }
 
 /// Memory operand *and* writable — the destination of a memory write, e.g.
 /// what `CLR` and `NEG` require.
-#[allow(
-    dead_code,
-    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
-)]
 pub(crate) const fn is_memory_alterable(mode: u8, reg: u8) -> bool {
     is_memory(mode, reg) && is_alterable(mode, reg)
 }
@@ -384,10 +383,6 @@ impl M68k {
     /// upper bytes in them (`MOVEA.w.json.gz` case `364a [MOVEA.w A2, A3] 3`
     /// ends with `a3 = 0xFFFF_E780`) — and only [`Ea::Mem`] is masked to
     /// [`ADDR_MASK`], which is the address that actually reaches the bus.
-    #[allow(
-        dead_code,
-        reason = "called by the instruction tickets from M1-09 (#17) onward; only the tests use it today"
-    )]
     pub(crate) fn resolve_ea(
         &mut self,
         bus: &mut impl Bus,
@@ -406,13 +401,13 @@ impl M68k {
                 // Postincrement: the current value is the address, then the
                 // register moves past the operand.
                 let addr = self.a[r] & ADDR_MASK;
-                self.a[r] = self.a[r].wrapping_add(ea_step(reg, size));
+                self.set_an(reg, self.a[r].wrapping_add(ea_step(reg, size)));
                 Some(Ea::Mem(addr))
             }
             0b100 => {
                 // Predecrement: the register moves first, then the new value is
                 // the address, and the calculation itself costs 2 clocks.
-                self.a[r] = self.a[r].wrapping_sub(ea_step(reg, size));
+                self.set_an(reg, self.a[r].wrapping_sub(ea_step(reg, size)));
                 self.cycles += PREDEC_CALC_CLOCKS;
                 Some(Ea::Mem(self.a[r] & ADDR_MASK))
             }
@@ -526,10 +521,6 @@ impl M68k {
     /// Memory goes through [`M68k::read_b`] / [`M68k::read_w`] / [`M68k::read_l`]
     /// so every access charges its bus cycles and is masked to 24 bits; a
     /// register access costs nothing.
-    #[allow(
-        dead_code,
-        reason = "called by the instruction tickets from M1-09 (#17) onward; only the tests use it today"
-    )]
     pub(crate) fn read_ea(&mut self, bus: &mut impl Bus, ea: Ea, size: Size) -> u32 {
         debug_assert!(
             ea.accepts_size(size),
@@ -550,6 +541,24 @@ impl M68k {
         }
     }
 
+    /// Write an address register, keeping the stack pointer's stored mirror in
+    /// step.
+    ///
+    /// `a[7]` is only the active half of the stack pointer: the other half lives
+    /// in `ssp`/`usp` for the current mode, and a `MOVEA` to A7 or an `(A7)+` /
+    /// `-(A7)` moves it, so both places have to agree ([`M68k::set_active_sp`]).
+    /// A save state and the conformance harness read `ssp`/`usp` back, which is
+    /// how a core that only updated `a[7]` was caught — `MOVEA.w (A7)+,A0`
+    /// (case `305f [MOVEA.w (A7)+, A0] 117`).
+    #[inline]
+    fn set_an(&mut self, reg: u8, value: u32) {
+        if reg == SP_REG {
+            self.set_active_sp(value);
+        } else {
+            self.a[usize::from(reg)] = value;
+        }
+    }
+
     /// Write `value` to the operand at `ea`, affecting only `size` bits.
     ///
     /// A byte or word write to Dn keeps the upper bits (M68000UM, section 3
@@ -561,10 +570,6 @@ impl M68k {
     /// TODO(M1-29, #37): a word or long access at an odd address is an address
     /// error (vector 2) before anything is read or written; this layer just
     /// passes the address on and `Ea::Mem` is where that check will hang.
-    #[allow(
-        dead_code,
-        reason = "called by the instruction tickets from M1-09 (#17) onward; only the tests use it today"
-    )]
     pub(crate) fn write_ea(&mut self, bus: &mut impl Bus, ea: Ea, size: Size, value: u32) {
         debug_assert!(
             ea.accepts_size(size),
@@ -581,7 +586,7 @@ impl M68k {
             }
             Ea::AddrReg(r) => {
                 let i = usize::from(r);
-                self.a[i] = match size {
+                let written = match size {
                     // Not a legal encoding (see `resolve_ea`); the debug_assert
                     // above fires on any path that gets here, and the low-byte
                     // merge keeps an unreachable release build well defined
@@ -592,6 +597,9 @@ impl M68k {
                     Size::Word => (value as i16) as i32 as u32,
                     Size::Long => value,
                 };
+                // Only a MOVEA can write an An this way — a plain MOVE's
+                // destination may not be an An (see `crate::decode`).
+                self.set_an(r, written);
             }
             Ea::Mem(addr) => match size {
                 Size::Byte => self.write_b(bus, addr, value as u8),
