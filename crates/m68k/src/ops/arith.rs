@@ -29,16 +29,16 @@ use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
 
 /// Shift of the register field of the `1101` group and of `ADDQ`'s data field,
 /// bits 11..9.
-const ADD_REG_SHIFT: u32 = 9;
+const ALU_REG_SHIFT: u32 = 9;
 /// Shift of the operation/size field: bits 8..6 for `ADD`/`ADDA` (`ooo`), 7..6
 /// (`ss`) for `ADDX`/`ADDI`/`ADDQ`. Both are three-field-wide extractions, and
-/// [`add_size`] keeps only the two size bits.
-const ADD_OP_SHIFT: u32 = 6;
+/// [`alu_size`] keeps only the two size bits.
+const ALU_OP_SHIFT: u32 = 6;
 /// Shift of an EA mode, bits 5..3; the EA register is bits 2..0.
 const EA_MODE_SHIFT: u32 = 3;
 /// `ADD`/`ADDA` operation bit, bit 8: with bit 6 or 7 set it selects the
 /// `Dn + <ea> → <ea>` direction, and for `ADDA` it selects word or long.
-const ADD_MODE_TO_EA: u8 = 0b100;
+const ALU_MODE_TO_EA: u8 = 0b100;
 /// EA mode `001`, an address register.
 const EA_MODE_AN: u8 = 0b001;
 /// EA mode `100`, `-(An)`.
@@ -49,14 +49,14 @@ const EA_MODE_111: u8 = 0b111;
 const EA_REG_IMMEDIATE: u8 = 0b100;
 
 /// Bit 3 of `ADDX`: 0 = register mode, 1 = `-(Ay),-(Ax)` memory mode.
-const ADDX_MEMORY: u16 = 0b1000;
+const ALU_X_MEMORY: u16 = 0b1000;
 
 /// Size from the two `ss` bits of `ADDI`/`ADDQ` and from `oo` in `ADD`'s
 /// `ooo` operation field.
 ///
 /// `None` for `0b11`, which is `Scc`/`DBcc` in the `0101` group and undefined
 /// in `0000 0110`; decode rejects both, so `None` here is a core bug.
-const fn add_size(bits: u8) -> Option<Size> {
+const fn alu_size(bits: u8) -> Option<Size> {
     match bits & 0b11 {
         0b00 => Some(Size::Byte),
         0b01 => Some(Size::Word),
@@ -72,17 +72,17 @@ impl M68k {
     /// 100/101/110 adds data register `ddd` *into* the effective address, a
     /// read-modify-write of that one location (M68000UM section 8, "ADD").
     pub(crate) fn op_add(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
-        let reg = field(opcode, ADD_REG_SHIFT);
-        let op_mode = field(opcode, ADD_OP_SHIFT);
+        let reg = field(opcode, ALU_REG_SHIFT);
+        let op_mode = field(opcode, ALU_OP_SHIFT);
         let mode = field(opcode, EA_MODE_SHIFT);
         let ea_reg = field(opcode, 0);
-        let Some(size) = add_size(op_mode) else {
+        let Some(size) = alu_size(op_mode) else {
             // `011`/`111` are ADDA and `11`-sized `ADD` does not exist, so
             // `classify` never routes them here.
             return self.op_illegal(bus);
         };
 
-        if op_mode & ADD_MODE_TO_EA == 0 {
+        if op_mode & ALU_MODE_TO_EA == 0 {
             // ADD <ea>,Dn: the source first, so `(A0)+` steps once.
             let Some(src) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
                 return self.op_illegal(bus);
@@ -113,11 +113,11 @@ impl M68k {
     /// flag is touched — that is the only difference from `ADD` (M68000UM
     /// section 8, "ADDA").
     pub(crate) fn op_adda(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
-        let reg = field(opcode, ADD_REG_SHIFT);
-        let op_mode = field(opcode, ADD_OP_SHIFT);
+        let reg = field(opcode, ALU_REG_SHIFT);
+        let op_mode = field(opcode, ALU_OP_SHIFT);
         let mode = field(opcode, EA_MODE_SHIFT);
         let ea_reg = field(opcode, 0);
-        let size = if op_mode & ADD_MODE_TO_EA == 0 {
+        let size = if op_mode & ALU_MODE_TO_EA == 0 {
             Size::Word
         } else {
             Size::Long
@@ -148,15 +148,15 @@ impl M68k {
     /// words or longs at `-(Ay)` and `-(Ax)` with `X` and stores into `(Ax)`
     /// (M68000UM section 8, "ADDX").
     pub(crate) fn op_addx(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
-        let dest = field(opcode, ADD_REG_SHIFT);
+        let dest = field(opcode, ALU_REG_SHIFT);
         let src = field(opcode, 0);
-        let Some(size) = add_size(field(opcode, ADD_OP_SHIFT)) else {
+        let Some(size) = alu_size(field(opcode, ALU_OP_SHIFT)) else {
             // `ss = 11` is ADDA.L, which decode routes away before the ADDX
             // overlap check, so this cannot happen.
             return self.op_illegal(bus);
         };
 
-        if opcode & ADDX_MEMORY == 0 {
+        if opcode & ALU_X_MEMORY == 0 {
             let left = self.d[usize::from(src)];
             let right = self.d[usize::from(dest)];
             let result = self.add_extend_flags(left, right, size);
@@ -192,7 +192,7 @@ impl M68k {
     pub(crate) fn op_addi(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
         let mode = field(opcode, EA_MODE_SHIFT);
         let ea_reg = field(opcode, 0);
-        let Some(size) = add_size(field(opcode, ADD_OP_SHIFT)) else {
+        let Some(size) = alu_size(field(opcode, ALU_OP_SHIFT)) else {
             return self.op_illegal(bus);
         };
 
@@ -221,10 +221,10 @@ impl M68k {
     /// To an address register the operation is always 32 bits whatever the size
     /// field says, and no flag changes (M68000UM section 8, "ADDQ").
     pub(crate) fn op_addq(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
-        let quick = field(opcode, ADD_REG_SHIFT);
+        let quick = field(opcode, ALU_REG_SHIFT);
         let mode = field(opcode, EA_MODE_SHIFT);
         let ea_reg = field(opcode, 0);
-        let Some(size) = add_size(field(opcode, ADD_OP_SHIFT)) else {
+        let Some(size) = alu_size(field(opcode, ALU_OP_SHIFT)) else {
             return self.op_illegal(bus);
         };
         // The data field holds 1..8 and `000` means 8.
@@ -688,5 +688,430 @@ mod tests {
         assert!(cpu.flag_v(), "two negatives give a positive");
         assert!(!cpu.flag_n());
         assert_eq!(cpu.pc, PROGRAM + 8, "opcode + 3 extension words");
+    }
+
+    // ── The subtract class (M1-11, #19) ──────────────────────────────────────
+    //
+    // Mirrors the add tests above opcode for opcode, because `SUB` is `ADD`'
+    // twin: the same fields, the same illegal combinations, the same
+    // read-modify-write and extension-word ordering rules. Only the arithmetic
+    // and the direction of the two-operand forms differ, so those are what the
+    // assertions below pin hardest.
+
+    /// `SUB.B D1,D0` (`$9001`) with `$00 - $01`: the byte wraps up to `$FF`, and
+    /// a borrow sets C, X and N (M68000UM section 8, "SUB").
+    #[test]
+    fn sub_b_borrow() {
+        let (mut cpu, mut bus) = run(0x9001, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_0000;
+        cpu.d[1] = 0x0000_0001;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_00FF, "byte subtract keeps the upper 24 bits");
+        assert!(cpu.flag_c(), "$00 - $01 borrows out of bit 7");
+        assert!(cpu.flag_x(), "X copies C");
+        assert!(cpu.flag_n(), "the wrapped byte is negative");
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v(), "0 - 1 cannot overflow");
+    }
+
+    /// `SUB.W D1,D0` (`$9041`) with `$8000 - $1`: the signed minimum minus one
+    /// is the positive maximum, so V is set while no borrow leaves bit 15.
+    #[test]
+    fn sub_w_overflow() {
+        let (mut cpu, mut bus) = run(0x9041, &[0x4E71]);
+        cpu.d[0] = 0x1234_8000;
+        cpu.d[1] = 0x0000_0001;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0x1234_7FFF);
+        assert!(cpu.flag_v(), "-32768 - 1 is +32767: signed overflow");
+        assert!(!cpu.flag_n());
+        assert!(!cpu.flag_c(), "no borrow out of bit 15");
+        assert!(!cpu.flag_x());
+        assert!(!cpu.flag_z());
+    }
+
+    /// `SUB.L D1,D0` (`$9081`) with `$0 - $1`: the borrow out of bit 31 reaches
+    /// both C and X, and Z is cleared by the all-ones result.
+    #[test]
+    fn sub_l_borrow_out_of_bit_31() {
+        let (mut cpu, mut bus) = run(0x9081, &[0x4E71]);
+        cpu.d[0] = 0x0000_0000;
+        cpu.d[1] = 0x0000_0001;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xFFFF_FFFF);
+        assert!(cpu.flag_c());
+        assert!(cpu.flag_x());
+        assert!(cpu.flag_n());
+        assert!(!cpu.flag_z());
+    }
+
+    /// `SUB.B D1,D0` (`$9001`) with equal operands: unlike `SUBX`, plain `SUB`
+    /// sets Z on a zero result rather than leaving it alone.
+    #[test]
+    fn sub_zero_result_sets_z() {
+        let (mut cpu, mut bus) = run(0x9001, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_0042;
+        cpu.d[1] = 0x0000_0042;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_0000);
+        assert!(cpu.flag_z(), "SUB sets Z, it does not leave it");
+        assert!(!cpu.flag_c(), "equal operands do not borrow");
+        assert!(!cpu.flag_x());
+        assert!(!cpu.flag_n());
+    }
+
+    /// `SUB.W A1,D0` (`$9049`) and `SUB.L A1,D0` (`$9089`) read the address
+    /// register at the operand size, and the size reaches the borrow too: the
+    /// word form sees `$FFFE`, which borrows, the long form sees `$1FFFE`,
+    /// which does not.
+    #[test]
+    fn sub_from_an_uses_the_selected_size() {
+        let (mut cpu, mut bus) = run(0x9049, &[0x4E71]);
+        cpu.a[1] = 0x0001_FFFE;
+        cpu.d[0] = 0xDEAD_0003;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_0005, "only the low word is subtracted");
+        assert!(cpu.flag_c(), "$3 - $FFFE borrows out of bit 15");
+        assert!(!cpu.flag_v(), "3 - -2 does not overflow");
+
+        let (mut cpu, mut bus) = run(0x9089, &[0x4E71]);
+        cpu.a[1] = 0x0001_FFFE;
+        cpu.d[0] = 0xDEAD_0003;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAB_0005, "the whole of A1 is subtracted");
+        assert!(!cpu.flag_c(), "and it does not borrow out of bit 31");
+    }
+
+    /// `SUB.B #imm,D0` (`$903C`) takes the low byte of one extension word and
+    /// consumes exactly that word.
+    #[test]
+    fn sub_immediate_source_uses_the_operand_width() {
+        let (mut cpu, mut bus) = run(0x903C, &[0x1234, 0x4E71]);
+        cpu.d[0] = 0xDEAD_00CC;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_0098, "$CC - $34");
+        assert!(!cpu.flag_c(), "$CC is the larger operand");
+        assert!(cpu.flag_n());
+        assert_eq!(cpu.pc, PROGRAM + 4, "one extension word");
+    }
+
+    /// `SUB.W D0,(A0)+` (`$9158`) is a read-modify-write of one location, and
+    /// the operand the EA names is the *minuend*: `$0005 - $0002`, never
+    /// `$0002 - $0005`, and the post-increment moves A0 exactly once.
+    #[test]
+    fn sub_dn_from_ea_is_rmw_on_one_resolved_ea() {
+        let (mut cpu, mut bus) = run(0x9158, &[0x4E71]);
+        cpu.a[0] = MEM;
+        cpu.d[0] = 0xDEAD_0002;
+        bus.write_word(MEM, 0x0005);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            bus.read_long(MEM),
+            0x0003_0000,
+            "(A0) - D0 at the old address, not D0 - (A0)"
+        );
+        assert_eq!(cpu.a[0], MEM + 2, "one step, not two");
+        assert!(!cpu.flag_c());
+        assert!(!cpu.flag_z());
+    }
+
+    /// `SUB.B D1,(A0)` (`$9310`) touches one byte of memory, and it is the
+    /// memory byte that the register is taken away from.
+    #[test]
+    fn sub_b_to_memory_touches_only_its_byte() {
+        let (mut cpu, mut bus) = run(0x9310, &[0x4E71]);
+        cpu.a[0] = MEM;
+        cpu.d[1] = 0x0000_00AA;
+        bus.mem[MEM as usize] = 0x01;
+        bus.mem[MEM as usize + 1] = 0x55;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            &bus.mem[MEM as usize..MEM as usize + 2],
+            &[0x57, 0x55],
+            "$01 - $AA wraps to $57 and the next byte is untouched"
+        );
+        assert!(cpu.flag_c(), "$01 - $AA borrows");
+        assert!(cpu.flag_x());
+        assert!(!cpu.flag_n(), "$57 is positive");
+        assert_eq!(cpu.a[0], MEM);
+    }
+
+    /// `SUBA.W D0,A1` (`$92C0`) sign-extends the word source into a 32-bit
+    /// subtract and leaves the flags exactly as they were (M68000UM section 8,
+    /// "SUBA").
+    #[test]
+    fn suba_w_sign_extends() {
+        let (mut cpu, mut bus) = run(0x92C0, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_FFFF;
+        cpu.a[1] = 0x0000_1000;
+        cpu.set_ccr(ALL_FLAGS);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[1], 0x0000_1001, "$FFFF sign extends to -1");
+        assert_eq!(cpu.ccr(), ALL_FLAGS, "SUBA affects no flag");
+    }
+
+    /// `SUBA.L D1,A0` (`$91C1`) stores the full 32-bit difference: A0 is the
+    /// minuend, and a borrow out of bit 31 is dropped rather than reaching the
+    /// flags or the upper bits.
+    #[test]
+    fn suba_l_stores_the_full_32_bit_difference() {
+        let (mut cpu, mut bus) = run(0x91C1, &[0x4E71]);
+        cpu.d[1] = 0xFFFF_0000;
+        cpu.a[0] = 0x0002_0000;
+        cpu.set_ccr(ALL_FLAGS);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[0], 0x0003_0000, "A0 - D1, not D1 - A0");
+        assert_eq!(cpu.ccr(), ALL_FLAGS);
+    }
+
+    /// `SUBQ.L #8,D0` (`$5180`): the `000` data field means 8, not 0.
+    #[test]
+    fn subq_8_encoding() {
+        let (mut cpu, mut bus) = run(0x5180, &[0x4E71]);
+        cpu.d[0] = 0x0000_0003;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xFFFF_FFFB, "subtracts 8");
+        assert!(cpu.flag_c());
+        assert!(cpu.flag_x());
+        assert!(cpu.flag_n());
+        assert!(!cpu.flag_v(), "3 - 8 is not a signed overflow");
+    }
+
+    /// `SUBQ.W #1,A0` (`$5348`) subtracts 1 from all 32 bits of A0 and touches
+    /// no flag; a word-only subtract would have left `$0001FFFF` here.
+    #[test]
+    fn subq_8_from_an_flagless() {
+        let (mut cpu, mut bus) = run(0x5348, &[0x4E71]);
+        cpu.a[0] = 0x0001_0000;
+        cpu.set_ccr(ALL_FLAGS);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[0], 0x0000_FFFF, "32-bit subtract, not a 16-bit one");
+        assert_eq!(cpu.ccr(), ALL_FLAGS, "SUBQ to An affects no flag");
+    }
+
+    /// `SUBQ.B #8,(A0)` (`$5110`) is a normal byte subtract for the flags.
+    #[test]
+    fn subq_to_memory_sets_the_sub_flags() {
+        let (mut cpu, mut bus) = run(0x5110, &[0x4E71]);
+        cpu.a[0] = MEM;
+        bus.mem[MEM as usize] = 0x00;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(bus.mem[MEM as usize], 0xF8);
+        assert!(!cpu.flag_z());
+        assert!(cpu.flag_c());
+        assert!(cpu.flag_x());
+        assert!(cpu.flag_n());
+        assert!(!cpu.flag_v(), "0 - 8 is not a signed overflow");
+    }
+
+    /// `SUBQ.B #1,A0` (`$5308`) is not an instruction, and neither is
+    /// `SUBI.W #imm,A0` (`$0448`): both decode to Illegal, so running one
+    /// raises vector 3 and leaves the register alone.
+    #[test]
+    fn byte_subq_and_immediate_to_an_are_illegal() {
+        let (mut cpu, mut bus) = run(0x5308, &[0x4E71]);
+        cpu.a[0] = MEM;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
+        assert_eq!(cpu.a[0], MEM);
+
+        let (mut cpu, mut bus) = run(0x0448, &[0x4E71]);
+        cpu.a[0] = MEM;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
+        assert_eq!(cpu.a[0], MEM);
+    }
+
+    /// `SUBX.B D1,D0` (`$9101`) leaves Z alone when the result is zero and
+    /// clears it when the result is not, in both directions from a preset Z —
+    /// the rule that keeps a multi-precision chain's Z correct.
+    #[test]
+    fn subx_z_sticky() {
+        let (mut cpu, mut bus) = run(0x9101, &[0x4E71]);
+        cpu.d[0] = 0x0000_0001;
+        cpu.d[1] = 0x0000_0000;
+        cpu.set_ccr(SR_Z);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0] & 0xFF, 0x01);
+        assert!(!cpu.flag_z(), "a non-zero result clears Z");
+
+        let (mut cpu, mut bus) = run(0x9101, &[0x4E71]);
+        cpu.d[0] = 0;
+        cpu.d[1] = 0;
+        cpu.set_ccr(SR_Z);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0] & 0xFF, 0x00);
+        assert!(cpu.flag_z(), "a zero result leaves a set Z alone");
+
+        let (mut cpu, mut bus) = run(0x9101, &[0x4E71]);
+        cpu.d[0] = 0;
+        cpu.d[1] = 0;
+        cpu.set_ccr(0);
+
+        cpu.step(&mut bus);
+
+        assert!(!cpu.flag_z(), "a zero result leaves a clear Z alone");
+    }
+
+    /// `SUBX.B D1,D0` (`$9101`) folds X in as a third operand — an extra
+    /// subtrahend, not a carry — and writes the borrow out back to X.
+    #[test]
+    fn subx_extend_is_the_third_operand() {
+        let (mut cpu, mut bus) = run(0x9101, &[0x4E71]);
+        cpu.d[0] = 0x0000_0000;
+        cpu.d[1] = 0x0000_00FF;
+        cpu.set_ccr(SR_X);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0] & 0xFF, 0x00, "$00 - $FF - X wraps to zero");
+        assert!(cpu.flag_c());
+        assert!(cpu.flag_x(), "X comes back out as the borrow");
+
+        let (mut cpu, mut bus) = run(0x9101, &[0x4E71]);
+        cpu.d[0] = 0x0000_0010;
+        cpu.d[1] = 0x0000_0000;
+        cpu.set_ccr(SR_X | SR_Z | SR_C | SR_V | SR_N);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0] & 0xFF, 0x0F, "$10 - $00 - X");
+        assert!(!cpu.flag_c(), "no borrow, so X clears too");
+        assert!(!cpu.flag_x());
+        assert!(!cpu.flag_z(), "non-zero result clears Z");
+    }
+
+    /// `SUBX.B -(A1),-(A0)` (`$9109`) reads and writes at the decremented
+    /// addresses, each pointer moving exactly one byte (M68000UM section 8,
+    /// "SUBX": "An is decremented ... before the operation").
+    #[test]
+    fn subx_predecrement_uses_the_decremented_addresses_once() {
+        let (mut cpu, mut bus) = run(0x9109, &[0x4E71]);
+        cpu.a[0] = MEM + 2;
+        cpu.a[1] = MEM + 4;
+        bus.mem[MEM as usize + 3] = 0x40;
+        bus.mem[MEM as usize + 1] = 0x02;
+        cpu.set_ccr(SR_X);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[0], MEM + 1, "Ax decremented by one byte");
+        assert_eq!(cpu.a[1], MEM + 3, "Ay decremented by one byte");
+        assert_eq!(
+            bus.mem[MEM as usize + 1],
+            0xC1,
+            "$02 - $40 - X at (Ax), not the other way round"
+        );
+        assert_eq!(
+            bus.mem[MEM as usize + 3],
+            0x40,
+            "the source byte is not moved"
+        );
+        assert_eq!(bus.mem[MEM as usize], 0x00);
+        assert!(cpu.flag_c(), "$02 - $40 - X borrows");
+        assert!(cpu.flag_x());
+    }
+
+    /// `SUBI.B #imm,D0` (`$0400`) subtracts the low byte of one extension word.
+    #[test]
+    fn subi_b_uses_the_low_byte_of_one_extension_word() {
+        let (mut cpu, mut bus) = run(0x0400, &[0x1234, 0x4E71]);
+        cpu.d[0] = 0xDEAD_00D0;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_009C, "$D0 - low byte $34");
+        assert!(!cpu.flag_c());
+        assert_eq!(cpu.pc, PROGRAM + 4, "one extension word");
+    }
+
+    /// `SUBI.L #imm,($2000).W` (`$04B8 $1234 $5678 $2000`): two extension words
+    /// for the immediate, high word first, *before* the destination's own
+    /// address word. The operands are deliberately asymmetric so a wrong order
+    /// cannot still land at `$2000` with `$12345678` in hand.
+    #[test]
+    fn subi_l_memory() {
+        let (mut cpu, mut bus) = run(0x04B8, &[0x1234, 0x5678, MEM as u16, 0x4E71]);
+        bus.write_long(MEM, 0x0000_0001);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(bus.read_long(MEM), 0xEDCB_A989, "$1 - $12345678");
+        assert!(cpu.flag_c());
+        assert!(cpu.flag_x());
+        assert!(cpu.flag_n());
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v(), "1 - a positive does not overflow");
+        assert_eq!(cpu.pc, PROGRAM + 8, "opcode + 3 extension words");
+    }
+
+    /// The seam CMP (M1-12) and NEG (M1-14) reuse: `sub_flags_no_x` sets
+    /// N/Z/V/C from the difference and leaves X exactly where it was — even when
+    /// the difference does not borrow, which is the case that would silently
+    /// clear X under CMP. `sub_flags`, the entry SUB itself uses, still copies C
+    /// into X.
+    #[test]
+    fn sub_flags_no_x_leaves_x_alone() {
+        let (mut cpu, _bus) = run(0x4E71, &[]);
+        cpu.set_ccr(SR_X);
+
+        let result = cpu.sub_flags_no_x(0x0000_0100, 0x0000_0001, false, Size::Word);
+
+        assert_eq!(result, 0x0000_FF01, "$1 - $100, never $100 - $1");
+        assert!(cpu.flag_c(), "$1 - $100 borrows");
+        assert!(cpu.flag_n(), "the result is negative at word size");
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v());
+        assert!(cpu.flag_x(), "a borrow must not clear a set X here either");
+
+        let (mut cpu, _bus) = run(0x4E71, &[]);
+        cpu.set_ccr(SR_X);
+
+        let result = cpu.sub_flags_no_x(0x0000_0001, 0x0000_0100, false, Size::Word);
+
+        assert_eq!(result, 0x0000_00FF);
+        assert!(!cpu.flag_c(), "$100 - $1 does not borrow");
+        assert!(cpu.flag_x(), "and X keeps the value it had: CMP leaves X alone");
+
+        let (mut cpu, _bus) = run(0x4E71, &[]);
+        cpu.set_ccr(SR_X);
+
+        let result = cpu.sub_flags(0x0000_0001, 0x0000_0100, false, Size::Word);
+
+        assert_eq!(result, 0x0000_00FF);
+        assert!(!cpu.flag_c());
+        assert!(!cpu.flag_x(), "SUB takes X from the borrow, so it clears here");
     }
 }

@@ -677,6 +677,145 @@ mod tests {
         }
     }
 
+    /// The `1001` group splits the same way as `1101`: operation modes
+    /// `000`/`001`/`010` are `SUB <ea>,Dn` (`Dn - <ea> → Dn`), `100`/`101`/`110`
+    /// are `SUB Dn,<ea>` (`<ea> - Dn → <ea>`), and `011`/`111` are `SUBA.W` and
+    /// `SUBA.L` (M68000UM "SUB", "SUBA"; M1-11, #19). `$9089` is the reminder
+    /// that a word or long `SUB` may *read* an address register.
+    #[test]
+    fn sub_group_sizes_directions_and_suba() {
+        for (opcode, name) in [
+            (0x9001u16, "SUB.B D1,D0"),
+            (0x9041, "SUB.W D1,D0"),
+            (0x9081, "SUB.L D1,D0"),
+            (0x9090, "SUB.L (A0),D0"),
+            (0x9089, "SUB.L A1,D0"),
+            (0x903C, "SUB.B #imm,D0"),
+            (0x9110, "SUB.B D0,(A0)"),
+            (0x9150, "SUB.W D0,(A0)"),
+            (0x91A0, "SUB.L D0,-(A0)"),
+            (0x91B8, "SUB.L D0,$0000.W"),
+            (0x92C0, "SUBA.W D0,A1"),
+            (0x92C8, "SUBA.W A0,A1"),
+            (0x91C0, "SUBA.L D0,A0"),
+            (0x93C8, "SUBA.L A0,A1"),
+        ] {
+            assert_ne!(
+                decode(opcode),
+                Op::Unimplemented,
+                "{name} (${opcode:04X}) must decode to its own variant"
+            );
+        }
+        assert_eq!(decode(0x9001), Op::Sub, "SUB.B D1,D0");
+        assert_eq!(decode(0x9110), Op::Sub, "SUB.B D0,(A0)");
+        assert_eq!(decode(0x92C8), Op::Suba, "SUBA.W A0,A1");
+        assert_eq!(decode(0x93C8), Op::Suba, "SUBA.L A0,A1");
+    }
+
+    /// `SUBX` is `1001 xxx 1 ss 00 m yyy`, so it lands inside `SUB`'s
+    /// `100`..`110` operation modes exactly where `ADDX` lands inside `ADD`'s,
+    /// and only the forced `00` at bits 5..4 tells them apart. `$9100` is
+    /// `SUBX.B D0,D0` — subtract with the incoming `X` and a sticky `Z` — while
+    /// `$9110` differs in bit 4 alone and is `SUB.B D0,(A0)`, a plain memory
+    /// subtract (M68000UM "SUBX"; M1-11, #19).
+    #[test]
+    fn subx_decodes_before_the_sub_it_overlaps() {
+        for (opcode, name) in [
+            (0x9100u16, "SUBX.B D0,D0"),
+            (0x9140, "SUBX.W D0,D0"),
+            (0x9180, "SUBX.L D0,D0"),
+            (0x9108, "SUBX.B -(A0),-(A0)"),
+            (0x934F, "SUBX.W -(A7),-(A1)"),
+            (0x9B0F, "SUBX.B -(A7),-(A5) — measured in SUBX.b.json.gz"),
+            (0x9D83, "SUBX.L D3,D6 — measured in SUBX.l.json.gz"),
+        ] {
+            assert_eq!(decode(opcode), Op::Subx, "{name} (${opcode:04X})");
+        }
+        // The near-misses: an EA mode outside `000`/`001` is a plain `SUB`.
+        assert_eq!(decode(0x9110), Op::Sub, "SUB.B D0,(A0)");
+        assert_eq!(decode(0x9150), Op::Sub, "SUB.W D0,(A0)");
+        // ... and `ss` = `11` would make the operation-mode field `111`, which
+        // is SUBA.L, so SUBX has no undefined size to reject.
+        assert_eq!(decode(0x91C0), Op::Suba, "SUBA.L D0,A0");
+    }
+
+    /// The EA combinations the subtract class may not do are illegal instructions
+    /// decided at decode, so `crate::ops::arith` never re-checks them
+    /// (M68000PM/AD 2.2.12; M1-11, #19).
+    #[test]
+    fn sub_illegal_ea_combinations_decode_as_illegal() {
+        for (opcode, name) in [
+            (0x9008u16, "SUB.B A0,D0: An read a byte"),
+            (0x903D, "SUB.B (d8,PC,Xn)68020,D0: not a 68000 mode"),
+            (0x913D, "SUB.B D0,(d8,PC,Xn)68020: not a 68000 mode"),
+            (0x917C, "SUB.W D0,#imm: an immediate is not a destination"),
+            (0x91BA, "SUB.L D0,d16(PC): PC-relative is not a destination"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// `SUBI` is `$0400 + ss<<6 + <ea>` and its EA field names the destination,
+    /// so it must be alterable. The rest of the `0000` group is other people's
+    /// tickets and still decodes as unimplemented (M68000UM "SUBI"; #19).
+    #[test]
+    fn subi_decodes_and_validates_its_destination() {
+        for (opcode, name) in [
+            (0x0400u16, "SUBI.B #imm,D0"),
+            (0x0440, "SUBI.W #imm,D0"),
+            (0x0480, "SUBI.L #imm,D0"),
+            (0x0410, "SUBI.B #imm,(A0)"),
+            (0x0498, "SUBI.L #imm,(A0)+"),
+            (0x04B8, "SUBI.L #imm,($0000).W"),
+        ] {
+            assert_eq!(decode(opcode), Op::Subi, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x0448u16, "SUBI.W #imm,A0: SUBI may not write An"),
+            (0x047A, "SUBI.W #imm,d16(PC): not a destination"),
+            (0x047C, "SUBI.W #imm,#imm: not a destination"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        // `ss` = `11` is not a size `SUBI` defines and no ticket has claimed it.
+        assert_eq!(decode(0x04C0), Op::Unimplemented, "SUBI with ss = 11");
+    }
+
+    /// `SUBQ` is `0101 ddd 1 ss eeeeee` with `ss` != `11`, its quick data in
+    /// bits 11..9 and data `000` meaning 8. `Scc`/`DBcc` (bit 8 set with
+    /// `ss` = `11`) stay unimplemented for the branch ticket, as does the
+    /// `bit 8 clear, ss = 11` encoding `ADDQ` left alone too (M68000UM Format V,
+    /// "SUBQ", and the operation-code-map appendix; M1-11, #19).
+    #[test]
+    fn subq_decodes_and_validates_its_destination() {
+        for (opcode, name) in [
+            (0x5180u16, "SUBQ.L #8,D0: data 000 means 8"),
+            (0x5140, "SUBQ.W #1,D0"),
+            (0x5318, "SUBQ.B #1,(A0)+"),
+            (0x5192, "SUBQ.L #8,(A2): data 000 means 8 here too"),
+            (0x53A0, "SUBQ.L #1,-(A0)"),
+            (0x5F4A, "SUBQ.W #7,A2"),
+            (0x5348, "SUBQ.W #1,A0"),
+            (0x5548, "SUBQ.W #2,A0"),
+        ] {
+            assert_eq!(decode(opcode), Op::Subq, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x5308u16, "SUBQ.B #1,A0: SUBQ to An is word or long only"),
+            (0x537A, "SUBQ.W #1,d16(PC): not a destination"),
+            (0x51BC, "SUBQ.L #8,#imm: not a destination"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x51C8u16, "Scc.EQ -(A0) — the branch ticket"),
+            (0x51CC, "DBRA D1,d16 — the branch ticket"),
+            (0x50C0, "bit 8 clear with ss = 11: defined by nobody yet"),
+        ] {
+            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+        }
+    }
+
     /// Every opcode has an entry, and the entry is what [`classify`] says it
     /// should be — the table is the pattern, applied to all 65536 of them, not
     /// a list that can silently miss one.
