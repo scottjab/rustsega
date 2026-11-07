@@ -58,6 +58,12 @@ impl M68k {
         match op {
             Op::Illegal | Op::LineA | Op::LineF => self.op_illegal(bus),
             Op::Trap => self.op_trap(bus, opcode),
+            // The move class (`0001`/`0010`/`0011` and `0111`). Each handler
+            // re-reads the size, destination and source fields from the opcode,
+            // so the tag carries no payload (see [`move_]).
+            Op::Move => self.op_move(bus, opcode),
+            Op::Movea => self.op_movea(bus, opcode),
+            Op::Moveq => self.op_moveq(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming

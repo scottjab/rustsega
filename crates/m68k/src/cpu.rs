@@ -453,10 +453,6 @@ impl M68k {
     /// Called once at the end of every instruction, which is what leaves `pc`
     /// and `prefetch` in exactly the state a SingleStepTests case starts a case
     /// with: `pc` on the next opcode, the queue two words wide from there.
-    #[allow(
-        dead_code,
-        reason = "called by the instruction tickets from M1-05 (#13) onward; only the tests use it today"
-    )]
     pub(crate) fn advance_opcode(&mut self, bus: &mut impl Bus) {
         self.pop_word(bus);
     }

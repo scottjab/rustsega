@@ -63,14 +63,7 @@ fn the_suite_ships_all_six_move_files() {
         eprintln!("{}", harness::skip_line(harness::SUITE_DIR));
         return;
     };
-    for name in [
-        "MOVE.b",
-        "MOVE.w",
-        "MOVE.l",
-        "MOVEA.w",
-        "MOVEA.l",
-        "MOVE.q",
-    ] {
+    for name in ["MOVE.b", "MOVE.w", "MOVE.l", "MOVEA.w", "MOVEA.l", "MOVE.q"] {
         assert!(
             names.iter().any(|n| n == name),
             "{name} should be in the suite; it lists {:?}",

@@ -13,6 +13,13 @@
 //! Bits 14, 12, 11, 7, 6 and 5 do not exist on the 68000. Every write to SR
 //! must be masked with [`SR_MASK`]; the CCR is the low byte and is masked with
 //! [`CCR_MASK`].
+//!
+//! The module also owns the shared condition-code rules — [`M68k::set_nz`] and
+//! [`M68k::set_logic_flags`] — so instruction tickets apply the same rule
+//! instead of each re-deriving which of N, Z, V, C and X it may touch.
+
+use crate::M68k;
+use crate::ea::Size;
 
 /// Trace bit (bit 15). Taking a trace exception is not implemented yet.
 pub const SR_T: u16 = 0x8000;
@@ -43,3 +50,37 @@ pub const CCR_MASK: u16 = 0x1F;
 /// SR right after a reset: S = 1 (supervisor), T = 0, interrupt mask = 7, all
 /// condition codes clear. See M68000UM chapter 5 "Reset".
 pub const SR_RESET: u16 = 0x2700;
+
+impl M68k {
+    /// Set N and Z from `value` at operand width `size`, leaving V, C and X
+    /// untouched.
+    ///
+    /// N is the most significant bit *of the operand* and Z means "the operand
+    /// is zero", so both are computed on `value` masked to `size`: a byte MOVE
+    /// of `$00` sets Z even when the destination register's upper bits are
+    /// nonzero (M68000UM, section 1 "Condition Codes": N and Z reflect the
+    /// result of the operation at its own size). [`crate::ea::Size::msb`] and
+    /// [`crate::ea::Size::mask`] are the width's bit and mask.
+    pub(crate) fn set_nz(&mut self, value: u32, size: Size) {
+        let result = value & size.mask();
+        self.set_flag(SR_N, result & size.msb() != 0);
+        self.set_flag(SR_Z, result == 0);
+    }
+
+    /// The flag rule of the move and logic class: N and Z from the result, V
+    /// and C cleared, X unchanged.
+    ///
+    /// MOVE and MOVEQ use this (M68000PM section 8, "MOVE — Move" and "MOVEQ —
+    /// Move Quick to Data Register": "Condition codes ... N and Z are set
+    /// according to the result; V and C are cleared; X is unaffected"). `ANDI`/
+    /// `ORI`/`EORI`/`NOT` and the shift group take the same rule when their
+    /// tickets land, which is why it lives here rather than in one handler.
+    ///
+    /// MOVEA is *not* one of them: it leaves every flag alone, so it calls
+    /// neither helper.
+    pub(crate) fn set_logic_flags(&mut self, value: u32, size: Size) {
+        self.set_nz(value, size);
+        self.set_flag(SR_V, false);
+        self.set_flag(SR_C, false);
+    }
+}
