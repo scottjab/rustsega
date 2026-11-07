@@ -31,12 +31,12 @@
 //! | `0111` | `MOVEQ` |
 //! | `1000` | `OR`, `DIV`, `SBCD` |
 //! | `1001` | `SUB`, `SUBA`, `SUBX` |
-//! | `1010` | line A (`1010` emulator) — the 68000 has no line emulator, so this is a reserved format: [`crate::ops::EXC_ILLEGAL`] |
+//! | `1010` | line A (`1010` emulator) — the 68000 has no line emulator, so this is a reserved format: [`crate::exceptions::EXC_ILLEGAL`] |
 //! | `1011` | `CMP`, `CMPA`, `CMPM`, `EOR` |
 //! | `1100` | `AND`, `MUL`, `ABCD`, `EXG` |
 //! | `1101` | `ADD`, `ADDA`, `ADDX` |
 //! | `1110` | shifts and rotates |
-//! | `1111` | line F (`1111` emulator) — reserved on the 68000 like `1010`: [`crate::ops::EXC_ILLEGAL`] |
+//! | `1111` | line F (`1111` emulator) — reserved on the 68000 like `1010`: [`crate::exceptions::EXC_ILLEGAL`] |
 //!
 //! The whole map is documented here because every instruction ticket reads it
 //! off this table, but only the two groups the core routes today (`1010`,
@@ -73,11 +73,11 @@ pub enum Op {
     /// never be mistaken for a working one.
     Unimplemented,
     /// Not a valid instruction on the 68000: takes the illegal-instruction
-    /// exception (vector [`crate::ops::EXC_ILLEGAL`]).
+    /// exception (vector [`crate::exceptions::EXC_ILLEGAL`]).
     Illegal,
     /// An opcode in the `1010` group (M68000UM Format I, "Line 1010 emulator
     /// instruction"). The 68000 has no line emulator, so it takes
-    /// [`crate::ops::EXC_ILLEGAL`] like any other reserved opcode; the variant
+    /// [`crate::exceptions::EXC_ILLEGAL`] like any other reserved opcode; the variant
     /// is separate from [`Op::Illegal`] because the 68010 (M1-12, #20) does
     /// have a line-A vector and will route the two differently.
     LineA,
@@ -85,6 +85,11 @@ pub enum Op {
     /// instruction"). [`Op::LineA`] in every respect on the 68000 — illegal
     /// instruction — and separate for the same 68010 reason.
     LineF,
+    /// `TRAP #n`, `$4E40 + n` (M68000PM section 8, "TRAP — Trap"): the opcode's
+    /// low nibble is the trap number and the whole instruction is one word, so
+    /// the tag has no payload — [`crate::ops`] re-reads the nibble. Takes vector
+    /// [`crate::exceptions::trap_vector`], which is measured in `TRAP.json.gz`.
+    Trap,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -137,6 +142,9 @@ fn classify(opcode: u16) -> Op {
         // has to be read to know what they are.
         0xA000..=0xAFFF => Op::LineA,
         0xF000..=0xFFFF => Op::LineF,
+        // `4E40 + n`: sixteen traps, all of them one word. `$4E40..=$4E4F` is
+        // the whole group, so no operand field has to be read to know it.
+        0x4E40..=0x4E4F => Op::Trap,
         // Every other group is a real instruction whose handler has not been
         // written yet; the tickets that write them split these groups up.
         _ => Op::Unimplemented,
@@ -186,6 +194,9 @@ mod tests {
     /// Until an instruction's ticket lands, its opcodes are unimplemented —
     /// loudly, not silently. `$4E71` is `NOP`.
     ///
+    /// The `$4E4x` traps are the exception to this in the same group: TRAP is
+    /// not an arithmetic instruction but an exception route, and #16 owns it.
+    ///
     /// This test is expected to change as instructions land: when `NOP` is
     /// implemented it decodes to its own variant, and the ticket that does it
     /// moves this assertion to an opcode still unimplemented. That licence is
@@ -193,6 +204,11 @@ mod tests {
     #[test]
     fn unknown_is_unimplemented_for_now() {
         assert_eq!(decode(0x4E71), Op::Unimplemented, "NOP");
+        // ... except the traps, which #16 wired up, and which sit right next to
+        // NOP in the `$4E` group.
+        assert_range_decodes_to(0x4E40..=0x4E4F, Op::Trap);
+        assert_eq!(decode(0x4E3F), Op::Unimplemented, "just below the traps");
+        assert_eq!(decode(0x4E50), Op::Unimplemented, "just above the traps");
         assert_eq!(decode(0x0000), Op::Unimplemented, "ORI.b #imm,D0");
         assert_eq!(decode(0x3280), Op::Unimplemented, "MOVE.l (A0),D1");
     }
