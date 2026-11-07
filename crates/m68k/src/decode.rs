@@ -567,9 +567,12 @@ mod tests {
         assert_range_decodes_to(0xF000..=0xFFFF, Op::LineF);
         // The groups either side of them are not. `1001` was the anchor here
         // until #19 implemented SUB/SUBA/SUBX, so it is now `1000` — OR, DIV and
-        // SBCD, still unimplemented — and `1011`, CMP/CMPA/CMPM/EOR.
+        // SBCD, still unimplemented — and `1011`. `1011`'s anchor moved to
+        // `$B100` with #20, which implemented CMP/CMPA/CMPM there; `$B100` is
+        // `EOR.B D0,D0`, the part of the group M1-13 owns, so the assertion kept
+        // its meaning (see `cmpm_decodes_before_eor`).
         assert_eq!(decode(0x8FFF), Op::Unimplemented);
-        assert_eq!(decode(0xB000), Op::Unimplemented);
+        assert_eq!(decode(0xB100), Op::Unimplemented, "EOR.B D0,D0");
     }
 
     /// `$4AFC` is `ILLEGAL` (M68000PM/AD section 8).
@@ -963,6 +966,164 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
         }
+    }
+
+    /// The `1011` group splits on the operation-mode field in bits 8..6:
+    /// `000`/`001`/`010` are `CMP <ea>,Dn` (`Dn - <ea>`, flags only), `011` and
+    /// `111` are `CMPA.W`/`CMPA.L`, and `100`/`101`/`110` are EOR's
+    /// (M68000UM "CMP", "CMPA"; M1-12, #20). `$B049` is the reminder that a word
+    /// or long `CMP` may *read* an address register, and `$B009` — the same
+    /// operand one byte down — is not an instruction at all.
+    #[test]
+    fn cmp_group_sizes_and_cmpa() {
+        for (opcode, name) in [
+            (0xB001u16, "CMP.B D1,D0"),
+            (0xB041, "CMP.W D1,D0"),
+            (0xB081, "CMP.L D1,D0"),
+            (0xB090, "CMP.L (A0),D0"),
+            (0xB049, "CMP.W A1,D0"),
+            (0xB03C, "CMP.B #imm,D0: the 68000 runs it, measured in CMP.b"),
+            (0xB0BA, "CMP.W d16(PC),D0"),
+            (0xB2C0, "CMPA.W D0,A1"),
+            (0xB2C8, "CMPA.W A0,A1"),
+            (0xB1C0, "CMPA.L D0,A0"),
+            (0xBFC8, "CMPA.L A0,A7"),
+        ] {
+            assert_ne!(
+                decode(opcode),
+                Op::Unimplemented,
+                "{name} (${opcode:04X}) must decode to its own variant"
+            );
+        }
+        assert_eq!(decode(0xB001), Op::Cmp, "CMP.B D1,D0");
+        assert_eq!(decode(0xB2C8), Op::Cmpa, "CMPA.W A0,A1");
+        assert_eq!(decode(0xB1C0), Op::Cmpa, "CMPA.L D0,A0");
+        for (opcode, name) in [
+            (0xB009u16, "CMP.B A1,D0: An read a byte"),
+            (0xB03D, "CMP.B (d8,PC,Xn)68020,D0: not a 68000 mode"),
+            (0xB07D, "CMP.W (d8,PC,Xn)68020,D0: not a 68000 mode"),
+            (0xB0BD, "CMP.L (d8,PC,Xn)68020,D0: not a 68000 mode"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// `CMPM` is `1011 xxx 1 ss 001 yyy` — the address-register-direct case of
+    /// EOR's half of the group, `1011 RRR 1ss eeeeee` (M68000UM "CMPM", "EOR").
+    /// Neither bit 8 nor the size tells the two apart, so the EA mode has to be
+    /// read before an opcode in `1ss` can be routed: `$B109` is
+    /// `CMPM.B (A1)+,(A0)+`, comparing and stepping two pointers, while `$B101`
+    /// is `EOR.B D1,D0`, which M1-13 owns and which must stay
+    /// [`Op::Unimplemented`]. Claiming all of `1ss` for the compare would hand
+    /// EOR's whole range to `op_cmpm` and nothing would notice until M1-13
+    /// landed.
+    ///
+    /// Every CMPM opcode below is measured in the pinned suite (`CMP.b/w/l`,
+    /// whose case names spell the mode out as `[CMP.b (A1)+, (A0)+]`); none of
+    /// the EOR ones is — EOR never uses mode `001`, which is what makes the two
+    /// sets disjoint.
+    #[test]
+    fn cmpm_decodes_before_eor() {
+        for (opcode, name) in [
+            (0xB108u16, "CMPM.B (A0)+,(A0)+"),
+            (0xB109, "CMPM.B (A1)+,(A0)+"),
+            (0xB10A, "CMPM.B (A2)+,(A0)+"),
+            (0xB709, "CMPM.B (A1)+,(A3)+ — measured in CMP.b"),
+            (0xB149, "CMPM.W (A1)+,(A0)+ — measured in CMP.w"),
+            (0xB74C, "CMPM.W (A4)+,(A3)+"),
+            (0xB188, "CMPM.L (A0)+,(A0)+"),
+            (0xBF8F, "CMPM.L (A7)+,(A7)+ — measured in CMP.l"),
+        ] {
+            assert_eq!(decode(opcode), Op::Cmpm, "{name} (${opcode:04X})");
+        }
+        // Bit 8 set with any other EA mode is EOR, still unimplemented (M1-13),
+        // including the data-register form CMPM's `001` is one bit away from.
+        for (opcode, name) in [
+            (0xB101u16, "EOR.B D1,D0"),
+            (0xB110, "EOR.B D0,(A0)"),
+            (0xB132, "EOR.B D0,(d8,A2,Xn) — measured in EOR.b"),
+            (0xB36C, "EOR.W D1,(d16,A4) — measured in EOR.w"),
+            (0xB782, "EOR.L D3,D2 — measured in EOR.l"),
+        ] {
+            assert_eq!(
+                decode(opcode),
+                Op::Unimplemented,
+                "{name} (${opcode:04X}) must stay EOR's until M1-13"
+            );
+        }
+        // And operation mode `111` is CMPA.L, not a fourth CMPM size: CMPA has to
+        // be claimed before the `1ss` half is split at all, or `$B1C8` —
+        // `ss` = `11`, mode `001` — would read as a compare-memory with an
+        // undefined width.
+        assert_eq!(decode(0xB1C8), Op::Cmpa, "CMPA.L A0,A0, not CMPM");
+    }
+
+    /// `CMPI` is `$0C00 + ss<<6 + <ea>`, the third immediate-operation pattern in
+    /// the `0000` group after `SUBI` (`$0400`) and `ADDI` (`$0600`). Its EA field
+    /// names the destination, which must be data-alterable; the 68000 does not
+    /// allow PC-relative there either (M68000UM "CMPI", and M68000PM/AD 2.2.12).
+    /// Measured in `CMP.b/w/l`, whose `$0Cxx` cases use Dn, the indirect modes
+    /// and the two absolute forms and nothing else (M1-12, #20).
+    #[test]
+    fn cmpi_decodes_and_validates_its_destination() {
+        for (opcode, name) in [
+            (0x0C00u16, "CMPI.B #imm,D0"),
+            (0x0C40, "CMPI.W #imm,D0"),
+            (0x0C80, "CMPI.L #imm,D0"),
+            (0x0C10, "CMPI.B #imm,(A0)"),
+            (0x0C98, "CMPI.L #imm,(A0)+"),
+            (0x0CB8, "CMPI.L #imm,($0000).W"),
+        ] {
+            assert_eq!(decode(opcode), Op::Cmpi, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x0C48u16, "CMPI.W #imm,A0: CMPI may not name An"),
+            (
+                0x0C7A,
+                "CMPI.W #imm,d16(PC): the 68000 does not allow PC-relative here"
+            ),
+            (0x0C7C, "CMPI.W #imm,#imm: not an operand to compare against"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        // `ss` = `11` is not a size CMPI defines and no ticket has claimed it.
+        assert_eq!(decode(0x0CC0), Op::Unimplemented, "CMPI with ss = 11");
+    }
+
+    /// `TST` is `0100 1010 ss eeeeee` with `ss` != `11`, so it occupies
+    /// `$4A00`..`$4ABF` — and **`$4AC0`..`$4AFF` is `TAS`**, `ILLEGAL` included
+    /// at `$4AFC`. That boundary in [`classify`] is what keeps this ticket out of
+    /// M1-27's opcode space. A `TST` operand may not be An, PC-relative or an
+    /// immediate on the 68000 (M68000PM section 8 "TST"; measured over
+    /// `TST.b/w/l`, which use Dn, the five address-register-indirect modes and
+    /// the two absolute forms and nothing else; M1-12, #20).
+    #[test]
+    fn tst_decodes_and_leaves_tas_alone() {
+        for (opcode, name) in [
+            (0x4A00u16, "TST.B D0"),
+            (0x4A40, "TST.W D0"),
+            (0x4A80, "TST.L D0"),
+            (0x4A10, "TST.B (A0)"),
+            (0x4A58, "TST.W (A0)+"),
+            (0x4AA1, "TST.L -(A1)"),
+            (0x4AB8, "TST.L ($0000).W"),
+        ] {
+            assert_eq!(decode(opcode), Op::Tst, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x4A08u16, "TST.B A0: An is not a TST operand on the 68000"),
+            (0x4A3A, "TST.B d16(PC): neither is PC-relative here"),
+            (0x4A3C, "TST.B #imm: nor an immediate"),
+            (0x4A3D, "TST.B (d8,PC,Xn)68020: not a 68000 mode"),
+            (0x4A49, "TST.W A0"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        // The `ss` = `11` sixth of `$4Axx` is TAS's and unclaimed; it stays loud
+        // rather than becoming a TST with an undefined width.
+        assert_range_decodes_to(0x4AC0..=0x4AFB, Op::Unimplemented);
+        assert_eq!(decode(0x4AFC), Op::Illegal, "ILLEGAL, inside the TAS range");
+        assert_range_decodes_to(0x4AFD..=0x4AFF, Op::Unimplemented);
     }
 
     /// Every opcode has an entry, and the entry is what [`classify`] says it

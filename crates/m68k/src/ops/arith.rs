@@ -1403,4 +1403,191 @@ mod tests {
             "SUB takes X from the borrow, so it clears here"
         );
     }
+
+    /// `CMP.B D1,D0` (`$B001`) sets Z on equality and stores nothing: `Dn - <ea>`
+    /// is computed for its flags and thrown away (M68000UM section 8, "CMP";
+    /// M1-12, #20).
+    #[test]
+    fn cmp_equal_sets_z() {
+        let (mut cpu, mut bus) = run(0xB001, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_00FF;
+        cpu.d[1] = 0xCAFE_00FF;
+        cpu.set_ccr(SR_C | SR_V | SR_N);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_00FF, "CMP never writes its destination");
+        assert_eq!(cpu.d[1], 0xCAFE_00FF, "nor its source");
+        assert!(cpu.flag_z(), "the difference is zero");
+        assert!(!cpu.flag_n());
+        assert!(!cpu.flag_c(), "and equal operands do not borrow");
+        assert!(!cpu.flag_v());
+        assert!(!cpu.flag_x(), "X was clear, and a compare does not set it");
+    }
+
+    /// `CMP.W D1,D0` (`$B041`) sets C on a borrow and leaves X exactly as it was
+    /// in *both* directions: a compare is a subtraction whose result is discarded,
+    /// so the copy into X that `sub_flags` does for SUB must not happen (M68000UM
+    /// "CMP": "X is unaffected"; M1-12, #20).
+    #[test]
+    fn cmp_borrow_sets_c_not_x() {
+        let (mut cpu, mut bus) = run(0xB041, &[0x4E71]);
+        cpu.d[0] = 0x0000_0000;
+        cpu.d[1] = 0x0000_0001;
+
+        cpu.step(&mut bus);
+
+        assert!(cpu.flag_c(), "0 - 1 borrows");
+        assert!(cpu.flag_n(), "the difference is $FFFF");
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v(), "two positives cannot overflow");
+        assert!(!cpu.flag_x(), "and X stays clear rather than taking the borrow");
+
+        let (mut cpu, mut bus) = run(0xB041, &[0x4E71]);
+        cpu.d[0] = 0x0000_0001;
+        cpu.d[1] = 0x0000_0000;
+        cpu.set_ccr(SR_X);
+
+        cpu.step(&mut bus);
+
+        assert!(!cpu.flag_c(), "1 - 0 does not borrow");
+        assert!(cpu.flag_x(), "so a set X is not cleared either");
+    }
+
+    /// `CMPA.W D0,A0` (`$B0C0`) sign-extends the word source and compares it
+    /// against the whole 32-bit address register, not just its low word, and
+    /// leaves X alone (M68000UM "CMPA": "Word operation ... the source operand is
+    /// extended to 32 bits ... sign extended"; M1-12, #20).
+    #[test]
+    fn cmpa_w_sign_extends() {
+        let (mut cpu, mut bus) = run(0xB0C0, &[0x4E71]);
+        cpu.a[0] = 0xFFFF_FFFF;
+        cpu.d[0] = 0xDEAD_FFFF;
+
+        cpu.step(&mut bus);
+
+        assert!(cpu.flag_z(), "$FFFF sign extends to -1, which is A0");
+        assert!(!cpu.flag_c(), "no borrow");
+        assert!(!cpu.flag_v());
+
+        let (mut cpu, mut bus) = run(0xB0C0, &[0x4E71]);
+        cpu.a[0] = 0x8000_0000;
+        cpu.d[0] = 0xDEAD_FFFF;
+        cpu.set_ccr(SR_X);
+
+        cpu.step(&mut bus);
+
+        assert!(!cpu.flag_z(), "the compare is 32 bits wide, not 16");
+        assert!(cpu.flag_n(), "$80000001 is negative");
+        assert!(cpu.flag_c(), "and does not borrow");
+        assert!(cpu.flag_x(), "X unaffected");
+        assert_eq!(cpu.a[0], 0x8000_0000, "CMPA stores nothing either");
+    }
+
+    /// `CMPM.B (A1)+,(A0)` (`$B109`) compares `(Ax) - (Ay)` and steps **both**
+    /// pointers by one byte, writing nothing back; `(Ay)` is the source and is
+    /// read first (M68000UM section 8, "CMPM"; measured in `CMP.b`; M1-12, #20).
+    #[test]
+    fn cmpm_increments_both() {
+        let (mut cpu, mut bus) = run(0xB109, &[0x4E71]);
+        cpu.a[0] = MEM;
+        cpu.a[1] = MEM + 0x10;
+        bus.mem[MEM as usize] = 0x01;
+        bus.mem[MEM as usize + 0x10] = 0x02;
+        cpu.set_ccr(SR_X);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[0], MEM + 1, "Ax stepped by one byte");
+        assert_eq!(cpu.a[1], MEM + 0x11, "and Ay stepped by one byte too");
+        assert!(cpu.flag_c(), "$01 - $02 borrows, so it is (Ax) - (Ay)");
+        assert!(cpu.flag_n(), "the difference is $FF");
+        assert!(!cpu.flag_z());
+        assert!(cpu.flag_x(), "X unaffected");
+        assert_eq!(bus.mem[MEM as usize], 0x01, "CMPM stores nothing");
+        assert_eq!(bus.mem[MEM as usize + 0x10], 0x02);
+    }
+
+    /// `CMPM.B (A0)+,(A0)` (`$B108`) is #19's `-(An)` test from the other side:
+    /// each pointer is resolved exactly once per operand, so the two bytes
+    /// compared are consecutive and `A0` finishes two ahead, and `(Ay)` is read
+    /// first, which the borrow can see (M68000UM "CMPM", addressing modes).
+    #[test]
+    fn cmpm_same_register_reads_consecutive_bytes_in_order() {
+        let (mut cpu, mut bus) = run(0xB108, &[0x4E71]);
+        cpu.a[0] = MEM;
+        bus.mem[MEM as usize] = 0x01; // (Ay) = (A0), read first
+        bus.mem[MEM as usize + 1] = 0x02; // (Ax) = (A0) one byte along
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[0], MEM + 2, "one step per operand, no double read");
+        assert!(!cpu.flag_c(), "$02 - $01 does not borrow");
+        assert!(!cpu.flag_z(), "and the difference is not zero");
+    }
+
+    /// `CMPI.L #imm,($2000).W` (`$0CB8`): two extension words for the immediate,
+    /// high word first, *before* the destination's own address word — the same
+    /// order `SUBI` uses, so the words are deliberately asymmetric and the
+    /// comparison only comes out equal if they were read in the right order
+    /// (M68000UM "CMPI"; M1-12, #20).
+    #[test]
+    fn cmpi_l_reads_its_immediate_before_the_destination() {
+        let (mut cpu, mut bus) = run(0x0CB8, &[0x1234, 0x5678, MEM as u16, 0x4E71]);
+        bus.write_long(MEM, 0x1234_5678);
+        cpu.set_ccr(SR_X);
+
+        cpu.step(&mut bus);
+
+        assert!(cpu.flag_z(), "immediate and destination are equal");
+        assert!(!cpu.flag_c());
+        assert!(cpu.flag_x(), "X unaffected");
+        assert_eq!(bus.read_long(MEM), 0x1234_5678, "CMPI stores nothing");
+        assert_eq!(cpu.pc, PROGRAM + 8, "opcode + 3 extension words");
+    }
+
+    /// `TST.W D0` (`$4A40`) sets N and Z from the operand and clears V and C,
+    /// leaving X alone (M68000UM "TST": N and Z are set according to the operand,
+    /// V and C are cleared, X is unaffected; M1-12, #20).
+    #[test]
+    fn tst_clears_v_c() {
+        let (mut cpu, mut bus) = run(0x4A40, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_0000;
+        cpu.set_ccr(ALL_FLAGS);
+
+        cpu.step(&mut bus);
+
+        assert!(cpu.flag_z(), "the low word is zero");
+        assert!(!cpu.flag_n(), "N comes from the word, not the whole register");
+        assert!(!cpu.flag_v(), "V is cleared");
+        assert!(!cpu.flag_c(), "C is cleared");
+        assert!(cpu.flag_x(), "X is unaffected");
+        assert_eq!(cpu.d[0], 0xDEAD_0000, "TST does not write");
+
+        let (mut cpu, mut bus) = run(0x4A40, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_8000;
+
+        cpu.step(&mut bus);
+
+        assert!(cpu.flag_n(), "N comes from the operand at its own size");
+        assert!(!cpu.flag_z());
+    }
+
+    /// `TST.B (A0)` (`$4A10`) tests one byte and still reads it: `$80` sets N even
+    /// though the other bytes of the bus entry are zero (M68000UM "TST").
+    #[test]
+    fn tst_b_memory_tests_one_byte() {
+        let (mut cpu, mut bus) = run(0x4A10, &[0x4E71]);
+        cpu.a[0] = MEM;
+        bus.mem[MEM as usize] = 0x80;
+        cpu.set_ccr(SR_C | SR_V);
+
+        cpu.step(&mut bus);
+
+        assert!(cpu.flag_n(), "the byte is negative");
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_c());
+        assert!(!cpu.flag_v());
+        assert_eq!(cpu.a[0], MEM, "no pointer movement for a plain (An)");
+    }
 }
