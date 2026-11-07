@@ -7,5 +7,14 @@ publish.workspace = true
 
 [dependencies]
 
+[dev-dependencies]
+# Only tests: the core itself keeps no dependencies, per docs/ARCHITECTURE.md.
+# `flate2` is for the pinned 680x0 suite, which is served as `.json.gz` only
+# (M1-03, #11); it is already in Cargo.lock as a dependency of `png`.
+serde = { workspace = true }
+serde_json = { workspace = true }
+flate2 = { workspace = true }
+testkit = { path = "../testkit" }
+
 [lints]
 workspace = true
