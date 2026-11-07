@@ -79,13 +79,19 @@ impl M68k {
             Op::Move => self.op_move(bus, opcode),
             Op::Movea => self.op_movea(bus, opcode),
             Op::Moveq => self.op_moveq(bus, opcode),
-            // The add class (`1101`, `0000 0110` and `0101`). As above, each
-            // handler re-reads its fields from the opcode (see [`arith]).
+            // The add and subtract classes (`1101`/`1001`, `0000 0110`/`0000
+            // 0100` and the two halves of `0101`). As above, each handler
+            // re-reads its fields from the opcode (see [`arith]).
             Op::Add => self.op_add(bus, opcode),
             Op::Adda => self.op_adda(bus, opcode),
             Op::Addx => self.op_addx(bus, opcode),
             Op::Addi => self.op_addi(bus, opcode),
             Op::Addq => self.op_addq(bus, opcode),
+            Op::Sub => self.op_sub(bus, opcode),
+            Op::Suba => self.op_suba(bus, opcode),
+            Op::Subx => self.op_subx(bus, opcode),
+            Op::Subi => self.op_subi(bus, opcode),
+            Op::Subq => self.op_subq(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming
