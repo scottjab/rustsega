@@ -67,6 +67,7 @@ use crate::M68k;
 use crate::bus::Bus;
 use crate::decode::MOVEQ_BIT8;
 use crate::ea::{Ea, Size, sign_extend_byte};
+use crate::ops::field;
 
 /// Shift of MOVE's size field, bits 13..12 (`01` byte, `11` word, `10` long).
 const SIZE_SHIFT: u32 = 12;
@@ -77,8 +78,6 @@ const DEST_REG_SHIFT: u32 = 9;
 const DEST_MODE_SHIFT: u32 = 6;
 /// Shift of the source EA's mode, bits 5..3; the register is bits 2..0.
 const SRC_MODE_SHIFT: u32 = 3;
-/// Width of a mode or register field.
-const FIELD_MASK: u16 = 0b111;
 
 impl M68k {
     /// `MOVE <ea>,Dn | (An) | …`: copy one operand, at the width in bits 13..12
@@ -193,14 +192,6 @@ impl M68k {
         );
         ea
     }
-}
-
-/// One 3-bit field of `opcode` at `shift`.
-#[inline]
-const fn field(opcode: u16, shift: u32) -> u8 {
-    // `as` rather than `u8::from` because this is a `const fn` and `From` is not
-    // a const trait on this toolchain (see `ea::sign_extend_word`).
-    ((opcode >> shift) & FIELD_MASK) as u8
 }
 
 #[cfg(test)]

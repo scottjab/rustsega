@@ -42,9 +42,11 @@
 //! off this table, but only the groups the core routes today are acted on:
 //! `1010` and `1111` (line A / line F), the `0111` group (`MOVEQ`, #17), the
 //! three move groups `0001`/`0010`/`0011` (`MOVE` and `MOVEA`, #17), the traps
-//! in `0100`, and the one documented illegal opcode. Every other group decodes
-//! to [`Op::Unimplemented`] and panics loudly until its ticket lands (M1-08, #16
-//! onward).
+//! in `0100`, the one documented illegal opcode, the `1101` group (`ADD`,
+//! `ADDA`, `ADDX`, #18), the `0101` group's `ADDQ` half (#18) and the `$0600`
+//! `ADDI` pattern inside `0000` (#18). Everything else in those groups still
+//! decodes to [`Op::Unimplemented`] and panics loudly until its ticket lands
+//! (M1-08, #16 onward).
 //!
 //! # EA validity is a decode-time rule
 //!
@@ -106,6 +108,31 @@ pub enum Op {
     /// 11..9 and bit 8 clear (M68000UM, "Instruction Formats", Format IV).
     /// Bit 8 set is [`Op::Illegal`] on the 68000.
     Moveq,
+    /// `ADD <ea>,Dn` and `ADD Dn,<ea>`, the `1101` group's operation modes
+    /// `000`/`001`/`010` and `100`/`101`/`110` (M68000UM "ADD — Add", #18).
+    /// [`crate::ops::arith`] re-reads the size, direction, register and source
+    /// or destination EA from the opcode bits.
+    Add,
+    /// `ADDA <ea>,An`: the `1101` group's operation modes `011` (word) and
+    /// `111` (long). The destination is the address register in bits 11..9
+    /// (M68000UM "ADDA — Add Address", #18).
+    Adda,
+    /// `ADDX` — extend-form add, `1101 xxx 1 ss 00 m yyy` (M68000UM "ADDX — Add
+    /// with Extend", #18). Both operands are predecrement address-register
+    /// indirect when bit 3 is set, `Dy`/`Dx` when it is clear; bits 11..9 pick
+    /// the destination and bits 2..0 the source, which is the reverse of every
+    /// other two-operand instruction here.
+    Addx,
+    /// `ADDI #imm,<ea>`, `$0600 + ss<<6 + <ea>` (M68000UM "ADDI — Add Integer",
+    /// #18). The immediate is the operand encoded in the EA field as mode `111`
+    /// register `100`, and it is fetched before the destination's own extension
+    /// words.
+    Addi,
+    /// `ADDQ #quick,<ea>`, `0101 ddd 0 ss mmm rrr` with `ss` != `11` (M68000UM
+    /// "ADDQ — Add Quick", #18). Data `000` means 8, and a destination of mode
+    /// `001` is an address register added to in full 32 bits without touching
+    /// the flags.
+    Addq,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -124,6 +151,12 @@ const AN_DIRECT_MODE: u8 = 0b001;
 /// with [`crate::ops::move_`], which re-reads the opcode, so the bit is spelled
 /// once.
 pub(crate) const MOVEQ_BIT8: u16 = 0x0100;
+
+/// Bit 8 of an `0101`-group opcode: clear for `ADDQ`/`SUBQ`
+/// (`0101 ddd 0 ss mmm rrr`), set for `Scc`/`DBcc`
+/// (`0101 ccc 1 11 mmm rrr`) — M68000UM "Instruction Formats", Format V, and
+/// the operation-code-map appendix.
+const ADDQ_BIT8: u16 = 0x0100;
 
 /// Every opcode's [`Op`], indexed by the opcode itself, so a decode is one load.
 ///
@@ -178,6 +211,16 @@ fn classify(opcode: u16) -> Op {
         // `0111 RRR 0 dddddddd`: the whole `0111` group is MOVEQ, and the
         // encodings with bit 8 set are illegal on the 68000.
         0x7000..=0x7FFF => classify_moveq(opcode),
+        // `0000 0110 ss eeeeee`: `ADDI` is the only instruction with that fixed
+        // pattern, so the whole `$0600..=$06FF` range is its group. The rest of
+        // the `0000` group (ORI, the bit operations, MOVEP, the other
+        // immediates) is untouched here.
+        0x0600..=0x06FF => classify_addi(opcode),
+        // `0101 ddd 0 ss eeeeee` and `0101 ccc 1 11 ...`: the whole `0101` group
+        // is ADDQ, SUBQ, Scc and DBcc, and only ADDQ is #18's.
+        0x5000..=0x5FFF => classify_addq(opcode),
+        // `1101 ddd ooo eeeeee`: ADD, ADDA and ADDX.
+        0xD000..=0xDFFF => classify_add(opcode),
         // Every other group is a real instruction whose handler has not been
         // written yet; the tickets that write them split these groups up.
         _ => Op::Unimplemented,
@@ -236,6 +279,120 @@ fn classify_moveq(opcode: u16) -> Op {
     } else {
         Op::Moveq
     }
+}
+
+/// One opcode of the `1101` group: `ADD`, `ADDA` or `ADDX`.
+///
+/// The operation-mode field is bits 8..6, so the format is
+/// `1101 ddd ooo mmm rrr` with the EA in the low six bits: `000`/`001`/`010`
+/// are `ADD <ea>,Dn` at byte/word/long, `100`/`101`/`110` are the same three
+/// sizes with the direction reversed (`ADD Dn,<ea>`), and `011`/`111` are
+/// `ADDA.W`/`ADDA.L` (M68000UM "ADD", "ADDA").
+///
+/// # Why `ADDX` has to be recognised first
+///
+/// `ADDX` is `1101 xxx 1 ss 00 m yyy` (M68000UM "ADDX"), so its operation-mode
+/// field is `1ss` — one of `ADD`'s three `Dn,<ea>` modes — and its `00` at
+/// bits 5..4 forces the EA mode to `000` or `001`, i.e. a register-operand EA.
+/// Those are exactly the opcodes an `ADD Dn,<ea>` with a data-register or
+/// address-register destination would use, and on the 68000 no `ADD` may
+/// destination an address register at all, so the whole overlap belongs to
+/// `ADDX`. Testing `mode <= 001` after `ADD` would silently misroute every
+/// `ADDX` to `op_add`: `$D100` (`ADDX.B D0,D0`) would add `D0` to itself
+/// without the extend carry and write flags `ADD` does not use. See
+/// [`crate::ops::arith::op_addx`] for the semantics the two then share.
+fn classify_add(opcode: u16) -> Op {
+    let op_mode = ((opcode >> 6) & 0b111) as u8;
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+
+    if (0b100..=0b110).contains(&op_mode) && mode <= AN_DIRECT_MODE {
+        return Op::Addx;
+    }
+    // `011` and `111` are ADDA, whose destination is an address register, so
+    // neither the data-register width nor the data-operand rules below apply.
+    if op_mode == 0b011 || op_mode == 0b111 {
+        // ADDA's source may be any data operand, address registers included:
+        // `ADDA.W A0,A1` is legal (M68000UM "ADDA", source "data" with An
+        // allowed by the operand-type column of M68000PM/AD section 2.2.12).
+        if !is_data(mode, reg) {
+            return Op::Illegal;
+        }
+        return Op::Adda;
+    }
+    let Some(size) = Size::from_bits(u16::from(op_mode & 0b11)) else {
+        // `0b011`/`0b111` were the two undefined widths and they left above, so
+        // this is unreachable; naming the route keeps the function total.
+        return Op::Illegal;
+    };
+    if op_mode < 0b100 {
+        // `ADD <ea>,Dn`: the destination is a data register by construction, so
+        // only the source can be illegal. An address register read a byte is
+        // the same rejection `MOVE` makes for the identical reason.
+        if !is_data(mode, reg) || (size == Size::Byte && mode == AN_DIRECT_MODE) {
+            return Op::Illegal;
+        }
+        Op::Add
+    } else {
+        // `ADD Dn,<ea>`: the destination is written, so it must be
+        // data-alterable — which rules out `An` direct (no `ADD` may write an
+        // address register; that is `ADDA`'s job), `d16(PC)` and an immediate.
+        // An opcode with `An` direct here never reaches this line, because
+        // `ADDX` claimed it above.
+        if !is_data_alterable(mode, reg) {
+            return Op::Illegal;
+        }
+        Op::Add
+    }
+}
+
+/// `$0600 + ss<<6 + <ea>`: `ADDI #imm,<ea>` (M68000UM "ADDI — Add Integer").
+///
+/// The EA field names the *destination*, which must be alterable, and the
+/// immediate itself lives in the instruction's extension words, so
+/// [`crate::ops::arith::op_addi`] resolves it as mode `111` register `100`.
+fn classify_addi(opcode: u16) -> Op {
+    // `ss` = `11` is not one of the three widths `ADDI` defines. It is not
+    // `SUBI` (which has its own opcode pattern) and no ticket has claimed it,
+    // so it stays unimplemented rather than guessed at.
+    if Size::from_bits((opcode >> 6) & 0b11).is_none() {
+        return Op::Unimplemented;
+    }
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    Op::Addi
+}
+
+/// One opcode of the `0101` group: [`Op::Addq`], or [`Op::Unimplemented`] for
+/// the encodings its neighbours own — `SUBQ` (bit 8 set with a real size) and
+/// `Scc`/`DBcc` (bit 8 set with `ss` = `11`, M68000UM Format V) — plus the
+/// `bit 8 clear, ss = 11` encodings, which are neither and are not claimed by
+/// any ticket yet (M68000UM operation-code-map appendix).
+fn classify_addq(opcode: u16) -> Op {
+    if opcode & ADDQ_BIT8 != 0 {
+        return Op::Unimplemented;
+    }
+    let Some(size) = Size::from_bits((opcode >> 6) & 0b11) else {
+        return Op::Unimplemented;
+    };
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if mode == AN_DIRECT_MODE {
+        // `ADDQ` to an address register always adds 32 bits, so the byte form
+        // is not encodable (M68000UM "ADDQ": "... the byte size is not allowed
+        // for address register destination").
+        if size == Size::Byte {
+            return Op::Illegal;
+        }
+        return Op::Addq;
+    }
+    if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    Op::Addq
 }
 
 #[cfg(test)]
@@ -363,6 +520,160 @@ mod tests {
                 Op::Illegal,
                 "{name} (${opcode:04X}) must take the illegal-instruction route"
             );
+        }
+    }
+
+    /// The `1101` group splits on the operation-mode field in bits 8..6:
+    /// `000`/`001`/`010` are `ADD <ea>,Dn` at byte/word/long, `100`/`101`/`110`
+    /// the same three sizes as `ADD Dn,<ea>`, and `011`/`111` are `ADDA.W` and
+    /// `ADDA.L` (M68000UM "ADD", "ADDA"; M1-10, #18). `$D089` is the reminder
+    /// that a word or long `ADD` may *read* an address register.
+    #[test]
+    fn add_group_sizes_directions_and_adda() {
+        for (opcode, name) in [
+            (0xD001u16, "ADD.B D1,D0"),
+            (0xD041, "ADD.W D1,D0"),
+            (0xD081, "ADD.L D1,D0"),
+            (0xD090, "ADD.L (A0),D0"),
+            (0xD089, "ADD.L A1,D0"),
+            (0xD03C, "ADD.B #imm,D0"),
+            (0xD110, "ADD.B D0,(A0)"),
+            (0xD150, "ADD.W D0,(A0)"),
+            (0xD1A0, "ADD.L D0,-(A0)"),
+            (0xD1B8, "ADD.L D0,$0000.W"),
+            (0xD2C0, "ADDA.W D0,A1"),
+            (0xD2C8, "ADDA.W A0,A1"),
+            (0xD1C0, "ADDA.L D0,A0"),
+            (0xD3C8, "ADDA.L A0,A1"),
+        ] {
+            assert_ne!(
+                decode(opcode),
+                Op::Unimplemented,
+                "{name} (${opcode:04X}) must decode to its own variant"
+            );
+        }
+        assert_eq!(decode(0xD001), Op::Add, "ADD.B D1,D0");
+        assert_eq!(decode(0xD110), Op::Add, "ADD.B D0,(A0)");
+        assert_eq!(decode(0xD2C8), Op::Adda, "ADDA.W A0,A1");
+        assert_eq!(decode(0xD3C8), Op::Adda, "ADDA.L A0,A1");
+    }
+
+    /// `ADDX` is `1101 xxx 1 ss 00 m yyy`, so it lands inside `ADD`'s
+    /// `100`..`110` operation modes and can only be told apart by its EA mode
+    /// (`000`/`001`, from the forced `00` at bits 5..4). These two opcodes
+    /// differ in bit 4 alone, and the classification order is what makes them
+    /// different instructions: `$D100` is `ADDX.B D0,D0`, adding with the old
+    /// `X` and leaving `Z` alone on a zero result, while `$D110` is
+    /// `ADD.B D0,(A0)`, adding without the carry-in and setting `Z` normally.
+    /// Classify `ADD` first and `$D100` silently becomes an `ADD` — same width,
+    /// same registers, wrong arithmetic (M68000UM "ADDX"; M1-10, #18).
+    #[test]
+    fn addx_decodes_before_the_add_it_overlaps() {
+        for (opcode, name) in [
+            (0xD100u16, "ADDX.B D0,D0"),
+            (0xD140, "ADDX.W D0,D0"),
+            (0xD180, "ADDX.L D0,D0"),
+            (0xD108, "ADDX.B -(A0),-(A0)"),
+            (0xD34F, "ADDX.W -(A7),-(A1)"),
+            (0xD909, "ADDX.B -(A1),-(A4) — measured in ADDX.b.json.gz"),
+            (0xDD80, "ADDX.L D0,D6 — measured in ADDX.l.json.gz"),
+        ] {
+            assert_eq!(decode(opcode), Op::Addx, "{name} (${opcode:04X})");
+        }
+        // The near-misses: an EA mode outside `000`/`001` is a plain `ADD`.
+        assert_eq!(decode(0xD110), Op::Add, "ADD.B D0,(A0)");
+        assert_eq!(decode(0xD150), Op::Add, "ADD.W D0,(A0)");
+        // ... and `ss` = `11` would make the operation-mode field `111`, which
+        // is ADDA.L, so ADDX has no undefined size to reject.
+        assert_eq!(decode(0xD1C0), Op::Adda, "ADDA.L D0,A0");
+    }
+
+    /// The EA combinations the add class may not do are illegal instructions
+    /// decided at decode, so `crate::ops::arith` never re-checks them
+    /// (M68000PM/AD 2.2.12; M1-10, #18).
+    #[test]
+    fn add_illegal_ea_combinations_decode_as_illegal() {
+        for (opcode, name) in [
+            (0xD008u16, "ADD.B A0,D0: An read a byte"),
+            (0xD03D, "ADD.B (d8,PC,Xn)68020,D0: not a 68000 mode"),
+            (0xD13D, "ADD.B D0,(d8,PC,Xn)68020: not a 68000 mode"),
+            (0xD17C, "ADD.W D0,#imm: an immediate is not a destination"),
+            (0xD1BA, "ADD.L D0,d16(PC): PC-relative is not a destination"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// `ADDI` is `$0600 + ss<<6 + <ea>` and its EA field names the destination,
+    /// so it must be alterable. The rest of the `0000` group is other people's
+    /// tickets and still decodes as unimplemented (M68000UM "ADDI"; #18).
+    #[test]
+    fn addi_decodes_and_validates_its_destination() {
+        for (opcode, name) in [
+            (0x0600u16, "ADDI.B #imm,D0"),
+            (0x0640, "ADDI.W #imm,D0"),
+            (0x0680, "ADDI.L #imm,D0"),
+            (0x0610, "ADDI.B #imm,(A0)"),
+            (0x0698, "ADDI.L #imm,(A0)+"),
+            (0x06B8, "ADDI.L #imm,($0000).W"),
+        ] {
+            assert_eq!(decode(opcode), Op::Addi, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x0648u16, "ADDI.W #imm,A0: ADDI may not write An"),
+            (0x067A, "ADDI.W #imm,d16(PC): not a destination"),
+            (0x067C, "ADDI.W #imm,#imm: not a destination"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        // `ss` = `11` is not a size `ADDI` defines and no ticket has claimed
+        // it, so it stays loud rather than guessed at.
+        assert_eq!(decode(0x06C0), Op::Unimplemented, "ADDI with ss = 11");
+        // Its neighbours in the `0000` group are untouched by this ticket.
+        for (opcode, name) in [
+            (0x0000u16, "ORI.B #imm,D0"),
+            (0x0200, "ANDI.B #imm,D0"),
+            (0x0400, "the $04 pattern, which is not ADDI"),
+            (0x0700, "the pattern one size above ADDI"),
+            (0x0800, "BTST #imm,D0"),
+        ] {
+            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// `ADDQ` is `0101 ddd 0 ss eeeeee` with `ss` != `11`, its quick data in
+    /// bits 11..9 and data `000` meaning 8; `SUBQ` (bit 8 set), `Scc`/`DBcc`
+    /// (bit 8 set with `ss` = `11`) and the undefined `bit 8 clear, ss = 11`
+    /// encodings all stay unimplemented for their own tickets (M68000UM Format
+    /// V, "ADDQ", and the operation-code-map appendix; M1-10, #18).
+    #[test]
+    fn addq_decodes_and_validates_its_destination() {
+        for (opcode, name) in [
+            (0x5080u16, "ADDQ.L #8,D0: data 000 means 8"),
+            (0x5240, "ADDQ.W #1,D0"),
+            (0x5618, "ADDQ.B #3,(A0)+"),
+            (0x5092, "ADDQ.L #8,(A2): data 000 means 8 here too"),
+            (0x52A0, "ADDQ.L #1,-(A0)"),
+            (0x5E4A, "ADDQ.W #7,A2 — measured in ADD.w.json.gz"),
+            (0x5248, "ADDQ.W #1,A0"),
+            (0x5448, "ADDQ.W #2,A0"),
+        ] {
+            assert_eq!(decode(opcode), Op::Addq, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x5208u16, "ADDQ.B #1,A0: ADDQ to An is word or long only"),
+            (0x527A, "ADDQ.W #1,d16(PC): not a destination"),
+            (0x50BC, "ADDQ.L #8,#imm: not a destination"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x5380u16, "SUBQ.L #1,D0 — #19"),
+            (0x51C8, "Scc.EQ -(A0) — the branch ticket"),
+            (0x51CC, "DBRA D1,d16 — the branch ticket"),
+            (0x50C0, "bit 8 clear with ss = 11: defined by nobody yet"),
+        ] {
+            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
         }
     }
 

@@ -36,12 +36,27 @@
 //! [`crate::exceptions`] (M1-08, #16); this module only says which opcode takes
 //! which route.
 
+mod arith;
 mod move_;
 
 use crate::M68k;
 use crate::bus::Bus;
 use crate::decode::Op;
 use crate::exceptions::{EXC_ILLEGAL, trap_vector};
+
+/// Width of a mode or register field, the mask [`field`] applies.
+const FIELD_MASK: u16 = 0b111;
+
+/// One 3-bit field of `opcode` at `shift`.
+///
+/// Every handler here re-reads its own operand fields from the opcode, so this
+/// is shared rather than repeated per module.
+#[inline]
+pub(crate) const fn field(opcode: u16, shift: u32) -> u8 {
+    // `as` rather than `u8::from` because this is a `const fn` and `From` is not
+    // a const trait on this toolchain (see `ea::sign_extend_word`).
+    ((opcode >> shift) & FIELD_MASK) as u8
+}
 
 /// Width in bytes of a `TRAP #n` instruction: the single word `4E40 + n`, which
 /// is what makes the address the frame carries `pc + 2` (M68000PM section 8,
@@ -64,6 +79,13 @@ impl M68k {
             Op::Move => self.op_move(bus, opcode),
             Op::Movea => self.op_movea(bus, opcode),
             Op::Moveq => self.op_moveq(bus, opcode),
+            // The add class (`1101`, `0000 0110` and `0101`). As above, each
+            // handler re-reads its fields from the opcode (see [`arith]).
+            Op::Add => self.op_add(bus, opcode),
+            Op::Adda => self.op_adda(bus, opcode),
+            Op::Addx => self.op_addx(bus, opcode),
+            Op::Addi => self.op_addi(bus, opcode),
+            Op::Addq => self.op_addq(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming

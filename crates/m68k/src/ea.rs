@@ -155,7 +155,7 @@ const INDEX_CALC_CLOCKS: u64 = 2;
 ///
 /// Written with `as` rather than `i32::from` because `From` is not a const
 /// trait, so `#[rustfmt::skip]`-style `const fn` helpers cannot use it.
-const fn sign_extend_word(value: u16) -> u32 {
+pub(crate) const fn sign_extend_word(value: u16) -> u32 {
     (value as i16) as u32
 }
 
