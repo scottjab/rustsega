@@ -108,12 +108,16 @@ fn unimplemented_base_failure() -> String {
 /// The same control case with `ILLEGAL` (`$4AFC`, M68000PM/AD section 8) as the
 /// instruction under execution.
 ///
-/// Where [`BASE`] panics, this one *returns*: it routes to the exception stub,
-/// which records the vector and charges no clocks (`src/ops/mod.rs`, #15; the
-/// real frame is M1-08, #16). Tests that need the clock count compared need a
-/// case that gets there, because `Machine::run` compares `length` on the
+/// Where [`BASE`] panics, this one *returns*: it takes the illegal-instruction
+/// exception, which pushes the frame and jumps to the vector long
+/// (`src/exceptions.rs`, M1-08 #16). Tests that need the clock count compared
+/// need a case that gets there, because `Machine::run` compares `length` on the
 /// `Ok(cycles)` branch and records the panic on the other — they are mutually
 /// exclusive, so a panicking case never reaches the cycle check.
+///
+/// The `final` side is the state #16 really produces, not the "nothing changed"
+/// copy it had while the route was a stub (#15): the SSP has moved down a frame,
+/// `pc` is the vector long, and the queue came from there.
 fn illegal_case() -> harness::TestCase {
     let mut c = base();
     c.name = "4afc [does nothing] 1".to_string();
@@ -121,11 +125,29 @@ fn illegal_case() -> harness::TestCase {
     // same instruction, and the suite lists them because they are part of the
     // machine state, so the fixture says `4AFC` in both places.
     c.initial.prefetch[0] = 0x4AFC;
-    c.final_state.prefetch[0] = 0x4AFC;
     for state in [&mut c.initial, &mut c.final_state] {
         state.ram[0].1 = 0x4A;
         state.ram[1].1 = 0xFC;
     }
+    // Exception entry reads the handler long from `$00000C`, which this
+    // fixture's RAM does not list, so it comes back as zero: the "handler" is
+    // address 0 and the queue refills from there.
+    c.final_state.prefetch = [0, 0];
+    c.final_state.pc = 0;
+    c.final_state.ssp = SSP - 6;
+    // The frame itself, listed byte by byte the way the suite does it. Only the
+    // addresses a case lists are compared, so these six bytes really do assert
+    // what the push wrote: SR where it was (`0x2701`), then the address of the
+    // faulting opcode (`$00000C00`), which is how an illegal-instruction frame
+    // lets a handler decode the opcode (M68000UM "Stack Frame Formats").
+    c.final_state.ram.extend_from_slice(&[
+        (SSP - 6, 0x27),
+        (SSP - 5, 0x01),
+        (SSP - 4, 0x00),
+        (SSP - 3, 0x00),
+        (SSP - 2, 0x0C),
+        (SSP - 1, 0x00),
+    ]);
     c
 }
 
@@ -318,13 +340,15 @@ fn only_state_and_cycles_checks_the_cycle_count() {
 
     // The cycle comparison itself needs a case that *returns*: `run` compares
     // `length` on the `Ok(cycles)` branch and records the panic on the other,
-    // so `4E71` can never reach it. `4AFC` goes through the exception stub and
-    // comes back with 0 clocks.
+    // so `4E71` can never reach it. `4AFC` takes the exception and comes back
+    // with 0 clocks, because the entry sequence charges its own 34 into
+    // `M68k::cycles` and the instruction-overhead channel is still M1-31's
+    // (#39) — see the module docs of `src/ops/mod.rs`.
     let mut returns = illegal_case();
     assert_eq!(
         run(&returns, harness::Check::StateAndCycles),
         Vec::<String>::new(),
-        "the case's `length: 0` is what the stub returns, so StateAndCycles is clean"
+        "the case's `length: 0` is what the step returns, so StateAndCycles is clean"
     );
     returns.length = 4;
     assert_eq!(run(&returns, harness::Check::State), Vec::<String>::new());

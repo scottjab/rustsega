@@ -25,6 +25,7 @@ mod bus;
 mod cpu;
 mod decode;
 mod ea;
+mod exceptions;
 mod ops;
 mod sr;
 
@@ -35,4 +36,7 @@ pub mod testbus;
 pub use bus::{ADDR_MASK, Bus};
 pub use cpu::{M68k, RESET_CYCLES};
 pub use ea::{Ea, Size};
+pub use exceptions::{
+    EXC_CHK, EXC_DIV_ZERO, EXC_ILLEGAL, EXC_PRIVILEGE, EXC_TRAPV, TRAP_VECTOR_BASE, trap_vector,
+};
 pub use sr::{CCR_MASK, SR_C, SR_INT_MASK, SR_MASK, SR_N, SR_RESET, SR_S, SR_T, SR_V, SR_X, SR_Z};

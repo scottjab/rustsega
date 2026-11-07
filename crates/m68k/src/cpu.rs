@@ -21,7 +21,7 @@ pub const RESET_CYCLES: u32 = 132;
 /// One 68000 bus cycle is 4 clock cycles (M68000UM, "Bus Cycles": S0–S3, four
 /// clock phases per access). Every bus access charged by the helpers below is
 /// one bus cycle, so 4 clocks; a long is two word accesses, so 8.
-const BUS_CYCLE_CLOCKS: u64 = 4;
+pub(crate) const BUS_CYCLE_CLOCKS: u64 = 4;
 
 /// Clocks [`M68k::step`] reports for a step taken while the HALT pin is
 /// asserted, until M1-31 (#39) times the interrupt-acknowledge sequence.
@@ -205,9 +205,10 @@ impl M68k {
     ///
     /// Nothing here pops the queue: the pop that finishes an instruction is
     /// [`M68k::advance_opcode`], which the handlers call once they have read
-    /// their operands. The three exception routes deliberately leave `pc`, the
-    /// queue and the registers where they are, because the frame that belongs
-    /// with them is M1-08 (#16) — see the module docs of [`crate::ops`].
+    /// their operands. The exception routes do not pop either — an exception
+    /// discards the queue and refills it from the handler, which is
+    /// [`crate::exceptions`] and what [`M68k::step`]'s `bus` argument is for
+    /// (M1-08, #16).
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
         if self.halted {
             // HALT asserted: the CPU stops accessing the bus and re-samples the
@@ -223,7 +224,7 @@ impl M68k {
         self.pending_exception = None;
 
         let opcode = self.prefetch[0];
-        let used = self.run_op(crate::decode::decode(opcode), opcode);
+        let used = self.run_op(bus, crate::decode::decode(opcode), opcode);
         // TODO(M1-31, #39): this is the one place instruction clocks enter
         // `cycles`, but the bus helpers and the EA layer's internal clocks
         // (`INDEX_CALC_CLOCKS`, `PREDEC_CALC_CLOCKS`) already self-charge, so
@@ -231,10 +232,6 @@ impl M68k {
         // double-count. No handler returns non-zero clocks today, so nothing
         // can double-count yet; the timing tickets settle which number wins.
         self.cycles += u64::from(used);
-        // No handler reaches the bus yet — the exception stubs record a vector
-        // and nothing else, and the frame that would write it is #16 — so
-        // `bus` is here only because the core's `step` signature is fixed.
-        let _ = bus;
         used
     }
 
@@ -264,6 +261,23 @@ impl M68k {
             self.usp = self.a[7];
             self.a[7] = self.ssp;
         }
+    }
+
+    /// Set the active stack pointer, in both places it lives.
+    ///
+    /// `a[7]` mirrors whichever pointer SR.S selects, and `ssp`/`usp` are the
+    /// stored halves a save state (and the conformance harness, which compares
+    /// both) reads back — [`M68k::swap_stack_pointers`] keeps them consistent
+    /// across a mode change, and this keeps them consistent across a push or a
+    /// pop. Writing only `a[7]` leaves the stored pointer for the current mode
+    /// one frame behind.
+    pub(crate) fn set_active_sp(&mut self, value: u32) {
+        if self.is_supervisor() {
+            self.ssp = value;
+        } else {
+            self.usp = value;
+        }
+        self.a[7] = value;
     }
 
     /// The CCR: the low byte of SR, masked with [`CCR_MASK`].
@@ -862,9 +876,17 @@ mod tests {
 
     // ---- step(): decode the queue front, dispatch, record the route ----
 
+    /// Where a `step` that takes an exception pushes its frame, and the handler
+    /// the vector table points at — both inside [`Ram64k`], and both different
+    /// from `PROGRAM_BASE`, so a test can tell a frame from a fetch.
+    const STACK_TOP: u32 = 0x0000_2000;
+    const ILLEGAL_HANDLER: u32 = 0x0000_3000;
+
     /// A CPU with `opcode` in the queue front, which is what `step` runs. The
     /// registers are non-reset values on purpose, so any state a test finds
-    /// changed is the step's doing and not a coincidence of `M68k::new`.
+    /// changed is the step's doing and not a coincidence of `M68k::new`. The
+    /// vector table points every vector at [`ILLEGAL_HANDLER`] and the stack is
+    /// inside the bus, because a route that takes an exception now writes both.
     fn cpu_at_opcode(opcode: u16) -> (M68k, Ram64k) {
         let mut cpu = M68k::new();
         cpu.pc = PROGRAM_BASE;
@@ -872,16 +894,23 @@ mod tests {
         cpu.d[0] = 0x1111_2222;
         cpu.a[0] = 0x0010_4000;
         cpu.set_sr(0x2700);
-        (cpu, Ram64k::new())
+        let mut bus = Ram64k::new();
+        cpu.ssp = STACK_TOP;
+        cpu.a[7] = STACK_TOP;
+        for slot in (0x00..=0x7Fu32).step_by(4) {
+            bus.poke_long(slot, ILLEGAL_HANDLER);
+        }
+        bus.poke_long(ILLEGAL_HANDLER, 0x1234_5678);
+        (cpu, bus)
     }
 
-    /// Illegal, line A and line F all record the illegal-instruction vector —
-    /// the 68000 has no line emulator, so all three reserved routes take the one
-    /// exception — and, being stubs, change nothing else (M1-07, #15; the frame
-    /// is M1-08, #16, real line-A/F vectors are the 68010's, M1-12, #20).
+    /// Illegal, line A and line F all record the illegal-instruction vector and
+    /// take its frame — the 68000 has no line emulator, so all three reserved
+    /// routes take the one exception (M1-07, #15 routed them; M1-08, #16 gave
+    /// them the frame; real line-A/F vectors are the 68010's, M1-12, #20).
     #[test]
     fn step_records_the_exception_vector_of_each_illegal_route() {
-        use crate::ops::EXC_ILLEGAL;
+        use crate::exceptions::EXC_ILLEGAL;
         for (opcode, name) in [
             (0x4AFC, "ILLEGAL"),
             (0xA123, "line A"),
@@ -892,26 +921,43 @@ mod tests {
             (0xFFFF, "line F, group end"),
         ] {
             let (mut cpu, mut bus) = cpu_at_opcode(opcode);
-            let mut before = cpu.clone();
+            let before = cpu.clone();
             assert_eq!(
                 cpu.step(&mut bus),
                 0,
-                "{name} is a stub, so it charges no clocks"
+                "{name}: the entry sequence charges its own 34 clocks, so the handler still returns none"
             );
-            // The record is the one field the step is allowed to touch, so it
-            // is copied across rather than excluded from the comparison.
-            before.pending_exception = cpu.pending_exception;
             assert_eq!(
                 cpu.pending_exception,
                 Some(EXC_ILLEGAL),
                 "{name} (${opcode:04X}) must record the illegal-instruction vector"
             );
-            assert_eq!(cpu, before, "{name} must not change the CPU yet");
-            assert!(
-                bus.accesses.is_empty(),
-                "{name} must not touch the bus: {:?}",
-                bus.accesses
+            // The frame, which is what the route is for: SR where it was, the
+            // address of the opcode that could not execute, handler in `pc`.
+            assert_eq!(cpu.a[7], STACK_TOP - 6, "{name} pushed a frame");
+            assert_eq!(
+                bus.peek_word(STACK_TOP - 6),
+                0x2700,
+                "{name}: SR word at SP, as it was before the exception"
             );
+            assert_eq!(
+                bus.peek_long(STACK_TOP - 4),
+                PROGRAM_BASE,
+                "{name}: PC long at SP + 2, pointing at the faulting opcode"
+            );
+            assert_eq!(
+                cpu.pc, ILLEGAL_HANDLER,
+                "{name}: PC from the long at $00000C"
+            );
+            assert_eq!(
+                cpu.cycles - before.cycles,
+                crate::exceptions::EXCEPTION_ENTRY_CLOCKS,
+                "{name} costs 34 clocks (M68000UM execution times)"
+            );
+            // Only the exception's own fields move: no register is the
+            // exception's business.
+            assert_eq!(cpu.d, before.d, "{name} must not touch Dn");
+            assert_eq!(cpu.a[..7], before.a[..7], "{name} must not touch An");
         }
     }
 
@@ -919,10 +965,16 @@ mod tests {
     /// CPU ever took.
     #[test]
     fn step_replaces_the_previous_step_s_exception_record() {
-        use crate::ops::EXC_ILLEGAL;
+        use crate::exceptions::EXC_ILLEGAL;
         let (mut cpu, mut bus) = cpu_at_opcode(0x4AFC);
         cpu.step(&mut bus);
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
+        // Another exception next, so the record is written twice and the point
+        // of the test — replaced, not kept or merged — still applies. `step`
+        // runs the queue front, so the queue is what decides (`step` refilled
+        // it with the handler's words, which are `NOP`-free on purpose
+        // elsewhere).
+        cpu.prefetch = [0xA000, 0x4AFC];
         cpu.step(&mut bus);
         assert_eq!(
             cpu.pending_exception,
@@ -963,7 +1015,7 @@ mod tests {
     /// from `pc` or decoded `prefetch[1]` would panic instead of routing.
     #[test]
     fn step_runs_the_instruction_at_the_front_of_the_queue() {
-        use crate::ops::EXC_ILLEGAL;
+        use crate::exceptions::EXC_ILLEGAL;
         let (mut cpu, mut bus) = cpu_at_opcode(0x4E71);
         cpu.prefetch = [0xA000, 0x4E71];
         assert_eq!(cpu.step(&mut bus), 0);

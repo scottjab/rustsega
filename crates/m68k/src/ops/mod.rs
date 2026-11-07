@@ -6,52 +6,56 @@
 //!
 //! Handlers take the opcode and re-read their own operand fields from its bits
 //! (which is why [`crate::decode::Op`] carries no payload), and take
-//! `bus: &mut impl Bus` as soon as they touch memory — the exception stubs
-//! below do not, so they do not take it yet.
+//! `bus: &mut impl Bus` as soon as they touch memory — TRAP and the illegal
+//! routes do, so both take it here.
 //!
 //! A handler returns the 68k clocks the instruction cost. [`M68k::step`] adds
 //! that to [`M68k::cycles`] once, so a handler must not also charge the clocks
 //! it returns; the self-charging bus helpers (`read_w` and friends) and the EA
 //! layer's internal clocks are the exception, and how those three numbers add
-//! up is M1-31 (#39/#40)'s business, not this module's.
+//! up is M1-31 (#39/#40)'s business, not this module's. That is why the
+//! exception handlers below return 0: the entry sequence they run charges its
+//! own 34 clocks (see [`crate::exceptions`]).
+//!
+//! # The exception path
+//!
+//! `Op::Illegal` covers the reserved opcodes, and `Op::LineA` / `Op::LineF`
+//! cover the `1010` and `1111` groups — see [`crate::decode`]. All three run
+//! [`M68k::op_illegal`], which enters the illegal-instruction exception. That is
+//! the 68000's behaviour: the MC68000 has no line emulator, so Formats I and J
+//! in M68000UM are reserved encodings there and a reserved opcode raises the
+//! illegal-instruction exception (M68000PM section 8, "ILLEGAL INSTRUCTION").
+//! The separate line-A and line-F emulator vectors are a 68010 feature, and #20
+//! (M1-12) adds them then — which is why `Op::LineA` and `Op::LineF` are
+//! distinct variants rather than aliases of `Op::Illegal`.
+//!
+//! `Op::Trap` is the other opcode that is nothing but an exception: `4E40 + n`,
+//! one word, vector `32 + n` (M68000PM section 8, "TRAP").
+//!
+//! The frame, the vector map and the measurements behind each number live in
+//! [`crate::exceptions`] (M1-08, #16); this module only says which opcode takes
+//! which route.
 
-use crate::cpu::M68k;
+use crate::M68k;
+use crate::bus::Bus;
 use crate::decode::Op;
+use crate::exceptions::{EXC_ILLEGAL, trap_vector};
 
-/// The illegal-instruction exception: vector 3, handler long at `$00000C`.
-///
-/// This is the only exception vector this module needs, because it is the only
-/// one the 68000 takes from a decoded opcode: [`Op::LineA`] and [`Op::LineF`]
-/// take it too (see [`M68k::op_illegal`]).
-///
-/// # Which number a vector is: the convention this crate uses
-///
-/// Vector `n` here means "the handler long is at `$000000 + 4 * n`" — the
-/// number is the slot address divided by four. That is not a style choice, it
-/// is what the pinned suite does, and it is measurable: every `TRAP #n` case in
-/// `TRAP.json.gz` installs its handler long at `$0080 + 4 * n` (measured over
-/// all sixteen — `4e40` reads `$0080..=$0083`, `4e42` reads `$0088..=$008B`,
-/// `4e4f` reads `$00BC..=$00BF`), which makes TRAP #n vector `32 + n`. The
-/// harness reads the same map from the other end (`tests/harness/mod.rs`:
-/// `$000008` is *address error*, `$00000C` is *illegal instruction*), and the
-/// 178 087 exception cases the sweep skips all fetch from `$00000C`.
-///
-/// Motorola's "Exception Vector Memory Map" figure labels the same slots one
-/// higher, because it counts the reset pair as vectors 1 and 2: illegal
-/// instruction is "vector 4" there and vector 3 here. Same slot, same long,
-/// two labelling conventions — which is why tickets #15 and #16 both quote "4"
-/// for it. Anyone adding a vector: take the slot *address* from the hardware
-/// map first and divide by four, rather than quoting a number out of a manual.
-/// M1-08 (#16) reconciles the whole map in `exceptions.rs`; the measurement is
-/// recorded on #15 and on the reconciliation issue so the two cannot diverge.
-pub(crate) const EXC_ILLEGAL: u8 = 3;
+/// Width in bytes of a `TRAP #n` instruction: the single word `4E40 + n`, which
+/// is what makes the address the frame carries `pc + 2` (M68000PM section 8,
+/// "TRAP"; measured in `TRAP.json.gz`, where every frame holds `pc + 2`).
+const TRAP_WIDTH: u32 = 2;
+
+/// Low nibble of a TRAP opcode: the trap number, `4E40 + n`.
+const TRAP_NUMBER_MASK: u16 = 0x000F;
 
 impl M68k {
     /// Run the operation `op`, which [`crate::decode`] found for `opcode`, and
     /// return the 68k clocks it cost.
-    pub(crate) fn run_op(&mut self, op: Op, opcode: u16) -> u32 {
+    pub(crate) fn run_op(&mut self, bus: &mut impl Bus, op: Op, opcode: u16) -> u32 {
         match op {
-            Op::Illegal | Op::LineA | Op::LineF => self.op_illegal(),
+            Op::Illegal | Op::LineA | Op::LineF => self.op_illegal(bus),
+            Op::Trap => self.op_trap(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming
@@ -62,8 +66,8 @@ impl M68k {
         }
     }
 
-    /// The illegal-instruction exception, vector [`EXC_ILLEGAL`] — and the
-    /// route for the `1010` and `1111` groups as well.
+    /// The illegal-instruction exception, [`EXC_ILLEGAL`] — and the route for
+    /// the `1010` and `1111` groups as well.
     ///
     /// The 68000 has no line-emulator mechanism at all. M68000UM's instruction
     /// formats list Format I ("Line 1010 emulator instruction") and Format J
@@ -73,11 +77,38 @@ impl M68k {
     /// separate line-A and line-F emulator vectors are a 68010 addition, and
     /// giving them their own vectors is M1-12 (#20)'s job; `Op::LineA` and
     /// `Op::LineF` stay distinct in the decode table so #20 has the distinction
-    /// to route on. There is deliberately no line-A/line-F vector constant here:
-    /// the pinned 680x0 suite has no A-line or F-line file, so nothing of ours
-    /// could pin one, and a number nobody can check is worse than none.
-    pub(crate) fn op_illegal(&mut self) -> u32 {
-        self.exception_stub(EXC_ILLEGAL)
+    /// to route on. There is deliberately no line-A/line-F vector constant in
+    /// this crate: see [`crate::exceptions`].
+    ///
+    /// The frame carries `self.pc`, the address of the opcode that could not be
+    /// executed, so a handler can decode it (M68000PM "ILLEGAL INSTRUCTION").
+    /// The queue is not popped: the exception discards it and refills from the
+    /// handler.
+    ///
+    /// Charges the exception entry's 34 clocks through
+    /// [`M68k::exception`](crate::M68k::exception) and returns 0, like every
+    /// other handler here (see the module docs and the M1-31 note in
+    /// [`M68k::step`]).
+    pub(crate) fn op_illegal(&mut self, bus: &mut impl Bus) -> u32 {
+        let faulting_pc = self.pc;
+        self.exception(bus, EXC_ILLEGAL, faulting_pc);
+        0
+    }
+
+    /// `TRAP #n`: enter the trap exception for the opcode's low nibble, with
+    /// the address of the instruction *after* the TRAP in the frame, so the
+    /// handler returns to the code following it (M68000PM section 8, "TRAP").
+    ///
+    /// TRAP is one word wide, so that address is `pc + 2` — measured, not
+    /// assumed: all 8065 `TRAP.json.gz` cases have `pc + 2` in the frame.
+    ///
+    /// Clocks: as for [`M68k::op_illegal`], the 34 clocks are charged by the
+    /// entry sequence itself and this returns 0.
+    pub(crate) fn op_trap(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let number = (opcode & TRAP_NUMBER_MASK) as u8;
+        let return_pc = self.pc.wrapping_add(TRAP_WIDTH);
+        self.exception(bus, trap_vector(number), return_pc);
+        0
     }
 
     /// An instruction the core does not have yet.
@@ -88,19 +119,5 @@ impl M68k {
     /// (see `tests/harness/mod.rs`), so a whole-suite run still finishes.
     fn op_unimplemented(&self, opcode: u16) -> ! {
         unimplemented!("m68k opcode {opcode:04X}")
-    }
-
-    /// Record that the CPU took the exception `vector`, and nothing else.
-    ///
-    /// A stub on purpose, and deliberately an incomplete one: real exception
-    /// entry stops the current instruction, pushes the 6-byte frame (SR then
-    /// PC) under the new SSP, and fetches the handler long from
-    /// `$000000 + 4 * vector` — that is M1-08 (#16). Half-building a frame here
-    /// would leave a PC, queue and stack that #16 has to unpick, so this
-    /// changes no register, no memory and no clock; it only leaves the vector
-    /// number somewhere a test can see which route a decoded opcode took.
-    fn exception_stub(&mut self, vector: u8) -> u32 {
-        self.pending_exception = Some(vector);
-        0
     }
 }
