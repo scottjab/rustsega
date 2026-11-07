@@ -371,21 +371,14 @@ impl M68k {
     ///
     /// Hands over the word already sitting at the back of the queue (it was
     /// fetched while the CPU was still decoding) and charges only the refill,
-    /// 4 clocks. See `pop_word`.
-    #[allow(
-        dead_code,
-        reason = "called by the instruction tickets from M1-05 (#13) onward; only the tests use it today"
-    )]
+    /// 4 clocks. See `pop_word`, and [`M68k::ext_addr`] for the address that
+    /// word has while it is still queued.
     pub(crate) fn fetch_ext_word(&mut self, bus: &mut impl Bus) -> u16 {
         self.pop_word(bus)
     }
 
     /// A long extension word: two queue words, high word first, so 8 clocks and
     /// `pc` advances by 4.
-    #[allow(
-        dead_code,
-        reason = "called by the instruction tickets from M1-05 (#13) onward; only the tests use it today"
-    )]
     pub(crate) fn fetch_ext_long(&mut self, bus: &mut impl Bus) -> u32 {
         let high = u32::from(self.fetch_ext_word(bus));
         let low = u32::from(self.fetch_ext_word(bus));
