@@ -23,6 +23,10 @@ pub const RESET_CYCLES: u32 = 132;
 /// one bus cycle, so 4 clocks; a long is two word accesses, so 8.
 const BUS_CYCLE_CLOCKS: u64 = 4;
 
+/// Clocks [`M68k::step`] reports for a step taken while the HALT pin is
+/// asserted, until M1-31 (#39) times the interrupt-acknowledge sequence.
+const HALTED_CLOCKS: u32 = 4;
+
 /// How far ahead of [`M68k::pc`] the prefetch queue has already read, in bytes.
 ///
 /// The queue holds two words ([`M68k::prefetch`]), `pc` is the address of the
@@ -113,6 +117,15 @@ pub struct M68k {
     pub stopped: bool,
     /// True while the HALT pin is asserted (the CPU stops accessing the bus).
     pub halted: bool,
+    /// Vector number of the exception the last [`M68k::step`] took, or `None`
+    /// if that step did not take one ([`crate::ops`] holds the numbers).
+    ///
+    /// Stub state, from M1-07 (#15): the illegal / line A / line F routes
+    /// record the vector and stop there. M1-08 (#16) replaces this with real
+    /// exception entry — the 6-byte frame, the handler long fetch — and then
+    /// the field is what the frame is built from, which is why it is plain CPU
+    /// data rather than something only tests can see.
+    pub pending_exception: Option<u8>,
     /// Running total of 68k clocks consumed since the last [`M68k::reset`].
     /// Bus accesses charge themselves (see [`M68k::read_w`]), and
     /// [`M68k::step`] will add instruction cycles as they land; the scheduler
@@ -142,6 +155,7 @@ impl M68k {
             ipl: 0,
             stopped: false,
             halted: false,
+            pending_exception: None,
             cycles: 0,
         }
     }
@@ -162,6 +176,7 @@ impl M68k {
         self.ipl = 0;
         self.stopped = false;
         self.halted = false;
+        self.pending_exception = None;
         self.cycles = 0;
         self.set_sr(SR_RESET);
 
@@ -183,11 +198,44 @@ impl M68k {
 
     /// Run one instruction (or one exception). Returns the 68k clocks used.
     ///
-    /// Stub until the decode/instruction tickets; instruction fetch, decode
-    /// and exception handling are explicitly out of scope for M1-01.
+    /// The instruction is `prefetch[0]`, because the front of the queue is the
+    /// word under execution (see [`M68k::pc`]); the operation comes from the
+    /// decode table ([`crate::decode`]) and the handler from [`crate::ops`],
+    /// which re-reads its operand fields from the opcode bits.
+    ///
+    /// Nothing here pops the queue: the pop that finishes an instruction is
+    /// [`M68k::advance_opcode`], which the handlers call once they have read
+    /// their operands. The three exception routes deliberately leave `pc`, the
+    /// queue and the registers where they are, because the frame that belongs
+    /// with them is M1-08 (#16) — see the module docs of [`crate::ops`].
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
+        if self.halted {
+            // HALT asserted: the CPU stops accessing the bus and re-samples the
+            // interrupt pins. The real cost is the interrupt-acknowledge
+            // sequence, which is M1-31 (#39/#40); the number here only has to
+            // be non-zero so a halted CPU still moves the scheduler along.
+            self.cycles += u64::from(HALTED_CLOCKS);
+            return HALTED_CLOCKS;
+        }
+
+        // One step, at most one exception: what the previous step recorded is
+        // history by now.
+        self.pending_exception = None;
+
+        let opcode = self.prefetch[0];
+        let used = self.run_op(crate::decode::decode(opcode), opcode);
+        // TODO(M1-31, #39): this is the one place instruction clocks enter
+        // `cycles`, but the bus helpers and the EA layer's internal clocks
+        // (`INDEX_CALC_CLOCKS`, `PREDEC_CALC_CLOCKS`) already self-charge, so
+        // once a handler returns a total that includes them this would
+        // double-count. No handler returns non-zero clocks today, so nothing
+        // can double-count yet; the timing tickets settle which number wins.
+        self.cycles += u64::from(used);
+        // No handler reaches the bus yet — the exception stubs record a vector
+        // and nothing else, and the frame that would write it is #16 — so
+        // `bus` is here only because the core's `step` signature is fixed.
         let _ = bus;
-        0
+        used
     }
 
     /// Mask `value` with [`SR_MASK`] and store it in SR, swapping the stack
@@ -810,5 +858,138 @@ mod tests {
             cpu.prefetch[0], 0x2A53,
             "and that word is now the queue front"
         );
+    }
+
+    // ---- step(): decode the queue front, dispatch, record the route ----
+
+    /// A CPU with `opcode` in the queue front, which is what `step` runs. The
+    /// registers are non-reset values on purpose, so any state a test finds
+    /// changed is the step's doing and not a coincidence of `M68k::new`.
+    fn cpu_at_opcode(opcode: u16) -> (M68k, Ram64k) {
+        let mut cpu = M68k::new();
+        cpu.pc = PROGRAM_BASE;
+        cpu.prefetch = [opcode, 0x4E71];
+        cpu.d[0] = 0x1111_2222;
+        cpu.a[0] = 0x0010_4000;
+        cpu.set_sr(0x2700);
+        (cpu, Ram64k::new())
+    }
+
+    /// Illegal, line A and line F each record their vector — and, being stubs,
+    /// change nothing else (M1-07, #15; the frame is M1-08, #16).
+    #[test]
+    fn step_records_the_exception_vector_of_each_illegal_route() {
+        use crate::ops::{EXC_ILLEGAL, EXC_LINE_A, EXC_LINE_F};
+        for (opcode, vector, name) in [
+            (0x4AFC, EXC_ILLEGAL, "ILLEGAL"),
+            (0xA123, EXC_LINE_A, "line A"),
+            (0xF123, EXC_LINE_F, "line F"),
+        ] {
+            let (mut cpu, mut bus) = cpu_at_opcode(opcode);
+            let mut before = cpu.clone();
+            assert_eq!(
+                cpu.step(&mut bus),
+                0,
+                "{name} is a stub, so it charges no clocks"
+            );
+            // The record is the one field the step is allowed to touch, so it
+            // is copied across rather than excluded from the comparison.
+            before.pending_exception = cpu.pending_exception;
+            assert_eq!(
+                cpu.pending_exception,
+                Some(vector),
+                "{name} (${opcode:04X}) must record vector {vector}"
+            );
+            assert_eq!(cpu, before, "{name} must not change the CPU yet");
+            assert!(
+                bus.accesses.is_empty(),
+                "{name} must not touch the bus: {:?}",
+                bus.accesses
+            );
+        }
+    }
+
+    /// The record describes the step that just ran, not the last exception the
+    /// CPU ever took.
+    #[test]
+    fn step_replaces_the_previous_step_s_exception_record() {
+        use crate::ops::{EXC_ILLEGAL, EXC_LINE_A};
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4AFC);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
+        cpu.step(&mut bus);
+        assert_eq!(
+            cpu.pending_exception, Some(EXC_ILLEGAL),
+            "the same route twice still records it once"
+        );
+
+        cpu.pending_exception = Some(99);
+        cpu.prefetch[0] = 0xA000;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pending_exception, Some(EXC_LINE_A), "replaced, not kept");
+    }
+
+    /// An unimplemented instruction is a panic, not a silent no-op: a suite
+    /// that reported a passing case for an instruction that never ran would be
+    /// worse than one that stops.
+    #[test]
+    fn step_panics_loudly_on_an_unimplemented_opcode() {
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4E71); // NOP, until its ticket
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cpu.step(&mut bus)
+        }))
+        .expect_err("NOP has no handler, so step must not return");
+        let text = error
+            .downcast_ref::<String>()
+            .expect("the panic payload is a formatted message");
+        assert!(
+            text.contains("m68k opcode 4E71"),
+            "the panic must name the opcode it could not run, got {text:?}"
+        );
+    }
+
+    /// The instruction `step` runs is `prefetch[0]`, not whatever a read of
+    /// `pc` would return: the queue front here is a line A opcode while the
+    /// word behind it is the unimplemented `$4E71`, so a `step` that fetched
+    /// from `pc` or decoded `prefetch[1]` would panic instead of routing.
+    #[test]
+    fn step_runs_the_instruction_at_the_front_of_the_queue() {
+        use crate::ops::EXC_LINE_A;
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4E71);
+        cpu.prefetch = [0xA000, 0x4E71];
+        assert_eq!(cpu.step(&mut bus), 0);
+        assert_eq!(cpu.pending_exception, Some(EXC_LINE_A));
+
+        // And the same opcode written into memory at `pc` is still not what it
+        // runs, because the queue front is.
+        let (mut cpu, mut bus) = cpu_at_opcode(0xA000);
+        bus.mem[PROGRAM_BASE as usize] = 0x4E;
+        bus.mem[PROGRAM_BASE as usize + 1] = 0x71;
+        assert_eq!(cpu.step(&mut bus), 0);
+        assert_eq!(cpu.pending_exception, Some(EXC_LINE_A));
+    }
+
+    /// With HALT asserted the CPU stops accessing the bus; the clocks are a
+    /// placeholder until M1-31 (#39) times the interrupt-acknowledge sequence.
+    #[test]
+    fn step_charges_halted_clocks_and_touches_no_bus() {
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4E71); // would panic if decoded
+        cpu.halted = true;
+        assert_eq!(cpu.step(&mut bus), HALTED_CLOCKS);
+        assert_ne!(HALTED_CLOCKS, 0, "a halted step must still move time on");
+        assert_eq!(cpu.cycles, u64::from(HALTED_CLOCKS));
+        assert_eq!(cpu.step(&mut bus), HALTED_CLOCKS);
+        assert_eq!(
+            cpu.cycles,
+            u64::from(HALTED_CLOCKS) * 2,
+            "and keeps moving it on"
+        );
+        assert!(
+            bus.accesses.is_empty(),
+            "no bus traffic while halted: {:?}",
+            bus.accesses
+        );
+        assert_eq!(cpu.pc, PROGRAM_BASE, "HALT is not a fetch");
+        assert_eq!(cpu.pending_exception, None, "HALT is not an exception");
     }
 }

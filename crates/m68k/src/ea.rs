@@ -171,6 +171,196 @@ const fn ea_step(reg: u8, size: Size) -> u32 {
     }
 }
 
+/// Which operand class an EA field belongs to, from the `(mode, reg)` pair.
+///
+/// The classification behind [`is_data`], [`is_memory`], [`is_control`] and the
+/// alterable predicates, so the six of them cannot drift apart: each is one set
+/// of these, exactly as M68000PM/AD section 2.2.12 "Effective Addressing Mode
+/// Summary" tabulates them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EaClass {
+    /// `000` Dn.
+    DataReg,
+    /// `001` An — data-class for word and long only, which is what
+    /// [`Ea::accepts_size`] enforces at access time.
+    AddrReg,
+    /// `010` (An).
+    Indirect,
+    /// `011` (An)+.
+    PostIncrement,
+    /// `100` -(An).
+    PreDecrement,
+    /// `101` d16(An).
+    Displacement,
+    /// `110` d8(An,Xn).
+    Indexed,
+    /// `111` `000`/`001`: abs.W, abs.L.
+    Absolute,
+    /// `111` `010`/`011`: d16(PC), d8(PC,Xn).
+    PcRelative,
+    /// `111` `100`: #immediate.
+    Immediate,
+    /// `111` `101`-`111`: not an addressing mode on the 68000.
+    Invalid,
+}
+
+/// The class of an EA field: `mode` is bits 5..3, `reg` bits 2..0.
+///
+/// In mode `111` the register field *is* the sub-mode (M68000UM, "Effective
+/// Address Calculation"), which is why `reg` matters for that mode alone and is
+/// ignored for every other mode.
+const fn ea_class(mode: u8, reg: u8) -> EaClass {
+    match mode {
+        0b000 => EaClass::DataReg,
+        0b001 => EaClass::AddrReg,
+        0b010 => EaClass::Indirect,
+        0b011 => EaClass::PostIncrement,
+        0b100 => EaClass::PreDecrement,
+        0b101 => EaClass::Displacement,
+        0b110 => EaClass::Indexed,
+        0b111 => match reg {
+            0b000 | 0b001 => EaClass::Absolute,
+            0b010 | 0b011 => EaClass::PcRelative,
+            0b100 => EaClass::Immediate,
+            // `101` is the 68010+ `(d8,PC,Xn)`, `110`/`111` the 68020+
+            // bracketed forms. On the 68000 none of them is a mode, which is
+            // also why [`M68k::resolve_ea`] declines them.
+            _ => EaClass::Invalid,
+        },
+        // `mode` is 3 bits, so this is unreachable; naming it beats a `todo!()`
+        // on a path a caller could one day reach with a bad mask.
+        _ => EaClass::Invalid,
+    }
+}
+
+/// Is `(mode, reg)` a real addressing mode on the 68000 at all?
+///
+/// False only for mode `111` with register `101`-`111`, which the manual
+/// reserves for the 68010/68020 (M68000UM, "Effective Address Calculation");
+/// an opcode carrying one is an illegal instruction (vector 3, `crate::ops`).
+#[allow(
+    dead_code,
+    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use it today"
+)]
+pub(crate) const fn ea_mode_valid(mode: u8, reg: u8) -> bool {
+    !matches!(ea_class(mode, reg), EaClass::Invalid)
+}
+
+/// Can `(mode, reg)` be a *data* operand (source or destination of a
+/// move/ALU-class instruction)?
+///
+/// Every valid mode qualifies (M68000PM/AD 2.2.12: the Data column is marked
+/// for all of them), with one size caveat: mode `001` An is data-class for word
+/// and long only, and [`Ea::accepts_size`] rejects the byte case.
+#[allow(
+    dead_code,
+    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
+)]
+pub(crate) const fn is_data(mode: u8, reg: u8) -> bool {
+    ea_mode_valid(mode, reg)
+}
+
+/// Can `(mode, reg)` name *memory* — i.e. is the operand read or written
+/// through the address bus?
+///
+/// The address register indirect group, the two absolute forms and the two
+/// PC-relative ones. Not Dn or An (registers), not #immediate (its value is in
+/// the instruction stream, not in memory at the EA), and not an invalid mode
+/// (M68000PM/AD 2.2.12).
+#[allow(
+    dead_code,
+    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
+)]
+pub(crate) const fn is_memory(mode: u8, reg: u8) -> bool {
+    matches!(
+        ea_class(mode, reg),
+        EaClass::Indirect
+            | EaClass::PostIncrement
+            | EaClass::PreDecrement
+            | EaClass::Displacement
+            | EaClass::Indexed
+            | EaClass::Absolute
+            | EaClass::PcRelative
+    )
+}
+
+/// Can `(mode, reg)` be a *control* operand — the address a `JMP`, `JSR` or
+/// `LEA` computes?
+///
+/// The address register indirect group minus `(An)+` and `-(An)`, plus the
+/// absolute and PC-relative forms (M68000PM/AD section 8, the addressing-mode
+/// tables of those instructions: postincrement and predecrement are excluded
+/// because a control operand is only read, never stepped over or into). The
+/// 68010 adds `(An)+` and `-(An)` to `LEA`; this core is a 68000.
+#[allow(
+    dead_code,
+    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
+)]
+pub(crate) const fn is_control(mode: u8, reg: u8) -> bool {
+    matches!(
+        ea_class(mode, reg),
+        EaClass::Indirect
+            | EaClass::Displacement
+            | EaClass::Indexed
+            | EaClass::Absolute
+            | EaClass::PcRelative
+    )
+}
+
+/// Can an instruction *write* an operand at `(mode, reg)`?
+///
+/// True for Dn, An, the address register indirect group and the absolute forms.
+/// False for the PC-relative modes and #immediate: `d16(PC)` names a spot in
+/// the instruction stream and an immediate *is* its own value, so neither is
+/// somewhere a result can go (M68000PM/AD 2.2.12, and the "destination operand"
+/// wording of the section 8 instruction descriptions).
+#[allow(
+    dead_code,
+    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
+)]
+pub(crate) const fn is_alterable(mode: u8, reg: u8) -> bool {
+    matches!(
+        ea_class(mode, reg),
+        EaClass::DataReg
+            | EaClass::AddrReg
+            | EaClass::Indirect
+            | EaClass::PostIncrement
+            | EaClass::PreDecrement
+            | EaClass::Displacement
+            | EaClass::Indexed
+            | EaClass::Absolute
+    )
+}
+
+/// A valid *data destination* — what `MOVE`, `ADD`, `CLR`, `NEG` and the rest
+/// of that family may write.
+///
+/// Not `is_data` and `is_alterable` together, because the two columns of
+/// M68000PM/AD 2.2.12 differ on one mode: `001` An passes both (`ADDQ.W #1,A0`
+/// really does write an An through an EA field, so An is alterable, and An is a
+/// data-class source), yet no data-class instruction may name an An as its
+/// destination — `MOVE.W D0,A0` does not exist, `MOVEA`/`LEA`/`ADDA` are what
+/// writes an An from data, and their destination is the address register in
+/// their extension field, not an EA field. So the set is Dn plus the writable
+/// memory modes, and An is in it neither way.
+#[allow(
+    dead_code,
+    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
+)]
+pub(crate) const fn is_data_alterable(mode: u8, reg: u8) -> bool {
+    is_memory_alterable(mode, reg) || matches!(ea_class(mode, reg), EaClass::DataReg)
+}
+
+/// Memory operand *and* writable — the destination of a memory write, e.g.
+/// what `CLR` and `NEG` require.
+#[allow(
+    dead_code,
+    reason = "called by the instruction tickets from M1-08 (#16) onward, which check EA validity in decode; only the tests use them today"
+)]
+pub(crate) const fn is_memory_alterable(mode: u8, reg: u8) -> bool {
+    is_memory(mode, reg) && is_alterable(mode, reg)
+}
+
 impl M68k {
     /// Resolve an EA to an [`Ea`], applying the `(An)+` / `-(An)` register
     /// update as a side effect and consuming the mode's extension words.
@@ -1355,5 +1545,172 @@ mod tests {
         assert_eq!(Size::from_bits(2), Some(Size::Long));
         assert_eq!(Size::from_bits(3), None, "11 is the invalid size code");
         assert_eq!(Size::from_bits(0xFFFF), None, "and so is anything wider");
+    }
+
+    // ---- Operand-class predicates (M68000PM/AD 2.2.12) ----
+
+    /// `(mode, reg)` as one byte, so an expected set reads like the manual's
+    /// table: high three bits mode, low three register.
+    const fn enc(mode: u8, reg: u8) -> u8 {
+        (mode << 3) | reg
+    }
+
+    /// All 64 EA fields, in table order.
+    fn all_ea_fields() -> Vec<(u8, u8)> {
+        (0..8u8)
+            .flat_map(|mode| (0..8u8).map(move |reg| (mode, reg)))
+            .collect()
+    }
+
+    /// The eight fields of one mode, `reg` running `000`-`111`.
+    fn mode_block(mode: u8) -> Vec<u8> {
+        (0..8u8).map(|reg| enc(mode, reg)).collect()
+    }
+
+    /// What a predicate accepts, in table order.
+    fn accepted(pred: fn(u8, u8) -> bool) -> Vec<u8> {
+        all_ea_fields()
+            .into_iter()
+            .filter(|&(mode, reg)| pred(mode, reg))
+            .map(|(mode, reg)| enc(mode, reg))
+            .collect()
+    }
+
+    /// Every mode, with the three mode-`111` sub-modes the 68000 does not have
+    /// taken back out again.
+    fn every_valid_field() -> Vec<u8> {
+        let mut want: Vec<u8> = (0..8u8).flat_map(mode_block).collect();
+        for reg in [0b101, 0b110, 0b111] {
+            want.retain(|&field| field != enc(ABSOLUTE, reg));
+        }
+        want
+    }
+
+    #[test]
+    fn ea_mode_valid_rejects_only_the_modes_the_68000_lacks() {
+        // M68000UM, "Effective Address Calculation": mode `111` takes its
+        // sub-mode from the register field, and `101` (68010 `(d8,PC,Xn)`) and
+        // `110`/`111` (68020+ bracketed) do not exist here. These are exactly
+        // the three fields `resolve_ea` declines (see `mode_111_101_to_111`).
+        assert_eq!(accepted(ea_mode_valid), every_valid_field());
+        for reg in [0b101, 0b110, 0b111] {
+            assert!(
+                !ea_mode_valid(ABSOLUTE, reg),
+                "mode 111 reg {reg:03b} must not be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn is_data_accepts_every_valid_mode() {
+        // M68000PM/AD 2.2.12: the Data column is marked for every mode, An
+        // included (word and long only, which `Ea::accepts_size` enforces).
+        assert_eq!(accepted(is_data), every_valid_field());
+    }
+
+    #[test]
+    fn is_memory_is_the_addressed_modes() {
+        // Memory = the address register indirect group plus the absolute and
+        // PC-relative forms. Not Dn, not An, not #immediate (M68000PM/AD 2.2.12).
+        let mut want = Vec::new();
+        for mode in [AN_IND, AN_POST, AN_PRE, D16_AN, D8_AN_XN] {
+            want.extend(mode_block(mode));
+        }
+        want.extend([enc(ABSOLUTE, ABS_W), enc(ABSOLUTE, ABS_L)]);
+        want.extend([
+            enc(ABSOLUTE, D16_PC),
+            enc(ABSOLUTE, D8_PC_XN),
+        ]);
+        assert_eq!(accepted(is_memory), want);
+    }
+
+    #[test]
+    fn is_control_excludes_the_increment_modes() {
+        // `JMP`, `JSR` and `LEA` take the address register indirect group minus
+        // `(An)+` and `-(An)`, plus absolute and PC-relative (M68000PM/AD
+        // section 8, their addressing-mode tables).
+        let mut want = Vec::new();
+        for mode in [AN_IND, D16_AN, D8_AN_XN] {
+            want.extend(mode_block(mode));
+        }
+        want.extend([
+            enc(ABSOLUTE, ABS_W),
+            enc(ABSOLUTE, ABS_L),
+            enc(ABSOLUTE, D16_PC),
+            enc(ABSOLUTE, D8_PC_XN),
+        ]);
+        assert_eq!(accepted(is_control), want);
+    }
+
+    #[test]
+    fn is_alterable_excludes_pc_relative_and_immediate() {
+        // Writable = Dn, An, the address register indirect group, absolute.
+        // `d16(PC)` / `d8(PC,Xn)` name a spot in the instruction stream and
+        // #immediate is its own value, so neither can hold a result.
+        let mut want = Vec::new();
+        for mode in [DN, AN, AN_IND, AN_POST, AN_PRE, D16_AN, D8_AN_XN] {
+            want.extend(mode_block(mode));
+        }
+        want.extend([enc(ABSOLUTE, ABS_W), enc(ABSOLUTE, ABS_L)]);
+        assert_eq!(accepted(is_alterable), want);
+    }
+
+    /// The combination the ticket calls out: An direct and the PC-relative
+    /// modes are data-class but not destinations, so no `MOVE.W D0,A0`, and no
+    /// `CLR d16(PC)`.
+    #[test]
+    fn is_data_alterable_is_false_for_an_and_pc_relative() {
+        assert!(is_data_alterable(DN, 0), "D0");
+        assert!(is_data_alterable(AN_IND, 0), "(A0)");
+        assert!(is_data_alterable(AN_POST, 0), "(A0)+");
+        assert!(is_data_alterable(AN_PRE, 0), "-(A0)");
+        assert!(is_data_alterable(D16_AN, 0), "d16(A0)");
+        assert!(is_data_alterable(D8_AN_XN, 0), "d8(A0,X0)");
+        assert!(is_data_alterable(ABSOLUTE, ABS_W), "abs.W");
+        assert!(is_data_alterable(ABSOLUTE, ABS_L), "abs.L");
+
+        assert!(!is_data_alterable(AN, 0), "An is not a data destination");
+        assert!(!is_data_alterable(AN, 7), "not even A7");
+        assert!(!is_data_alterable(ABSOLUTE, D16_PC), "d16(PC)");
+        assert!(!is_data_alterable(ABSOLUTE, D8_PC_XN), "d8(PC,Xn)");
+        assert!(!is_data_alterable(ABSOLUTE, IMMEDIATE), "#immediate");
+        for reg in [0b101, 0b110, 0b111] {
+            assert!(
+                !is_data_alterable(ABSOLUTE, reg),
+                "invalid sub-mode {reg:03b} is not a destination either"
+            );
+        }
+    }
+
+    #[test]
+    fn is_memory_alterable_is_the_writable_memory_modes() {
+        let mut want = Vec::new();
+        for mode in [AN_IND, AN_POST, AN_PRE, D16_AN, D8_AN_XN] {
+            want.extend(mode_block(mode));
+        }
+        want.extend([enc(ABSOLUTE, ABS_W), enc(ABSOLUTE, ABS_L)]);
+        assert_eq!(accepted(is_memory_alterable), want);
+    }
+
+    /// An invalid field is in no class at all: a decode that asks one of these
+    /// predicates gets `false` from every one of them, so it can route the
+    /// opcode to the illegal-instruction exception without special cases.
+    #[test]
+    fn invalid_fields_are_in_no_class() {
+        for reg in [0b101, 0b110, 0b111] {
+            for (name, pred) in [
+                ("is_data", is_data as fn(u8, u8) -> bool),
+                ("is_memory", is_memory),
+                ("is_control", is_control),
+                ("is_alterable", is_alterable),
+                ("is_data_alterable", is_data_alterable),
+                ("is_memory_alterable", is_memory_alterable),
+            ] {
+                assert!(
+                    !pred(ABSOLUTE, reg),
+                    "{name} must reject mode 111 reg {reg:03b}"
+                );
+            }
+        }
     }
 }
