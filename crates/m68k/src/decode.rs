@@ -43,8 +43,10 @@
 //! `1010` and `1111` (line A / line F), the `0111` group (`MOVEQ`, #17), the
 //! three move groups `0001`/`0010`/`0011` (`MOVE` and `MOVEA`, #17), the traps
 //! in `0100`, the one documented illegal opcode, the `1101` group (`ADD`,
-//! `ADDA`, `ADDX`, #18), the `0101` group's `ADDQ` half (#18) and the `$0600`
-//! `ADDI` pattern inside `0000` (#18). Everything else in those groups still
+//! `ADDA`, `ADDX`, #18), the `1001` group (`SUB`, `SUBA`, `SUBX`, #19), the
+//! `0101` group's `ADDQ` and `SUBQ` halves (#18, #19), the `$0600` `ADDI`
+//! pattern inside `0000` (#18) and the `$0400` `SUBI` pattern inside `0000`
+//! (#19). Everything else in those groups still
 //! decodes to [`Op::Unimplemented`] and panics loudly until its ticket lands
 //! (M1-08, #16 onward).
 //!
@@ -133,6 +135,34 @@ pub enum Op {
     /// `001` is an address register added to in full 32 bits without touching
     /// the flags.
     Addq,
+    /// `SUB <ea>,Dn` and `SUB Dn,<ea>`, the `1001` group's operation modes
+    /// `000`/`001`/`010` and `100`/`101`/`110` (M68000UM "SUB — Subtract",
+    /// #19). The two directions differ in which operand is the minuend: the
+    /// first is `Dn - <ea> → Dn`, the second `<ea> - Dn → <ea>`.
+    /// [`crate::ops::arith`] re-reads the size, direction, register and EA from
+    /// the opcode bits.
+    Sub,
+    /// `SUBA <ea>,An`: the `1001` group's operation modes `011` (word, source
+    /// sign-extended) and `111` (long). Destination is the address register in
+    /// bits 11..9, and no condition code changes (M68000UM "SUBA — Subtract
+    /// Address", #19).
+    Suba,
+    /// `SUBX` — extend-form subtract, `1001 xxx 1 ss 00 m yyy` (M68000UM "SUBX
+    /// — Subtract with Extend", #19). `Dy`/`Dx` when bit 3 is clear, `-(Ay)`/
+    /// `-(Ax)` when set; bits 11..9 pick the destination and bits 2..0 the
+    /// source, exactly as in [`Op::Addx`]. Subtract with entry borrow `X`, and
+    /// `Z` is left alone on a zero result.
+    Subx,
+    /// `SUBI #imm,<ea>`, `$0400 + ss<<6 + <ea>` (M68000UM "SUBI — Subtract
+    /// Integer", #19). The immediate is the operand encoded in the EA field as
+    /// mode `111` register `100` and is fetched before the destination's own
+    /// extension words.
+    Subi,
+    /// `SUBQ #quick,<ea>`, `0101 ddd 1 ss mmm rrr` with `ss` != `11` (M68000UM
+    /// "SUBQ — Subtract Quick", #19). Data `000` means 8, and a destination of
+    /// mode `001` is an address register subtracted from in full 32 bits without
+    /// touching the flags.
+    Subq,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -152,11 +182,11 @@ const AN_DIRECT_MODE: u8 = 0b001;
 /// once.
 pub(crate) const MOVEQ_BIT8: u16 = 0x0100;
 
-/// Bit 8 of an `0101`-group opcode: clear for `ADDQ`/`SUBQ`
-/// (`0101 ddd 0 ss mmm rrr`), set for `Scc`/`DBcc`
+/// Bit 8 of an `0101`-group opcode: clear for `ADDQ` (`0101 ddd 0 ss mmm rrr`),
+/// set for `SUBQ` (`0101 ddd 1 ss mmm rrr`) and for `Scc`/`DBcc`
 /// (`0101 ccc 1 11 mmm rrr`) — M68000UM "Instruction Formats", Format V, and
 /// the operation-code-map appendix.
-const ADDQ_BIT8: u16 = 0x0100;
+const QUICK_BIT8: u16 = 0x0100;
 
 /// Every opcode's [`Op`], indexed by the opcode itself, so a decode is one load.
 ///
@@ -211,16 +241,29 @@ fn classify(opcode: u16) -> Op {
         // `0111 RRR 0 dddddddd`: the whole `0111` group is MOVEQ, and the
         // encodings with bit 8 set are illegal on the 68000.
         0x7000..=0x7FFF => classify_moveq(opcode),
+        // `0000 0100 ss eeeeee`: SUBI is the only instruction with that fixed
+        // pattern, so the whole `$0400..=$04FF` range is its group (the same
+        // shape `ADDI` uses at `$0600`).
+        0x0400..=0x04FF => classify_subi(opcode),
         // `0000 0110 ss eeeeee`: `ADDI` is the only instruction with that fixed
         // pattern, so the whole `$0600..=$06FF` range is its group. The rest of
         // the `0000` group (ORI, the bit operations, MOVEP, the other
         // immediates) is untouched here.
         0x0600..=0x06FF => classify_addi(opcode),
-        // `0101 ddd 0 ss eeeeee` and `0101 ccc 1 11 ...`: the whole `0101` group
-        // is ADDQ, SUBQ, Scc and DBcc, and only ADDQ is #18's.
-        0x5000..=0x5FFF => classify_addq(opcode),
+        // `0101 ddd 0 ss eeeeee` is ADDQ and `0101 ddd 1 ss eeeeee` is SUBQ;
+        // bit 8 set with `ss` = `11` is Scc/DBcc, which stays unimplemented for
+        // the branch ticket.
+        0x5000..=0x5FFF => {
+            if opcode & QUICK_BIT8 == 0 {
+                classify_addq(opcode)
+            } else {
+                classify_subq(opcode)
+            }
+        }
         // `1101 ddd ooo eeeeee`: ADD, ADDA and ADDX.
         0xD000..=0xDFFF => classify_add(opcode),
+        // `1001 ddd ooo eeeeee`: SUB, SUBA and SUBX.
+        0x9000..=0x9FFF => classify_sub(opcode),
         // Every other group is a real instruction whose handler has not been
         // written yet; the tickets that write them split these groups up.
         _ => Op::Unimplemented,
@@ -366,15 +409,118 @@ fn classify_addi(opcode: u16) -> Op {
     Op::Addi
 }
 
-/// One opcode of the `0101` group: [`Op::Addq`], or [`Op::Unimplemented`] for
-/// the encodings its neighbours own — `SUBQ` (bit 8 set with a real size) and
-/// `Scc`/`DBcc` (bit 8 set with `ss` = `11`, M68000UM Format V) — plus the
-/// `bit 8 clear, ss = 11` encodings, which are neither and are not claimed by
-/// any ticket yet (M68000UM operation-code-map appendix).
-fn classify_addq(opcode: u16) -> Op {
-    if opcode & ADDQ_BIT8 != 0 {
+/// One opcode of the `1001` group: `SUB`, `SUBA` or `SUBX`.
+///
+/// The operation-mode field is bits 8..6, so the format is
+/// `1001 ddd ooo mmm rrr` with the EA in the low six bits:
+/// `000`/`001`/`010` are `SUB <ea>,Dn` (`Dn - <ea> → Dn`) at byte/word/long,
+/// `100`/`101`/`110` are the same three sizes reversed (`SUB Dn,<ea>`, which is
+/// `<ea> - Dn → <ea>`), and `011`/`111` are `SUBA.W`/`SUBA.L`
+/// (M68000UM "SUB", "SUBA").
+///
+/// # Why `SUBX` has to be recognised first
+///
+/// Exactly as for [`classify_add`]: `SUBX` is `1001 xxx 1 ss 00 m yyy`
+/// (M68000UM "SUBX"), so its operation-mode field is `1ss` — one of `SUB`'s
+/// three `Dn,<ea>` modes — and its forced `00` at bits 5..4 makes the EA mode
+/// `000` or `001`, a register-operand EA. Testing `mode <= 001` after `SUB`
+/// would misroute every `SUBX` to `op_sub`, which would subtract without the
+/// entry borrow and set `Z` unconditionally, breaking the multi-precision chains
+/// `SUBX` exists for. See [`crate::ops::arith::op_subx`].
+fn classify_sub(opcode: u16) -> Op {
+    let op_mode = ((opcode >> 6) & 0b111) as u8;
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+
+    if (0b100..=0b110).contains(&op_mode) && mode <= AN_DIRECT_MODE {
+        return Op::Subx;
+    }
+    // `011` and `111` are SUBA, whose destination is an address register, so
+    // neither the data-register width nor the data-operand rules below apply.
+    if op_mode == 0b011 || op_mode == 0b111 {
+        // SUBA's source may be any data operand, address registers included:
+        // `SUBA.W A0,A1` is legal (M68000UM "SUBA", source "data"; M68000PM/AD
+        // section 2.2.12 allows An).
+        if !is_data(mode, reg) {
+            return Op::Illegal;
+        }
+        return Op::Suba;
+    }
+    let Some(size) = Size::from_bits(u16::from(op_mode & 0b11)) else {
+        // `0b011`/`0b111` were the two undefined widths and they left above, so
+        // this is unreachable; naming the route keeps the function total.
+        return Op::Illegal;
+    };
+    if op_mode < 0b100 {
+        // `SUB <ea>,Dn`: the destination is a data register by construction, so
+        // only the source can be illegal, and an address register read a byte is
+        // the same rejection `MOVE` and `ADD` make for the identical reason.
+        if !is_data(mode, reg) || (size == Size::Byte && mode == AN_DIRECT_MODE) {
+            return Op::Illegal;
+        }
+        Op::Sub
+    } else {
+        // `SUB Dn,<ea>`: the destination is written, so it must be
+        // data-alterable — which rules out `An` direct (no `SUB` may write an
+        // address register; that is `SUBA`'s job), `d16(PC)` and an immediate.
+        // An opcode with `An` direct here never reaches this line, because
+        // `SUBX` claimed it above.
+        if !is_data_alterable(mode, reg) {
+            return Op::Illegal;
+        }
+        Op::Sub
+    }
+}
+
+/// `$0400 + ss<<6 + <ea>`: `SUBI #imm,<ea>` (M68000UM "SUBI — Subtract
+/// Integer").
+///
+/// The EA field names the *destination*, which must be alterable, and the
+/// immediate itself lives in the instruction's extension words, so
+/// [`crate::ops::arith::op_subi`] resolves it as mode `111` register `100`.
+fn classify_subi(opcode: u16) -> Op {
+    // `ss` = `11` is not one of the three widths `SUBI` defines, and no ticket
+    // has claimed it, so it stays unimplemented rather than guessed at.
+    if Size::from_bits((opcode >> 6) & 0b11).is_none() {
         return Op::Unimplemented;
     }
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    Op::Subi
+}
+
+/// One opcode of the `0101` group with bit 8 set: [`Op::Subq`], or
+/// [`Op::Unimplemented`] for the `Scc`/`DBcc` encodings (bit 8 set with
+/// `ss` = `11`, M68000UM Format V), which the branch ticket owns.
+///
+/// The rules are `classify_addq`'s: `SUBQ` to an address register always
+/// subtracts 32 bits, so the byte form is not encodable (M68000UM "SUBQ").
+fn classify_subq(opcode: u16) -> Op {
+    let Some(size) = Size::from_bits((opcode >> 6) & 0b11) else {
+        return Op::Unimplemented;
+    };
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if mode == AN_DIRECT_MODE {
+        if size == Size::Byte {
+            return Op::Illegal;
+        }
+        return Op::Subq;
+    }
+    if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    Op::Subq
+}
+
+/// One opcode of the `0101` group with bit 8 clear: [`Op::Addq`], or
+/// [`Op::Unimplemented`] for the `ss` = `11` encodings, which are neither ADDQ
+/// nor SUBQ and are not claimed by any ticket yet (M68000UM operation-code-map
+/// appendix).
+fn classify_addq(opcode: u16) -> Op {
     let Some(size) = Size::from_bits((opcode >> 6) & 0b11) else {
         return Op::Unimplemented;
     };
@@ -419,9 +565,10 @@ mod tests {
         assert_eq!(decode(0xF123), Op::LineF);
         assert_range_decodes_to(0xA000..=0xAFFF, Op::LineA);
         assert_range_decodes_to(0xF000..=0xFFFF, Op::LineF);
-        // The groups either side of them are not: `1001` is SUB/SUBA/SUBX and
-        // `0000` is the bit-operation group, so both stay unimplemented here.
-        assert_eq!(decode(0x9FFF), Op::Unimplemented);
+        // The groups either side of them are not. `1001` was the anchor here
+        // until #19 implemented SUB/SUBA/SUBX, so it is now `1000` — OR, DIV and
+        // SBCD, still unimplemented — and `1011`, CMP/CMPA/CMPM/EOR.
+        assert_eq!(decode(0x8FFF), Op::Unimplemented);
         assert_eq!(decode(0xB000), Op::Unimplemented);
     }
 
@@ -629,11 +776,12 @@ mod tests {
         // `ss` = `11` is not a size `ADDI` defines and no ticket has claimed
         // it, so it stays loud rather than guessed at.
         assert_eq!(decode(0x06C0), Op::Unimplemented, "ADDI with ss = 11");
-        // Its neighbours in the `0000` group are untouched by this ticket.
+        // Its neighbours in the `0000` group are untouched by this ticket. The
+        // `$04` pattern was one of them until #19 claimed it: `$0400` is SUBI,
+        // see `subi_decodes_and_validates_its_destination`.
         for (opcode, name) in [
             (0x0000u16, "ORI.B #imm,D0"),
             (0x0200, "ANDI.B #imm,D0"),
-            (0x0400, "the $04 pattern, which is not ADDI"),
             (0x0700, "the pattern one size above ADDI"),
             (0x0800, "BTST #imm,D0"),
         ] {
@@ -642,10 +790,12 @@ mod tests {
     }
 
     /// `ADDQ` is `0101 ddd 0 ss eeeeee` with `ss` != `11`, its quick data in
-    /// bits 11..9 and data `000` meaning 8; `SUBQ` (bit 8 set), `Scc`/`DBcc`
-    /// (bit 8 set with `ss` = `11`) and the undefined `bit 8 clear, ss = 11`
-    /// encodings all stay unimplemented for their own tickets (M68000UM Format
-    /// V, "ADDQ", and the operation-code-map appendix; M1-10, #18).
+    /// bits 11..9 and data `000` meaning 8; `Scc`/`DBcc` (bit 8 set with `ss` =
+    /// `11`) and the undefined `bit 8 clear, ss = 11` encodings stay
+    /// unimplemented for their own tickets. `SUBQ`, the bit-8-set half of the
+    /// group, is #19's and is covered by
+    /// `subq_decodes_and_validates_its_destination` (M68000UM Format V, "ADDQ",
+    /// and the operation-code-map appendix; M1-10, #18).
     #[test]
     fn addq_decodes_and_validates_its_destination() {
         for (opcode, name) in [
@@ -668,8 +818,7 @@ mod tests {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
         for (opcode, name) in [
-            (0x5380u16, "SUBQ.L #1,D0 — #19"),
-            (0x51C8, "Scc.EQ -(A0) — the branch ticket"),
+            (0x51C8u16, "Scc.EQ -(A0) — the branch ticket"),
             (0x51CC, "DBRA D1,d16 — the branch ticket"),
             (0x50C0, "bit 8 clear with ss = 11: defined by nobody yet"),
         ] {

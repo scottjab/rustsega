@@ -1,4 +1,5 @@
-//! Arithmetic instructions: `ADD`, `ADDA`, `ADDI`, `ADDQ`, `ADDX`.
+//! Arithmetic instructions: `ADD`, `ADDA`, `ADDI`, `ADDQ`, `ADDX`, and their
+//! subtract twins `SUB`, `SUBA`, `SUBI`, `SUBQ`, `SUBX`.
 //!
 //! Opcodes (M68000UM section 8, "Instruction Formats"):
 //!
@@ -10,16 +11,30 @@
 //! | `ADDX` | `1101 xxx 1 ss 00 1 yyy` | `-(Ay)` + `-(Ax)` + X → `(Ax)` |
 //! | `ADDI` | `0000 0110 ss mmm rrr` | `<#data>` + `<ea>` → `<ea>` |
 //! | `ADDQ` | `0101 ddd 0 ss mmm rrr` | data + `<ea>` → `<ea>`, data = 1..8, `000` means 8 |
+//! | `SUB` | `1001 ddd ooo mmm rrr` | `ooo` 000/001/010: Dd − `<ea>` → Dd; 100/101/110: `<ea>` − Dd → `<ea>`; `oo` = size |
+//! | `SUBA` | `1001 aaa 011 mmm rrr` / `1001 aaa 111 mmm rrr` | Aa − `<ea>` → Aa, word (sign-extended) / long |
+//! | `SUBX` | `1001 xxx 1 ss 00 0 yyy` | Dx − Dy − X → Dx |
+//! | `SUBX` | `1001 xxx 1 ss 00 1 yyy` | `(Ax)` − `-(Ay)` − X → `(Ax)` |
+//! | `SUBI` | `0000 0100 ss mmm rrr` | `<ea>` − `<#data>` → `<ea>` |
+//! | `SUBQ` | `0101 ddd 1 ss mmm rrr` | `<ea>` − data → `<ea>`, data = 1..8, `000` means 8 |
 //!
-//! Flags (M68000UM, "68000 CCR Affected by Instruction Set"). `ADD`, `ADDI`
-//! and `ADDQ` to a data or memory destination set `X = C`, `N`, `Z`, `V`, `C`.
-//! `ADDQ` to an address register and `ADDA` leave all five alone. `ADDX` is the
-//! odd one: the incoming `X` is a third operand of the sum, and `Z` is cleared
-//! by a non-zero result but *left unchanged* by a zero one, so a chain of
-//! byte adds can report zero across the whole width.
+//! Flags (M68000UM, "68000 CCR Affected by Instruction Set"). `SUB`, `SUBI` and
+//! `SUBQ` to a data or memory destination set `X = C`, `N`, `Z`, `V`, `C`, with
+//! `C` the borrow. `SUBQ` to an address register and `SUBA` leave all five
+//! alone. `SUBX` is the odd one, exactly as `ADDX` is: the incoming `X` is a
+//! third operand — a subtrahend, not a carry-in — and `Z` is cleared by a
+//! non-zero result but *left unchanged* by a zero one, so a chain of byte
+//! subtracts can report zero across the whole width.
 //!
-//! Illegal operands are rejected by [`crate::decode`], not here: `ADD.B` from
-//! or to `An`, `ADDQ.B` to `An`, and every non-data destination for `ADDI`.
+//! The two classes are siblings in more than the opcode map: every handler here
+//! shares [`M68k::resolve_arith_ea`], every flag rule is one helper per direction
+//! ([`M68k::add_flags`]/[`M68k::add_extend_flags`] and
+//! [`M68k::sub_flags`]/[`M68k::sub_extend_flags`]), and the size/field constants
+//! below are named `ALU_*` because both groups read them.
+//!
+//! Illegal operands are rejected by [`crate::decode`], not here: `ADD.B`/`SUB.B`
+//! from or to `An`, `ADDQ.B`/`SUBQ.B` to `An`, and every non-data destination for
+//! `ADDI`/`SUBI`.
 
 use crate::bus::Bus;
 use crate::cpu::M68k;
@@ -27,17 +42,19 @@ use crate::ea::{Ea, Size, sign_extend_word};
 use crate::ops::field;
 use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
 
-/// Shift of the register field of the `1101` group and of `ADDQ`'s data field,
-/// bits 11..9.
+/// Shift of the register field of the `1101`/`1001` groups and of `ADDQ`/
+/// `SUBQ`'s data field, bits 11..9.
 const ALU_REG_SHIFT: u32 = 9;
-/// Shift of the operation/size field: bits 8..6 for `ADD`/`ADDA` (`ooo`), 7..6
-/// (`ss`) for `ADDX`/`ADDI`/`ADDQ`. Both are three-field-wide extractions, and
-/// [`alu_size`] keeps only the two size bits.
+/// Shift of the operation/size field: bits 8..6 for `ADD`/`ADDA`/`SUB`/`SUBA`
+/// (`ooo`), 7..6 (`ss`) for `ADDX`/`ADDI`/`ADDQ` and their subtract twins. Both
+/// are three-field-wide extractions, and [`alu_size`] keeps only the two size
+/// bits.
 const ALU_OP_SHIFT: u32 = 6;
 /// Shift of an EA mode, bits 5..3; the EA register is bits 2..0.
 const EA_MODE_SHIFT: u32 = 3;
-/// `ADD`/`ADDA` operation bit, bit 8: with bit 6 or 7 set it selects the
-/// `Dn + <ea> → <ea>` direction, and for `ADDA` it selects word or long.
+/// `ADD`/`ADDA`/`SUB`/`SUBA` operation bit, bit 8: with bit 6 or 7 set it
+/// selects the `Dn op <ea> → <ea>` direction, and for `ADDA`/`SUBA` it selects
+/// word or long.
 const ALU_MODE_TO_EA: u8 = 0b100;
 /// EA mode `001`, an address register.
 const EA_MODE_AN: u8 = 0b001;
@@ -48,14 +65,15 @@ const EA_MODE_111: u8 = 0b111;
 /// EA register `100` inside mode `111`: immediate.
 const EA_REG_IMMEDIATE: u8 = 0b100;
 
-/// Bit 3 of `ADDX`: 0 = register mode, 1 = `-(Ay),-(Ax)` memory mode.
+/// Bit 3 of `ADDX`/`SUBX`: 0 = register mode, 1 = `-(Ay),-(Ax)` memory mode.
 const ALU_X_MEMORY: u16 = 0b1000;
 
-/// Size from the two `ss` bits of `ADDI`/`ADDQ` and from `oo` in `ADD`'s
-/// `ooo` operation field.
+/// Size from the two `ss` bits of `ADDI`/`ADDQ`/`SUBI`/`SUBQ` and from `oo` in
+/// `ADD`'s and `SUB`'s `ooo` operation field.
 ///
 /// `None` for `0b11`, which is `Scc`/`DBcc` in the `0101` group and undefined
-/// in `0000 0110`; decode rejects both, so `None` here is a core bug.
+/// in `0000 0110` and `0000 0100`; decode rejects all three, so `None` here is a
+/// core bug.
 const fn alu_size(bits: u8) -> Option<Size> {
     match bits & 0b11 {
         0b00 => Some(Size::Byte),
@@ -250,6 +268,199 @@ impl M68k {
         0
     }
 
+    /// `SUB`: `1001 ddd ooo mmm rrr`.
+    ///
+    /// `ooo` 000/001/010 subtracts the effective address *from* data register
+    /// `ddd` (`Dn - <ea> → Dn`); 100/101/110 subtract data register `ddd` *from*
+    /// the effective address (`<ea> - Dn → <ea>`), a read-modify-write of that
+    /// one location (M68000UM section 8, "SUB"). Which of the two an opcode is
+    /// decides which operand is the minuend, and getting it the other way round
+    /// is the single easiest way to fail every `SUB.W D0,(A0)` case in the suite.
+    pub(crate) fn op_sub(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let reg = field(opcode, ALU_REG_SHIFT);
+        let op_mode = field(opcode, ALU_OP_SHIFT);
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+        let Some(size) = alu_size(op_mode) else {
+            // `011`/`111` are SUBA and `11`-sized `SUB` does not exist, so
+            // `classify` never routes them here.
+            return self.op_illegal(bus);
+        };
+
+        if op_mode & ALU_MODE_TO_EA == 0 {
+            // SUB <ea>,Dn: the source is read first, so `(A0)+` steps once, and
+            // the register is the minuend.
+            let Some(src) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
+                return self.op_illegal(bus);
+            };
+            let value = self.read_ea(bus, src, size);
+            let result = self.sub_flags(value, self.d[usize::from(reg)], false, size);
+            self.write_ea(bus, Ea::DataReg(reg), size, result);
+        } else {
+            // SUB Dn,<ea>: one read-modify-write of the resolved destination.
+            // Resolving the EA twice would step `(A0)+` twice, so it is resolved
+            // once and the same `Ea` is read and written. Here the memory operand
+            // is the minuend and the register is taken away from it.
+            let subtrahend = self.d[usize::from(reg)];
+            let Some(dest) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
+                return self.op_illegal(bus);
+            };
+            let value = self.read_ea(bus, dest, size);
+            let result = self.sub_flags(subtrahend, value, false, size);
+            self.write_ea(bus, dest, size, result);
+        }
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `SUBA.W` (`1001 aaa 011 mmm rrr`) and `SUBA.L` (`1001 aaa 111 mmm rrr`).
+    ///
+    /// The word form sign-extends the source to 32 bits before subtracting, and
+    /// no flag is touched — the only difference from `SUB` is that the
+    /// destination is an address register and the borrow is thrown away
+    /// (M68000UM section 8, "SUBA").
+    pub(crate) fn op_suba(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let reg = field(opcode, ALU_REG_SHIFT);
+        let op_mode = field(opcode, ALU_OP_SHIFT);
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+        let size = if op_mode & ALU_MODE_TO_EA == 0 {
+            Size::Word
+        } else {
+            Size::Long
+        };
+
+        let Some(src) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
+            return self.op_illegal(bus);
+        };
+        let value = self.read_ea(bus, src, size);
+        let subtrahend = if size == Size::Word {
+            sign_extend_word(value as u16)
+        } else {
+            value
+        };
+        // The address register is the minuend, and the difference is written as a
+        // long so a borrow out of bit 31 wraps the whole register rather than
+        // re-sign-extending its low word. No flag is touched, which is why this
+        // cannot reuse `sub_flags`.
+        let difference = self.a[usize::from(reg)].wrapping_sub(subtrahend);
+        self.write_ea(bus, Ea::AddrReg(reg), Size::Long, difference);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `SUBX`: `1001 xxx 1 ss 00 m yyy`, `ss != 11`.
+    ///
+    /// Register mode subtracts `Dy` and the incoming `X` from `Dx`; memory mode
+    /// subtracts the bytes, words or longs at `-(Ay)` and `-(Ax)` with `X` and
+    /// stores into `(Ax)` (M68000UM section 8, "SUBX"). As for `ADDX`, bits 11..9
+    /// are the *destination* and bits 2..0 the source, and the decrements happen
+    /// before each access, so `-(A0),-(A0)` reads two consecutive locations.
+    pub(crate) fn op_subx(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let dest = field(opcode, ALU_REG_SHIFT);
+        let src = field(opcode, 0);
+        let Some(size) = alu_size(field(opcode, ALU_OP_SHIFT)) else {
+            // `ss = 11` is SUBA.L, which decode routes away before the SUBX
+            // overlap check, so this cannot happen.
+            return self.op_illegal(bus);
+        };
+
+        if opcode & ALU_X_MEMORY == 0 {
+            let subtrahend = self.d[usize::from(src)];
+            let minuend = self.d[usize::from(dest)];
+            let result = self.sub_extend_flags(subtrahend, minuend, size);
+            self.write_ea(bus, Ea::DataReg(dest), size, result);
+            self.advance_opcode(bus);
+            return 0;
+        }
+
+        // Memory mode: `-(Ay)` is resolved and read before `-(Ax)`, so
+        // `SUBX.B -(A0),-(A0)` subtracts the byte from itself with both pointers
+        // moving once, and each `Ea` is only resolved once.
+        let Some(src_ea) = self.resolve_arith_ea(bus, EA_PREDEC, src, size) else {
+            return self.op_illegal(bus);
+        };
+        let subtrahend = self.read_ea(bus, src_ea, size);
+        let Some(dest_ea) = self.resolve_arith_ea(bus, EA_PREDEC, dest, size) else {
+            return self.op_illegal(bus);
+        };
+        let minuend = self.read_ea(bus, dest_ea, size);
+        let result = self.sub_extend_flags(subtrahend, minuend, size);
+        self.write_ea(bus, dest_ea, size, result);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `SUBI`: `0000 0100 ss mmm rrr`.
+    ///
+    /// The immediate is the operand the EA field encodes as mode 111 register
+    /// 100, and it is fetched before the destination's own extension words, so
+    /// `SUBI.L #$12345678,d8(A0)` reads `$1234`, `$5678`, then `$d8` in that
+    /// order (M68000UM section 8, "SUBI"). The destination is the minuend.
+    pub(crate) fn op_subi(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+        let Some(size) = alu_size(field(opcode, ALU_OP_SHIFT)) else {
+            return self.op_illegal(bus);
+        };
+
+        // The immediate is mode 111 register 100 and it is fetched first, so its
+        // words come off the queue before the destination's own extension word
+        // (`resolve_ea` pops them as it resolves).
+        let Some(immediate) = self.resolve_arith_ea(bus, EA_MODE_111, EA_REG_IMMEDIATE, size)
+        else {
+            return self.op_illegal(bus);
+        };
+        let subtrahend = self.read_ea(bus, immediate, size);
+
+        let Some(dest) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
+            return self.op_illegal(bus);
+        };
+        let value = self.read_ea(bus, dest, size);
+        let result = self.sub_flags(subtrahend, value, false, size);
+        self.write_ea(bus, dest, size, result);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `SUBQ`: `0101 ddd 1 ss mmm rrr`, `ddd` = 1..8 and `000` meaning 8.
+    ///
+    /// To an address register the operation is always 32 bits whatever the size
+    /// field says, and no flag changes (M68000UM section 8, "SUBQ").
+    pub(crate) fn op_subq(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let quick = field(opcode, ALU_REG_SHIFT);
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+        let Some(size) = alu_size(field(opcode, ALU_OP_SHIFT)) else {
+            return self.op_illegal(bus);
+        };
+        // The data field holds 1..8 and `000` means 8.
+        let data = u32::from(if quick == 0 { 8 } else { quick });
+
+        if mode == EA_MODE_AN {
+            // Always a 32-bit subtract from An, whatever `ss` says, and no flag
+            // is touched — which is why this cannot reuse `sub_flags`.
+            let difference = self.a[usize::from(ea_reg)].wrapping_sub(data);
+            self.write_ea(bus, Ea::AddrReg(ea_reg), Size::Long, difference);
+            self.advance_opcode(bus);
+            return 0;
+        }
+
+        let Some(dest) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
+            return self.op_illegal(bus);
+        };
+        let value = self.read_ea(bus, dest, size);
+        let result = self.sub_flags(data, value, false, size);
+        self.write_ea(bus, dest, size, result);
+
+        self.advance_opcode(bus);
+        0
+    }
+
     /// Add `src` and `dst` at `size`, fold `extend` in as a carry-in, set
     /// X/N/Z/V/C from the result, and return the masked result.
     ///
@@ -262,8 +473,9 @@ impl M68k {
     /// the size's most significant bit (M68000UM, "Integer Arithmetic Status
     /// Bits").
     ///
-    /// `ADDX`'s sticky Z is layered on by [`M68k::add_extend_flags`], and the
-    /// subtract twin in M1-11 (#19) will need the same pair.
+    /// `ADDX`'s sticky Z is layered on by [`M68k::add_extend_flags`]; the
+    /// subtract side is the same pair of steps, [`M68k::sub_flags`] and
+    /// [`M68k::sub_extend_flags`].
     pub(crate) fn add_flags(&mut self, src: u32, dst: u32, extend: bool, size: Size) -> u32 {
         // `u64` so the carry out of the top operand bit survives the add; the
         // operands are masked first so a caller can hand over a full register.
@@ -299,10 +511,78 @@ impl M68k {
         result
     }
 
+    /// Subtract `src` (and `extend`, as an entry borrow) from `dst` at `size`,
+    /// set N/Z/V/C from the result, and return the masked result — **without
+    /// touching X**.
+    ///
+    /// This is the half of the subtract flag logic that does not own X, and it
+    /// exists as a seam on its own because `CMP` (M1-12) performs exactly this
+    /// subtraction and must leave X alone, while `NEG`/`NEGX`/`SBCD` (M1-14,
+    /// M1-20) need it with X. Keeping it separate is what lets them share the
+    /// borrow, overflow and zero rules without any of them setting a flag they
+    /// are not allowed to touch.
+    ///
+    /// `dst - src - extend` is done as `dst + !src + 1 - extend` in `u64` so the
+    /// borrow out of the top operand bit survives; the carry out is the inverse
+    /// of the borrow, so C is set when there is *no* carry, i.e. when
+    /// `src + extend > dst` unsigned. V is signed overflow of the subtraction:
+    /// the operands have opposite signs and the result has the sign of the
+    /// subtrahend, i.e. `((src ^ dst) & (result ^ dst))` at the size's most
+    /// significant bit (M68000UM, "Integer Arithmetic Status Bits" and "SUB").
+    pub(crate) fn sub_flags_no_x(&mut self, src: u32, dst: u32, extend: bool, size: Size) -> u32 {
+        // The operands are masked first so a caller can hand over a full
+        // register, whatever the operation size.
+        let mask = u64::from(size.mask());
+        let subtrahend = u64::from(src) & mask;
+        let minuend = u64::from(dst) & mask;
+        // `!subtrahend` is the one's complement inside `size`, and the `+ 1` is
+        // the two's complement that `extend` then takes a 1 back out of.
+        let difference = minuend + (!subtrahend & mask) + 1 - u64::from(extend);
+        let result = (difference & mask) as u32;
+        // A carry out of the top bit means the subtraction did *not* borrow.
+        let borrow = (difference & !mask) == 0;
+
+        self.set_flag(SR_C, borrow);
+        self.set_flag(SR_N, result & size.msb() != 0);
+        self.set_flag(SR_Z, result == 0);
+        // Signed overflow: operands of opposite sign, result with the sign of
+        // the subtrahend.
+        let subtrahend = subtrahend as u32;
+        let minuend = minuend as u32;
+        let overflow = ((subtrahend ^ minuend) & (result ^ minuend)) & size.msb();
+        self.set_flag(SR_V, overflow != 0);
+        result
+    }
+
+    /// [`M68k::sub_flags_no_x`] plus the X copy that `SUB`, `SUBI`, `SUBQ`,
+    /// `NEG` and friends all want: X ends up as the borrow, the same value C
+    /// holds (M68000UM, "68000 CCR Affected by Instruction Set").
+    pub(crate) fn sub_flags(&mut self, src: u32, dst: u32, extend: bool, size: Size) -> u32 {
+        let result = self.sub_flags_no_x(src, dst, extend, size);
+        let borrow = self.flag_c();
+        self.set_flag(SR_X, borrow);
+        result
+    }
+
+    /// `sub_flags` with `extend` taken from the current X and `SUBX`'s Z rule
+    /// applied: a non-zero result clears Z, a zero result leaves it alone, so a
+    /// chain of `SUBX`s reports zero across the whole width (M68000UM section 8,
+    /// "SUBX"). X still comes out as the borrow, which is what makes the next
+    /// link in the chain subtract it.
+    pub(crate) fn sub_extend_flags(&mut self, src: u32, dst: u32, size: Size) -> u32 {
+        let z_before = self.flag_z();
+        let x_before = self.flag_x();
+        let result = self.sub_flags(src, dst, x_before, size);
+        if result == 0 {
+            self.set_flag(SR_Z, z_before);
+        }
+        result
+    }
+
     /// Reads an arithmetic operand EA: any data operand, plus an address
-    /// register for `ADDA` and `ADDQ`, which [`crate::decode`] has already
-    /// checked. A `None` here means the decode table and this handler disagree;
-    /// the debug assert makes that loud in tests and the illegal-instruction
+    /// register for `ADDA`/`SUBA` and `ADDQ`/`SUBQ`, which [`crate::decode`] has
+    /// already checked. A `None` here means the decode table and this handler
+    /// disagree; the debug assert makes that loud in tests and the illegal-instruction
     /// route is what a release build takes (see [`M68k::resolve_move_ea`],
     /// which this mirrors for the move class).
     fn resolve_arith_ea(
@@ -708,7 +988,10 @@ mod tests {
 
         cpu.step(&mut bus);
 
-        assert_eq!(cpu.d[0], 0xDEAD_00FF, "byte subtract keeps the upper 24 bits");
+        assert_eq!(
+            cpu.d[0], 0xDEAD_00FF,
+            "byte subtract keeps the upper 24 bits"
+        );
         assert!(cpu.flag_c(), "$00 - $01 borrows out of bit 7");
         assert!(cpu.flag_x(), "X copies C");
         assert!(cpu.flag_n(), "the wrapped byte is negative");
@@ -1103,7 +1386,10 @@ mod tests {
 
         assert_eq!(result, 0x0000_00FF);
         assert!(!cpu.flag_c(), "$100 - $1 does not borrow");
-        assert!(cpu.flag_x(), "and X keeps the value it had: CMP leaves X alone");
+        assert!(
+            cpu.flag_x(),
+            "and X keeps the value it had: CMP leaves X alone"
+        );
 
         let (mut cpu, _bus) = run(0x4E71, &[]);
         cpu.set_ccr(SR_X);
@@ -1112,6 +1398,9 @@ mod tests {
 
         assert_eq!(result, 0x0000_00FF);
         assert!(!cpu.flag_c());
-        assert!(!cpu.flag_x(), "SUB takes X from the borrow, so it clears here");
+        assert!(
+            !cpu.flag_x(),
+            "SUB takes X from the borrow, so it clears here"
+        );
     }
 }
