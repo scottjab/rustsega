@@ -25,27 +25,35 @@ fn file_passes(name: &str) {
 }
 
 /// Two cases of `ASL.b` whose recorded final state cannot come from their own
-/// recorded initial state, on an 68000 or any other machine.
+/// recorded initial state, on an 68000 or any other machine: #209.
 ///
-/// Both are `$E502` = `ASL.B #2,D2`. A byte shift writes one byte, so the upper
-/// three bytes of `D2` have to survive it, and `#2` of the recorded byte has to
-/// be `$F8`/`$F4`. The file instead asks for:
+/// Both are `$E502` = `ASL.B #2,D2` (`i` = 0, so `ccc` = 2 is an immediate
+/// count; `ss` = `00` is byte), and each runs exactly one instruction, so a byte
+/// shift writes one byte: the upper three bytes of `D2` have to survive it.
 ///
 /// | case | `D2` in | `D2` asked for | byte shift by 2 gives |
 /// |---|---|---|---|
 /// | `1583` | `$CDFB7FBE` | `$2E5E4304` | `$CDFB7FF8` |
 /// | `1761` | `$417C7E7D` | `$6461D390` | `$417C7EF4` |
 ///
-/// Neither requested value is even a shift of the value it starts from
-/// (`$2E5E4304 >> 2` is `$0B9790C1`, not `$CDFB7FBE`), so the initial and final
-/// snapshots of these two cases do not belong to each other. They are the only
-/// two such cases in the 193,560 register-form cases of the 24 shift and rotate
-/// files, and they are the only cases in the whole group that ask a byte or word
-/// instruction to change the bits above the byte or word it names.
+/// Each requested value is not a shift of the value it starts from, and each
+/// recorded final *is* a correct `ASL.B #2` — data and all five condition codes
+/// — of some other register: `$2E5E4341 << 2` is `$2E5E4304` with `N=0 Z=0 V=1
+/// C=X=1`, and `$6461D364 << 2` is `$6461D390` with `N=1 Z=0 V=1 C=X=1`, exactly
+/// the `final.sr` of the two cases. So the snapshots are individually plausible
+/// but do not belong to each other, which no emulator behaviour can fix.
+///
+/// They are the only two cases in the 177,314 register-form cases of the 24
+/// shift and rotate files (193,560 cases in all) that ask a byte or word
+/// instruction to change the destination's bits above its own width, and the
+/// same file runs `ASL.B #2,D2` on both `initial.d2` values two cases earlier
+/// (`... 1341`, `... 1722`) recording the results we compute.
 ///
 /// So `asl_b_file_passes` runs `ASL.b` with these two cases dropped. That is a
 /// hole in the coverage of one file, not a weakening of a rule: every other case
-/// of `ASL.b`, including every other `$E502` case, is checked.
+/// of `ASL.b`, including every other `$E502` case, is checked, and the
+/// whole-suite run (`singlestep.rs`'s `all_instructions`) still reports the
+/// shortfall.
 const ASL_B_BROKEN_CASES: [&str; 2] = ["e502 [ASL.b Q, D2] 1583", "e502 [ASL.b Q, D2] 1761"];
 
 /// Every case of `ASL.b` except [`ASL_B_BROKEN_CASES`].

@@ -414,6 +414,31 @@ mod tests {
         );
     }
 
+    /// `LSR` is the logical half of the same width boundary, and the right-hand
+    /// half: `LSx` of more than the width is zero with `C` and `X` clear, while
+    /// `LSR.B` by exactly the width still carries the operand's own top bit out.
+    #[test]
+    fn a_logical_right_shift_past_its_width_is_zero_with_no_carry() {
+        let (value, flags) = run(by(8, false, 0b00, 0b01), 0, 0x80, 0);
+        assert_eq!(value, 0x00, "LSR.B #8 of $80 is zero");
+        assert_eq!(
+            flags,
+            SR_Z | SR_C | SR_X,
+            "and its own top bit is the last thing out"
+        );
+
+        let (value, flags) = run(by_d1(false, 0b00, 0b01), 9, 0x80, SR_X);
+        assert_eq!(value, 0x00, "LSR.B #9 of $80 is zero too");
+        assert_eq!(
+            flags, SR_Z,
+            "but the ninth place moved a zero, and that clears C and X"
+        );
+
+        let (value, flags) = run(by_d1(false, 0b10, 0b01), 40, 0x8000_0001, SR_X);
+        assert_eq!(value, 0, "LSR.L #40 of $80000001 is zero");
+        assert_eq!(flags, SR_Z, "with both C and X clear");
+    }
+
     /// A left shift past the width is zero with no carry; `V` keeps whatever the
     /// places that *did* move signed did.
     #[test]
