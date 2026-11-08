@@ -236,9 +236,10 @@ mod tests {
 
     /// Mode `001` inside the `$0000` group is `MOVEP`, not a bit operation:
     /// `MOVEP.L D0,(A0)` is `$0108`, whose EA field is exactly the field
-    /// `BTST D0,(A0)` would use. `MOVEP` is M1-25 (#33), so the whole mode `001`
-    /// column of this group stays unclaimed here (M68000PM/AD section 8,
-    /// "MOVEP — Move to/from Peripheral Device"; the ticket's own example).
+    /// `BTST D0,(A0)` would use. MOVEP landed with M1-25 (#33), so the mode `001`
+    /// column of this group is now claimed by `Op::Movep` and is still never a
+    /// bit operation (M68000PM/AD section 8, "MOVEP — Move to/from Peripheral
+    /// Device"; the ticket's own example).
     #[test]
     fn ea_001_is_not_bitop() {
         for tt in [BTST, BCHG, BCLR, BSET] {
@@ -249,15 +250,15 @@ mod tests {
                     let opcode = dynamic(bit_reg, tt, AN, reg);
                     assert_eq!(
                         decode(opcode),
-                        Op::Unimplemented,
-                        "${opcode:04X}: An direct in the bit-op group is MOVEP (M1-25)"
+                        Op::Movep,
+                        "${opcode:04X}: An direct in the bit-op group is MOVEP (#33)"
                     );
                 }
             }
         }
-        // The static form's mode `001` is not MOVEP — MOVEP has bit 8 set — but
-        // it is unassigned on the 68000 too, so it stays unclaimed until MOVEP's
-        // ticket has been through this group.
+        // The static form's mode `001` is not MOVEP — MOVEP has bit 8 set — and
+        // it is unassigned on the 68000, so it is the one encoding of this column
+        // that stays unclaimed.
         assert_eq!(
             decode(static_(BTST, AN, 0)),
             Op::Unimplemented,

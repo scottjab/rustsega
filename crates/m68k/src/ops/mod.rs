@@ -44,6 +44,7 @@ mod flow;
 mod logic;
 mod move_;
 mod movem;
+mod movep;
 mod muldiv;
 mod shift;
 
@@ -166,6 +167,9 @@ impl M68k {
             // shares the `$48??` window with SWAP/EXT/PEA/NBCD and takes the whole
             // top half of `$4C??` to itself (see [`movem`]).
             Op::Movem => self.op_movem(bus, opcode),
+            // `MOVEP` (`0000 ddd 1 oo 001 aaa`), the every-other-byte move that
+            // owns mode `001` of the `$0000` group (see [`movep`]).
+            Op::Movep => self.op_movep(bus, opcode),
             Op::Link => self.op_link(bus, opcode),
             Op::Unlk => self.op_unlk(bus, opcode),
             // The branch/condition group: `0110 cccc dddddddd` (`Bcc`, `BRA`,
