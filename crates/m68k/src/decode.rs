@@ -65,7 +65,7 @@
 //! as it lands — the pattern has to say which field of the opcode is the EA
 //! field, which is only knowable per instruction.
 
-use crate::ea::{Size, is_data, is_data_alterable};
+use crate::ea::{Size, is_control, is_data, is_data_alterable};
 use std::sync::OnceLock;
 
 /// What a decoded opcode means: which handler runs, or why none can.
@@ -239,7 +239,7 @@ pub enum Op {
     Ext,
     /// `SWAP Dn`, `$4840 + r` (M68000UM SWAP, #22). The other instruction that
     /// bit 6 of the `$48??` window leaves free, and the one place a `Dn`-only
-    /// opcode lives next to `PEA` and `MOVEM` — see [`classify_swap_ext`].
+    /// opcode lives next to `PEA` and `MOVEM` — see [`classify_swap_ext_pea`].
     Swap,
     /// `EXG Rx,Ry`: `1100 xxx 1 ooooo yyy` (M68000UM EXG, #22). The slot
     /// #21 reserved inside AND's group: operation `101` at mode `000` (`Dx,Dy`)
@@ -247,6 +247,25 @@ pub enum Op {
     /// operands are registers, so there is no EA to validate, and no flag is
     /// affected.
     Exg,
+    /// `LEA <ea>,An`, `$4000 + ddd<<9 + 0b111<<6 + <ea>` — the `0100` group's
+    /// opcodes with bits 8..6 all set (M68000UM "LEA — Address Register Indirect
+    /// and Program", M1-15, #23). The destination is always an address register
+    /// and the source is the *address* the EA field computes, so only the control
+    /// modes of [`crate::ea::is_control`] are legal and no flag is affected.
+    Lea,
+    /// `PEA <ea>`: PEA's half of the `$48??` window, `$4840 + <ea>` at a control
+    /// mode (M68000UM "PEA — Push Effective Address", M1-15, #23). [`Op::Lea`]'s
+    /// operand rule with the result pushed onto the stack instead of written to a
+    /// register; see [`classify_swap_ext_pea`] for how the window splits.
+    Pea,
+    /// `LINK An,d16`, `$4E50 + r` (M68000UM "LINK — Link Address Register",
+    /// M1-15, #23). Push `An`, make `An` point at what it pushed, then move the
+    /// stack pointer over `d16` of local space: one extension word, no EA field.
+    Link,
+    /// `UNLK An` — `UNLINK` in the manual and in the suite's file name —
+    /// `$4E58 + r` (M68000UM "UNLINK — Unlink Address Register", M1-15, #23).
+    /// The one-word teardown of [`Op::Link`].
+    Unlk,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -318,6 +337,12 @@ fn classify(opcode: u16) -> Op {
         // `4E40 + n`: sixteen traps, all of them one word. `$4E40..=$4E4F` is
         // the whole group, so no operand field has to be read to know it.
         0x4E40..=0x4E4F => Op::Trap,
+        // `0100 1110 0101 0nnn` and `0100 1110 0101 1nnn`: LINK and UNLK sit next
+        // to each other above the traps, and `r` is their only operand
+        // (M68000UM LINK, UNLINK). `$4E60..=$4E6F` between them and RESET is
+        // unassigned, so the two ranges stop where they do.
+        0x4E50..=0x4E57 => Op::Link,
+        0x4E58..=0x4E5F => Op::Unlk,
         // The three move groups: `00ss` with `ss` = `01` byte, `10` long,
         // `11` word. `$0000..=$0FFF` is *not* a move — `ss` = `00` is the
         // ORI/BTST/MOVEP group — so the range starts at `$1000`.
@@ -370,12 +395,20 @@ fn classify(opcode: u16) -> Op {
         0x4000..=0x40BF => classify_single_operand(opcode, Op::Negx),
         0x4200..=0x42BF => classify_single_operand(opcode, Op::Clr),
         0x4400..=0x44BF => classify_single_operand(opcode, Op::Neg),
-        // `0100 1000 0s 000 rrr` is SWAP and `0100 1000 1s 000 rrr` is EXT;
-        // every other opcode of the `$4800..=$48FF` window belongs to PEA
-        // (M1-15) or MOVEM (M1-24) and stays unimplemented, so this window is
-        // the one place a group is entered whole and then split by EA field —
-        // see [`classify_swap_ext`] and #22.
-        0x4800..=0x48FF => classify_swap_ext(opcode),
+        // `0100 ddd 111 eeeeee`: LEA. It is the reason TST, NOT, NEGX, CLR and
+        // NEG above stop at `??BF` instead of taking their whole `$xx00` block —
+        // bits 8..6 all set is LEA's, and nothing else in the `0100` group uses
+        // that triple (M68000UM LEA, and the instruction-set summary that lists
+        // `CHK` as `00`, `JMP` as `100` and `JSR` as `110` there). The eighth of
+        // the group, `$4800..=$48FF`, is bit 8 clear throughout, so LEA cannot
+        // reach SWAP, EXT, PEA or MOVEM.
+        0x4000..=0x4FFF if lea_bits(opcode) => classify_lea(opcode),
+        // `0100 1000 0100 0 rrr` is SWAP, `0100 1000 1s 000 rrr` is EXT and
+        // `0100 1000 01 mmm rrr` (`mmm` != `000`) is PEA; the rest of the
+        // `$4800..=$48FF` window is MOVEM (M1-24, #32) and unassigned space, so
+        // this window is the one place a group is entered whole and then split by
+        // EA field — see [`classify_swap_ext_pea`], #22 and #23.
+        0x4800..=0x48FF => classify_swap_ext_pea(opcode),
         // `0000 0000 ss eeeeee`, `0000 0010 ss eeeeee` and `0000 1010 ss eeeeee`:
         // ORI, ANDI and EORI, the three `#imm,<ea>` logic operations. Bit 8 is
         // clear throughout all three ranges, which is what keeps them apart from
@@ -864,44 +897,87 @@ fn classify_single_operand(opcode: u16, op: Op) -> Op {
     op
 }
 
-/// One opcode of the `$4800..=$48FF` window: [`Op::Swap`], [`Op::Ext`], or
-/// [`Op::Unimplemented`] for PEA and MOVEM (M68000UM SWAP, EXT, PEA, MOVEM;
-/// #22).
+/// Bits 8..6 of a `0100`-group opcode: set all three and it is
+/// `LEA <ea>,An`, `0100 ddd 111 eeeeee` (M68000UM "LEA — Address Register
+/// Indirect and Program"). Every other member of the group — NEGX, CLR, NEG,
+/// NOT, TST, SWAP, EXT, PEA, TAS, CHK, MOVEM, MOVE, JSR, JMP and the traps —
+/// leaves at least one of the three clear, which is what lets the single-operand
+/// ranges in [`classify`] stop at `??BF`; `LEA.json.gz` is the only suite file
+/// with an opcode of the shape.
+const fn lea_bits(opcode: u16) -> bool {
+    (opcode >> 6) & 0b111 == 0b111
+}
+
+/// One opcode of the `LEA` set: [`Op::Lea`] or [`Op::Illegal`] (M68000UM LEA,
+/// M1-15, #23).
 ///
-/// The window holds four instructions, and only two of them are here:
+/// `LEA` takes only the *control* addressing modes — `(An)`, `d16(An)`,
+/// `d8(An,Xn)`, `abs.W`, `abs.L`, `d16(PC)`, `d8(PC,Xn)`. `Dn`, `An`, `(An)+`,
+/// `-(An)` and `#imm` are not encodings of it, so `$41C8` (`LEA A0,A0`) and
+/// `$41D8` (`LEA (A0)+,A0`) are illegal instructions, and the 68010's extension
+/// of `LEA` to postincrement is not this core's business. `LEA.json.gz` runs
+/// exactly the 224 opcodes this admits (8 destinations x 28 control modes) and
+/// `PEA.json.gz` exactly the 28 that [`classify_swap_ext_pea`] takes.
+fn classify_lea(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if is_control(mode, reg) {
+        Op::Lea
+    } else {
+        Op::Illegal
+    }
+}
+
+/// One opcode of the `$4800..=$48FF` window: [`Op::Swap`], [`Op::Ext`],
+/// [`Op::Pea`], or [`Op::Unimplemented`] for MOVEM (M68000UM SWAP, EXT, PEA,
+/// MOVEM; #22, and PEA for M1-15, #23).
+///
+/// The window holds four instructions:
 ///
 /// ```text
-/// SWAP    0100 1000 0100 0 rrr      this ticket
-/// EXT     0100 1000 1s 00 0 rrr     this ticket (`s` = 0 word, 1 long)
-/// PEA     0100 1000 0dd mmm rrr     M1-15 (#23),  with mmm != 000
-/// MOVEM   0100 1000 1mmm mmm rrr    M1-24 (#32),   with mmm != 000
+/// SWAP    0100 1000 0100 0 rrr      this window, mode `000` with bit 6 set
+/// EXT     0100 1000 1s 00 0 rrr     this window, mode `000` with bit 7 set
+/// PEA     0100 1000 01 mmm rrr     M1-15 (#23), mode != `000`
+/// MOVEM   0100 1000 1mmm mmm rrr    M1-24 (#32),   mode != `000`
 /// ```
 ///
 /// So the EA mode field is what separates them, and it cannot be ignored: bit 7
 /// splits the window into PEA's half and MOVEM's half, and in each half the mode
-/// bits are the instruction's own operand field only while they are zero.
-/// Reading the suite's own opcodes makes that concrete — `PEA.json.gz` uses
-/// `$4850`..`$4857`, `$4868`..`$486F`, `$4870`..`$487B` and `MOVEM.w`/`MOVEM.l`
-/// use `$4890`..`$48F9`, while SWAP and EXT are exactly `$4840`..`$4847`,
+/// bits are the instruction's own operand field only in PEA's half. Reading the
+/// suite's own opcodes makes that concrete — `PEA.json.gz` uses `$4850`..`$4857`,
+/// `$4868`..`$486F` and `$4870`..`$487B`, exactly the control modes of `$4840` +
+/// EA; `MOVEM.w`/`MOVEM.l` use `$4890`..`$48F9`, where those same bits are a
+/// register list; and SWAP and EXT are exactly `$4840`..`$4847`,
 /// `$4880`..`$4887` and `$48C0`..`$48C7`. Claiming the window whole would have
-/// made `PEA.L (A0)` (`$48D0` is `MOVEM.L`) execute as an EXT.
+/// made `$48D0` (`MOVEM.L`) execute as a PEA.
 ///
-/// `$4800`..`$4807` — bit 7 clear, bit 6 clear, mode `000` — is left
-/// unimplemented rather than called illegal: it is PEA with an undefined
-/// destination, and undefined encodings stay loud until their ticket rules on
-/// them (as `$4AFC`, the one documented `ILLEGAL`, is handled separately).
-fn classify_swap_ext(opcode: u16) -> Op {
+/// PEA takes the same control modes `LEA` does (see [`classify_lea`]), so
+/// `$4848` (`PEA A0`), `$4858` (`PEA (A0)+`) and `$487C` (`PEA #imm`) are illegal
+/// instructions rather than unimplemented opcodes, exactly as an illegal mode in
+/// any other instruction's EA field is.
+///
+/// `$4800`..`$483F` — bit 7 clear, bit 6 clear — is unassigned on the 68000: PEA
+/// needs bit 6 set, and all 28 of its opcodes in `PEA.json.gz` have it. Those
+/// stay unimplemented rather than called illegal, as `$4AFC` — the one documented
+/// `ILLEGAL` — is handled separately.
+fn classify_swap_ext_pea(opcode: u16) -> Op {
     let mode = ((opcode >> 3) & 0b111) as u8;
-    if mode != 0 {
-        // A nonzero mode is PEA's `dd`/mode field or MOVEM's register list.
-        return Op::Unimplemented;
-    }
+    let reg = (opcode & 0b111) as u8;
     if opcode & SWAP_EXT_BIT7 != 0 {
-        Op::Ext
-    } else if opcode & SWAP_BIT6 != 0 {
-        Op::Swap
-    } else {
+        // MOVEM's half: only EXT lives here today, and only at mode `000`.
+        if mode == 0 {
+            Op::Ext
+        } else {
+            Op::Unimplemented
+        }
+    } else if opcode & SWAP_BIT6 == 0 {
         Op::Unimplemented
+    } else if mode == 0 {
+        Op::Swap
+    } else if is_control(mode, reg) {
+        Op::Pea
+    } else {
+        Op::Illegal
     }
 }
 
@@ -1019,6 +1095,72 @@ mod tests {
         assert_eq!(decode(0xE0C0), Op::Unimplemented, "ASR.W D0");
     }
 
+    /// The EA modes `LEA` and `PEA` address, written out from M68000UM's mode
+    /// list for the two instructions — `(An)`, `d16(An)`, `d8(An,Xn)`, `abs.W`,
+    /// `abs.L`, `d16(PC)`, `d8(PC,Xn)` — rather than by calling the production
+    /// [`is_control`], so these tests check that rule instead of restating it.
+    fn addresses(mode: u8, reg: u8) -> bool {
+        matches!(mode, 0b010 | 0b101 | 0b110) || (mode == 0b111 && reg <= 0b011)
+    }
+
+    /// `LINK An,d16` and `UNLK An` (`$4E50 + r` and `$4E58 + r`, M68000UM LINK,
+    /// UNLINK; M1-15, #23): the two slots above the traps, and nothing else.
+    #[test]
+    fn link_and_unlk_decode() {
+        assert_range_decodes_to(0x4E50..=0x4E57, Op::Link);
+        assert_range_decodes_to(0x4E58..=0x4E5F, Op::Unlk);
+        assert_eq!(decode(0x4E4F), Op::Trap, "TRAP #15, just below");
+        assert_eq!(decode(0x4E60), Op::Unimplemented, "unassigned, just above");
+    }
+
+    /// `LEA <ea>,An` is exactly the 224 opcodes `0100 ddd 111 mmm rrr` at a mode
+    /// it can address (M68000UM LEA; M1-15, #23). 224 = eight destinations times
+    /// the 28 control modes, which is also every opcode `LEA.json.gz` runs.
+    ///
+    /// Stated over the whole `$4000..=$4FFF` group, because that is where the
+    /// risk is: `LEA` shares the group with NEGX, CLR, NEG, NOT, TST, SWAP, EXT,
+    /// PEA, MOVEM, CHK, TAS, JSR and the `ILLEGAL` opcode, and the only thing
+    /// telling them apart is bits 8..6 plus the mode field. The `!= Op::Lea`
+    /// half of the assertion is what keeps #19, #32 and #36's opcodes out of it.
+    #[test]
+    fn lea_is_exactly_its_own_opcodes() {
+        let mut lea = 0;
+        for opcode in 0x4000u16..=0x4FFF {
+            let mode = ((opcode >> 3) & 0b111) as u8;
+            let reg = (opcode & 0b111) as u8;
+            let shape = opcode & 0x1C0 == 0x1C0;
+            let want = shape && addresses(mode, reg);
+            assert_eq!(decode(opcode) == Op::Lea, want, "LEA? ${opcode:04X}");
+            if shape && !addresses(mode, reg) {
+                assert_eq!(
+                    decode(opcode),
+                    Op::Illegal,
+                    "mode {mode:b} {reg:b} is no address to take, and bits 8..6 say LEA"
+                );
+            }
+            lea += u8::from(want);
+        }
+        assert_eq!(lea, 224, "eight destinations x 28 addressable modes");
+    }
+
+    /// `PEA <ea>` is exactly the 28 opcodes `0100 1000 01 mmm rrr` at a mode it
+    /// can address — bit 6 set, bit 7 clear — and so neither SWAP/EXT (mode
+    /// `000`) nor MOVEM (bit 7) nor the unassigned `$4800`..`$483F` (M68000UM
+    /// PEA; M1-15, #23). See [`swap_ext_and_pea_decode_and_leave_movem_alone`].
+    #[test]
+    fn pea_is_exactly_its_own_opcodes() {
+        let mut pea = 0;
+        for opcode in 0x4800u16..=0x48FF {
+            let mode = ((opcode >> 3) & 0b111) as u8;
+            let reg = (opcode & 0b111) as u8;
+            let shape = opcode & 0x1C0 == 0x040;
+            let want = shape && addresses(mode, reg);
+            assert_eq!(decode(opcode) == Op::Pea, want, "PEA? ${opcode:04X}");
+            pea += u8::from(want);
+        }
+        assert_eq!(pea, 28, "the opcode count PEA.json.gz covers");
+    }
+
     /// `$4AFC` is `ILLEGAL` (M68000PM/AD section 8).
     #[test]
     fn illegal_opcode() {
@@ -1046,7 +1188,10 @@ mod tests {
         // NOP in the `$4E` group.
         assert_range_decodes_to(0x4E40..=0x4E4F, Op::Trap);
         assert_eq!(decode(0x4E3F), Op::Unimplemented, "just below the traps");
-        assert_eq!(decode(0x4E50), Op::Unimplemented, "just above the traps");
+        // LINK (`$4E50`..`$4E57`) and UNLK (`$4E58`..`$4E5F`) are above the traps
+        // now (#23), so the anchor moves to the first unassigned opcode after
+        // them — `$4E60`..`$4E6F`, between UNLK and RESET.
+        assert_eq!(decode(0x4E60), Op::Unimplemented, "just above UNLK");
         // `$0000` was ORI until #21 implemented it (see
         // `ori_andi_eori_decode_and_leave_ccr_sr_alone`); `$0100` is BTST,
         // the bit-test half of the same `$0000` group that M1-14 (#22) owns.
@@ -1922,17 +2067,18 @@ mod tests {
     }
 
     /// The `$48??` window is SWAP, EXT, PEA and MOVEM (M68000UM SWAP, EXT, PEA,
-    /// MOVEM; M1-14, #22), and what separates them is the EA mode field: mode
-    /// `000` is SWAP (bit 7 clear) or EXT (bit 7 set, bit 6 the size), and every
-    /// other mode belongs to PEA or MOVEM and stays [`Op::Unimplemented`].
+    /// MOVEM; M1-14 #22 and M1-15 #23), and what separates them is the EA mode
+    /// field: mode `000` is SWAP (bit 7 clear) or EXT (bit 7 set, bit 6 the
+    /// size), a control mode with bit 7 clear is PEA, and anything else is MOVEM
+    /// and stays [`Op::Unimplemented`].
     ///
     /// The PEA and MOVEM opcodes below are read off the pinned suite, not
-    /// invented: `PEA.json.gz` runs `$4850`..`$4857` and `$4868`..`$486F`,
-    /// `MOVEM.w.json.gz` runs `$4890`.. and `MOVEM.l.json.gz` runs `$48D0`.., so
-    /// this test is what stops SWAP and EXT from swallowing the first opcode of
-    /// M1-15 (#23) and M1-24 (#32) along the way.
+    /// invented: `PEA.json.gz` runs `$4850`..`$4857`, `$4868`..`$486F` and
+    /// `$4870`..`$487B`, `MOVEM.w.json.gz` runs `$4890`.. and `MOVEM.l.json.gz`
+    /// runs `$48D0`.., so this test is what stops SWAP, EXT and now PEA from
+    /// swallowing the first opcode of M1-24 (#32) along the way.
     #[test]
-    fn swap_and_ext_decode_and_leave_pea_and_movem_alone() {
+    fn swap_ext_and_pea_decode_and_leave_movem_alone() {
         for (opcode, want, name) in [
             (0x4840u16, Op::Swap, "SWAP D0"),
             (0x4847, Op::Swap, "SWAP D7"),
@@ -1940,14 +2086,20 @@ mod tests {
             (0x4887, Op::Ext, "EXT.W D7"),
             (0x48C0, Op::Ext, "EXT.L D0"),
             (0x48C7, Op::Ext, "EXT.L D7"),
+            // PEA's half of the window at a control mode (#23): `$4840` + the EA
+            // field. These are the opcodes `PEA.json.gz` runs.
+            (0x4850, Op::Pea, "PEA (A0): measured in PEA.json.gz"),
+            (0x4868, Op::Pea, "PEA d16(A0): measured in PEA.json.gz"),
+            (0x487A, Op::Pea, "PEA d16(PC): measured in PEA.json.gz"),
         ] {
             assert_eq!(decode(opcode), want, "{name} (${opcode:04X})");
         }
 
+        // A mode `LEA`/`PEA` cannot address is an illegal instruction, not an
+        // unimplemented opcode: `$4848` is `PEA A0`.
+        assert_eq!(decode(0x4848), Op::Illegal, "mode 001 in PEA's half");
+
         for (opcode, name) in [
-            (0x4850u16, "PEA (A0): measured in PEA.json.gz"),
-            (0x4868, "PEA d16(A0): measured in PEA.json.gz"),
-            (0x4848, "mode 001 in SWAP’s half of the window"),
             (0x4890, "MOVEM.W #reglist,(A0): measured in MOVEM.w.json.gz"),
             (
                 0x48A0,
@@ -1955,11 +2107,12 @@ mod tests {
             ),
             (0x48D0, "MOVEM.L #reglist,(A0): measured in MOVEM.l.json.gz"),
             (0x4CC0, "MOVEM.L #reglist,-(A0) in the $4C half"),
-            (
-                0x4800,
-                "SWAP’s half with mode 000 and bit 6 clear: PEA with no destination",
-            ),
-            (0x4807, "the same, at A7"),
+            // Bit 6 clear, bit 7 clear: unassigned on the 68000. PEA is
+            // `0100 1000 01 mmm rrr`, so `$4800` is not `PEA` with a missing
+            // destination, and it stays loudly unimplemented rather than
+            // illegal.
+            (0x4800, "unassigned: bit 6 and bit 7 clear"),
+            (0x4807, "the same, at r=7"),
         ] {
             assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
         }
