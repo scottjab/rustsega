@@ -244,7 +244,7 @@ mod tests {
     /// [`M68k::set_sr`] so the stack pointers are where a real CPU would have
     /// left them.
     fn run_with_sr(opcode: u16, rest: &[u16], sr: u16) -> (M68k, TestBus) {
-        let (mut cpu, mut bus) = run(opcode, rest);
+        let (mut cpu, bus) = run(opcode, rest);
         cpu.set_sr(sr);
         (cpu, bus)
     }
@@ -350,7 +350,11 @@ mod tests {
         let (mut cpu, mut bus) = run(0x44FC, &[0x1234, 0x4E71]); // MOVE.W #$1234,CCR
         cpu.sr = RESET_SR | ALL_FLAGS;
         cpu.step(&mut bus);
-        assert_eq!(cpu.ccr(), 0x04, "0x1234 & 0x1F is Z");
+        assert_eq!(
+            cpu.ccr(),
+            SR_X | SR_Z,
+            "the low five bits of $1234 are X and Z ($34 & $1F = $14)"
+        );
         assert_eq!(
             cpu.sr & !u16::from(CCR_MASK),
             RESET_SR & !CCR_MASK,
@@ -380,8 +384,9 @@ mod tests {
     /// and `A7` never became the USP.
     #[test]
     fn move_to_sr_user_mode_privilege_violation() {
-        let (mut cpu, mut bus) = run_with_sr(0x467C, &[0x2700, 0x4E71], RESET_SR & !SR_S);
-        // MOVE.W #$2700,SR in user mode.
+        let (mut cpu, mut bus) = run_with_sr(0x46FC, &[0x0000, 0x4E71], RESET_SR & !SR_S);
+        // MOVE #0,SR in user mode: allowed, it would clear S *and* the mask, so a
+        // written SR is distinguishable from the SR the exception entry leaves.
         bus.write_long(u32::from(EXC_PRIVILEGE) * 4, MEM);
         cpu.set_active_sp(USER_SP);
 
@@ -392,7 +397,10 @@ mod tests {
         assert!(cpu.is_supervisor(), "the exception entered supervisor mode");
         assert_eq!(cpu.ssp, STACK_TOP - 6, "only the exception frame moved");
         assert_eq!(cpu.usp, USER_SP, "the operand was never resolved on the USP");
-        assert_eq!(cpu.sr, RESET_SR & !SR_S, "the denied write did not happen");
+        // The entry sets S (see `crate::exceptions::M68k::exception`), so the most
+        // SR can be after a denied write is `RESET_SR`: mask 7, T clear, and none
+        // of the operand's bits.
+        assert_eq!(cpu.sr, RESET_SR, "the denied write did not happen");
     }
 
     /// `MOVE #imm,SR` is the one way to leave supervisor mode: `S` clears and
@@ -400,7 +408,7 @@ mod tests {
     /// and section 1 "User Stack Pointer").
     #[test]
     fn move_to_sr_clears_s_and_switches_stack() {
-        let (mut cpu, mut bus) = run(0x467C, &[0x001F, 0x4E71]); // MOVE.W #$001F,SR
+        let (mut cpu, mut bus) = run(0x46FC, &[0x001F, 0x4E71]); // MOVE #$001F,SR
         let usp_before = 0x0000_8000;
         cpu.usp = usp_before;
 
@@ -501,7 +509,9 @@ mod tests {
             cpu.set_active_sp(USER_SP);
             cpu.step(&mut bus);
             assert_eq!(cpu.pending_exception, Some(EXC_PRIVILEGE), "${opcode:04X}");
-            assert_eq!(cpu.sr, RESET_SR & !SR_S, "${opcode:04X} wrote anyway");
+            // The S bit the exception entry sets is the only difference from the
+            // user-mode SR, so the operand never reached SR.
+            assert_eq!(cpu.sr, RESET_SR, "${opcode:04X} wrote anyway");
             assert_eq!(cpu.usp, USER_SP, "${opcode:04X} read the operand");
             assert_eq!(cpu.ssp, STACK_TOP - 6, "${opcode:04X} frame");
         }
@@ -527,7 +537,7 @@ mod tests {
         assert_eq!(cpu.a[2], 0x0000_7F00);
 
         // `MOVE USP,A7` in supervisor mode moves the SSP and leaves the USP.
-        let (mut cpu, mut bus) = run(0x4E67, &[0x4E71]); // MOVE USP,A7
+        let (mut cpu, mut bus) = run(0x4E6F, &[0x4E71]); // MOVE USP,A7
         cpu.usp = 0x0000_7F00;
         cpu.step(&mut bus);
         assert_eq!(cpu.ssp, 0x0000_7F00);
