@@ -133,6 +133,14 @@ impl M68k {
             Op::Pea => self.op_pea(bus, opcode),
             Op::Link => self.op_link(bus, opcode),
             Op::Unlk => self.op_unlk(bus, opcode),
+            // The branch/condition group: `0110 cccc dddddddd` (`Bcc`, `BRA`,
+            // `BSR`) and the mode-`001` split of `0101 cccc 11 eeeeee` (`DBcc`,
+            // `Scc`). They share one condition-code test, so they share a module
+            // (see [`address`], [`flow`]).
+            Op::Bcc => self.op_bcc(bus, opcode),
+            Op::Bsr => self.op_bsr(bus, opcode),
+            Op::Scc => self.op_scc(bus, opcode),
+            Op::Dbcc => self.op_dbcc(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming

@@ -266,6 +266,26 @@ pub enum Op {
     /// `$4E58 + r` (M68000UM "UNLINK — Unlink Address Register", M1-15, #23).
     /// The one-word teardown of [`Op::Link`].
     Unlk,
+    /// `Bcc d8`/`Bcc d16`, and `BRA` as its `cccc` = `0000` case: the whole
+    /// `0110` group except condition code `0001`, which is [`Op::Bsr`]
+    /// (M68000UM Format VI, "Bcc — Branch Conditional", M1-16, #24). The
+    /// condition code and the displacement are both re-read from the opcode,
+    /// and a zero byte displacement means a displacement word follows.
+    Bcc,
+    /// `BSR d8`/`BSR d16`: `0110 0001 dddddddd`, `Bcc` with condition code
+    /// `0001` and a long push of the return address first (M68000UM "BSR —
+    /// Branch to Subroutine", M1-16, #24). `RTS` is #33's, not this ticket's.
+    Bsr,
+    /// `Scc <ea>` — `0101 cccc 11 eeeeee` at every EA mode but `001`, which is
+    /// [`Op::Dbcc`] (M68000UM Format V, "Scc — Set Conditional", M1-16, #24).
+    /// Writes `$FF` when [`crate::sr::test_cc`] says the condition holds and
+    /// `$00` when it does not; byte only.
+    Scc,
+    /// `DBcc Dn,d16` — `0101 cccc 11 001 rrr`, the mode-`001` sixth of
+    /// [`Op::Scc`]'s opcode (M68000UM "DBcc — Decrement and Branch", M1-16,
+    /// #24). The `rrr` is the loop counter, and the `eeeeee` that would be the
+    /// EA is the first bits of the displacement word instead.
+    Dbcc,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -362,16 +382,24 @@ fn classify(opcode: u16) -> Op {
         // `0000 1100 ss eeeeee`: `CMPI` is the third instruction of that shape,
         // after SUBI at `$0400` and ADDI at `$0600`.
         0x0C00..=0x0CFF => classify_cmpi(opcode),
-        // `0101 ddd 0 ss eeeeee` is ADDQ and `0101 ddd 1 ss eeeeee` is SUBQ;
-        // bit 8 set with `ss` = `11` is Scc/DBcc, which stays unimplemented for
-        // the branch ticket.
+        // `0101 ddd 0 ss eeeeee` is ADDQ and `0101 ddd 1 ss eeeeee` is SUBQ —
+        // unless `ss` = `11`, which is not a size: `ss` = `11` is Format V,
+        // `Scc`/`DBcc`, and it takes both halves of bit 8 because there the bit
+        // is the low bit of the condition code (M68000UM Format V; M1-16, #24).
         0x5000..=0x5FFF => {
-            if opcode & QUICK_BIT8 == 0 {
+            if opcode & SCC_DBCC_BITS == SCC_DBCC_BITS {
+                classify_scc_dbcc(opcode)
+            } else if opcode & QUICK_BIT8 == 0 {
                 classify_addq(opcode)
             } else {
                 classify_subq(opcode)
             }
         }
+        // `0110 cccc dddddddd`: the whole branch group. The low byte is a
+        // displacement and not an effective address, so no opcode of the group is
+        // an illegal operand combination — see [`classify_bcc`] (M68000UM Format
+        // VI; M1-16, #24).
+        0x6000..=0x6FFF => classify_bcc(opcode),
         // `1101 ddd ooo eeeeee`: ADD, ADDA and ADDX.
         0xD000..=0xDFFF => classify_add(opcode),
         // `1001 ddd ooo eeeeee`: SUB, SUBA and SUBX.
@@ -648,9 +676,58 @@ fn classify_subi(opcode: u16) -> Op {
     Op::Subi
 }
 
-/// One opcode of the `0101` group with bit 8 set: [`Op::Subq`], or
-/// [`Op::Unimplemented`] for the `Scc`/`DBcc` encodings (bit 8 set with
-/// `ss` = `11`, M68000UM Format V), which the branch ticket owns.
+/// `0101 cccc 11 eeeeee`: bits 7..6 of Format V set, which is how the `0101`
+/// group's `ss` = `11` sixth is recognised before `ADDQ`/`SUBQ` get to read it as
+/// a size (M68000UM Format V; M1-16, #24).
+const SCC_DBCC_BITS: u16 = 0x00C0;
+
+/// The `Scc` EA mode that is not an effective address: `DBcc`'s register field
+/// (`0101 cccc 11 001 rrr`, M68000UM "DBcc"). `ADDQ`'s `AN_DIRECT_MODE` happens to
+/// be the same number and means something completely different there.
+const DBCC_MODE: u8 = 0b001;
+
+/// The condition code `0001` — false — which in the branch group is the opcode
+/// that pushes: `BSR` (M68000UM "BSR").
+const BSR_CC: u16 = 0b0001;
+
+/// One opcode of Format V, `0101 cccc 11 eeeeee`: [`Op::Dbcc`] where the EA mode
+/// is `001` and [`Op::Scc`] everywhere else.
+///
+/// The split is the whole of the distinction between the two instructions: for
+/// `DBcc` the `eee` register field is the loop counter and the remaining `eee`
+/// bits are the top of a 16-bit displacement, so no `DBcc` opcode carries an
+/// effective address and none can be illegal (M68000UM "DBcc", "Scc"). `Scc`
+/// does write memory, so it takes the usual destination rule — it is a byte
+/// write, exactly `CLR`'s (#22).
+fn classify_scc_dbcc(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if mode == DBCC_MODE {
+        return Op::Dbcc;
+    }
+    if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    Op::Scc
+}
+
+/// One opcode of Format VI, `0110 cccc dddddddd`: [`Op::Bsr`] for condition code
+/// `0001` and [`Op::Bcc`] for the other fifteen, `0000` (`BRA`) included —
+/// `BRA` is not a separate instruction on the 68000, which is why `Bcc.json.gz`
+/// contains it 512 times (M68000UM "BRA — Branch", "Bcc — Branch Conditional";
+/// M1-16, #24).
+fn classify_bcc(opcode: u16) -> Op {
+    if (opcode >> 8) & 0b1111 == BSR_CC {
+        Op::Bsr
+    } else {
+        Op::Bcc
+    }
+}
+
+/// One opcode of the `0101` group with bit 8 set: [`Op::Subq`].
+///
+/// `ss` = `11` never reaches it: [`SCC_DBCC_BITS`] takes those to
+/// [`classify_scc_dbcc`] first.
 ///
 /// The rules are `classify_addq`'s: `SUBQ` to an address register always
 /// subtracts 32 bits, so the byte form is not encodable (M68000UM "SUBQ").
@@ -672,10 +749,12 @@ fn classify_subq(opcode: u16) -> Op {
     Op::Subq
 }
 
-/// One opcode of the `0101` group with bit 8 clear: [`Op::Addq`], or
-/// [`Op::Unimplemented`] for the `ss` = `11` encodings, which are neither ADDQ
-/// nor SUBQ and are not claimed by any ticket yet (M68000UM operation-code-map
-/// appendix).
+/// One opcode of the `0101` group with bit 8 clear: [`Op::Addq`].
+///
+/// `ss` = `11` no longer reaches it — #24 took that sixth of the group to
+/// [`classify_scc_dbcc`] — so the [`Op::Unimplemented`] arm below, which used to be
+/// how those opcodes were reported, is unreachable in practice. It stays because
+/// [`Size::from_bits`] is total over the two bits.
 fn classify_addq(opcode: u16) -> Op {
     let Some(size) = Size::from_bits((opcode >> 6) & 0b11) else {
         return Op::Unimplemented;
@@ -1448,8 +1527,8 @@ mod tests {
             (0x50C0u16, "Scc.T D0 — one bit of the EA below DBcc"),
             (0x51C0, "Scc.F D0 — bit 8 set is still Scc"),
             (0x57D0, "Scc.EQ (A0)"),
-            (0x5F39, "Scc.LE ($0000).L — mode 111, reg 001"),
-            (0x5FC1, "Scc.LE -(A1) — mode 100"),
+            (0x5FF9, "Scc.LE ($0000).L — mode 111, reg 001"),
+            (0x5FE1, "Scc.LE -(A1) — mode 100"),
         ] {
             assert_eq!(decode(opcode), Op::Scc, "{name} (${opcode:04X})");
         }
@@ -1457,10 +1536,10 @@ mod tests {
         // exactly as they are for `CLR` (#22) — and mode `001` never reaches the
         // rule, because `DBcc` took it first.
         for (opcode, name) in [
-            (0x5732u16, "Scc.EQ d16(PC): not a destination"),
-            (0x5734, "Scc.EQ #imm: immediates are source-only"),
+            (0x57FAu16, "Scc.EQ d16(PC): not a destination"),
+            (0x57FC, "Scc.EQ #imm: immediates are source-only"),
             (
-                0x573E,
+                0x57FF,
                 "Scc.EQ with mode 111, reg 111: no such address mode",
             ),
         ] {

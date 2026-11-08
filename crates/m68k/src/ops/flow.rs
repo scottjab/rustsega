@@ -1,7 +1,202 @@
-//! Tests for the branch/condition group (M1-16, #24): `Bcc`/`BRA`, `BSR`,
-//! `DBcc` and `Scc`.
+//! The branch/condition group: `Bcc` and `BRA` (M68000UM Format VI), `BSR`,
+//! and the two halves of Format V, `Scc` and `DBcc` (M1-16, #24).
 //!
-//! The handlers live in the `impl M68k` block below the tests.
+//! All four decide with [`crate::sr::test_cc`] on the condition code in bits
+//! 11..8 of the opcode, which is why they are one module: `BEQ`, `SBEQ` and
+//! `DBEQ` cannot disagree about what Z means.
+//!
+//! # The base a displacement is measured from
+//!
+//! Every branch displacement in this group is added to `pc + 2` — the address of
+//! the displacement itself, which is what [`crate::ea::M68k::ext_addr`] names —
+//! and not to the address of the opcode. For `DBcc` that is not obvious from the
+//! manual's phrasing, so it is measured: all 2005 of `DBcc.json.gz`'s
+//! branch-taking, non-skipped cases want `address of the displacement word +
+//! d16`, and `ops::flow::tests::dbcc_branch_base_is_the_displacement_word` pins
+//! it. `Bcc` and `BSR` use the same base, which the same measurement confirms.
+//!
+//! `pc + 2` is *not* masked to 24 bits, and neither is the target: `pc` is a
+//! 32-bit value that only the bus fetches through a mask, and 907 of
+//! `DBcc.json.gz`'s, 7 of `BSR.json.gz`'s and 4 of `Bcc.json.gz`'s cases end
+//! with a `pc` above `$FFFFFF`. See [`crate::ea`] and #193, which is the same
+//! finding for `LEA`/`PEA`.
+//!
+//! # Timing
+//!
+//! The handlers return 0, like every other handler in this module: the clocks a
+//! branch costs come from the self-charging bus helpers, which is enough to keep
+//! the property the manual cares about — a taken branch refills the queue and so
+//! costs [`crate::M68k::jump_to`]'s 8 clocks, a not-taken one slides the window
+//! for 4. The reference totals (Bcc taken 10, `Bcc.B` not taken 8, `Bcc.W` not
+//! taken 12, BSR 18, DBcc 12/10/14, Scc 4/6 — M68000UM appendix "Instruction
+//! Timing") are M1-31's (#39/#40) to settle, and adding them here on top of the
+//! cycles the queue already charged would only double-count them.
+
+use crate::M68k;
+use crate::bus::Bus;
+use crate::ea::{Ea, Size, sign_extend_byte, sign_extend_word};
+use crate::ops::field;
+use crate::sr::test_cc;
+
+/// Bit positions of the fields the four handlers re-read (M68000UM Formats V and
+/// VI): the condition code is bits 11..8, the EA mode is 5..3 and the EA — or
+/// `DBcc`'s counter — register is 2..0.
+const CC_SHIFT: u32 = 8;
+/// The EA mode field, [`crate::ea::M68k::resolve_ea`]'s first argument.
+const EA_MODE_SHIFT: u32 = 3;
+/// The EA register field, [`crate::ea::M68k::resolve_ea`]'s second argument.
+const EA_REG_SHIFT: u32 = 0;
+
+/// A `Bcc`/`BSR` byte displacement of zero is not a branch to the next
+/// instruction: it is the escape hatch that means a 16-bit displacement word
+/// follows (M68000UM "Bcc — Branch Conditional").
+const WORD_DISPLACEMENT: u8 = 0;
+/// How many bytes wider the instruction is when that word is there, which is how
+/// much further `BSR`'s return address is.
+const WORD_DISPLACEMENT_WIDTH: u32 = 2;
+
+/// The value `Scc` writes when the condition is true: `$FF`, not `$01`
+/// (M68000UM "Scc — Set Conditional": "if condition FALSE, 0; else, all ones").
+const SCC_TRUE: u8 = 0xFF;
+
+/// The value `DBcc`'s counter holds after the decrement that ends the loop, and
+/// the reason the loop does not branch a final time: the counter is a *word*, so
+/// `0 - 1` is `$FFFF` rather than "ran out" (M68000UM "DBcc — Decrement and
+/// Branch": "if result of decrement = $FFFF, do not branch").
+const DBCC_EXPIRED: u16 = 0xFFFF;
+
+impl M68k {
+    /// `Bcc d8`, `Bcc d16`, and `BRA` under them as condition code `0000`
+    /// (M68000UM "Bcc — Branch Conditional", "BRA — Branch Program").
+    ///
+    /// Take the branch and the queue is refilled at `pc + 2 + disp`; leave it and
+    /// the instruction just finishes, having spent the displacement word if there
+    /// was one. Neither moves a flag: `Bcc` reads N, Z, V and C and writes none
+    /// (M68000UM "68000 CCR Affected by Instruction Set").
+    pub(crate) fn op_bcc(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let base = self.branch_base();
+        let (disp, _wide) = self.branch_displacement(bus, opcode);
+
+        if test_cc(condition(opcode), self.sr) {
+            self.jump_to(bus, base.wrapping_add(disp));
+        } else {
+            self.advance_opcode(bus);
+        }
+        0
+    }
+
+    /// `BSR d8`/`BSR d16`, `0110 0001 dddddddd`: `Bcc` with a call attached
+    /// (M68000UM "BSR — Branch to Subroutine").
+    ///
+    /// The pushed long is the address of the *following instruction*, so it is
+    /// `pc + 2` for a byte displacement and `pc + 4` for a word one — the branch
+    /// base plus however wide the displacement was. `RTS` is #33's.
+    pub(crate) fn op_bsr(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let base = self.branch_base();
+        let (disp, wide) = self.branch_displacement(bus, opcode);
+
+        self.push_long(bus, base.wrapping_add(wide));
+        self.jump_to(bus, base.wrapping_add(disp));
+        0
+    }
+
+    /// `Scc <ea>`, `0101 cccc 11 eeeeee` at every mode but `001`
+    /// (M68000UM "Scc — Set Conditional"): `$FF` where the condition holds and
+    /// `$00` where it does not, into a byte-sized operand.
+    ///
+    /// Decode already rejected the modes that cannot be a byte destination
+    /// (#24's split of `0x5000..=0x5FFF`), so `resolve_ea` cannot fail here; the
+    /// `else` is the same belt-and-braces `op_clr` uses.
+    pub(crate) fn op_scc(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let reg = field(opcode, EA_REG_SHIFT);
+        let holds = test_cc(condition(opcode), self.sr);
+
+        let Some(dest) = self.resolve_ea(bus, mode, reg, Size::Byte) else {
+            return self.op_illegal(bus);
+        };
+        // The 68000's dummy read, as in `op_clr`: a register read costs nothing,
+        // a memory one is a real bus cycle whose value is thrown away.
+        self.read_ea(bus, dest, Size::Byte);
+        self.write_ea(
+            bus,
+            dest,
+            Size::Byte,
+            u32::from(if holds { SCC_TRUE } else { 0 }),
+        );
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `DBcc Dn,d16`, `0101 cccc 11 001 rrr` (M68000UM "DBcc — Decrement and
+    /// Branch"): with the condition true, fall through and leave the counter
+    /// alone; otherwise decrement the low word of `Dn` and branch unless that
+    /// decrement ran the loop out.
+    ///
+    /// The counter is `Dn.w` only — bits 31..16 keep their value, which is why
+    /// this writes through `write_ea` at [`Size::Word`] instead of assigning to
+    /// `self.d[]` — and the base is the address of the displacement word.
+    pub(crate) fn op_dbcc(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let base = self.branch_base();
+        // The displacement word is popped before the condition is looked at: it is
+        // part of the instruction either way, and the base has to be read while
+        // `pc` is still the opcode's address.
+        let disp = sign_extend_word(self.fetch_ext_word(bus));
+
+        if test_cc(condition(opcode), self.sr) {
+            self.advance_opcode(bus);
+            return 0;
+        }
+        let counter = field(opcode, EA_REG_SHIFT);
+        let next = (self.d[usize::from(counter)] as u16).wrapping_sub(1);
+        self.write_ea(bus, Ea::DataReg(counter), Size::Word, u32::from(next));
+
+        if next == DBCC_EXPIRED {
+            self.advance_opcode(bus);
+        } else {
+            self.jump_to(bus, base.wrapping_add(disp));
+        }
+        0
+    }
+
+    /// The address a branch displacement is measured from: `pc + 2`, the address
+    /// of the displacement word, captured before anything is popped exactly like
+    /// [`crate::ea::M68k::ext_addr`] — except that this one does not mask, because
+    /// `pc` does not (see the module docs).
+    #[inline]
+    fn branch_base(&self) -> u32 {
+        self.pc.wrapping_add(2)
+    }
+
+    /// The displacement of a `Bcc`/`BRA`/`BSR`, and how much wider that made the
+    /// instruction: bits 7..0 sign extended, unless they are zero, in which case a
+    /// 16-bit displacement word follows and is popped here (M68000UM "Bcc":
+    /// "If displacement = $00 then a word displacement follows").
+    ///
+    /// The other side of that rule is what the 68020 added and the 68000 does not
+    /// have: `$FF` is a displacement of -1 here, never a long-branch marker, so
+    /// `$60FF` is `BRA.B #-1`.
+    fn branch_displacement(&mut self, bus: &mut impl Bus, opcode: u16) -> (u32, u32) {
+        let low = opcode as u8;
+        if low == WORD_DISPLACEMENT {
+            (
+                sign_extend_word(self.fetch_ext_word(bus)),
+                WORD_DISPLACEMENT_WIDTH,
+            )
+        } else {
+            (sign_extend_byte(low), 0)
+        }
+    }
+}
+
+/// The condition code of a `Bcc`/`BSR`/`Scc`/`DBcc` opcode: bits 11..8, which is
+/// four bits wide by construction because bit 12 is the group's own bit
+/// (M68000UM Formats V and VI).
+const fn condition(opcode: u16) -> u8 {
+    (opcode >> CC_SHIFT) as u8
+}
+
 #[cfg(test)]
 mod tests {
     use crate::M68k;
@@ -104,7 +299,7 @@ mod tests {
             "the return address is the next instruction, not the branch target"
         );
         assert_eq!(cpu.ssp, STACK_TOP - 4, "the stored mirror moves too");
-        assert_eq!(cpu.pc, PROGRAM, "$1002 - 4");
+        assert_eq!(cpu.pc, PROGRAM - 2, "$1002 - 4, not the return address");
     }
 
     /// `BSR.W $F0` (`$6100`, `$00F0`): the return address is past the
@@ -139,8 +334,8 @@ mod tests {
 
         cpu.step(&mut bus);
 
-        assert_eq!(cpu.d[1], 0, "the skipped MOVEQ #1,D1 never ran");
-        assert_eq!(cpu.d[2], 2, "the target ran");
+        assert_eq!(cpu.d[0], 0, "the skipped MOVEQ #1,D0 never ran");
+        assert_eq!(cpu.d[1], 2, "the target ran");
     }
 
     /// The branch target keeps its bits above the 24-bit bus mask: `BRA.W
@@ -288,8 +483,9 @@ mod tests {
         let (mut cpu, mut bus) = run(0x6700, &[0x0FF0, 0x4E71]); // BEQ not taken
         cpu.set_ccr(ALL_FLAGS);
         cpu.set_flag(SR_Z, false);
+        let before = cpu.sr & ALL_FLAGS;
         cpu.step(&mut bus);
-        assert_eq!(cpu.sr & ALL_FLAGS, ALL_FLAGS, "BEQ not taken");
+        assert_eq!(cpu.sr & ALL_FLAGS, before, "BEQ not taken");
 
         let (mut cpu, mut bus) = run(DBCC_D0 | (1 << 8), &[0xFFFC, 0x4E71]); // DBF taken
         cpu.d[0] = 1;
@@ -297,11 +493,12 @@ mod tests {
         cpu.step(&mut bus);
         assert_eq!(cpu.sr & ALL_FLAGS, ALL_FLAGS, "DBF taken");
 
-        let (mut cpu, mut bus) = run(0x57C0, &[0x4E71]); // SEQ
+        let (mut cpu, mut bus) = run(0x57C0, &[0x4E71]); // SEQ false
         cpu.set_ccr(ALL_FLAGS);
         cpu.set_flag(SR_Z, false);
+        let before = cpu.sr & ALL_FLAGS;
         cpu.step(&mut bus);
-        assert_eq!(cpu.sr & ALL_FLAGS, ALL_FLAGS, "SEQ false");
+        assert_eq!(cpu.sr & ALL_FLAGS, before, "SEQ false");
     }
 
     /// `Bcc` branches exactly when [`test_cc`] says so, for all sixteen codes —
@@ -340,12 +537,8 @@ mod tests {
 
                 cpu.step(&mut bus);
 
-                let want = if test_cc(cc as u8, sr) { 0xFF } else { 0 };
-                assert_eq!(
-                    cpu.d[0] & 0xFF,
-                    u32::from(want),
-                    "cc {cc:04b} at SR {sr:04X}"
-                );
+                let want: u32 = if test_cc(cc as u8, sr) { 0xFF } else { 0 };
+                assert_eq!(cpu.d[0] & 0xFF, want, "cc {cc:04b} at SR {sr:04X}");
             }
         }
     }
