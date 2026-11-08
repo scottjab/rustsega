@@ -41,6 +41,7 @@ mod arith;
 mod flow;
 mod logic;
 mod move_;
+mod shift;
 
 use crate::M68k;
 use crate::bus::Bus;
@@ -129,6 +130,10 @@ impl M68k {
             // `0100 1000 01 …` and `$4E50`/`$4E58`): the operand is an address,
             // so they live together in [`address`] and none of them touches a
             // condition code.
+            // The shift and rotate group (`1110 ccc d ss i tt rrr`): one handler
+            // for all eight mnemonics and three sizes, because the operation is
+            // one loop over a place count (see [`shift`).
+            Op::Shift => self.op_shift(bus, opcode),
             Op::Lea => self.op_lea(bus, opcode),
             Op::Pea => self.op_pea(bus, opcode),
             Op::Link => self.op_link(bus, opcode),
