@@ -141,6 +141,18 @@ impl M68k {
             Op::Bsr => self.op_bsr(bus, opcode),
             Op::Scc => self.op_scc(bus, opcode),
             Op::Dbcc => self.op_dbcc(bus, opcode),
+            // The `$4E` group's control transfers — `0100 1110 10/11 mmm rrr`
+            // above `LINK`/`UNLK`, and the four one-word members `$4E71`, `$4E73`,
+            // `$4E75` and `$4E77`. They move control rather than data, so they live
+            // with the branches in [`flow`]; `JMP`/`JSR` share their operand
+            // reading with [`address`] and `RTE` is the first instruction that
+            // can change which stack `A7` names.
+            Op::Jmp => self.op_jmp(bus, opcode),
+            Op::Jsr => self.op_jsr(bus, opcode),
+            Op::Rts => self.op_rts(bus, opcode),
+            Op::Rtr => self.op_rtr(bus, opcode),
+            Op::Rte => self.op_rte(bus, opcode),
+            Op::Nop => self.op_nop(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming

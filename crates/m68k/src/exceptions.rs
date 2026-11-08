@@ -229,20 +229,15 @@ impl M68k {
     ///
     /// The privileged instructions are MOVE to SR/CCR from a memory source,
     /// ANDI/ORI/EORI to SR, MOVE from/to USP, RTE, STOP and RESET (M68000PM
-    /// section 8, "supervisor programs only"). They are not implemented yet;
-    /// this is the check they all start with, so the ticket that lands each one
-    /// has the exception path without re-deriving it.
+    /// section 8, "supervisor programs only"). `RTE` is the first of them with a
+    /// handler (M1-17, #25); the others start with this same check when their
+    /// ticket lands.
     ///
     /// The frame carries `self.pc`, the address of the privileged instruction
     /// itself, so a handler can decode and re-execute it. Charges the exception
-    /// entry's clocks like [`M68k::exception`].
-    // Called by the privileged-instruction tickets (MOVE to SR, ANDI/ORI/EORI
-    // to SR, MOVE from/to USP, RTE, STOP, RESET); only the tests here use it
-    // today, which is the same arrangement `advance_opcode` has.
-    #[allow(
-        dead_code,
-        reason = "called by the privileged-instruction tickets; only the tests use it today"
-    )]
+    /// entry's clocks like [`M68k::exception`], and a caller that gets `false`
+    /// must have done nothing else yet: `RTE` checks before it pops, so the frame
+    /// of a denied RTE is the stack the return address is still sitting on.
     pub(crate) fn check_supervisor(&mut self, bus: &mut impl Bus) -> bool {
         if self.is_supervisor() {
             return true;

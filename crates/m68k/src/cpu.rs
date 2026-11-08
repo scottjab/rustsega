@@ -998,27 +998,31 @@ mod tests {
     /// worse than one that stops.
     #[test]
     fn step_panics_loudly_on_an_unimplemented_opcode() {
-        let (mut cpu, mut bus) = cpu_at_opcode(0x4E71); // NOP, until its ticket
+        // `RESET`, still unimplemented (M1-27). This used to be `4E71`, which was
+        // unimplemented until M1-17 (#25) gave it a handler; what the test needs
+        // is any opcode that has none, and `decode::tests` keeps `4E70` as the
+        // same anchor on the other side of the decoder.
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4E70);
         let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cpu.step(&mut bus)))
-            .expect_err("NOP has no handler, so step must not return");
+            .expect_err("RESET has no handler, so step must not return");
         let text = error
             .downcast_ref::<String>()
             .expect("the panic payload is a formatted message");
         assert!(
-            text.contains("m68k opcode 4E71"),
+            text.contains("m68k opcode 4E70"),
             "the panic must name the opcode it could not run, got {text:?}"
         );
     }
 
     /// The instruction `step` runs is `prefetch[0]`, not whatever a read of
     /// `pc` would return: the queue front here is a line A opcode while the
-    /// word behind it is the unimplemented `$4E71`, so a `step` that fetched
+    /// word behind it is the unimplemented `$4E70`, so a `step` that fetched
     /// from `pc` or decoded `prefetch[1]` would panic instead of routing.
     #[test]
     fn step_runs_the_instruction_at_the_front_of_the_queue() {
         use crate::exceptions::EXC_ILLEGAL;
-        let (mut cpu, mut bus) = cpu_at_opcode(0x4E71);
-        cpu.prefetch = [0xA000, 0x4E71];
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4E70);
+        cpu.prefetch = [0xA000, 0x4E70];
         assert_eq!(cpu.step(&mut bus), 0);
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
 
@@ -1026,7 +1030,7 @@ mod tests {
         // runs, because the queue front is.
         let (mut cpu, mut bus) = cpu_at_opcode(0xA000);
         bus.mem[PROGRAM_BASE as usize] = 0x4E;
-        bus.mem[PROGRAM_BASE as usize + 1] = 0x71;
+        bus.mem[PROGRAM_BASE as usize + 1] = 0x70;
         assert_eq!(cpu.step(&mut bus), 0);
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
     }
