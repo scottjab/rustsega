@@ -137,7 +137,10 @@ impl M68k {
     /// `write_ea` masks the bus address, not the value stored in `a[7]`, and
     /// `UNLINK.json.gz` ends 8032 of its 8065 cases with an `SSP` above
     /// `$FFFFFF`.
-    fn push_long(&mut self, bus: &mut impl Bus, value: u32) {
+    ///
+    /// `pub(crate)` rather than private to this module because `BSR`
+    /// ([`super::flow`]) pushes a return address the same way (#24).
+    pub(crate) fn push_long(&mut self, bus: &mut impl Bus, value: u32) {
         let sp = self.a[usize::from(SP_REG)].wrapping_sub(4);
         self.write_ea(bus, Ea::AddrReg(SP_REG), Size::Long, sp);
         self.write_l(bus, sp, value);

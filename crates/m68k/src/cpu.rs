@@ -468,11 +468,16 @@ impl M68k {
     /// (M68000UM, "Instruction Processing": the branch processor loads the new
     /// PC and instruction fetching restarts there, so the words the queue had
     /// already fetched are thrown away).
+    ///
+    /// `pc` keeps the whole 32-bit `addr`; only the two fetches are masked, which
+    /// is the difference between a branch target and a bus address. Measured: 907
+    /// of `DBcc.json.gz`'s, 7 of `BSR.json.gz`'s and 4 of `Bcc.json.gz`'s cases
+    /// end with a `pc` above `$FFFFFF` (#193 is the same finding for `LEA`/`PEA`).
     pub(crate) fn jump_to(&mut self, bus: &mut impl Bus, addr: u32) {
-        let addr = addr & ADDR_MASK;
         self.pc = addr;
-        self.prefetch[0] = self.read_w(bus, addr);
-        self.prefetch[1] = self.read_w(bus, (addr + 2) & ADDR_MASK);
+        let fetch = addr & ADDR_MASK;
+        self.prefetch[0] = self.read_w(bus, fetch);
+        self.prefetch[1] = self.read_w(bus, (fetch + 2) & ADDR_MASK);
     }
 }
 
