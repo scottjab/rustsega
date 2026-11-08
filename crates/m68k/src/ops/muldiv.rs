@@ -1,8 +1,11 @@
-//! `MULU` and `MULS`: the 16×16 → 32 multiplies (M68000UM MULU, MULS; M1-21, #29).
+//! `MULU`, `MULS`, `DIVU` and `DIVS`: the 16-bit multiplies and divides
+//! (M68000UM MULU, MULS, DIVU, DIVS; M1-21 #29, M1-22 #30).
 //!
 //! ```text
 //! MULU  1100 ddd 011 mmm rrr    Dn.w × <ea>.w → Dn.l, unsigned
 //! MULS  1100 ddd 111 mmm rrr    Dn.w × <ea>.w → Dn.l, signed
+//! DIVU  1000 ddd 011 mmm rrr    Dn.l / <ea>.w → remainder:quotient, unsigned
+//! DIVS  1000 ddd 111 mmm rrr    Dn.l / <ea>.w → remainder:quotient, signed
 //! ```
 //!
 //! Both multiply the *low word* of the destination register — the destination is
@@ -23,17 +26,35 @@
 //!
 //! The cost is therefore a property of the operand: `MULU #0,D0` is 42 clocks and
 //! `MULU #$FFFF,D0` is 74, and a program cannot make a multiply cheap.
+//!
+//! # The divides
+//!
+//! `DIVU`/`DIVS` divide the destination **long** by the source **word** and pack
+//! the answer remainder-high / quotient-low. Three outcomes, in this order: a
+//! zero source raises divide by zero ([`crate::EXC_DIV_ZERO`], vector 5, slot
+//! `$14`, the frame holding the divide's own address because the instruction is
+//! restarted); a quotient that does not fit a word sets `V`, clears `C` and
+//! leaves `Dn` alone; otherwise the low word is the quotient, the high word the
+//! remainder, `N`/`Z` come from the quotient and `V`/`C` are cleared. `DIVS`
+//! truncates toward zero and its remainder takes the sign of the **dividend**.
+//!
+//! Divide timing is `base + 2n` in `n` of the quotient (see [`div_clocks`]) and
+//! is an approximation on purpose: #30 ships the semantics, and the exact
+//! divider law — like the bus wait states this core does not model — belongs to
+//! M1-31 (#39/#40).
 
 use crate::bus::Bus;
 use crate::cpu::M68k;
 use crate::ea::{Ea, Size, sign_extend_word};
+use crate::exceptions::EXC_DIV_ZERO;
 use crate::ops::field;
+use crate::sr::{SR_C, SR_N, SR_V, SR_Z};
 
 /// Clocks a multiply costs whatever its operands are: the fetch, the operand
 /// read, the 16-iteration array and the long write-back (M68000UM section 8,
 /// "MULU"/"MULS", "Execution Clocks [..]: 38 + 2n"). The `[..]` in the manual
 /// is the execution time alone; `+ 2n` covers the data-dependent part and the
-/// addressing time is added separately by [`mul_ea_clocks`].
+/// addressing time is added separately by [`ea_clocks`].
 const MUL_BASE_CLOCKS: u32 = 38;
 /// Clocks each iteration of the multiply array costs: `2n` in the formula above.
 const MUL_ITERATION_CLOCKS: u32 = 2;
@@ -52,7 +73,9 @@ const INDEX_CALC: u32 = 2;
 /// as it is in `ea::PREDEC_CALC_CLOCKS`.
 const PREDEC_CALC: u32 = 2;
 
-/// Clocks the source effective address costs on top of `38 + 2n`.
+/// Clocks a word-read source effective address costs on top of the
+/// instruction's own cost: the same table for a multiply and for a divide, which
+/// both read one word from an EA in the same way.
 ///
 /// Measured mode by mode against every non-exception case of `MULU.json.gz` and
 /// `MULS.json.gz`: `length - (38 + 2n)` is exactly this constant for each mode,
@@ -63,7 +86,7 @@ const PREDEC_CALC: u32 = 2;
 ///
 /// Mode `001` cannot reach a multiply: [`crate::decode`] decodes it to
 /// [`crate::decode::Op::Illegal`] (#29).
-const fn mul_ea_clocks(mode: u8, reg: u8) -> u32 {
+const fn ea_clocks(mode: u8, reg: u8) -> u32 {
     match mode {
         // `Dn`: the operand is already in the register file.
         0b000 => 0,
@@ -88,6 +111,20 @@ const fn mul_ea_clocks(mode: u8, reg: u8) -> u32 {
     }
 }
 
+/// The worst case of each divide, from M68000UM "68000 Programmers Interface"
+/// ("Divide Instructions": DIVU 68/70/140, DIVS 74/76/158 — typical, 64-bit
+/// extension, worst case). Only the worst case is a 16/32-bit divide, and `n`
+/// below runs 0..=16, so the bases are `140 - 2*16` and `158 - 2*16`.
+const DIVU_WORST_CLOCKS: u32 = 140;
+/// See [`DIVU_WORST_CLOCKS`].
+const DIVS_WORST_CLOCKS: u32 = 158;
+/// `DIVU`'s base: [`DIVU_WORST_CLOCKS`] less its 16 iterations.
+const DIVU_BASE_CLOCKS: u32 = DIVU_WORST_CLOCKS - 2 * DIV_MAX_ITERATIONS;
+/// `DIVS`' base, same again for [`DIVS_WORST_CLOCKS`].
+const DIVS_BASE_CLOCKS: u32 = DIVS_WORST_CLOCKS - 2 * DIV_MAX_ITERATIONS;
+/// The most a divide iterates: one pass per quotient bit.
+const DIV_MAX_ITERATIONS: u32 = 16;
+
 /// `n` for MULU: the number of set bits in the source word (M68000UM section 8,
 /// "MULU — Multiply Unsigned": `38 + 2n`, `n` counted over the source operand).
 /// Which way round `n` goes — source, destination, or something else — is what
@@ -111,6 +148,73 @@ const fn muls_iterations(source: u16) -> u32 {
     let shifted = (source as u32) << 1;
     let transitions = shifted ^ (shifted >> 1);
     (transitions & 0xFFFF).count_ones()
+}
+
+/// `32 / 16` as the two divides need it, or `None` for **division overflow**
+/// (M68000UM DIVU/DIVS: "if the magnitude of the quotient is too large for a
+/// word the operation is terminated, `V` is set and the destination is
+/// unaltered"). The signed form truncates toward zero and leaves the remainder
+/// with the sign of the dividend — "the sign of the remainder is the sign of the
+/// dividend" — which is what Rust's `/` and `%` already do.
+///
+/// Both halves go through a wider type on purpose: `-2^31 / -1` is the one case
+/// whose true quotient does not fit the operands' own width, and a 32-bit `abs()`
+/// or negation wraps on it (`divs_overflow_min_int_by_minus_one`).
+fn divide_32_by_16(dividend: u32, divisor: u16, signed: bool) -> Option<(u16, u16)> {
+    if signed {
+        let dividend = i64::from(dividend as i32);
+        let divisor = i64::from(divisor as i16);
+        let quotient = dividend / divisor;
+        if quotient > i64::from(i16::MAX) || quotient < i64::from(i16::MIN) {
+            return None;
+        }
+        Some((quotient as u16, (dividend % divisor) as u16))
+    } else {
+        let divisor = u32::from(divisor);
+        // The quotient needs 17 bits exactly when the dividend's top word is
+        // already at least the divisor: one compare, and the `/` below is never
+        // reached with a zero divisor (the caller checks first).
+        if (dividend >> 16) >= divisor {
+            return None;
+        }
+        Some(((dividend / divisor) as u16, (dividend % divisor) as u16))
+    }
+}
+
+/// The approximate cost of a divide: `base + 2n` in `n` **of the quotient** —
+/// set bits for `DIVU`, bit transitions for `DIVS`, the same two counts the
+/// multiplies use ([`mulu_iterations`], [`muls_iterations`]) taken of the answer
+/// being built rather than of the source, because an array divider walks the
+/// quotient it is producing.
+///
+/// **This is an approximation, which is as far as #30 takes it.** The measured
+/// costs of the pinned suite run 106..=144 for `DIVU` and 126..=152 for `DIVS`
+/// (over the 4964 and 4992 cases of the two files that do not end in the suite's
+/// exception handler), so the shape and the span are right but single cases are
+/// off by up to about ten clocks; both files are therefore checked state-only.
+/// Two facts from that measurement are for M1-31 (#39/#40), which owns the real
+/// divider law: every cost is a multiple of 2, and no function of the quotient
+/// alone fits — the same `DIVU` quotient appears at two different costs, so the
+/// hardware looks at the walk order or the dividend as well. The manual's worst
+/// cases are right by construction, and `divu_timing_examples` /
+/// `divs_timing_examples` pin the shape.
+const fn div_clocks(signed: bool, quotient: u16) -> u32 {
+    if signed {
+        DIVS_BASE_CLOCKS + MUL_ITERATION_CLOCKS * muls_iterations(quotient)
+    } else {
+        DIVU_BASE_CLOCKS + MUL_ITERATION_CLOCKS * mulu_iterations(quotient)
+    }
+}
+
+/// A divide that overflows is charged its worst case: the real divider aborts
+/// the walk partway through, and this core has not fitted where (see
+/// [`div_clocks`]; M1-31 #39/#40 owns the number).
+const fn div_overflow_clocks(signed: bool) -> u32 {
+    if signed {
+        DIVS_WORST_CLOCKS
+    } else {
+        DIVU_WORST_CLOCKS
+    }
 }
 
 impl M68k {
@@ -160,7 +264,111 @@ impl M68k {
         self.write_ea(bus, Ea::DataReg(reg), Size::Long, result);
         self.set_logic_flags(result, Size::Long);
         self.advance_opcode(bus);
-        MUL_BASE_CLOCKS + MUL_ITERATION_CLOCKS * iterations + mul_ea_clocks(mode, ea_reg)
+        MUL_BASE_CLOCKS + MUL_ITERATION_CLOCKS * iterations + ea_clocks(mode, ea_reg)
+    }
+
+    /// `DIVU <ea>,Dn` — unsigned 32/16 divide (M68000UM DIVU; M1-22, #30).
+    pub(crate) fn op_divu(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        self.op_div(bus, opcode, false)
+    }
+
+    /// `DIVS <ea>,Dn` — signed 32/16 divide (M68000UM DIVS; M1-22, #30).
+    pub(crate) fn op_divs(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        self.op_div(bus, opcode, true)
+    }
+
+    /// The two divides as one body, in the shape M68000UM DIVU/DIVS give them:
+    /// `Dn.l / <ea>.w`, quotient to the **low** word of `Dn` and remainder to its
+    /// **high** word, `N`/`Z` taken from the quotient and `V` from whether it
+    /// fitted.
+    ///
+    /// Three outcomes, and their order is what matters:
+    ///
+    /// * **divide by zero** — group 1 exception, vector [`crate::EXC_DIV_ZERO`]
+    ///   (slot `$14`), raised before the destination is touched and before the
+    ///   instruction advances, so the frame carries the divide's own address.
+    /// * **division overflow** — `V = 1`, `C = 0`, `Dn` untouched.
+    /// * **a normal divide** — the packed remainder-high / quotient-low result.
+    ///
+    /// The source is a word read, so `resolve_ea` is called with `Size::Word`
+    /// exactly as [`Self::op_mul`] does; a source that resolves to an odd access
+    /// raises address error from inside `resolve_ea` and returns `None` here
+    /// (M1-29 #37 is why 3101 of the 8065 cases of `DIVU.json.gz` end in the
+    /// suite's exception handler instead of on a result).
+    fn op_div(&mut self, bus: &mut impl Bus, opcode: u16, signed: bool) -> u32 {
+        let reg = field(opcode, 9);
+        let mode = field(opcode, 3);
+        let ea_reg = field(opcode, 0);
+        debug_assert_ne!(
+            mode,
+            crate::decode::AN_DIRECT_MODE,
+            "DIVU/DIVS with an An source is illegal and decode rejects it (${opcode:04X})"
+        );
+        // The divide's own address, captured *before* the EA is resolved: an
+        // extension-word mode advances `pc` while it is fetched (see
+        // [`Self::ext_addr`]), and a faulted divide is restarted, so the frame
+        // has to carry the address of the instruction rather than of whatever
+        // `pc` ended up pointing at. `div_by_zero_traps_vector_5` and the
+        // suite's one divide-by-zero case, `80ef [DIVU (d16, A7), D0] 5745`,
+        // hold it: the push is `$00000C00`, the divide itself.
+        let divide_pc = self.pc;
+        let source = match self.resolve_ea(bus, mode, ea_reg, Size::Word) {
+            Some(ea) => ea,
+            None => return self.op_illegal(bus),
+        };
+        // Both operands are read before `Dn` is written, and the source is read
+        // on every path: an overflowing or trapping divide still consumes it, so
+        // `DIVU (A0)+,D0` moves A0 exactly once however the divide ends.
+        let dividend = self.read_ea(bus, Ea::DataReg(reg), Size::Long);
+        let divisor = self.read_ea(bus, source, Size::Word) as u16;
+
+        if divisor == 0 {
+            // Divide by zero (M68000UM "Division by Zero"). The instruction is
+            // *restarted*, so the frame carries the address of the divide
+            // itself, not of the instruction after it. The ticket guessed "the PC
+            // of the instruction following the divide"; the suite is explicit:
+            // case `80ef [DIVU (d16, A7), D0] 5745` starts at `$000C00` and
+            // pushes the frame `$000C00 / $2710`, i.e. its own address.
+            //
+            // The condition codes are cleared except `X`, and `Dn` is left
+            // alone — same case: SR `$271D` (X,N,Z,C) in, `$2710` (X) out.
+            self.set_flag(SR_N, false);
+            self.set_flag(SR_Z, false);
+            self.set_flag(SR_V, false);
+            self.set_flag(SR_C, false);
+            // `0` for the reason [`Self::op_illegal`] gives: the exception has
+            // already been charged, and this instruction has not advanced.
+            self.exception(bus, EXC_DIV_ZERO, divide_pc);
+            return 0;
+        }
+
+        match divide_32_by_16(dividend, divisor, signed) {
+            Some((quotient, remainder)) => {
+                self.write_ea(
+                    bus,
+                    Ea::DataReg(reg),
+                    Size::Long,
+                    u32::from(quotient) | (u32::from(remainder) << 16),
+                );
+                // `N` is bit 15 of the quotient and `Z` its zero test — of the
+                // quotient alone, never of the packed long, whose top bit is the
+                // remainder's sign (M68000UM DIVU: "N,Z set from the result",
+                // the result being the quotient).
+                self.set_logic_flags(u32::from(quotient), Size::Word);
+                self.advance_opcode(bus);
+                div_clocks(signed, quotient) + ea_clocks(mode, ea_reg)
+            }
+            None => {
+                // Overflow. `V` set and `C` cleared; `N`, `Z` and `X` are left
+                // exactly as they were. The manual calls `N` and `Z` undefined
+                // here, but the chip is specific, and so is every overflowing
+                // case of the pinned files (1567 in `DIVU`, 2479 in `DIVS`).
+                self.set_flag(SR_V, true);
+                self.set_flag(SR_C, false);
+                self.advance_opcode(bus);
+                div_overflow_clocks(signed) + ea_clocks(mode, ea_reg)
+            }
+        }
     }
 }
 
@@ -406,11 +614,13 @@ mod tests {
     }
 
     /// `DIVx D1,D0` with `dividend` in D0 and `divisor` in D1, stepped once.
-    /// Returns the CPU and `step`'s clock count, like [`multiply`].
-    fn divide(op_mode: u16, dividend: u32, divisor: u32) -> (M68k, u32) {
+    /// Returns the CPU and `step`'s clock count, like [`multiply`]. Both are
+    /// `i32` so the signed cases read as signed: an operand of `$FFFF` as a
+    /// divisor is `-1`, which is the interesting one.
+    fn divide(op_mode: u16, dividend: i32, divisor: i32) -> (M68k, u32) {
         let (mut cpu, mut bus) = cpu_with_program(&[div(op_mode, 0, 0b000, 1)]);
-        cpu.d[0] = dividend;
-        cpu.d[1] = divisor;
+        cpu.d[0] = dividend as u32;
+        cpu.d[1] = divisor as u32;
         let cycles = cpu.step(&mut bus);
         (cpu, cycles)
     }
@@ -451,7 +661,7 @@ mod tests {
         // Quotient 1 with a negative remainder: the packed long is negative and
         // `N` is still clear.
         let (cpu, _) = divide(DIVS, -7, -4);
-        assert_eq!(cpu.d[0], 0xFFFF_0001, "-7 / -4 = 1 remainder -3");
+        assert_eq!(cpu.d[0], 0xFFFD_0001, "-7 / -4 = 1 remainder -3");
         assert!(!cpu.flag_n());
     }
 
@@ -520,10 +730,12 @@ mod tests {
         assert!(!cpu.flag_c());
         assert!(cpu.flag_n() && cpu.flag_z(), "N and Z left alone");
 
-        // One below the cliff, `(-2^31 + 1) / -1` fits and is a normal divide.
-        let (cpu, _) = divide(DIVS, 0x8000_0001, 0xFFFF);
-        assert_eq!(cpu.d[0], 0x0000_7FFF, "quotient 0x7FFF, remainder 0");
+        // `0x7FFF / -1` is the last divide that still fits: quotient -32767,
+        // exactly `i16::MIN`, written as a normal result with `V` clear.
+        let (cpu, _) = divide(DIVS, 0x7FFF, -1);
+        assert_eq!(cpu.d[0], 0x0000_8001, "quotient 0x8001, remainder 0");
         assert!(!cpu.flag_v());
+        assert!(cpu.flag_n());
     }
 
     /// Divide by zero is exception vector 5 — the long at `$14` — and the frame
@@ -559,8 +771,8 @@ mod tests {
             );
             assert_eq!(
                 Bus::read_word(&mut bus, sp - 6) & ALL_FLAGS,
-                ALL_FLAGS,
-                "the frame's SR is the SR as it was before the trap"
+                SR_X,
+                "the frame's SR has N, Z, V and C already cleared: the suite's case goes from SR $271D to a pushed $2710"
             );
             assert_eq!(cpu.d[0], 0xDEAD_BEEF, "the divide wrote nothing");
             assert!(!cpu.flag_n() && !cpu.flag_z() && !cpu.flag_v() && !cpu.flag_c());
@@ -575,8 +787,8 @@ mod tests {
     #[test]
     fn div_source_steps_once_on_every_path() {
         for (dividend, divisor, want_d0) in [
-            (100u32, 7u32, 0x0002_000E),    // normal
-            (0x0001_0001, 1, 0x0001_0001),  // overflow: Dn untouched
+            (100u32, 7u32, 0x0002_000E),   // normal
+            (0x0001_0001, 1, 0x0001_0001), // overflow: Dn untouched
         ] {
             let (mut cpu, mut bus) = cpu_with_program(&[div(DIVU, 0, 0b011, 0)]);
             bus.load_words(DATA, &[u16::try_from(divisor).unwrap(), 0]);
@@ -594,7 +806,11 @@ mod tests {
         cpu.a[0] = DATA;
         cpu.d[0] = 1;
         cpu.step(&mut bus);
-        assert_eq!(cpu.a[0], DATA + 2, "a trapped divide still consumed its operand");
+        assert_eq!(
+            cpu.a[0],
+            DATA + 2,
+            "a trapped divide still consumed its operand"
+        );
     }
 
     /// The `DIVU` cost model: `108 + 2n` with `n` the set bits of the quotient,
@@ -603,7 +819,7 @@ mod tests {
     #[test]
     fn divu_timing_examples() {
         for (dividend, want) in [
-            (0x0000_0000u32, 108), // quotient 0: no set bits
+            (0x0000_0000i32, 108), // quotient 0: no set bits
             (0x0000_0001, 110),    // one set bit
             (0x0000_00FF, 124),    // eight
             (0x0000_5555, 124),    // 0x5555 has eight set bits too
@@ -626,7 +842,7 @@ mod tests {
             (0x0000_5555, 158),    // alternating bits: the worst case
             (-1, 128),             // quotient -1 = 0xFFFF: a single transition
         ] {
-            let (_, cycles) = divide(DIVS, dividend as u32, 1);
+            let (_, cycles) = divide(DIVS, dividend, 1);
             assert_eq!(cycles, want, "DIVS ${dividend:#X}/1");
         }
     }
