@@ -41,6 +41,7 @@
 use crate::M68k;
 use crate::bus::Bus;
 use crate::ea::{Ea, SP_REG, Size, sign_extend_byte, sign_extend_word};
+use crate::exceptions::EXC_TRAPV;
 use crate::ops::field;
 use crate::sr::test_cc;
 
@@ -52,6 +53,15 @@ const CC_SHIFT: u32 = 8;
 const EA_MODE_SHIFT: u32 = 3;
 /// The EA register field, [`crate::ea::M68k::resolve_ea`]'s second argument.
 const EA_REG_SHIFT: u32 = 0;
+
+/// Width of `TRAPV` in bytes, which is the distance from its opcode to the
+/// instruction a taken trap pushes: `$4E76` has no extension word (M68000UM
+/// "TRAPV — Trap on Overflow").
+const TRAPV_WIDTH: u32 = 2;
+
+/// Clocks for `RESET` (M68000UM appendix "Instruction Timing"), the number
+/// [`M68k::op_reset`] hands back because RESET makes no bus access of its own.
+pub(crate) const RESET_CLOCKS: u32 = 132;
 
 /// A `Bcc`/`BSR` byte displacement of zero is not a branch to the next
 /// instruction: it is the escape hatch that means a 16-bit displacement word
@@ -289,6 +299,76 @@ impl M68k {
         0
     }
 
+    /// `TRAPV` `$4E76` (M68000UM "TRAPV — Trap on Overflow"): take the vector-7
+    /// overflow exception when `V` is set, and do *nothing* when it is clear —
+    /// not even a flag change, which is why the flag is read here rather than
+    /// folded into the result of some other operation.
+    ///
+    /// The pushed PC is the address of the **next** instruction, `opcode + 2`:
+    /// TRAPV has no extension word, so unlike `JSR`/`BSR` there is nothing to
+    /// step past first (M68000UM "TRAPV", and [`crate::exceptions`] on which PC a
+    /// frame carries). The exception route discards the queue, so `V` clear is the
+    /// only path that reaches [`M68k::advance_opcode`].
+    pub(crate) fn op_trapv(&mut self, bus: &mut impl Bus, _opcode: u16) -> u32 {
+        if self.flag_v() {
+            let return_pc = self.pc.wrapping_add(TRAPV_WIDTH);
+            self.exception(bus, EXC_TRAPV, return_pc);
+            return 0;
+        }
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `RESET` `$4E70` (M68000UM "RESET — Reset"): pulse the reset line to every
+    /// device behind the bus.
+    ///
+    /// The CPU is *not* one of those devices. M68000UM "RESET — Reset" is explicit
+    /// that the slave devices are reset and the program continues, so this calls
+    /// [`Bus::reset_devices`] and then simply finishes the opcode; calling
+    /// [`crate::M68k::reset`] here would restart the very CPU running the
+    /// instruction, and `RESET.json.gz` would never see its `pc + 2`.
+    ///
+    /// Privileged, and the check comes first: a denied RESET pulses nothing.
+    ///
+    /// The 132 clocks are the manual's figure (M68000UM appendix "Instruction
+    /// Timing"). They are returned rather than left to the self-charging helpers
+    /// because RESET makes no bus access of its own for those to charge — but see
+    /// the TODO on [`M68k::step`] about which clock total wins, which is M1-31
+    /// (#39).
+    pub(crate) fn op_reset(&mut self, bus: &mut impl Bus, _opcode: u16) -> u32 {
+        if !self.check_supervisor(bus) {
+            return 0;
+        }
+        bus.reset_devices();
+        self.advance_opcode(bus);
+        RESET_CLOCKS
+    }
+
+    /// `STOP` `$4E72 <word>` (M68000UM "STOP — Stop the Processor"): load the
+    /// whole of `SR` from the extension word and halt until the next interrupt or
+    /// reset.
+    ///
+    /// `SR` goes in through [`crate::M68k::set_sr`] rather than by assignment, so a
+    /// STOP whose operand clears `S` swaps `A7` to the USP exactly as `MOVE to SR`
+    /// does. `stopped` is set *after* that, because the halt is a consequence of
+    /// the new status word, not a separate state the operand could override.
+    ///
+    /// The halt itself is what [`crate::M68k::stopped`] is for: `step` returns
+    /// early while it is set. Nothing clears it yet — the wake-up path is #36,
+    /// which owns STOP and HALT's interrupt side together.
+    ///
+    /// Privileged, like RESET: a denied STOP writes no `SR` and halts nothing.
+    pub(crate) fn op_stop(&mut self, bus: &mut impl Bus, _opcode: u16) -> u32 {
+        if !self.check_supervisor(bus) {
+            return 0;
+        }
+        let status = self.fetch_ext_word(bus);
+        self.set_sr(status);
+        self.stopped = true;
+        self.advance_opcode(bus);
+        0
+    }
+
     /// The long at the top of the active stack, with `A7` moved up past it: the
     /// return address of `RTS`, and the second half of `RTR`'s and `RTE`'s frame
     /// (M68000UM RTS/RTR/RTE). [`crate::M68k::push_long`] is the other direction.
@@ -355,9 +435,11 @@ const fn condition(opcode: u16) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use super::RESET_CLOCKS;
     use crate::M68k;
     use crate::bus::Bus;
-    use crate::exceptions::EXC_PRIVILEGE;
+    use crate::cpu::STOPPED_CLOCKS;
+    use crate::exceptions::{EXC_PRIVILEGE, EXC_TRAPV};
     use crate::sr::test_cc;
     use crate::sr::{SR_C, SR_N, SR_S, SR_V, SR_X, SR_Z};
     use crate::testbus::{TestBus, cpu_with_program};
@@ -899,6 +981,136 @@ mod tests {
             PROGRAM,
             "and the address of the RTE itself, so a handler can decode it: see
              the `crate::exceptions` module docs on which PC a frame carries"
+        );
+    }
+
+    // --- TRAPV --------------------------------------------------------------
+
+    /// `TRAPV` (`$4E76`) takes the vector-7 overflow exception with the address
+    /// of the *next* instruction when `V` is set, and does nothing at all when
+    /// `V` is clear — not even a flag change (M68000UM "TRAPV — Trap on
+    /// Overflow"; #35).
+    #[test]
+    fn trapv_only_when_v() {
+        // V clear: the instruction is a two-byte no-op. Every register and flag
+        // is where the next instruction would have left it, and nothing is on
+        // the stack.
+        let (mut cpu, mut bus) = run(0x4E76, &[0x4E71]);
+        cpu.set_ccr(ALL_FLAGS & !SR_V);
+        let before = cpu.clone();
+
+        assert_eq!(cpu.step(&mut bus), 0);
+
+        assert_eq!(cpu.pending_exception, None, "V clear, so no exception");
+        assert_eq!(cpu.pc, PROGRAM + 2, "past the opcode");
+        assert_eq!(cpu.ssp, STACK_TOP, "and nothing was pushed");
+        assert_eq!(cpu.ccr(), ALL_FLAGS & !SR_V, "TRAPV moves no flag");
+        assert_eq!(before.ccr(), ALL_FLAGS & !SR_V);
+
+        // V set: vector 7, and the pushed PC is the address of the instruction
+        // *after* TRAPV — the opcode word plus two, since TRAPV has no extension
+        // (M68000UM "TRAPV", "Program Counter"; the same rule as TRAP).
+        let (mut cpu, mut bus) = run(0x4E76, &[0x4E71]);
+        bus.write_long(u32::from(EXC_TRAPV) * 4, MEM);
+        cpu.set_flag(SR_V, true);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pending_exception, Some(EXC_TRAPV));
+        assert_eq!(cpu.pc, MEM, "vector 7 is the overflow exception");
+        assert_eq!(cpu.ssp, STACK_TOP - 6, "format 0 frame: SR then PC");
+        assert_eq!(
+            bus.read_long(STACK_TOP - 4),
+            PROGRAM + 2,
+            "the address of the next instruction, not of TRAPV itself"
+        );
+        assert_eq!(
+            bus.read_word(STACK_TOP - 6) & SR_V,
+            SR_V,
+            "the frame carries the V that caused it, so an RTS-style return can"
+        );
+    }
+
+    // --- RESET --------------------------------------------------------------
+
+    /// `RESET` (`$4E70`) resets every device behind the bus and nothing else: the
+    /// CPU keeps running, keeps its registers, and simply moves past the opcode
+    /// (M68000UM "RESET — Reset": "All slave devices ... are reset. The CPU does
+    /// not reset itself"; #35).
+    #[test]
+    fn reset_calls_bus_reset_devices() {
+        let (mut cpu, mut bus) = run(0x4E70, &[0x4E71]);
+        let d_before = cpu.d;
+        let a_before = cpu.a;
+
+        assert_eq!(cpu.step(&mut bus), RESET_CLOCKS, "RESET costs 132 clocks");
+
+        assert_eq!(bus.reset_count, 1, "the RESET line was pulsed once");
+        assert_eq!(cpu.pc, PROGRAM + 2, "the CPU kept going");
+        assert_eq!(cpu.d, d_before, "no register is cleared");
+        assert_eq!(cpu.a, a_before);
+        assert_eq!(cpu.pending_exception, None);
+    }
+
+    /// `RESET` is privileged: in user mode it is the vector-8 exception and the
+    /// bus line is never pulsed (M68000UM "RESET", "Mode"; #35).
+    #[test]
+    fn reset_in_user_mode_is_a_privilege_violation() {
+        let (mut cpu, mut bus) = run(0x4E70, &[0x4E71]);
+        cpu.set_sr(RESET_SR & !SR_S);
+        bus.write_long(u32::from(EXC_PRIVILEGE) * 4, MEM);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pending_exception, Some(EXC_PRIVILEGE));
+        assert_eq!(bus.reset_count, 0, "a denied RESET resets nothing");
+    }
+
+    // --- STOP ---------------------------------------------------------------
+
+    /// `STOP` (`$4E72`, `#imm`) writes the extension word into the whole of `SR`
+    /// and halts the CPU until the next interrupt or reset — which this ticket
+    /// only halts *for*; the wake-up is #36. `SR` goes in through `set_sr`, so a
+    /// STOP that clears `S` swaps `A7` to the USP the way `MOVE to SR` does
+    /// (M68000UM "STOP — Stop the Processor"; #35).
+    #[test]
+    fn stop_loads_sr_and_halts_until_interrupt() {
+        let (mut cpu, mut bus) = run(0x4E72, &[0x0003, 0x4E71]); // STOP #$0003
+
+        assert_eq!(cpu.step(&mut bus), 0);
+
+        assert_eq!(cpu.sr, 0x0003, "the whole SR, not just the CCR");
+        assert!(!cpu.is_supervisor(), "so bit 13 of the operand is the mode");
+        assert!(cpu.stopped, "and the CPU halted");
+        assert_eq!(cpu.pc, PROGRAM + 4, "both words were consumed");
+
+        // While stopped a `step` runs no instruction: `pc`, `SR` and the memory
+        // at the queue front are untouched, and it reports clocks rather than 0
+        // (the wake path is #36, so this is the whole of the halted behaviour).
+        let before = cpu.clone();
+        assert_eq!(cpu.step(&mut bus), STOPPED_CLOCKS);
+        assert_eq!(cpu.pc, before.pc, "no instruction ran");
+        assert_eq!(cpu.sr, before.sr);
+        assert_eq!(cpu.d, before.d);
+        assert_eq!(cpu.prefetch, before.prefetch);
+    }
+
+    /// `STOP` is privileged: in user mode it is the vector-8 exception, `SR` is
+    /// untouched, and the CPU keeps running (M68000UM "STOP", "Mode"; #35).
+    #[test]
+    fn stop_in_user_mode_is_a_privilege_violation() {
+        let (mut cpu, mut bus) = run(0x4E72, &[0x0003, 0x4E71]);
+        cpu.set_sr(RESET_SR & !SR_S);
+        bus.write_long(u32::from(EXC_PRIVILEGE) * 4, MEM);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pending_exception, Some(EXC_PRIVILEGE));
+        assert!(!cpu.stopped, "a denied STOP does not halt");
+        assert_eq!(
+            cpu.sr & 0x00FF,
+            0,
+            "the operand `$0003` was not loaded; only exception entry's own S bit moved SR"
         );
     }
 

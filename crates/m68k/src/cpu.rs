@@ -25,7 +25,17 @@ pub(crate) const BUS_CYCLE_CLOCKS: u64 = 4;
 
 /// Clocks [`M68k::step`] reports for a step taken while the HALT pin is
 /// asserted, until M1-31 (#39) times the interrupt-acknowledge sequence.
+/// Clocks for a `step` taken while HALT is asserted.
+///
+/// The real cost is the interrupt-acknowledge sequence, which is M1-31 (#39);
+/// the number here only has to be non-zero so a halted CPU still moves the
+/// scheduler along.
 const HALTED_CLOCKS: u32 = 4;
+
+/// Clocks for a `step` taken while `STOP` has the CPU halted, the same stand-in
+/// as [`HALTED_CLOCKS`] for the same reason: the processor is not executing, and
+/// #36 owns the interrupt side of STOP where the real number will come from.
+pub(crate) const STOPPED_CLOCKS: u32 = 4;
 
 /// How far ahead of [`M68k::pc`] the prefetch queue has already read, in bytes.
 ///
@@ -217,6 +227,14 @@ impl M68k {
             // be non-zero so a halted CPU still moves the scheduler along.
             self.cycles += u64::from(HALTED_CLOCKS);
             return HALTED_CLOCKS;
+        }
+
+        if self.stopped {
+            // STOP left the CPU halted: no fetch, no decode, no opcode. Nothing
+            // clears `stopped` yet — the interrupt and reset wake-up paths are
+            // #36 — so a stopped CPU just burns these clocks forever.
+            self.cycles += u64::from(STOPPED_CLOCKS);
+            return STOPPED_CLOCKS;
         }
 
         // One step, at most one exception: what the previous step recorded is
@@ -998,31 +1016,32 @@ mod tests {
     /// worse than one that stops.
     #[test]
     fn step_panics_loudly_on_an_unimplemented_opcode() {
-        // `RESET`, still unimplemented (M1-27). This used to be `4E71`, which was
-        // unimplemented until M1-17 (#25) gave it a handler; what the test needs
-        // is any opcode that has none, and `decode::tests` keeps `4E70` as the
-        // same anchor on the other side of the decoder.
-        let (mut cpu, mut bus) = cpu_at_opcode(0x4E70);
+        // `$4E74`, which has no handler and is the hole left in `$4E70..=$4E77`
+        // once RESET, NOP, RTE, RTS, TRAPV and RTR are taken. This used to be
+        // `4E71` before M1-17 (#25), then `4E70` before #35 gave RESET one; what
+        // the test needs is any opcode that has none, and `decode::tests` keeps
+        // `4E74` as the same anchor on the other side of the decoder.
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4E74);
         let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cpu.step(&mut bus)))
-            .expect_err("RESET has no handler, so step must not return");
+            .expect_err("an opcode with no handler must not let step return");
         let text = error
             .downcast_ref::<String>()
             .expect("the panic payload is a formatted message");
         assert!(
-            text.contains("m68k opcode 4E70"),
+            text.contains("m68k opcode 4E74"),
             "the panic must name the opcode it could not run, got {text:?}"
         );
     }
 
     /// The instruction `step` runs is `prefetch[0]`, not whatever a read of
     /// `pc` would return: the queue front here is a line A opcode while the
-    /// word behind it is the unimplemented `$4E70`, so a `step` that fetched
+    /// word behind it is the unimplemented `$4E74`, so a `step` that fetched
     /// from `pc` or decoded `prefetch[1]` would panic instead of routing.
     #[test]
     fn step_runs_the_instruction_at_the_front_of_the_queue() {
         use crate::exceptions::EXC_ILLEGAL;
-        let (mut cpu, mut bus) = cpu_at_opcode(0x4E70);
-        cpu.prefetch = [0xA000, 0x4E70];
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4E74);
+        cpu.prefetch = [0xA000, 0x4E74];
         assert_eq!(cpu.step(&mut bus), 0);
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
 
@@ -1030,7 +1049,7 @@ mod tests {
         // runs, because the queue front is.
         let (mut cpu, mut bus) = cpu_at_opcode(0xA000);
         bus.mem[PROGRAM_BASE as usize] = 0x4E;
-        bus.mem[PROGRAM_BASE as usize + 1] = 0x70;
+        bus.mem[PROGRAM_BASE as usize + 1] = 0x74;
         assert_eq!(cpu.step(&mut bus), 0);
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
     }

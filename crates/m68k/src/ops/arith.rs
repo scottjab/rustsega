@@ -637,6 +637,45 @@ impl M68k {
         0
     }
 
+    /// `TAS`: `1001 0110 00 mmm rrr` — read `<ea>` as a byte, set the flags from
+    /// it, and write it back with bit 7 set (M68000UM section 8, "TAS — Test and
+    /// Set"; #35).
+    ///
+    /// Two things distinguish it from the [`M68k::op_tst`] above it, which is
+    /// otherwise the same shape:
+    ///
+    /// * the size is byte-only. `TAS` shares the `$4Axx` field with `TST` but
+    ///   takes the `ss` = `11` slot that `TST` must refuse, so there is no
+    ///   `alu_size` call here — `decode::classify_tas` already rejected every
+    ///   operand mode that cannot be altered, which is why an address register
+    ///   direct or an immediate reaches this file as `Op::Illegal` and never as
+    ///   `Op::Tas`.
+    /// * the read is a read-modify-write, so the same resolved [`Ea`] is read and
+    ///   then written. Resolving twice would step `(A0)+` a second time.
+    ///
+    /// The flags are the `TST` rule — [`M68k::set_logic_flags`], which sets N and
+    /// Z from the value, clears V and C, and leaves X alone — and they are set
+    /// from the value **before** bit 7 is forced, which is what makes `TAS` of
+    /// zero set `Z` while storing `$80`.
+    ///
+    /// The store is an ordinary byte write: M68000UM notes that the write-back is
+    /// not locked against an interrupt, so there is no bus-level special case to
+    /// model here.
+    pub(crate) fn op_tas(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+
+        let Some(ea) = self.resolve_arith_ea(bus, mode, ea_reg, Size::Byte) else {
+            return self.op_illegal(bus);
+        };
+        let value = self.read_ea(bus, ea, Size::Byte);
+        self.set_logic_flags(value, Size::Byte);
+        self.write_ea(bus, ea, Size::Byte, value | 0x0080);
+
+        self.advance_opcode(bus);
+        0
+    }
+
     /// `NEG`: `0100 0100 ss mmm rrr` — `0 - <ea> → <ea>` (M68000UM section 8,
     /// "NEG"; M1-14, #22).
     pub(crate) fn op_neg(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
@@ -1854,6 +1893,82 @@ mod tests {
         assert!(!cpu.flag_c());
         assert!(!cpu.flag_v());
         assert_eq!(cpu.a[0], MEM, "no pointer movement for a plain (An)");
+    }
+
+    /// `TAS.B <ea>` (`$4AC0 | <ea>`) reads the byte, sets N and Z from **that
+    /// byte as read**, clears V and C, leaves X alone, and writes the byte back
+    /// with bit 7 set. Both halves matter: the flags come from the old value and
+    /// the store is the point of the instruction (M68000UM "TAS — Test and Set":
+    /// "N and Z are set according to the operand value ... V and C are cleared;
+    /// X is unaffected"; #35).
+    #[test]
+    fn tas_sets_bit7_and_flags() {
+        // `TAS.B D0` on `$7F`: the write-back is `$FF`, so N is set — and it is
+        // set from the operand's own bit 7 being cleared, which is why this case
+        // is the one that separates "flags from the value read" from "flags
+        // from the value stored".
+        let (mut cpu, mut bus) = run(0x4AC0, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_007F;
+        cpu.set_ccr(SR_Z | SR_V | SR_C); // X clear, and it must stay clear
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_00FF, "bit 7 set, upper 24 bits kept");
+        assert!(
+            !cpu.flag_n(),
+            "N comes from the `$7F` that was read, not the `$FF` that was stored"
+        );
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v(), "V is cleared");
+        assert!(!cpu.flag_c(), "C is cleared");
+        assert!(!cpu.flag_x(), "X is unaffected");
+        assert_eq!(cpu.pc, PROGRAM + 2, "one opcode word, no extension");
+
+        // `TAS.B D0` on zero: Z is set, from the value *read*, even though the
+        // value stored back is `$80` — which is not zero and not negative as a
+        // byte would make N come out set.
+        let (mut cpu, mut bus) = run(0x4AC0, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_FF00;
+        cpu.set_ccr(SR_X | SR_V | SR_C);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_FF80);
+        assert!(cpu.flag_z(), "Z comes from the operand, not the result");
+        assert!(cpu.flag_x(), "X is unaffected, so it stays set here");
+        assert!(!cpu.flag_n(), "N too comes from the operand");
+
+        // `TAS.B (A0)` (`$4AD0`): the byte really is read and really is written
+        // back, at the same address — a read-modify-write, not a store of a
+        // computed value over a stale read. `$4AC8` is not this instruction: mode
+        // `001` is An direct, which `classify_tas` sends to `Op::Illegal`.
+        let (mut cpu, mut bus) = run(0x4AD0, &[0x4E71]);
+        cpu.a[0] = MEM;
+        bus.write_word(MEM, 0x1234);
+        cpu.set_ccr(SR_Z | SR_V | SR_C);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            bus.read_word(MEM),
+            0x9234,
+            "the byte at MEM — the high one, big-endian — is set; the other is left alone"
+        );
+        assert!(!cpu.flag_n(), "N comes from the `$12` read, not the `$92` stored");
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_c() && !cpu.flag_v());
+        assert_eq!(cpu.a[0], MEM, "a plain (An) does not move");
+
+        // `TAS.B (A0)+` (`$4AD8`) steps the pointer exactly once: one byte read
+        // and the same byte written, so `A0` ends one past the byte, not two.
+        let (mut cpu, mut bus) = run(0x4AD8, &[0x4E71]);
+        cpu.a[0] = MEM;
+        bus.write_word(MEM, 0x0102);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(bus.read_word(MEM), 0x8102, "one byte set, one byte left");
+        assert_eq!(cpu.a[0], MEM + 1, "A0 moved once");
     }
 
     /// Every condition code the `NEG`/`CLR` tests below start from, so a rule
