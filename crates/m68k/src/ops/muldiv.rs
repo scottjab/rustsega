@@ -124,6 +124,13 @@ const DIVU_BASE_CLOCKS: u32 = DIVU_WORST_CLOCKS - 2 * DIV_MAX_ITERATIONS;
 const DIVS_BASE_CLOCKS: u32 = DIVS_WORST_CLOCKS - 2 * DIV_MAX_ITERATIONS;
 /// The most a divide iterates: one pass per quotient bit.
 const DIV_MAX_ITERATIONS: u32 = 16;
+/// A `DIVU` that overflows: 10 clocks over the source's own addressing time,
+/// measured over all 2469 overflowing cases of `DIVU.json.gz`. See
+/// [`div_overflow_clocks`].
+const DIVU_OVERFLOW_CLOCKS: u32 = 10;
+/// A `DIVS` that overflows: 16 (or 18) clocks, same measurement over 3753 cases
+/// of `DIVS.json.gz`. See [`div_overflow_clocks`].
+const DIVS_OVERFLOW_CLOCKS: u32 = 16;
 
 /// `n` for MULU: the number of set bits in the source word (M68000UM section 8,
 /// "MULU — Multiply Unsigned": `38 + 2n`, `n` counted over the source operand).
@@ -187,17 +194,21 @@ fn divide_32_by_16(dividend: u32, divisor: u16, signed: bool) -> Option<(u16, u1
 /// being built rather than of the source, because an array divider walks the
 /// quotient it is producing.
 ///
-/// **This is an approximation, which is as far as #30 takes it.** The measured
-/// costs of the pinned suite run 106..=144 for `DIVU` and 126..=152 for `DIVS`
-/// (over the 4964 and 4992 cases of the two files that do not end in the suite's
-/// exception handler), so the shape and the span are right but single cases are
-/// off by up to about ten clocks; both files are therefore checked state-only.
-/// Two facts from that measurement are for M1-31 (#39/#40), which owns the real
-/// divider law: every cost is a multiple of 2, and no function of the quotient
-/// alone fits — the same `DIVU` quotient appears at two different costs, so the
-/// hardware looks at the walk order or the dividend as well. The manual's worst
-/// cases are right by construction, and `divu_timing_examples` /
-/// `divs_timing_examples` pin the shape.
+/// **This is an approximation, which is as far as #30 takes it**: M1-31 (#39 and
+/// #40) owns the divider's real clock law. Measured over the 4964 `DIVU` and
+/// 4992 `DIVS` cases of the pinned suite that do not end in its exception
+/// handler, with the source's own [`ea_clocks`] taken back out:
+///
+/// * every cost is a multiple of 2;
+/// * a completed divide is 38..=136 for `DIVU` and 120..=154 for `DIVS` — both
+///   under the manual's 140 / 158 worst case that [`DIVU_BASE_CLOCKS`] and
+///   [`DIVS_BASE_CLOCKS`] are anchored to, but spread far wider than this model,
+///   which cannot go below its own 108 / 126 base;
+/// * no function of the quotient alone can fit it: 171 of the 4774 distinct
+///   `DIVU` quotients appear at two different costs, so the divider also depends
+///   on the dividend or on the order the walk runs in.
+///
+/// `divu_timing_examples` and `divs_timing_examples` pin the shape that ships.
 const fn div_clocks(signed: bool, quotient: u16) -> u32 {
     if signed {
         DIVS_BASE_CLOCKS + MUL_ITERATION_CLOCKS * muls_iterations(quotient)
@@ -206,14 +217,19 @@ const fn div_clocks(signed: bool, quotient: u16) -> u32 {
     }
 }
 
-/// A divide that overflows is charged its worst case: the real divider aborts
-/// the walk partway through, and this core has not fitted where (see
-/// [`div_clocks`]; M1-31 #39/#40 owns the number).
+/// A divide that overflows never walks the quotient at all, and the suite says
+/// so in clocks: every one of its 2469 overflowing `DIVU` cases costs 10 clocks
+/// on top of the source's own [`ea_clocks`], and every one of its 3753
+/// overflowing `DIVS` cases 16 or 18 — this core charges the lower, the spread
+/// being one for M1-31 (#39/#40) to split rather than guess at here. It is the
+/// only number in this file measured from the chip's timing rather than from the
+/// manual, and it says an aborted divide is roughly a *tenth* of the cost of the
+/// divide it gave up on.
 const fn div_overflow_clocks(signed: bool) -> u32 {
     if signed {
-        DIVS_WORST_CLOCKS
+        DIVS_OVERFLOW_CLOCKS
     } else {
-        DIVU_WORST_CLOCKS
+        DIVU_OVERFLOW_CLOCKS
     }
 }
 
@@ -342,6 +358,9 @@ impl M68k {
             return 0;
         }
 
+        // The two outcomes cost different amounts, so which one this is decides
+        // the clock count as well as the destination: see [`div_clocks`] and
+        // [`div_overflow_clocks`].
         match divide_32_by_16(dividend, divisor, signed) {
             Some((quotient, remainder)) => {
                 self.write_ea(
@@ -362,7 +381,7 @@ impl M68k {
                 // Overflow. `V` set and `C` cleared; `N`, `Z` and `X` are left
                 // exactly as they were. The manual calls `N` and `Z` undefined
                 // here, but the chip is specific, and so is every overflowing
-                // case of the pinned files (1567 in `DIVU`, 2479 in `DIVS`).
+                // case of the pinned files (2469 in `DIVU`, 3753 in `DIVS`).
                 self.set_flag(SR_V, true);
                 self.set_flag(SR_C, false);
                 self.advance_opcode(bus);
@@ -699,10 +718,14 @@ mod tests {
         cpu.sr |= ALL_FLAGS;
         cpu.d[0] = 0x0001_0001;
         cpu.d[1] = 1;
-        cpu.step(&mut bus);
+        let clocks = cpu.step(&mut bus);
         assert_eq!(cpu.d[0], 0x0001_0001, "D0 is not written on overflow");
         assert!(cpu.flag_v());
         assert!(!cpu.flag_c(), "overflow sets V and clears C");
+        assert_eq!(
+            clocks, 10,
+            "and it is cheap: the walk never ran, so 10 clocks, not the 108 a divide that finished starts from"
+        );
         assert!(cpu.flag_n(), "N is left alone");
         assert!(cpu.flag_z(), "Z is left alone");
         assert!(cpu.flag_x(), "X is unaffected");
@@ -724,10 +747,14 @@ mod tests {
         cpu.sr |= ALL_FLAGS;
         cpu.d[0] = 0x8000_0000;
         cpu.d[1] = 0xFFFF;
-        cpu.step(&mut bus);
+        let clocks = cpu.step(&mut bus);
         assert_eq!(cpu.d[0], 0x8000_0000, "D0 untouched");
         assert!(cpu.flag_v());
         assert!(!cpu.flag_c());
+        assert_eq!(
+            clocks, 16,
+            "16 clocks for the aborted `DIVS` (18 on some operands)"
+        );
         assert!(cpu.flag_n() && cpu.flag_z(), "N and Z left alone");
 
         // `0x7FFF / -1` is the last divide that still fits: quotient -32767,
