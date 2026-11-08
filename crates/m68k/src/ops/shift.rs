@@ -307,7 +307,7 @@ impl M68k {
 mod tests {
     use super::*;
     use crate::sr::{SR_N, SR_Z};
-    use crate::testbus::TestBus;
+    use crate::testbus::{TestBus, cpu_with_program};
 
     /// The five condition code bits.
     const CC: u16 = SR_X | SR_N | SR_Z | SR_V | SR_C;
@@ -606,5 +606,124 @@ mod tests {
         let lsr_w_d5 = by(4, false, 0b01, 0b01) & !0b111 | 0b101;
         cpu.op_shift(&mut TestBus::new(), lsr_w_d5);
         assert_eq!(cpu.d[5], 0x1234_0567, "LSR.W #4 of $5678 is $567");
+    }
+
+    // ---- memory form: `1110 0tt d 11 eeeeee` (M1-19, #27) ----
+
+    /// `1110 0tt d 11 eeeeee`, the memory form, in pieces. `tt` selects the same
+    /// pair of mnemonics as in the register form but sits at bits 10..9, bit 8 is
+    /// still the direction, and the count field is gone: `ss` = `11` means the low
+    /// six bits are the effective address, the size is always word and the count
+    /// is always one (M68000UM "Instruction Formats", Format IX).
+    fn mem_op(kind: u8, left: bool, ea: u8) -> u16 {
+        0xE000 | (u16::from(kind) << MEM_KIND_SHIFT) | (u16::from(left) << 8) | 0b11 << 6
+            | u16::from(ea)
+    }
+
+    /// `tt` of the memory form: bits 10..9, not bits 4..3 as in the register form.
+    const MEM_KIND_SHIFT: u32 = 9;
+
+    /// `ASx.W (A0)`: the operand is the word `A0` points at, so `eeeeee` is
+    /// mode `010`, register `000`.
+    const EA_A0_IND: u8 = 0b010 << 3;
+    /// `ASx.W (A0)+`, for the read-modify-write test.
+    const EA_A0_POST: u8 = 0b011 << 3;
+
+    /// Where the operand of the memory-form tests lives: clear of the program at
+    /// `$1000` and of the stack at `$10000`.
+    const OPERAND: u32 = 0x0000_2000;
+
+    /// Run one memory-form instruction over the word at [`OPERAND`], which starts
+    /// at `value`, with `X` set to `x`. Returns the word memory holds afterwards
+    /// and the five condition codes.
+    fn run_memory(opcode: u16, value: u16, x: bool) -> (u16, u16) {
+        let (mut cpu, mut bus) = cpu_with_program(&[opcode, 0x4E71]);
+        cpu.a[0] = OPERAND;
+        cpu.set_flag(SR_X, x);
+        bus.load_words(OPERAND, &[value]);
+        cpu.step(&mut bus);
+        (bus.read_word(OPERAND), cpu.sr & CC)
+    }
+
+    /// Memory-form `ASL`: word size, one place, and the operand is memory — so
+    /// this is where a shift first moves real bus traffic, and `TestBus` is big
+    /// endian: the byte at `$2000` is the high byte of the word at `$2000`.
+    #[test]
+    fn asl_memory_word() {
+        let asl_a0 = mem_op(0b00, true, EA_A0_IND);
+
+        let (value, flags) = run_memory(asl_a0, 0xFFFE, false);
+        assert_eq!(value, 0xFFFC, "ASL.W (A0) of $FFFE");
+        assert_eq!(
+            flags, SR_N | SR_C | SR_X,
+            "the sign went out and N comes from the result"
+        );
+
+        let (value, flags) = run_memory(asl_a0, 0x8000, false);
+        assert_eq!(value, 0x0000, "ASL.W (A0) of $8000 is zero");
+        assert_eq!(
+            flags, SR_Z | SR_V | SR_C | SR_X, "and the sign changed, so V is set"
+        );
+
+        let (mut cpu, mut bus) = cpu_with_program(&[asl_a0, 0x4E71]);
+        cpu.a[0] = OPERAND;
+        bus.load_words(OPERAND, &[0xFFFE]);
+        cpu.step(&mut bus);
+        assert_eq!(
+            &bus.mem[OPERAND as usize..OPERAND as usize + 2],
+            &[0xFF, 0xFC],
+            "the word goes back big endian, high byte at the operand address"
+        );
+    }
+
+    /// Memory-form `ROR`: the width-bit rotate, so the bit that leaves the low
+    /// end enters the sign and `X` is outside the ring — here `X` starts set and
+    /// the rotate pushes a zero out, which must leave `X` alone while clearing `C`.
+    #[test]
+    fn ror_memory_word() {
+        let ror_a0 = mem_op(0b11, false, EA_A0_IND);
+
+        let (value, flags) = run_memory(ror_a0, 0x0002, true);
+        assert_eq!(value, 0x0001, "ROR.W (A0) of $2");
+        assert_eq!(
+            flags, SR_X,
+            "C takes the zero that rotated out; X, which a ROx never writes, stayed set"
+        );
+
+        let (value, flags) = run_memory(ror_a0, 0x0001, false);
+        assert_eq!(value, 0x8000, "ROR.W (A0) of $1 is the sign");
+        assert_eq!(flags, SR_N | SR_C, "with C set and X still clear");
+    }
+
+    /// Memory-form `ROXR`: `X` is part of the ring, so it comes in at the sign and
+    /// the bit that leaves the low end becomes the new `X`.
+    #[test]
+    fn roxr_memory_word_with_x() {
+        let roxr_a0 = mem_op(0b10, false, EA_A0_IND);
+
+        let (value, flags) = run_memory(roxr_a0, 0x0000, true);
+        assert_eq!(value, 0x8000, "ROXR.W (A0) of $0 with X set pulls X into the sign");
+        assert_eq!(flags, SR_N, "and both X and C take the zero that left");
+
+        let (value, flags) = run_memory(roxr_a0, 0x0001, false);
+        assert_eq!(value, 0x0000, "ROXR.W (A0) of $1 with X clear is zero");
+        assert_eq!(flags, SR_Z | SR_C | SR_X, "with C and X both set");
+    }
+
+    /// The memory form is a read-modify-write: one resolve, so `(A0)+` steps once
+    /// and the word is written back to the address that was read (M68000UM
+    /// "Address Register Indirect with Postincrement"; the same property #22 pins
+    /// for `NEG` and #21 for `AND`).
+    #[test]
+    fn memory_form_postincrement_steps_the_pointer_once() {
+        let asr_a0_post = mem_op(0b00, false, EA_A0_POST);
+        let (mut cpu, mut bus) = cpu_with_program(&[asr_a0_post, 0x4E71]);
+        cpu.a[0] = OPERAND;
+        bus.load_words(OPERAND, &[0x8000]);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[0], OPERAND + 2, "(A0)+ steps exactly once");
+        assert_eq!(bus.read_word(OPERAND), 0xC000, "at the address that was read");
     }
 }
