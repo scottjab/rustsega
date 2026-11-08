@@ -209,6 +209,7 @@ impl M68k {
         Op::Reset => self.op_reset(bus, opcode),
         Op::Stop => self.op_stop(bus, opcode),
         Op::Tas => self.op_tas(bus, opcode),
+        Op::Chk => self.op_chk(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming

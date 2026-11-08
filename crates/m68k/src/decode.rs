@@ -446,6 +446,13 @@ pub enum Op {
     /// that [`Op::Tst`] deliberately leaves alone. Its operand must be
     /// data-alterable, and `$4AFC` inside the range is `ILLEGAL`.
     Tas,
+    /// `CHK.W Dn,<ea>` — `0100 ddd 110 mmm rrr` (M68000UM "CHK — Check Data
+    /// Register Against Upper Bound", #35). `Dn` is read, never written; the
+    /// operand takes the same data-alterable set TAS uses, and anything else is
+    /// [`Op::Illegal`]. The `100` neighbour of bits 8..6, `$4100`..`$4F7F`, is
+    /// `CHK.L`, which is a 68020 instruction and so decodes to [`Op::Illegal`]
+    /// here rather than to [`Op::Unimplemented`] — see the note on the decode arm.
+    Chk,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -650,6 +657,18 @@ fn classify(opcode: u16) -> Op {
         // this arm can take the top half of `$4C??` whole: `$4C00`..`$4C7F` is
         // unassigned on the 68000 and stays [`Op::Unimplemented`] below it.
         0x4C80..=0x4CFF => classify_movem(opcode),
+        // `0100 ddd 110 mmm rrr`: CHK.W (M68000UM "CHK — Check Data Register
+        // Against Upper Bound", #35). Bits 8..6 = `110` is CHK's alone in the
+        // `0100` group — LEA takes `111`, JMP and JSR are `$4EE8`/`$4EB8`, and
+        // MOVEM's `0100 1d00 1s` leaves bits 8..6 at `010`/`011`, so the two
+        // never meet and the order of the arms is only about readability.
+        0x4000..=0x4FFF if opcode & 0x1C0 == 0x180 => classify_chk(opcode),
+        // Bits 8..6 = `100` in the same group is `CHK.L`, which the 68000 does not
+        // have (M68000UM lists CHK as word only; the long form is 68020). An
+        // instruction the CPU cannot know about is an illegal instruction, not an
+        // unassigned encoding, and `CHK.json.gz` agrees: `$4D00` and friends are
+        // exception cases, not `Unimplemented`.
+        0x4000..=0x4FFF if opcode & 0x1C0 == 0x100 => Op::Illegal,
         // `0000 0000 ss eeeeee`, `0000 0010 ss eeeeee` and `0000 1010 ss eeeeee`:
         // ORI, ANDI and EORI, the three `#imm,<ea>` logic operations. Bit 8 is
         // clear throughout all three ranges, which is what keeps them apart from
@@ -1671,6 +1690,27 @@ fn classify_tas(opcode: u16) -> Op {
         return Op::Illegal;
     }
     Op::Tas
+}
+
+/// CHK takes the operand set TAS takes: a data register or memory, read-only for
+/// our purposes but still an `<ea>` that a byte/word operand can live in
+/// (M68000UM "CHK — Check Data Register Against Upper Bound", "Effective Address
+/// Calculation"; #35). An `An`-direct, PC-relative or immediate source is
+/// therefore [`Op::Illegal`], which is what the ~3100 non-trapping exception
+/// cases of `CHK.json.gz` fetch `$0C` for.
+fn classify_chk(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    // CHK only ever *reads* its operand, so its set is the data *read* set, not
+    // the data-alterable one the `NEG`/`CLR`/`TAS` group uses: `#immediate` and
+    // the three PC-relative forms are all legal operands here (CHK.json.gz runs
+    // them), and only mode `001` — naming a register instead of a value — and
+    // mode `111`/`111`, which is no mode at all, are rejected (M68000UM CHK,
+    // "Effective Address Calculation"; M68000PM/AD 2.2.12 "Data").
+    if mode == AN_DIRECT_MODE || !is_data(mode, reg) {
+        return Op::Illegal;
+    }
+    Op::Chk
 }
 
 #[cfg(test)]
@@ -3464,7 +3504,54 @@ mod tests {
         // `$4AC0`..`$4AFF` in `TAS.json.gz`.
         assert_eq!(decode(0x487A), Op::Pea, "PEA d16(PC), just below");
         assert_eq!(decode(0x4C00), Op::Unimplemented, "bit 7 clear, just below");
-        assert_eq!(decode(0x4D00), Op::Unimplemented, "bit 8 set, just above");
+        // `$4D00` is above MOVEM rather than part of it, but it is no longer
+        // unassigned: bits 8..6 = `100` in the `0100` group is `CHK.L`, which the
+        // 68000 does not implement (M68000UM lists CHK as word only; the long form
+        // is 68020), so it is an illegal instruction (#35). MOVEM's own window,
+        // which is what this test is about, is untouched.
+        assert_eq!(decode(0x4D00), Op::Illegal, "bit 8 set: CHK.l, 68020-only");
+    }
+
+    /// CHK is `0100 ddd 110 mmm rrr` (M68000UM "CHK — Check Data Register Against
+    /// Upper Bound"; #35). All eight register slots are walked so a stray mask in
+    /// the decode arm shows up as a count failure rather than as 250 opcodes that
+    /// quietly stayed [`Op::Unimplemented`], and the whole of the `0100 ddd 100`
+    /// block below each one is CHK's 68020-only long form, which must be illegal.
+    #[test]
+    fn chk_is_exactly_its_own_opcodes() {
+        let mut chk = 0u16;
+        for dn in 0..8u16 {
+            let base = 0x4000 | (dn << 9);
+            // The data-alterable operand fields, and only those.
+            for mode in 0..8u8 {
+                for reg in 0..8u8 {
+                    let opcode = base | 0x180 | (u16::from(mode) << 3) | u16::from(reg);
+                    let want = if mode != 0b001 && is_data(mode, reg) {
+                        Op::Chk
+                    } else {
+                        Op::Illegal
+                    };
+                    assert_eq!(decode(opcode), want, "chk.w ${opcode:04X}");
+                    chk += u16::from(want == Op::Chk);
+                }
+            }
+            // CHK.l: bits 8..6 = `100`, the `$40`-wide block directly below —
+            // `101` under it is still unassigned and `111` above is LEA.
+            for offset in 0..0x40u16 {
+                let opcode = base | 0x100 | offset;
+                assert_eq!(
+                    decode(opcode),
+                    Op::Illegal,
+                    "chk.l ${opcode:04X} is a 68020 instruction"
+                );
+            }
+        }
+        // 53 operand fields per register: the 48 of modes `000` and `010`..`110`,
+        // plus the five real sub-modes of `111` (abs.W, abs.L, d16(PC), d8(PC,Xn)
+        // and `#immediate` — all of them readable, so all of them legal here),
+        // minus mode `001`'s eight, which name an address register rather than a
+        // value. Times 8 destination registers.
+        assert_eq!(chk, 424, "the CHK opcode count");
     }
 
     /// NBCD is `0100 1000 00 mmm rrr`, the 64 opcodes of this window with both
