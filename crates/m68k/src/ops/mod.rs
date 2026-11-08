@@ -36,6 +36,7 @@
 //! [`crate::exceptions`] (M1-08, #16); this module only says which opcode takes
 //! which route.
 
+mod address;
 mod arith;
 mod logic;
 mod move_;
