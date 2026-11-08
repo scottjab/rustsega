@@ -186,7 +186,7 @@ impl M68k {
 mod tests {
     use crate::bus::Bus;
     use crate::cpu::M68k;
-    use crate::decode::{decode, Op};
+    use crate::decode::{Op, decode};
     use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
     use crate::testbus::{TestBus, cpu_with_program};
 
@@ -196,7 +196,7 @@ mod tests {
 
     /// Memory operand for the byte-size tests: well clear of the program at
     /// `$1000` and of the stack at `$1_0000`.
-    const MEM: u32 = 0x0020_00;
+    const MEM: u32 = 0x0000_2000;
 
     // The four `tt` values.
     const BTST: u8 = 0b00;
@@ -265,7 +265,11 @@ mod tests {
         );
         // And the neighbours that *are* bit operations do decode, so the rule
         // above is a hole in the family rather than the family being missing.
-        assert_ne!(decode(dynamic(0, BTST, DN, 0)), Op::Unimplemented, "BTST D0,D0");
+        assert_ne!(
+            decode(dynamic(0, BTST, DN, 0)),
+            Op::Unimplemented,
+            "BTST D0,D0"
+        );
         assert_ne!(decode(static_(BTST, DN, 0)), Op::Unimplemented, "BTST #,D0");
     }
 
@@ -394,7 +398,10 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(cpu.d[2], 0x0000_0000, "bit 5 went away");
-        assert!(!cpu.flag_z(), "bit 5 was set before the change, so Z is clear");
+        assert!(
+            !cpu.flag_z(),
+            "bit 5 was set before the change, so Z is clear"
+        );
 
         let (mut cpu, mut bus) = run(dynamic(1, BCHG, DN, 2), &[0x4E71]);
         cpu.d[1] = 5;
@@ -403,7 +410,10 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(cpu.d[2], 0x0000_0020, "bit 5 appeared");
-        assert!(cpu.flag_z(), "bit 5 was clear before the change, so Z is set");
+        assert!(
+            cpu.flag_z(),
+            "bit 5 was clear before the change, so Z is set"
+        );
     }
 
     /// `BCHG` on a memory operand is a byte read-modify-write at the byte the EA
@@ -439,7 +449,10 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(bus.read_byte(MEM), 0x83, "only bit 3 of $8B went away");
-        assert!(!cpu.flag_z(), "bit 3 was set before the clear, so Z is clear");
+        assert!(
+            !cpu.flag_z(),
+            "bit 3 was set before the clear, so Z is clear"
+        );
 
         let (mut cpu, mut bus) = run(opcode, &[0x0003, 0x4E71]);
         cpu.a[0] = MEM;
@@ -447,8 +460,15 @@ mod tests {
 
         cpu.step(&mut bus);
 
-        assert_eq!(bus.read_byte(MEM), 0x87, "clearing a clear bit changes nothing");
-        assert!(cpu.flag_z(), "bit 3 was clear before the clear, so Z is set");
+        assert_eq!(
+            bus.read_byte(MEM),
+            0x87,
+            "clearing a clear bit changes nothing"
+        );
+        assert!(
+            cpu.flag_z(),
+            "bit 3 was clear before the clear, so Z is set"
+        );
     }
 
     /// …and the same static form on a `Dn` is a **long** operation: `BCLR #31,D2`
@@ -462,7 +482,10 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(cpu.d[2], 0x7FFF_FFFF, "bit 31 of the long, not bit 7");
-        assert!(!cpu.flag_z(), "bit 31 was set before the clear, so Z is clear");
+        assert!(
+            !cpu.flag_z(),
+            "bit 31 was set before the clear, so Z is clear"
+        );
     }
 
     // ---- BSET ----
@@ -481,7 +504,11 @@ mod tests {
 
         assert_eq!(bus.read_byte(MEM), 0x8F, "bit 7 of $0F is $8F");
         assert!(cpu.flag_z(), "bit 7 was clear before the set, so Z is set");
-        assert_eq!(cpu.a[0], MEM + 1, "a byte operand steps A0 by one, not four");
+        assert_eq!(
+            cpu.a[0],
+            MEM + 1,
+            "a byte operand steps A0 by one, not four"
+        );
     }
 
     /// `BSET D1,D2` on a `Dn` is a long write: bit 31 of `D2`, with the low three
@@ -564,7 +591,11 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(bus.read_byte(MEM), 0x01, "written back where it read");
-        assert_eq!(bus.read_byte(MEM + 1), 0xFF, "not twice, so $20001 was never named");
+        assert_eq!(
+            bus.read_byte(MEM + 1),
+            0xFF,
+            "not twice, so $20001 was never named"
+        );
         assert_eq!(cpu.a[0], MEM + 1, "A0 moved once");
     }
 
@@ -582,7 +613,11 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(bus.read_byte(MEM), 0x02, "bit 0 cleared once");
-        assert_eq!(bus.read_byte(MEM + 1), 0xFF, "the next byte was never named");
+        assert_eq!(
+            bus.read_byte(MEM + 1),
+            0xFF,
+            "the next byte was never named"
+        );
         assert_eq!(cpu.a[0], MEM + 1, "A0 moved once");
     }
 
@@ -599,8 +634,16 @@ mod tests {
 
         cpu.step(&mut bus);
 
-        assert_eq!(bus.read_byte(MEM), 0x03, "bit 0 set once, not toggled twice");
-        assert_eq!(bus.read_byte(MEM + 1), 0xFF, "the next byte was never named");
+        assert_eq!(
+            bus.read_byte(MEM),
+            0x03,
+            "bit 0 set once, not toggled twice"
+        );
+        assert_eq!(
+            bus.read_byte(MEM + 1),
+            0xFF,
+            "the next byte was never named"
+        );
         assert_eq!(cpu.a[0], MEM + 1, "A0 moved once");
     }
 

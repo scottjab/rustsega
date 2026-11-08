@@ -1253,7 +1253,8 @@ const BIT_OP_REGISTER_SHIFT: u32 = 9;
 /// can only be the static form. `MOVEP` also has bit 8 set, and the mode `001`
 /// half of it is left to M1-25 (#33) by [`classify_bit_op`].
 const fn is_bit_op(opcode: u16) -> bool {
-    opcode & BIT_OP_NUMBER_BIT != 0 || (opcode >> BIT_OP_REGISTER_SHIFT) & 0b111 == BIT_OP_STATIC_DDD
+    opcode & BIT_OP_NUMBER_BIT != 0
+        || (opcode >> BIT_OP_REGISTER_SHIFT) & 0b111 == BIT_OP_STATIC_DDD
 }
 
 /// One opcode of the single-bit family: [`Op::BitDynamic`] or
@@ -1866,7 +1867,10 @@ mod tests {
         // down to the mode `001` column #28 left for M1-25 (#33): MOVEP, plus the
         // mode `001` encodings with bit 8 clear that the 68000 does not define.
         for (opcode, name) in [
-            (0x0108u16, "MOVEP.L D0,(A0): mode 001 of this group, not a bit op"),
+            (
+                0x0108u16,
+                "MOVEP.L D0,(A0): mode 001 of this group, not a bit op",
+            ),
             (0x0908, "the same mode, another bit number register"),
             (0x0808, "mode 001 with bit 8 clear, unassigned on the 68000"),
         ] {
@@ -2500,8 +2504,16 @@ mod tests {
             for tt in [0b01u16, 0b10, 0b11] {
                 let dynamic = 0x0100 | (tt << 6) | ea;
                 let static_ = 0x0800 | (tt << 6) | ea;
-                assert_eq!(decode(dynamic), Op::Illegal, "dynamic modify {name} ({dynamic:#06X})");
-                assert_eq!(decode(static_), Op::Illegal, "static modify {name} ({static_:#06X})");
+                assert_eq!(
+                    decode(dynamic),
+                    Op::Illegal,
+                    "dynamic modify {name} ({dynamic:#06X})"
+                );
+                assert_eq!(
+                    decode(static_),
+                    Op::Illegal,
+                    "static modify {name} ({static_:#06X})"
+                );
             }
         }
         // Mode `111` register `101` is not an effective address at all, so not
