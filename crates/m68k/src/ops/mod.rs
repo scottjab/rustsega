@@ -36,6 +36,7 @@
 //! [`crate::exceptions`] (M1-08, #16); this module only says which opcode takes
 //! which route.
 
+mod address;
 mod arith;
 mod logic;
 mod move_;
@@ -123,6 +124,14 @@ impl M68k {
             Op::Andi => self.op_andi(bus, opcode),
             Op::Ori => self.op_ori(bus, opcode),
             Op::Eori => self.op_eori(bus, opcode),
+            // `LEA`/`PEA`/`LINK`/`UNLK` (`0100 ddd 111 …`, PEA's half of
+            // `0100 1000 01 …` and `$4E50`/`$4E58`): the operand is an address,
+            // so they live together in [`address`] and none of them touches a
+            // condition code.
+            Op::Lea => self.op_lea(bus, opcode),
+            Op::Pea => self.op_pea(bus, opcode),
+            Op::Link => self.op_link(bus, opcode),
+            Op::Unlk => self.op_unlk(bus, opcode),
             // `Op::Unimplemented`, and every variant a later ticket adds before
             // it has a handler here: loud, so a missing instruction can never
             // be mistaken for a working one. A wildcard rather than naming

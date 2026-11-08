@@ -184,7 +184,7 @@ const PREDEC_CALC_CLOCKS: u64 = 2;
 /// The stack pointer register: `a[7]`, the address register with the two quirks
 /// — a byte push or pop steps it by two ([`ea_step`]), and it mirrors into the
 /// stored `ssp`/`usp` slot ([`M68k::set_an`]).
-const SP_REG: u8 = 7;
+pub(crate) const SP_REG: u8 = 7;
 
 const fn ea_step(reg: u8, size: Size) -> u32 {
     if reg == SP_REG && matches!(size, Size::Byte) {
@@ -303,10 +303,9 @@ pub(crate) const fn is_memory(mode: u8, reg: u8) -> bool {
 /// tables of those instructions: postincrement and predecrement are excluded
 /// because a control operand is only read, never stepped over or into). The
 /// 68010 adds `(An)+` and `-(An)` to `LEA`; this core is a 68000.
-#[allow(
-    dead_code,
-    reason = "the branch and test-and-set tickets (M1-14 onward) are the callers; only the tests use it today"
-)]
+///
+/// `LEA` and `PEA` are the callers so far (M1-15, #23); `JMP` and `JSR` add two
+/// more when M1-16 lands.
 pub(crate) const fn is_control(mode: u8, reg: u8) -> bool {
     matches!(
         ea_class(mode, reg),
@@ -418,7 +417,7 @@ impl M68k {
                 Some(Ea::Mem(self.a[r].wrapping_add(disp) & ADDR_MASK))
             }
             // 110 d8(An,Xn): one brief extension word, An + Xn + d8.
-            0b110 => self.indexed_ea(bus, self.a[r]),
+            0b110 => Some(Ea::Mem(self.indexed_addr(bus, self.a[r]) & ADDR_MASK)),
             // 111: the sub-mode comes from the register field of the EA
             // (M68000UM, "Effective Address Calculation", mode 111).
             0b111 => match reg {
@@ -444,7 +443,7 @@ impl M68k {
                 // d8(PC,Xn): the indexed form, same base.
                 0b011 => {
                     let base = self.ext_addr();
-                    self.indexed_ea(bus, base)
+                    Some(Ea::Mem(self.indexed_addr(bus, base) & ADDR_MASK))
                 }
                 // #imm: the operand *is* the extension word(s). A byte
                 // immediate occupies the low byte of one word, with the high
@@ -464,10 +463,70 @@ impl M68k {
         }
     }
 
+    /// The address an EA field *computes*, without reading or writing anything
+    /// there: `LEA` and `PEA` take the address itself as their operand
+    /// (M68000UM, "LEA — Address Register Indirect and Program" and "PEA — Push
+    /// Effective Address"; M1-15, #23).
+    ///
+    /// Two differences from [`M68k::resolve_ea`], and both matter:
+    ///
+    /// * the sum is **not** masked to [`ADDR_MASK`]. [`Ea::Mem`] holds the
+    ///   address that reaches the bus, so masking there is right; but `LEA` and
+    ///   `PEA` put the value in an address register, where the top eight bits are
+    ///   real. `LEA.json.gz` case `41fa [LEA (d16, PC), A0] 59` starts at
+    ///   `pc = $000C00` with displacement `$FFFFA3E9` and expects `A0 =
+    ///   $FFFFAFEB`, not the masked `$0000AFEB` — the report is #193, and 7162 of
+    ///   that file's 8065 cases and 7153 of `PEA.json.gz`'s end above the mask,
+    ///   so this is not an edge case.
+    /// * only the *control* modes are addressable: `Dn`, `An`, `(An)+`, `-(An)`
+    ///   and `#imm` have no address to hand over ([`is_control`], and the mode
+    ///   list M68000UM gives both instructions). `decode` rejects those first, so
+    ///   as in [`M68k::resolve_ea`] `None` here means a handler and the decoder
+    ///   disagree, and the caller turns it into an illegal instruction.
+    ///
+    /// `mode` and `reg` are the two halves of the EA field as in
+    /// [`M68k::resolve_ea`], and the extension words are consumed the same way —
+    /// including `d16(PC)`/`d8(PC,Xn)` measuring from [`M68k::ext_addr`].
+    pub(crate) fn ea_address(&mut self, bus: &mut impl Bus, mode: u8, reg: u8) -> Option<u32> {
+        if !is_control(mode, reg) {
+            return None;
+        }
+        let r = usize::from(reg);
+        let addr = match mode {
+            // (An): the register contents are the address, whole.
+            0b010 => self.a[r],
+            // d16(An).
+            0b101 => self.a[r].wrapping_add(sign_extend_word(self.fetch_ext_word(bus))),
+            // d8(An,Xn).
+            0b110 => self.indexed_addr(bus, self.a[r]),
+            // 111: the sub-mode is the register field, as in `resolve_ea`.
+            0b111 => match reg {
+                0b000 => sign_extend_word(self.fetch_ext_word(bus)),
+                0b001 => self.fetch_ext_long(bus),
+                0b010 => {
+                    let base = self.ext_addr();
+                    base.wrapping_add(sign_extend_word(self.fetch_ext_word(bus)))
+                }
+                0b011 => {
+                    let base = self.ext_addr();
+                    self.indexed_addr(bus, base)
+                }
+                // `is_control` excludes #imm and the three invalid sub-modes.
+                _ => return None,
+            },
+            // `is_control` excludes Dn, An, (An)+ and -(An).
+            _ => return None,
+        };
+        Some(addr)
+    }
+
     /// The `d8(An,Xn)` / `d8(PC,Xn)` brief extension word: `An` (or the PC
     /// relative base) + index register + 8-bit displacement, plus the 2 internal
     /// clocks the index calculation costs (M68000UM, "Index Displacement
     /// Addressing Mode").
+    ///
+    /// Returns the unmasked sum: [`M68k::resolve_ea`] masks it on the way into
+    /// [`Ea::Mem`] and [`M68k::ea_address`] hands it over whole.
     ///
     /// Bit layout of the brief extension word (M68000UM, "Index Registers"):
     /// bit 15 index register type (0 = Dn, 1 = An), bits 14..12 index register
@@ -477,7 +536,7 @@ impl M68k {
     /// them as part of the word and acts on nothing: 2339 of the 2729
     /// `d8(...,Xn)` cases in `LEA.json.gz` carry nonzero bits there and all of
     /// them still match the sum with the bits dropped.
-    fn indexed_ea(&mut self, bus: &mut impl Bus, base: u32) -> Option<Ea> {
+    fn indexed_addr(&mut self, bus: &mut impl Bus, base: u32) -> u32 {
         let brief = self.fetch_ext_word(bus);
         self.cycles += INDEX_CALC_CLOCKS;
 
@@ -497,9 +556,7 @@ impl M68k {
         };
         let disp = sign_extend_byte(brief as u8);
 
-        Some(Ea::Mem(
-            base.wrapping_add(index).wrapping_add(disp) & ADDR_MASK,
-        ))
+        base.wrapping_add(index).wrapping_add(disp)
     }
 
     /// Address of the extension word that the next [`M68k::fetch_ext_word`] will
