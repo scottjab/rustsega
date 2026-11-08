@@ -316,6 +316,16 @@ pub enum Op {
     /// `decode::tests::unknown_is_unimplemented_for_now` until this variant
     /// landed, which moved that anchor to `RESET` at `$4E70`.
     Nop,
+    /// The register-form shift and rotate group, `1110 ccc d ss i tt rrr` with
+    /// `ss` != `11`: `ASL`/`ASR`, `LSL`/`LSR`, `ROXL`/`ROXR` and `ROL`/`ROR` in
+    /// byte, word and long (M68000UM "ASL, ASR, LSL, LSR", "ROL, ROR", "ROXL,
+    /// ROXR"; M1-18, #26). One variant for all 3072 of them, because the size,
+    /// direction, count source and operation are all fields the handler reads —
+    /// see [`crate::ops::shift`].
+    ///
+    /// `ss` = `11` is not the fourth size: it is Format IX, memory-form
+    /// `ASx.w <ea>`, which stays [`Op::Unimplemented`] for M1-19 (#27).
+    Shift,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -493,10 +503,27 @@ fn classify(opcode: u16) -> Op {
         0x8000..=0x8FFF => classify_or(opcode),
         // `1100 ddd ooo eeeeee`: AND, and MUL/ABCD/EXG's space.
         0xC000..=0xCFFF => classify_and(opcode),
+        // `1110 ccc d ss i tt rrr`: the shifts and rotates, and memory-form ASx.
+        0xE000..=0xEFFF => classify_shift(opcode),
         // Every other group is a real instruction whose handler has not been
         // written yet; the tickets that write them split these groups up.
         _ => Op::Unimplemented,
     }
+}
+
+/// One opcode of the `1110` shift group: [`Op::Shift`] for the 3072 register-form
+/// encodings, and [`Op::Unimplemented`] for the 448 that are `ss` = `11`.
+///
+/// `ss` = `11` is not a size. In Format IX those two bits select an addressing
+/// mode, and `1110 ddd 11 iiii ii` is `ASx.W <ea>` — a different instruction, with
+/// its own count encoding and a memory operand, which is M1-19 (#27). Leaving it
+/// unimplemented is what lets [`crate::ops::shift`] treat `ss` as a size field
+/// without checking.
+fn classify_shift(opcode: u16) -> Op {
+    if (opcode >> 6) & 0b11 == 0b11 {
+        return Op::Unimplemented;
+    }
+    Op::Shift
 }
 
 /// One opcode of the `0001`/`0010`/`0011` move groups: [`Op::Move`],
@@ -1248,7 +1275,45 @@ mod tests {
         // out of the `1000` group; `0xC0C0` is `MULU`, likewise.
         assert_eq!(decode(0x8FFF), Op::Unimplemented, "DIVS");
         assert_eq!(decode(0xC0C0), Op::Unimplemented, "MULU");
-        assert_eq!(decode(0xE0C0), Op::Unimplemented, "ASR.W D0");
+        // `1110`'s anchor survived #26 by three bits: the register-form shifts
+        // are `Op::Shift` now, and only memory-form `ASx.W <ea>` (`ss` = `11`)
+        // is still unimplemented, for M1-19 (#27). See [`shift_group_decodes`].
+        assert_eq!(decode(0xE0C0), Op::Unimplemented, "ASR.W <ea>");
+    }
+
+    /// The `1110` group is the eight register-form shift and rotate mnemonics in
+    /// three sizes: `1110 ccc d ss i tt rrr` with `ss` != `11`, which is 3072 of
+    /// the group's 4096 opcodes (M68000UM "ASL, ASR, LSL, LSR"; M1-18, #26). The
+    /// other 1024 are `ss` = `11`: Format IX, memory-form `ASx.W <ea>`, M1-19
+    /// (#27).
+    #[test]
+    fn shift_group_decodes() {
+        // Real encodings, read off the suite's own case names.
+        assert_eq!(decode(0xE022), Op::Shift, "ASR.B D1,D2");
+        assert_eq!(decode(0xE3A2), Op::Shift, "ASL.L D1,D2");
+        assert_eq!(decode(0xE792), Op::Shift, "ROXL.L #3,D2");
+        assert_eq!(decode(0xE01A), Op::Shift, "ROR.B #8,D2");
+        assert_eq!(decode(0xE362), Op::Shift, "ASL.W D1,D2");
+        // The three sizes are `00`, `01` and `10`, so the first three quarters of
+        // the `$E0xx` block are all register form...
+        assert_range_decodes_to(0xE000..=0xE0BF, Op::Shift);
+        // ...and `11` is not a size but the addressing-mode field of a completely
+        // different instruction.
+        assert_range_decodes_to(0xE0C0..=0xE0FF, Op::Unimplemented);
+        assert_range_decodes_to(0xE4C0..=0xE4FF, Op::Unimplemented);
+        assert_range_decodes_to(0xEFC0..=0xEFFF, Op::Unimplemented);
+
+        let group = 0xE000u16..=0xEFFF;
+        let shifts = group.clone().filter(|op| decode(*op) == Op::Shift).count();
+        assert_eq!(
+            shifts, 3072,
+            "3 sizes * 2 directions * 4 kinds * 8 counts * 2 count sources * 8 registers"
+        );
+        assert_eq!(
+            group.into_iter().count() - shifts,
+            1024,
+            "memory-form ASx.W"
+        );
     }
 
     /// The EA modes `LEA` and `PEA` address, written out from M68000UM's mode

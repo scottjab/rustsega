@@ -46,8 +46,9 @@ fn word_files_fail_only_on_memory_form_cases() {
             eprintln!("{}", harness::skip_line(&name));
             return;
         };
-        let (memory, register): (Vec<_>, Vec<_>) =
-            cases.into_iter().partition(|case| is_memory_form(&case.name));
+        let (memory, register): (Vec<_>, Vec<_>) = cases
+            .into_iter()
+            .partition(|case| is_memory_form(&case.name));
 
         let register_report = harness::run_cases(&register, Check::StateSkipAddressErrors);
         assert!(
