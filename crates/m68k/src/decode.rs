@@ -229,6 +229,14 @@ pub enum Op {
     /// the bit number is the low eight bits of the instruction's first extension
     /// word instead of a register (M68000UM BTST/BCHG/BCLR/BSET; M1-20, #28).
     BitStatic,
+    /// `MOVEP.W`/`MOVEP.L`: `0000 ddd 1 oo 001 aaa` plus a 16-bit displacement
+    /// (M68000UM "MOVEP — Move to Peripheral Device"; M1-25, #33). The mode field
+    /// is fixed at `001`, so MOVEP is the mode `001` column of the `$0000` group
+    /// that [`Op::BitDynamic`] cannot have — which is why [`is_movep`] is tried
+    /// before [`is_bit_op`] and why one variant covers all four `oo` values: the
+    /// direction and the width are both fields the handler re-reads, as in
+    /// [`Op::Move`]. See [`crate::ops::movep`].
+    Movep,
     /// `NEG <ea>`, `$4400 + ss<<6 + <ea>` with `ss` != `11` (M68000UM NEG,
     /// #22). `0 - <ea>` written back to the same data-alterable operand, so it
     /// is [`Op::Not`]'s shape with [`crate::ops::arith`]'s subtract flags.
@@ -573,6 +581,10 @@ fn classify(opcode: u16) -> Op {
         0x0000..=0x00FF => classify_logic_imm(opcode, Op::Ori),
         0x0200..=0x02FF => classify_logic_imm(opcode, Op::Andi),
         0x0A00..=0x0AFF => classify_logic_imm(opcode, Op::Eori),
+        // MOVEP, `0000 ddd 1 oo 001 aaa`, before the single-bit family it shares
+        // bit 8 with: both spell an EA field, and mode `001` of that field is
+        // MOVEP's and never a bit operation's (see [`is_movep`]; M1-25, #33).
+        0x0000..=0x0FFF if is_movep(opcode) => Op::Movep,
         // The single-bit family, which shares the `0000` group with those three:
         // `0000 ddd 1 tt eeeeee` (bit number in `Ddd`) and `0000 1000 tt eeeeee`
         // (bit number in the extension word). Bit 8 set is the whole dynamic half
@@ -1379,6 +1391,21 @@ const BIT_OP_MNEMONIC_SHIFT: u32 = 6;
 /// form's `100` from the immediate operations' `000`/`001`/`010`/`101`/`110`.
 const BIT_OP_REGISTER_SHIFT: u32 = 9;
 
+/// Whether `opcode` is one of the 256 encodings of MOVEP, `0000 ddd 1 oo 001
+/// aaa` (M68000UM MOVEP; M1-25, #33): bit 8 set and the EA mode `001`, which
+/// together are unique to it in the `0000` group — every immediate operation has
+/// bit 8 clear, and no bit operation takes mode `001`.
+///
+/// Checked before [`is_bit_op`], which a MOVEP opcode satisfies.
+const fn is_movep(opcode: u16) -> bool {
+    opcode & MOVEP_MASK == MOVEP_MATCH
+}
+
+/// The bits that say MOVEP: bit 8 and the EA mode field.
+const MOVEP_MASK: u16 = 0x0138;
+/// What [`MOVEP_MASK`] selects to: bit 8 set, mode `001`.
+const MOVEP_MATCH: u16 = 0x0108;
+
 /// Whether `opcode` is one of the 8192 encodings of the single-bit family,
 /// `0000 ddd 1 tt eeeeee` or `0000 1000 tt eeeeee` (M68000UM BTST/BCHG/BCLR/
 /// BSET; M1-20, #28).
@@ -1387,8 +1414,8 @@ const BIT_OP_REGISTER_SHIFT: u32 = 9;
 /// operation nor MOVEP, and they are recognised apart from both by bit 8: every
 /// immediate (`ORI`, `ANDI`, `SUBI`, `ADDI`, `EORI`, `CMPI`) has bit 8 clear and a
 /// `ddd` of `000`/`001`/`010`/`101`/`110`, so a clear bit 8 with `ddd` = `100`
-/// can only be the static form. `MOVEP` also has bit 8 set, and the mode `001`
-/// half of it is left to M1-25 (#33) by [`classify_bit_op`].
+/// can only be the static form. `MOVEP` also has bit 8 set and reaches here, but
+/// [`is_movep`] claims it before this predicate is ever asked about it.
 const fn is_bit_op(opcode: u16) -> bool {
     opcode & BIT_OP_NUMBER_BIT != 0
         || (opcode >> BIT_OP_REGISTER_SHIFT) & 0b111 == BIT_OP_STATIC_DDD
@@ -1401,10 +1428,13 @@ const fn is_bit_op(opcode: u16) -> bool {
 ///
 /// Three corners, each of which a plain `match` on `tt` would get wrong:
 ///
-/// * **Mode `001` is `MOVEP`.** `MOVEP.L D0,(A0)` is `$0108`, whose EA field is
-///   exactly the field `BTST D0,(A0)` would use; M68000PM/AD section 8 spells
-///   bits 7..6 `d1 d0` there, not `tt`. So the whole mode `001` column of this
-///   group — dynamic *and* static — stays [`Op::Unimplemented`] for M1-25 (#33).
+/// * **Mode `001` was `MOVEP`, and is still not a bit operation.**
+///   `MOVEP.L D0,(A0)` is `$0108`, whose EA field is exactly the field `BTST
+///   D0,(A0)` would use; M68000PM/AD section 8 spells bits 7..6 `d1 d0` there,
+///   not `tt`. MOVEP itself has bit 8 set and went to [`Op::Movep`] with #33,
+///   so what is left in this corner is the mode `001` encodings with bit 8
+///   clear — `0000 1000 tt 001 aaa`, unassigned on the 68000 — and they stay
+///   [`Op::Unimplemented`].
 /// * **`BTST` reads, the other three write.** `is_data` is the operand rule of
 ///   `TST`, and `is_data_alterable` the one of `NOT`/`CLR`/`NEG`: a modify needs
 ///   an alterable destination, so `BCHG D1,d16(PC)` and `BCLR #3,#$1234` are
@@ -1416,7 +1446,9 @@ const fn is_bit_op(opcode: u16) -> bool {
 fn classify_bit_op(opcode: u16) -> Op {
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
-    if mode == 0b001 {
+    if mode == AN_DIRECT_MODE {
+        // Only reachable with bit 8 clear now that MOVEP owns the mode; the
+        // static-form `An` column is unassigned, not illegal.
         return Op::Unimplemented;
     }
     let writes = (opcode >> BIT_OP_MNEMONIC_SHIFT) & 0b11 != 0;
@@ -1739,11 +1771,17 @@ mod tests {
         // them — `$4E60`..`$4E6F`, between UNLK and RESET.
         assert_eq!(decode(0x4E60), Op::Unimplemented, "just above UNLK");
         // `$0000` was ORI until #21 implemented it (see
-        // `ori_andi_eori_decode_and_leave_ccr_sr_alone`) and `$0100` was BTST
-        // until #28 implemented the bit operations, so the anchor inside that
-        // group moves to the one encoding of it #28 deliberately left alone:
-        // `$0108` is `MOVEP.L D0,(A0)`, M1-25's (#33), not a bit operation.
-        assert_eq!(decode(0x0108), Op::Unimplemented, "MOVEP.L D0,(A0)");
+        // `ori_andi_eori_decode_and_leave_ccr_sr_alone`), `$0100` was BTST until
+        // #28 implemented the bit operations, and `$0108` was MOVEP until #33
+        // implemented that. The anchor inside the group is now `0000 1000 tt 001
+        // aaa`, the static bit-number form at `An` direct: MOVEP needs bit 8 set
+        // and no 68000 instruction has this encoding, so it is the one member of
+        // the group nothing has claimed.
+        assert_eq!(
+            decode(0x0808),
+            Op::Unimplemented,
+            "$0808: the bit-op group's static form at An direct"
+        );
         // The move groups — bits 15..12 = `0001`, `0010`, `0011` (`MOVE`,
         // `MOVEA`) and `0111` (`MOVEQ`) — left this list with #17, see
         // `move_family_is_not_unimplemented`, and MOVEM left it with #32. The anchor
@@ -2019,15 +2057,15 @@ mod tests {
         // `$0700`, `$0800` and the rest of the group's bit-8-set half — until #28,
         // which `bit_decodes_both_shapes_and_needs_no_size` and
         // `bit_modify_ops_need_an_alterable_destination` now cover. So the list is
-        // down to the mode `001` column #28 left for M1-25 (#33): MOVEP, plus the
-        // mode `001` encodings with bit 8 clear that the 68000 does not define.
+        // down to the one encoding of the mode `001` column MOVEP does not have:
+        // bit 8 clear, which #33 left unassigned (see
+        // `movep_takes_mode_001_and_leaves_bit_8_clear_alone`).
         for (opcode, name) in [
             (
-                0x0108u16,
-                "MOVEP.L D0,(A0): mode 001 of this group, not a bit op",
+                0x0808u16,
+                "mode 001 with bit 8 clear, unassigned on the 68000",
             ),
-            (0x0908, "the same mode, another bit number register"),
-            (0x0808, "mode 001 with bit 8 clear, unassigned on the 68000"),
+            (0x08C8, "the same, the top of that column"),
         ] {
             assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
         }
@@ -2678,13 +2716,15 @@ mod tests {
             Op::Illegal,
             "BTST <mode 111 register 101>"
         );
-        // And mode `001` is MOVEP's column of the group: neither a bit operation
-        // nor illegal, just not this ticket's (M1-25, #33).
+        // And mode `001` is MOVEP's column of the group, not a bit operation at
+        // all: with bit 8 set it is MOVEP, which #33 took (see
+        // `movep_takes_mode_001_and_leaves_bit_8_clear_alone`), and with bit 8
+        // clear it is the encoding the 68000 does not define.
         for tt in [0b00u16, 0b01, 0b10, 0b11] {
             let ea = 0b001u16 << 3;
             assert_eq!(
                 decode(0x0100 | (tt << 6) | ea),
-                Op::Unimplemented,
+                Op::Movep,
                 "dynamic, tt = {tt:b}, (A0) ({:04X})",
                 0x0100 | (tt << 6) | ea
             );
@@ -2693,6 +2733,57 @@ mod tests {
                 Op::Unimplemented,
                 "static, tt = {tt:b}, (A0) ({:04X})",
                 0x0800 | (tt << 6) | ea
+            );
+        }
+    }
+
+    /// The mode `001` column of the `$0000` group, walked rather than sampled.
+    /// MOVEP is `0000 ddd 1 oo 001 aaa` (M68000PM/AD section 8, "MOVEP — Move
+    /// to/from Peripheral Device"), so all 256 encodings of bit 8 set at mode
+    /// `001` are MOVEP for every data register, every address register and every
+    /// `oo` — and the 32 with bit 8 clear, `0000 1000 tt 001 aaa`, are nothing
+    /// the MC68000 has. The neighbouring modes of the same opcode are still bit
+    /// operations, which is what makes this a column rather than a hole (M1-25,
+    /// #33; M68000UM BTST/BCHG/BCLR/BSET).
+    #[test]
+    fn movep_takes_mode_001_and_leaves_bit_8_clear_alone() {
+        for dn in 0..8u16 {
+            for an in 0..8u16 {
+                for oo in 0..4u16 {
+                    let opcode = 0x0100 | (dn << 9) | (oo << 6) | (0b001 << 3) | an;
+                    assert_eq!(
+                        decode(opcode),
+                        Op::Movep,
+                        "MOVEP D{dn},(d16,A{an}) (${opcode:04X}, oo = {oo:02b})"
+                    );
+                }
+                // The same register pair with bit 8 clear is the static
+                // bit-number form at `An` direct, which the 68000 does not define.
+                let opcode = 0x0800 | (0b11 << 6) | (0b001 << 3) | an;
+                assert_eq!(
+                    decode(opcode),
+                    Op::Unimplemented,
+                    "0000 1000 11 001 {an:03b} (${opcode:04X})"
+                );
+                // And beside it, the same `ddd` and `aaa` at a mode MOVEP cannot
+                // use is a bit operation: `BSET D{dn},D{an}`, which is legal
+                // because a `Dn` is an alterable destination.
+                let bit_op = 0x01C0 | (dn << 9) | an;
+                assert_eq!(
+                    decode(bit_op),
+                    Op::BitDynamic,
+                    "BSET D{dn},D{an} (${bit_op:04X})"
+                );
+            }
+        }
+        // One row of the unassigned column, spelled out: all four `tt` values at
+        // `An` direct with bit 8 clear.
+        for tt in [0b00u16, 0b01, 0b10, 0b11] {
+            let opcode = 0x0800 | (tt << 6) | (0b001 << 3);
+            assert_eq!(
+                decode(opcode),
+                Op::Unimplemented,
+                "0000 1000 {tt:02b} 001 000 (${opcode:04X})"
             );
         }
     }
