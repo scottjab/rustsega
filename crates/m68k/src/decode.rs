@@ -219,6 +219,34 @@ pub enum Op {
     /// `EORI #imm,<ea>`, `$0A00 + ss<<6 + <ea>` (M68000UM EORI, #21).
     /// [`Op::Andi`] with a different operation and base opcode.
     Eori,
+    /// `NEG <ea>`, `$4400 + ss<<6 + <ea>` with `ss` != `11` (M68000UM NEG,
+    /// #22). `0 - <ea>` written back to the same data-alterable operand, so it
+    /// is [`Op::Not`]'s shape with [`crate::ops::arith`]'s subtract flags.
+    Neg,
+    /// `NEGX <ea>`, `$4000 + ss<<6 + <ea>` with `ss` != `11` (M68000UM NEGX,
+    /// #22). `0 - <ea> - X`, so it takes `SUBX`'s sticky `Z` as well
+    /// ([`Op::Addx`]'s add-side twin).
+    Negx,
+    /// `CLR <ea>`, `$4200 + ss<<6 + <ea>` with `ss` != `11` (M68000UM CLR,
+    /// #22). Zero to a data-alterable operand; on the 68000 the write to memory
+    /// is preceded by a read of the same location, which is not an optimisation
+    /// to skip.
+    Clr,
+    /// `EXT.W Dn` / `EXT.L Dn`, `$4880 + ss<<6 + r` (M68000UM EXT, #22). Bit 6
+    /// is the size — clear for the word, set for the long — and `r` is the only
+    /// operand, which is why no EA predicate applies and why mode `000` is all
+    /// of this opcode's EA field.
+    Ext,
+    /// `SWAP Dn`, `$4840 + r` (M68000UM SWAP, #22). The other instruction that
+    /// bit 6 of the `$48??` window leaves free, and the one place a `Dn`-only
+    /// opcode lives next to `PEA` and `MOVEM` — see [`classify_swap_ext`].
+    Swap,
+    /// `EXG Rx,Ry`: `1100 xxx 1 ooooo yyy` (M68000UM EXG, #22). The slot
+    /// #21 reserved inside AND's group: operation `101` at mode `000` (`Dx,Dy`)
+    /// or `001` (`Ax,Ay`), and operation `110` at mode `001` (`Dx,Ay`). Both
+    /// operands are registers, so there is no EA to validate, and no flag is
+    /// affected.
+    Exg,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -333,6 +361,21 @@ fn classify(opcode: u16) -> Op {
         // CCR and MOVE to SR (#34), so the range stops dead at `$46BF`, exactly
         // as TST's stops before TAS.
         0x4600..=0x46BF => classify_not(opcode),
+        // `0100 0000`, `0100 0010` and `0100 0100`, each `+ ss<<6 + <ea>`:
+        // NEGX, CLR and NEG, the three single-operand read-modify-writes of the
+        // `0100` group that take NOT's operand rule (M68000UM NEG, NEGX, CLR;
+        // M1-14, #22). As in NOT and TST, `ss` = `11` is left out of the range:
+        // `$40C0..=$40FF` is MOVE from SR's sixth (#34) and `$42C0..=$42FF` and
+        // `$44C0..=$44FF` are unassigned on the 68000.
+        0x4000..=0x40BF => classify_single_operand(opcode, Op::Negx),
+        0x4200..=0x42BF => classify_single_operand(opcode, Op::Clr),
+        0x4400..=0x44BF => classify_single_operand(opcode, Op::Neg),
+        // `0100 1000 0s 000 rrr` is SWAP and `0100 1000 1s 000 rrr` is EXT;
+        // every other opcode of the `$4800..=$48FF` window belongs to PEA
+        // (M1-15) or MOVEM (M1-24) and stays unimplemented, so this window is
+        // the one place a group is entered whole and then split by EA field —
+        // see [`classify_swap_ext`] and #22.
+        0x4800..=0x48FF => classify_swap_ext(opcode),
         // `0000 0000 ss eeeeee`, `0000 0010 ss eeeeee` and `0000 1010 ss eeeeee`:
         // ORI, ANDI and EORI, the three `#imm,<ea>` logic operations. Bit 8 is
         // clear throughout all three ranges, which is what keeps them apart from
@@ -687,8 +730,9 @@ fn classify_cmp(opcode: u16) -> Op {
     }
 }
 
-/// One opcode of the `1100` group: [`Op::And`], or [`Op::Unimplemented`] for the
-/// four corners of the group that MULU, MULS, ABCD and EXG own.
+/// One opcode of the `1100` group: [`Op::And`], [`Op::Exg`], or
+/// [`Op::Unimplemented`] for the three corners of the group that MULU, MULS and
+/// ABCD own.
 ///
 /// AND is `1100 ddd ooo eeeeee` with `ooo` = `000`/`001`/`010` for
 /// `AND <ea>,Dn` and `100`/`101`/`110` for `AND Dn,<ea>` (M68000UM AND, #21).
@@ -698,7 +742,7 @@ fn classify_cmp(opcode: u16) -> Op {
 /// MULU   1100 ddd 011 eeeeee    M1-14
 /// MULS   1100 ddd 111 eeeeee    M1-14
 /// ABCD   1100 ddd 100 00 m yyy  M1-16
-/// EXG    1100 xxx 101 000 yyy   M1-17, and 101 001 and 110 001
+/// EXG    1100 xxx 101 000 yyy   #22, and 101 001 and 110 001
 /// ```
 ///
 /// So the operation-mode test comes first, then the corners of the `1ss` half.
@@ -712,12 +756,28 @@ fn classify_and(opcode: u16) -> Op {
     let mode = ((opcode >> 3) & 0b111) as u8;
     let mul = matches!(op_mode, 0b011 | 0b111);
     let abcd = op_mode == 0b100 && mode <= AN_DIRECT_MODE;
-    let exg = (op_mode == 0b101 && mode <= AN_DIRECT_MODE)
-        || (op_mode == 0b110 && mode == AN_DIRECT_MODE);
-    if mul || abcd || exg {
+    if mul || abcd {
         return Op::Unimplemented;
     }
+    // EXG, the slot #21 reserved for this ticket: `101`/`000` is `EXG Dx,Dy`
+    // (`c140`), `101`/`001` is `EXG Ax,Ay` (`c94a`) and `110`/`001` is
+    // `EXG Dx,Ay` (`c18f`). `is_exg` is the same test [`crate::ops::logic`] uses
+    // to pick the two register files apart, so the two cannot drift.
+    if is_exg(op_mode, mode) {
+        return Op::Exg;
+    }
     classify_and_or(opcode, op_mode, Op::And)
+}
+
+/// The `1100` group's three EXG operand forms: operation `101` at mode `000`
+/// (`Dx,Dy`) or `001` (`Ax,Ay`), and operation `110` at mode `001` (`Dx,Ay`)
+/// (M68000UM EXG; #22, measured against `EXG.json.gz`).
+///
+/// Shared between [`classify_and`] and [`crate::ops::logic::M68k::op_exg`],
+/// which has to know which of the two registers names an address register so the
+/// stored half of `A7` moves with it.
+pub(crate) const fn is_exg(op_mode: u8, mode: u8) -> bool {
+    (op_mode == 0b101 && mode <= 0b001) || (op_mode == 0b110 && mode == 0b001)
 }
 
 /// One opcode of the `1000` group: [`Op::Or`], or [`Op::Unimplemented`] for
@@ -783,6 +843,73 @@ fn classify_not(opcode: u16) -> Op {
     }
     Op::Not
 }
+
+/// `$4000`/`$4200`/`$4400` `+ ss<<6 + <ea>`: `NEGX`, `CLR` and `NEG`, which are
+/// [`classify_not`]'s instruction shape with a different operation (M68000UM
+/// NEG, NEGX, CLR; #22). All three read one operand and write it back, so the
+/// operand set is `is_data_alterable`'s again: `Dn`, the four indirect modes and
+/// the two absolutes. That is not a guess — `NEG.b`, `NEGX.w` and `CLR.l` each
+/// measure exactly those eight modes over their 8065 cases and no `An`,
+/// PC-relative or immediate operand.
+///
+/// `op` says which of the three the caller's range is; nothing else differs.
+/// `classify` routes only `ss` != `11` here, so MOVE from SR (`$40C0`) and the
+/// two unassigned sixths cannot reach the handlers.
+fn classify_single_operand(opcode: u16, op: Op) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    op
+}
+
+/// One opcode of the `$4800..=$48FF` window: [`Op::Swap`], [`Op::Ext`], or
+/// [`Op::Unimplemented`] for PEA and MOVEM (M68000UM SWAP, EXT, PEA, MOVEM;
+/// #22).
+///
+/// The window holds four instructions, and only two of them are here:
+///
+/// ```text
+/// SWAP    0100 1000 0100 0 rrr      this ticket
+/// EXT     0100 1000 1s 00 0 rrr     this ticket (`s` = 0 word, 1 long)
+/// PEA     0100 1000 0dd mmm rrr     M1-15 (#23),  with mmm != 000
+/// MOVEM   0100 1000 1mmm mmm rrr    M1-24 (#32),   with mmm != 000
+/// ```
+///
+/// So the EA mode field is what separates them, and it cannot be ignored: bit 7
+/// splits the window into PEA's half and MOVEM's half, and in each half the mode
+/// bits are the instruction's own operand field only while they are zero.
+/// Reading the suite's own opcodes makes that concrete — `PEA.json.gz` uses
+/// `$4850`..`$4857`, `$4868`..`$486F`, `$4870`..`$487B` and `MOVEM.w`/`MOVEM.l`
+/// use `$4890`..`$48F9`, while SWAP and EXT are exactly `$4840`..`$4847`,
+/// `$4880`..`$4887` and `$48C0`..`$48C7`. Claiming the window whole would have
+/// made `PEA.L (A0)` (`$48D0` is `MOVEM.L`) execute as an EXT.
+///
+/// `$4800`..`$4807` — bit 7 clear, bit 6 clear, mode `000` — is left
+/// unimplemented rather than called illegal: it is PEA with an undefined
+/// destination, and undefined encodings stay loud until their ticket rules on
+/// them (as `$4AFC`, the one documented `ILLEGAL`, is handled separately).
+fn classify_swap_ext(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    if mode != 0 {
+        // A nonzero mode is PEA's `dd`/mode field or MOVEM's register list.
+        return Op::Unimplemented;
+    }
+    if opcode & SWAP_EXT_BIT7 != 0 {
+        Op::Ext
+    } else if opcode & SWAP_BIT6 != 0 {
+        Op::Swap
+    } else {
+        Op::Unimplemented
+    }
+}
+
+/// Bit 7 of a `$48??` opcode: set for EXT (and MOVEM), clear for SWAP (and PEA).
+const SWAP_EXT_BIT7: u16 = 0x0080;
+/// Bit 6 of a `$48??` opcode: SWAP's discriminator inside PEA's half, and EXT's
+/// size (`0` word, `1` long) inside MOVEM's half.
+const SWAP_BIT6: u16 = 0x0040;
 
 /// One opcode of the `$0000`/`$0200`/`$0A00` groups: [`Op::Ori`], [`Op::Andi`] or
 /// [`Op::Eori`] — the three `#imm,<ea>` logic operations, which are `ORI`'s
@@ -1689,8 +1816,14 @@ mod tests {
     /// `Dn op <ea>` at a glance, and EXG's third form is one bit away from
     /// `AND.L Dn,(An)+`, so the group split is asserted here opcode by opcode
     /// (M68000UM ABCD, SBCD, MULU, MULS, DIVU, DIVS, EXG; M1-13, #21).
+    ///
+    /// #22 took the EXG lines of this test to [`Op::Exg`] — they are now in
+    /// [`exg_decodes_its_three_legal_pairs`] — and replaced their coverage of
+    /// "a `1100` corner is not AND" with the MULS opcode `$C1C8` below, which no
+    /// other test names. ABCD, MULU, MULS, SBCD, DIVU and DIVS are unchanged.
     #[test]
-    fn decode_does_not_steal_abcd_mulu_exg() {
+    #[allow(clippy::needless_range_loop)]
+    fn decode_does_not_steal_abcd_mulu() {
         // The three the ticket names, then the rest of both groups.
         assert_ne!(decode(0xC100), Op::And, "ABCD.B (A0)+,(A1)+");
         assert_ne!(decode(0xC0C0), Op::And, "MULU D0,D0");
@@ -1700,9 +1833,7 @@ mod tests {
         assert_eq!(decode(0xC0C0), Op::Unimplemented, "MULU D0,D0");
         assert_eq!(decode(0xC0EE), Op::Unimplemented, "MULU d16(A0),D6");
         assert_eq!(decode(0xCFC8), Op::Unimplemented, "MULS D0,(A0)");
-        assert_eq!(decode(0xC141), Op::Unimplemented, "EXG D0,D1");
-        assert_eq!(decode(0xC148), Op::Unimplemented, "EXG A0,A1");
-        assert_eq!(decode(0xC189), Op::Unimplemented, "EXG D0,A1");
+        assert_eq!(decode(0xC1C8), Op::Unimplemented, "MULS.W (A0),D0");
         assert_eq!(decode(0x8100), Op::Unimplemented, "SBCD.B (A0)+,(A1)+");
         assert_eq!(decode(0x8108), Op::Unimplemented, "SBCD.B -(A0),-(A1)");
         assert_eq!(decode(0x80C0), Op::Unimplemented, "DIVU D0,D0");
@@ -1716,5 +1847,164 @@ mod tests {
         // EXG's other two homes are in groups AND never touches.
         assert_ne!(decode(0x48C0), Op::And, "EXG-shaped, the $48 group");
         assert_ne!(decode(0x4CC0), Op::And, "EXG-shaped, the $4C group");
+    }
+
+    /// `NEG` `$4400`, `NEGX` `$4000` and `CLR` `$4200`, each `+ ss<<6 + <ea>`,
+    /// all three under `is_data_alterable` (M68000UM NEG, NEGX, CLR; M1-14, #22).
+    ///
+    /// The legal list is the suite's own: each of `NEG.b`, `NEGX.w` and `CLR.l`
+    /// runs the same eight modes over its size — `Dn` (`$4400`), `(An)` (`$4410`),
+    /// `(An)+` (`$441F`), `-(An)` (`$4420`), `d16(An)` (`$442A`), `d8(An,Xn)`
+    /// including `d8(A7,Xn)` (`$4437`), `abs.W` (`$4438`) and `abs.L` (`$4439`) —
+    /// and never an `An`, a PC-relative operand or an immediate, so the two lists
+    /// below are the whole of the rule rather than a sample of it.
+    #[test]
+    fn neg_negx_clr_decode_and_validate_their_operands() {
+        for (opcode, want, name) in [
+            (0x4400u16, Op::Neg, "NEG.B D0"),
+            (0x4410, Op::Neg, "NEG.B (A0)"),
+            (0x441F, Op::Neg, "NEG.B (A7)+"),
+            (0x4420, Op::Neg, "NEG.B -(A0)"),
+            (0x442A, Op::Neg, "NEG.B d16(A2)"),
+            (0x4437, Op::Neg, "NEG.B d8(A7,Xn)"),
+            (0x4438, Op::Neg, "NEG.B (xxx).W"),
+            (0x44B9, Op::Neg, "NEG.L (xxx).L"),
+            (0x4481, Op::Neg, "NEG.L D1"),
+            (0x4001, Op::Negx, "NEGX.B D1"),
+            (0x4052, Op::Negx, "NEGX.W (A2)"),
+            (0x40B9, Op::Negx, "NEGX.L (xxx).L"),
+            (0x4200, Op::Clr, "CLR.B D0"),
+            (0x4237, Op::Clr, "CLR.B d8(A7,Xn)"),
+            (0x42A9, Op::Clr, "CLR.L d16(A1)"),
+            (0x42B9, Op::Clr, "CLR.L (xxx).L"),
+        ] {
+            assert_eq!(decode(opcode), want, "{name} (${opcode:04X})");
+        }
+
+        // The operands none of the three may take: an `An` (mode `001`), which
+        // NEG/NEGX/CLR do not sign-extend or otherwise write as an address, and
+        // the mode `111` sub-modes that are not alterable — `d16(PC)`, `#imm` and
+        // `d8(PC,Xn)` (M68000UM NEG: "Address register direct is illegal", and the
+        // destination-operand rules of the section 8 descriptions).
+        for (opcode, name) in [
+            (
+                0x4409u16,
+                "NEG.B A1: an address register is not a data destination",
+            ),
+            (0x4489, "NEG.L A1"),
+            (0x4049, "NEGX.W A1"),
+            (0x4289, "CLR.L A1"),
+            (
+                0x42BA,
+                "CLR.B d16(PC): an operand inside the instruction stream",
+            ),
+            (0x44BB, "NEG.L #imm"),
+            (0x44BC, "NEG.L d8(PC,Xn)"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+
+        // `ss` = `11` is outside all three ranges: `$40C0` is MOVE from SR, which
+        // `MOVEfromSR.json.gz` measures at `$40C0`..`$40F9` (M1-26, #34), and
+        // `$42C0`/`$44C0` are unassigned on the 68000.
+        for (opcode, name) in [
+            (
+                0x40C0u16,
+                "MOVE from SR D0: the first opcode of MOVEfromSR.json.gz",
+            ),
+            (0x40F9, "MOVE from SR (xxx).L"),
+            (0x42C0, "unassigned sixth of CLR’s group"),
+            (0x44C0, "unassigned sixth of NEG’s group"),
+            (0x44FF, "the top of NEG’s group"),
+        ] {
+            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// The `$48??` window is SWAP, EXT, PEA and MOVEM (M68000UM SWAP, EXT, PEA,
+    /// MOVEM; M1-14, #22), and what separates them is the EA mode field: mode
+    /// `000` is SWAP (bit 7 clear) or EXT (bit 7 set, bit 6 the size), and every
+    /// other mode belongs to PEA or MOVEM and stays [`Op::Unimplemented`].
+    ///
+    /// The PEA and MOVEM opcodes below are read off the pinned suite, not
+    /// invented: `PEA.json.gz` runs `$4850`..`$4857` and `$4868`..`$486F`,
+    /// `MOVEM.w.json.gz` runs `$4890`.. and `MOVEM.l.json.gz` runs `$48D0`.., so
+    /// this test is what stops SWAP and EXT from swallowing the first opcode of
+    /// M1-15 (#23) and M1-24 (#32) along the way.
+    #[test]
+    fn swap_and_ext_decode_and_leave_pea_and_movem_alone() {
+        for (opcode, want, name) in [
+            (0x4840u16, Op::Swap, "SWAP D0"),
+            (0x4847, Op::Swap, "SWAP D7"),
+            (0x4880, Op::Ext, "EXT.W D0"),
+            (0x4887, Op::Ext, "EXT.W D7"),
+            (0x48C0, Op::Ext, "EXT.L D0"),
+            (0x48C7, Op::Ext, "EXT.L D7"),
+        ] {
+            assert_eq!(decode(opcode), want, "{name} (${opcode:04X})");
+        }
+
+        for (opcode, name) in [
+            (0x4850u16, "PEA (A0): measured in PEA.json.gz"),
+            (0x4868, "PEA d16(A0): measured in PEA.json.gz"),
+            (0x4848, "mode 001 in SWAP’s half of the window"),
+            (0x4890, "MOVEM.W #reglist,(A0): measured in MOVEM.w.json.gz"),
+            (
+                0x48A0,
+                "MOVEM.W #reglist,-(A0): measured in MOVEM.w.json.gz",
+            ),
+            (0x48D0, "MOVEM.L #reglist,(A0): measured in MOVEM.l.json.gz"),
+            (0x4CC0, "MOVEM.L #reglist,-(A0) in the $4C half"),
+            (
+                0x4800,
+                "SWAP’s half with mode 000 and bit 6 clear: PEA with no destination",
+            ),
+            (0x4807, "the same, at A7"),
+        ] {
+            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// `EXG` is operation `101` at mode `000` (`Dx,Dy`) or `001` (`Ax,Ay`) and
+    /// operation `110` at mode `001` (`Dx,Ay`) — 192 opcodes, which is exactly the
+    /// set `EXG.json.gz` runs (`$C140`..`$C14F`, `$C188`..`$C18F` and the same for
+    /// every `xxx`) — and nothing else in the `1100` group (M68000UM EXG; M1-14,
+    /// #22).
+    ///
+    /// The neighbours are the point. `$C180` is operation `110` at mode `000`, one
+    /// bit from `Dx,Ay`, and is `AND.L D0,D0`; `$C198` is operation `110` at mode
+    /// `011` and is `AND.L D0,(A0)+`; `$C100` is ABCD and `$C1C0` is MULS, both
+    /// still unimplemented. An off-by-one in [`is_exg`] fails in one direction or
+    /// the other.
+    #[test]
+    fn exg_decodes_its_three_forms_and_nothing_else() {
+        for (opcode, name) in [
+            (0xC140u16, "EXG D0,D0"),
+            (0xC147, "EXG D0,D7"),
+            (0xC94A, "EXG A4,A2"),
+            (0xC14F, "EXG A0,A7"),
+            (0xC188, "EXG D0,A0"),
+            (0xC18F, "EXG D0,A7: the case that moves SSP"),
+            (0xCF47, "EXG D7,D7"),
+            (0xCF8F, "EXG D7,A7"),
+        ] {
+            assert_eq!(decode(opcode), Op::Exg, "{name} (${opcode:04X})");
+        }
+
+        assert_eq!(
+            decode(0xC180),
+            Op::And,
+            "AND.L D0,D0: operation 110 mode 000, one bit from EXG Dx,Ay"
+        );
+        assert_eq!(
+            decode(0xC198),
+            Op::And,
+            "AND.L D0,(A0)+: operation 110 mode 011"
+        );
+        assert_eq!(
+            decode(0x8198),
+            Op::Or,
+            "OR.L D0,(A0)+: operation 110 in the 1000 group, which has no EXG at all"
+        );
     }
 }
