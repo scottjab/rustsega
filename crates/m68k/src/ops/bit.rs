@@ -36,6 +36,152 @@
 //! `BCLR`'s two extra internal clocks when the bit number is 16 or more on a
 //! `Dn` operand (M68000UM "BCLR", "Timing").
 
+use crate::bus::Bus;
+use crate::cpu::M68k;
+use crate::ea::Size;
+use crate::ops::field;
+use crate::sr::SR_Z;
+
+/// Bit 3: the mode half of the effective-address field, which is where the
+/// operand starts; bit 0 is its register half.
+const EA_MODE_SHIFT: u32 = 3;
+/// Bit 9: the bottom of `ddd`, the three bits naming the `Dn` that holds the bit
+/// number in the dynamic form.
+const BIT_REGISTER_SHIFT: u32 = 9;
+/// Bits 7..6: `tt`, which of the four mnemonics.
+const MNEMONIC_SHIFT: u32 = 6;
+
+/// Which of the four mnemonics `tt` names, and so what happens to the bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mnemonic {
+    /// `BTST`: nothing is written back, so a read-only operand is legal.
+    Test,
+    /// `BCHG`: the bit is complemented.
+    Change,
+    /// `BCLR`: the bit is cleared.
+    Clear,
+    /// `BSET`: the bit is set.
+    Set,
+}
+
+impl Mnemonic {
+    /// `tt` to mnemonic: `00` `BTST`, `01` `BCHG`, `10` `BCLR`, `11` `BSET`.
+    #[inline]
+    const fn read(tt: u8) -> Self {
+        match tt & 0b11 {
+            0b00 => Mnemonic::Test,
+            0b01 => Mnemonic::Change,
+            0b10 => Mnemonic::Clear,
+            _ => Mnemonic::Set,
+        }
+    }
+
+    /// Whether the operand is written back. `BTST` is not, which is the only
+    /// reason it accepts the read-only effective addresses the other three may
+    /// not; decode applies the same split (`classify_bit_op`).
+    #[inline]
+    const fn writes(self) -> bool {
+        !matches!(self, Mnemonic::Test)
+    }
+
+    /// `value` with the bit `mask` names set to what this mnemonic sets it to.
+    /// `Test` returns `value` unchanged, so a caller that forgot to ask
+    /// [`Mnemonic::writes`] first cannot corrupt the operand.
+    #[inline]
+    const fn apply(self, value: u32, mask: u32) -> u32 {
+        match self {
+            Mnemonic::Test => value,
+            Mnemonic::Change => value ^ mask,
+            Mnemonic::Clear => value & !mask,
+            Mnemonic::Set => value | mask,
+        }
+    }
+}
+
+/// The operand width of a bit operation, which has no size field: a `Dn` operand
+/// is a **long** and every memory operand a **byte** (M68000UM "BTST — Bit
+/// Test": "the size of the operand is byte for all addressing modes except data
+/// register direct, in which case it is long").
+#[inline]
+const fn bit_op_size(opcode: u16) -> Size {
+    if field(opcode, EA_MODE_SHIFT) == 0 {
+        Size::Long
+    } else {
+        Size::Byte
+    }
+}
+
+/// Modulo the bit number is taken modulo, as a mask: 32 for a `Dn` operand, 8 for
+/// a byte one (M68000UM "BTST", Operation: "the bit number … modulo 32 or …
+/// modulo 8").
+#[inline]
+const fn bit_modulo(size: Size) -> u32 {
+    match size {
+        Size::Long => 31,
+        // Byte operands take it modulo 8. `Word` never reaches here, because
+        // [`bit_op_size`] only ever answers `Long` or `Byte`.
+        Size::Byte | Size::Word => 7,
+    }
+}
+
+impl M68k {
+    /// `BTST Dn,<ea>`/`BCHG Dn,<ea>`/`BCLR Dn,<ea>`/`BSET Dn,<ea>`: the dynamic
+    /// form, `0000 ddd 1 tt eeeeee`. The bit number is the whole of `Ddd` before
+    /// the operand-size modulo is applied (M68000UM "BTST — Bit Test", "Format";
+    /// M1-20, #28).
+    pub(crate) fn op_bit_dynamic(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let number = self.d[usize::from(field(opcode, BIT_REGISTER_SHIFT))];
+        self.bit_op(bus, opcode, number)
+    }
+
+    /// The static form, `0000 1000 tt eeeeee`: one extension word whose low eight
+    /// bits are the bit number (M68000UM "BTST", "Format").
+    ///
+    /// That word is the first thing after the opcode, so it is popped before the
+    /// operand is resolved. That is observable, not stylistic: `d16(PC)` and
+    /// `d8(PC,Xn)` base themselves on `ext_addr()`, the address of the extension
+    /// word being popped *at the moment they pop it*, and popping the bit number
+    /// first is what puts the displacement at `$4` rather than at `$2`.
+    pub(crate) fn op_bit_static(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let number = u32::from(self.fetch_ext_word(bus));
+        self.bit_op(bus, opcode, number)
+    }
+
+    /// What the two forms have in common: one operand of the width its own kind
+    /// dictates, `Z` from the bit **as it was**, and the operand written back
+    /// unless this is `BTST` (M68000UM "BTST"/"BCHG"/"BCLR"/"BSET", "Operation"
+    /// and "Flags"; M1-20, #28).
+    ///
+    /// The EA is resolved once and the same [`crate::ea::Ea`] is read and then
+    /// written, so a read-modify-write of a side-effecting operand —
+    /// `BCHG D1,(A0)+` — increments `A0` once and writes back to the byte it read.
+    /// The three modifying mnemonics also need no runtime check that their
+    /// operand may be written: `classify_bit_op` rejected the read-only ones.
+    fn bit_op(&mut self, bus: &mut impl Bus, opcode: u16, number: u32) -> u32 {
+        let mnemonic = Mnemonic::read(field(opcode, MNEMONIC_SHIFT));
+        let size = bit_op_size(opcode);
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+        let bit = number & bit_modulo(size);
+        let mask = 1u32 << bit;
+
+        let Some(dest) = self.resolve_ea(bus, mode, ea_reg, size) else {
+            return self.op_illegal(bus);
+        };
+        let value = self.read_ea(bus, dest, size);
+        // `Z` is set from the tested bit *before* the modification: set when that
+        // bit was 0. `N`, `V`, `C` and `X` are left exactly as they were, so this
+        // is one flag write and not a `set_logic_flags` call.
+        self.set_flag(SR_Z, value & mask == 0);
+        if mnemonic.writes() {
+            self.write_ea(bus, dest, size, mnemonic.apply(value, mask));
+        }
+
+        self.advance_opcode(bus);
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::bus::Bus;
@@ -183,19 +329,21 @@ mod tests {
 
             let (mut cpu, mut bus) = run(opcode, &[0x4E71]);
             cpu.a[0] = MEM;
+            cpu.d[1] = number;
             bus.write_byte(MEM, 0xFF ^ (1 << bit));
 
             cpu.step(&mut bus);
 
-            assert!(!cpu.flag_z(), "{number} reaches bit {bit}, which is clear");
+            assert!(cpu.flag_z(), "{number} reaches bit {bit}, which is clear");
 
             let (mut cpu, mut bus) = run(opcode, &[0x4E71]);
             cpu.a[0] = MEM;
+            cpu.d[1] = number;
             bus.write_byte(MEM, 1 << bit);
 
             cpu.step(&mut bus);
 
-            assert!(cpu.flag_z(), "{number} reaches bit {bit}, which is set");
+            assert!(!cpu.flag_z(), "{number} reaches bit {bit}, which is set");
             assert_eq!(bus.read_byte(MEM), 1 << bit, "BTST wrote nothing back");
         }
     }
@@ -246,7 +394,7 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(cpu.d[2], 0x0000_0000, "bit 5 went away");
-        assert!(cpu.flag_z(), "the bit was set before, so Z is set");
+        assert!(!cpu.flag_z(), "bit 5 was set before the change, so Z is clear");
 
         let (mut cpu, mut bus) = run(dynamic(1, BCHG, DN, 2), &[0x4E71]);
         cpu.d[1] = 5;
@@ -255,7 +403,7 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(cpu.d[2], 0x0000_0020, "bit 5 appeared");
-        assert!(!cpu.flag_z(), "the bit was clear before, so Z is clear");
+        assert!(cpu.flag_z(), "bit 5 was clear before the change, so Z is set");
     }
 
     /// `BCHG` on a memory operand is a byte read-modify-write at the byte the EA
@@ -291,7 +439,7 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(bus.read_byte(MEM), 0x83, "only bit 3 of $8B went away");
-        assert!(cpu.flag_z(), "bit 3 was set before the clear");
+        assert!(!cpu.flag_z(), "bit 3 was set before the clear, so Z is clear");
 
         let (mut cpu, mut bus) = run(opcode, &[0x0003, 0x4E71]);
         cpu.a[0] = MEM;
@@ -300,7 +448,7 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(bus.read_byte(MEM), 0x87, "clearing a clear bit changes nothing");
-        assert!(!cpu.flag_z(), "bit 3 was clear before, so Z is clear");
+        assert!(cpu.flag_z(), "bit 3 was clear before the clear, so Z is set");
     }
 
     /// …and the same static form on a `Dn` is a **long** operation: `BCLR #31,D2`
@@ -314,7 +462,7 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(cpu.d[2], 0x7FFF_FFFF, "bit 31 of the long, not bit 7");
-        assert!(cpu.flag_z());
+        assert!(!cpu.flag_z(), "bit 31 was set before the clear, so Z is clear");
     }
 
     // ---- BSET ----
@@ -332,7 +480,7 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(bus.read_byte(MEM), 0x8F, "bit 7 of $0F is $8F");
-        assert!(!cpu.flag_z(), "the bit was clear before the set");
+        assert!(cpu.flag_z(), "bit 7 was clear before the set, so Z is set");
         assert_eq!(cpu.a[0], MEM + 1, "a byte operand steps A0 by one, not four");
     }
 
@@ -369,21 +517,34 @@ mod tests {
             static_(BCHG, POST_INC, 0),
             static_(BCLR, A_INDIRECT, 0),
         ] {
-            let (mut cpu, mut bus) = run(opcode, &[0x0000, 0x4E71]);
-            cpu.d[1] = 0;
-            cpu.d[2] = 0;
-            cpu.d[3] = 0;
-            cpu.a[0] = MEM;
-            bus.write_byte(MEM, 0);
-            cpu.set_ccr(ALL_FLAGS);
+            // Both directions of the one flag that does move: `Z` is the
+            // complement of the tested bit, and it is the only one of the five
+            // whose value may change.
+            for bit_before in [false, true] {
+                let (mut cpu, mut bus) = run(opcode, &[0x0000, 0x4E71]);
+                // Bit 0 is the bit under test throughout, so the bit-number
+                // registers (`D1` and `D3` above) stay 0 and `bit_before` goes into
+                // the operand: bit 0 of `D2`, which every opcode here reads or
+                // writes, and of the byte at `A0`.
+                cpu.d[1] = 0;
+                cpu.d[2] = u32::from(bit_before);
+                cpu.d[3] = 0;
+                cpu.a[0] = MEM;
+                bus.write_byte(MEM, u8::from(bit_before));
+                cpu.set_ccr(ALL_FLAGS);
 
-            cpu.step(&mut bus);
+                cpu.step(&mut bus);
 
-            assert!(cpu.flag_z(), "{opcode:04X}: bit 0 was clear, so Z is set");
-            assert!(cpu.flag_n(), "{opcode:04X}: N is untouched");
-            assert!(cpu.flag_v(), "{opcode:04X}: V is untouched");
-            assert!(cpu.flag_c(), "{opcode:04X}: C is untouched");
-            assert!(cpu.flag_x(), "{opcode:04X}: X is untouched");
+                assert_eq!(
+                    cpu.flag_z(),
+                    !bit_before,
+                    "{opcode:04X}: Z is the complement of bit 0, which was {bit_before}"
+                );
+                assert!(cpu.flag_n(), "{opcode:04X}: N is untouched");
+                assert!(cpu.flag_v(), "{opcode:04X}: V is untouched");
+                assert!(cpu.flag_c(), "{opcode:04X}: C is untouched");
+                assert!(cpu.flag_x(), "{opcode:04X}: X is untouched");
+            }
         }
     }
 
@@ -453,7 +614,7 @@ mod tests {
 
         cpu.step(&mut bus);
 
-        assert!(cpu.flag_z(), "bit 0 of $FF is set");
+        assert!(!cpu.flag_z(), "bit 0 of $FF is set, so Z is clear");
         assert_eq!(cpu.a[0], MEM, "d16(An) does not move An");
     }
 

@@ -138,6 +138,11 @@ impl M68k {
             // count of one, so it lives beside it.
             Op::Shift => self.op_shift(bus, opcode),
             Op::ShiftMemory => self.op_shift_memory(bus, opcode),
+            // `BTST`, `BCHG`, `BCLR` and `BSET` (`0000 ddd 1 tt …` and
+            // `0000 1000 tt …`): one body, and the two entry points differ only
+            // in where the bit number comes from (see [`bit]).
+            Op::BitDynamic => self.op_bit_dynamic(bus, opcode),
+            Op::BitStatic => self.op_bit_static(bus, opcode),
             Op::Lea => self.op_lea(bus, opcode),
             Op::Pea => self.op_pea(bus, opcode),
             Op::Link => self.op_link(bus, opcode),
