@@ -219,6 +219,16 @@ pub enum Op {
     /// `EORI #imm,<ea>`, `$0A00 + ss<<6 + <ea>` (M68000UM EORI, #21).
     /// [`Op::Andi`] with a different operation and base opcode.
     Eori,
+    /// `ANDI`/`ORI`/`EORI #imm,CCR`: `$023C`, `$003C`, `$0A3C` (M68000UM "ANDI/ORI/EORI
+    /// to CCR", #34). One variant because the operation is the opcode's bits
+    /// 11..9 like [`Op::Andi`]; the operand is a *byte* immediate — one extension
+    /// word of which only the low byte is used — and the result goes to the CCR,
+    /// so the instruction is unprivileged and cannot change S.
+    LogicImmCcr,
+    /// `ANDI`/`ORI`/`EORI #imm,SR`: `$027C`, `$007C`, `$0A7C` (M68000UM
+    /// "ANDI/ORI/EORI to SR", #34). [`Op::LogicImmCcr`] with a *word* immediate
+    /// and the whole SR as the destination, which makes it privileged.
+    LogicImmSr,
     /// Bit test or modify with the bit number in a register: `0000 ddd 1 tt
     /// eeeeee` — `BTST D3,<ea>`, `BCHG D3,<ea>`, `BCLR`, `BSET` (M68000UM
     /// BTST/BCHG/BCLR/BSET; M1-20, #28). `tt` is one of the four mnemonics and
@@ -237,6 +247,21 @@ pub enum Op {
     /// direction and the width are both fields the handler re-reads, as in
     /// [`Op::Move`]. See [`crate::ops::movep`].
     Movep,
+    /// `MOVE SR,<ea>`, `$40C0 + <ea>` (M68000UM "MOVE from SR", #34). Not
+    /// privileged on the 68000, and it leaves the condition codes alone. The
+    /// destination is the data-alterable class, so `$40FC` (`#imm`) is illegal.
+    MoveFromSr,
+    /// `MOVE <ea>,CCR`, `$44C0 + <ea>` (M68000UM "MOVE to CCR", #34). Word
+    /// source; the low five bits become X N Z V C. Not privileged.
+    MoveToCcr,
+    /// `MOVE <ea>,SR`, `$46C0 + <ea>` (M68000UM "MOVE to SR", #34). Word source,
+    /// privileged, and the only non-exception way to change S: a write that
+    /// clears it switches the active stack pointer immediately
+    /// ([`crate::M68k::set_sr`]).
+    MoveToSr,
+    /// `MOVE An,USP` (`$4E60 + n`) and `MOVE USP,An` (`$4E68 + n`), told apart by
+    /// bit 3 (M68000UM "MOVE to/from USP", #34). Privileged in both directions.
+    MoveUsp,
     /// `NEG <ea>`, `$4400 + ss<<6 + <ea>` with `ss` != `11` (M68000UM NEG,
     /// #22). `0 - <ea>` written back to the same data-alterable operand, so it
     /// is [`Op::Not`]'s shape with [`crate::ops::arith`]'s subtract flags.
@@ -479,6 +504,10 @@ fn classify(opcode: u16) -> Op {
         // unassigned, so the two ranges stop where they do.
         0x4E50..=0x4E57 => Op::Link,
         0x4E58..=0x4E5F => Op::Unlk,
+        // `0100 1110 0110 d rrr`: `MOVE USP,An` (`d` = 1) and `MOVE An,USP`
+        // (`d` = 0), the only instructions of the `0100 1110` group besides the
+        // resets and `RESET` itself (M68000UM "MOVE to/from USP"; M1-26, #34).
+        0x4E60..=0x4E6F => Op::MoveUsp,
         // `0100 1110 11 mmm rrr` and `0100 1110 10 mmm rrr`: JMP and JSR take
         // the whole `$4E80..=$4EFF` window between them and differ in one bit of
         // the operand field, so the window is entered whole and split by the
@@ -549,11 +578,22 @@ fn classify(opcode: u16) -> Op {
         // NEGX, CLR and NEG, the three single-operand read-modify-writes of the
         // `0100` group that take NOT's operand rule (M68000UM NEG, NEGX, CLR;
         // M1-14, #22). As in NOT and TST, `ss` = `11` is left out of the range:
-        // `$40C0..=$40FF` is MOVE from SR's sixth (#34) and `$42C0..=$42FF` and
-        // `$44C0..=$44FF` are unassigned on the 68000.
+        // the four `ss` = `11` sixths below are the status-register moves (#34).
         0x4000..=0x40BF => classify_single_operand(opcode, Op::Negx),
         0x4200..=0x42BF => classify_single_operand(opcode, Op::Clr),
         0x4400..=0x44BF => classify_single_operand(opcode, Op::Neg),
+        // The four `ss` = `11` sixths of the `0100` group that the five groups
+        // above deliberately stop short of (M68000UM "MOVE from SR", "MOVE to
+        // CCR", "MOVE to SR"; M1-26, #34). Each takes a different operand rule,
+        // so each gets its own classifier rather than one shared guard:
+        // `$40C0` writes its destination and `$44C0`/`$46C0` read a data source.
+        0x40C0..=0x40FF => classify_move_from_sr(opcode),
+        // MOVE from CCR is a 68010 instruction: on the 68000 every `$42C0`..
+        // `$42FF` encoding is ILLEGAL, not unassigned (M68000UM "MOVE from CCR"
+        // is absent; the 68010 manual's $4E/68000 illegal-instruction list).
+        0x42C0..=0x42FF => Op::Illegal,
+        0x44C0..=0x44FF => classify_status_source(opcode, Op::MoveToCcr),
+        0x46C0..=0x46FF => classify_status_source(opcode, Op::MoveToSr),
         // `0100 ddd 111 eeeeee`: LEA. It is the reason TST, NOT, NEGX, CLR and
         // NEG above stop at `??BF` instead of taking their whole `$xx00` block —
         // bits 8..6 all set is LEA's, and nothing else in the `0100` group uses
@@ -1214,6 +1254,39 @@ fn classify_single_operand(opcode: u16, op: Op) -> Op {
     op
 }
 
+/// `$40C0 + <ea>`: `MOVE SR,<ea>` — [`Op::MoveFromSr`] or [`Op::Illegal`]
+/// (M68000UM "MOVE from SR", #34).
+///
+/// The destination is the data-alterable class — Dn and every memory mode — which
+/// is [`is_data_alterable`] exactly: `#imm` cannot receive a value and An is not
+/// in the manual's mode list for this instruction. `MOVE.json.gz` never reaches
+/// here (its `$40C0`-shaped cases are absent), and `MOVEfromSR.json.gz` uses Dn,
+/// the indirect modes, the two absolutes and `d16(An)`/`(d8,A0)` — the same set
+/// NEG, CLR and NEGX take, which is why the classifier is a one-liner over the
+/// existing predicate.
+fn classify_move_from_sr(opcode: u16) -> Op {
+    classify_single_operand(opcode, Op::MoveFromSr)
+}
+
+/// `$44C0 + <ea>` and `$46C0 + <ea>`: `MOVE <ea>,CCR` and `MOVE <ea>,SR` —
+/// `op` or [`Op::Illegal`] (M68000UM "MOVE to CCR"/"MOVE to SR", #34).
+///
+/// The source is the data class of the *read* rule with address-register direct
+/// removed: the manual lists `Dn`, `(An)`, `(An)+`, `-(An)`, `d16(An)`,
+/// `d8(An,Xn)`, `abs.W`, `abs.L`, `d16(PC)`, `d8(PC,Xn)` and `#imm`, which is
+/// `is_data` minus mode `001`. An direct is a legal data read for every other
+/// instruction but is not encoded for these two, and `MOVEtoCCR.json.gz` and
+/// `MOVEtoSR.json.gz` agree: both files cover `$44C0`..`$44FC` and
+/// `$46C0`..`$46FC` and never touch `$44C8`..`$44CF` / `$46C8`..`$46CF`.
+fn classify_status_source(opcode: u16, op: Op) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if mode == AN_DIRECT_MODE || !is_data(mode, reg) {
+        return Op::Illegal;
+    }
+    op
+}
+
 /// Bits 8..6 of a `0100`-group opcode: set all three and it is
 /// `LEA <ea>,An`, `0100 ddd 111 eeeeee` (M68000UM "LEA — Address Register
 /// Indirect and Program"). Every other member of the group — NEGX, CLR, NEG,
@@ -1476,14 +1549,22 @@ fn classify_bit_op(opcode: u16) -> Op {
 /// `op` says which of the three the caller's range is. The rules are
 /// [`classify_subi`]'s — the EA field names the destination, which must be
 /// data-alterable, and the immediate itself lives in the extension words — plus
-/// the two forms #34 owns: mode `111` register `100` is `ORI #imm,CCR`/`ANDI
-/// #imm,SRC`/`EORI #imm,SR`-style (`$003C`, `$023C`, `$0A3C`), and `ss` = `11`
-/// with that EA is MOVE to SR (`$00FC`, `$02FC`, `$0AFC`).
+/// the two forms #34 owns, both spelled mode `111` register `100` (M68000UM
+/// "ANDI/ORI/EORI to CCR" and "… to SR"): `ss` = `00` is the byte form that
+/// writes the CCR (`$003C`, `$023C`, `$0A3C`) and `ss` = `01` the word form that
+/// writes SR (`$007C`, `$027C`, `$0A7C`). `ss` = `10` and `ss` = `11` at that EA
+/// — `$00BC`, `$00FC`, … — are nothing on the 68000; the MOVE-to-CCR/SR spellings
+/// of those numbers are a 68020 thing, and the 68000 originals are `$44C0` and
+/// `$46C0`.
 fn classify_logic_imm(opcode: u16, op: Op) -> Op {
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
     if mode == 0b111 && reg == 0b100 {
-        return Op::Unimplemented;
+        return match (opcode >> 6) & 0b11 {
+            0b00 => Op::LogicImmCcr,
+            0b01 => Op::LogicImmSr,
+            _ => Op::Unimplemented,
+        };
     }
     if Size::from_bits((opcode >> 6) & 0b11).is_none() {
         return Op::Unimplemented;
@@ -1682,12 +1763,17 @@ mod tests {
 
     /// `LINK An,d16` and `UNLK An` (`$4E50 + r` and `$4E58 + r`, M68000UM LINK,
     /// UNLINK; M1-15, #23): the two slots above the traps, and nothing else.
+    ///
+    /// The slot above UNLK used to be unassigned; #34 filled it with
+    /// `MOVE USP,An`/`MOVE An,USP` (M68000UM "MOVE to/from USP"), so this test
+    /// asserts that too and the still-unassigned probe moves to `RESET`.
     #[test]
     fn link_and_unlk_decode() {
         assert_range_decodes_to(0x4E50..=0x4E57, Op::Link);
         assert_range_decodes_to(0x4E58..=0x4E5F, Op::Unlk);
         assert_eq!(decode(0x4E4F), Op::Trap, "TRAP #15, just below");
-        assert_eq!(decode(0x4E60), Op::Unimplemented, "unassigned, just above");
+        assert_range_decodes_to(0x4E60..=0x4E6F, Op::MoveUsp);
+        assert_eq!(decode(0x4E70), Op::Unimplemented, "RESET, just above");
     }
 
     /// `LEA <ea>,An` is exactly the 224 opcodes `0100 ddd 111 mmm rrr` at a mode
@@ -1767,9 +1853,11 @@ mod tests {
         assert_range_decodes_to(0x4E40..=0x4E4F, Op::Trap);
         assert_eq!(decode(0x4E3F), Op::Unimplemented, "just below the traps");
         // LINK (`$4E50`..`$4E57`) and UNLK (`$4E58`..`$4E5F`) are above the traps
-        // now (#23), so the anchor moves to the first unassigned opcode after
-        // them — `$4E60`..`$4E6F`, between UNLK and RESET.
-        assert_eq!(decode(0x4E60), Op::Unimplemented, "just above UNLK");
+        // now (#23), and `$4E60`..`$4E6F` above them is MOVE to/from USP (#34), so
+        // the anchor moves again — to `$4E72`, `STOP`, the next opcode in the group
+        // no ticket has claimed (M68000UM "MOVE to/from USP"; M1-26's STOP work is
+        // separate and unlanded).
+        assert_eq!(decode(0x4E72), Op::Unimplemented, "just above MOVE USP");
         // `$0000` was ORI until #21 implemented it (see
         // `ori_andi_eori_decode_and_leave_ccr_sr_alone`), `$0100` was BTST until
         // #28 implemented the bit operations, and `$0108` was MOVEP until #33
@@ -1835,11 +1923,11 @@ mod tests {
     /// unimplemented (M1-12, #20 — `RTR` sits directly above it, so this ticket
     /// cannot take `$4E76` by accident).
     ///
-    /// The rest of the count is the point: `RESET` `$4E70`, `STOP` `$4E72`, MOVE
-    /// to USP `$4E60`..`$4E67` and the `$4E78`/`$4E79` holes are still
-    /// unimplemented, and `JSR`/`JMP` plus their 72 illegal operand fields are
-    /// the whole of `$4E80`..`$4EFF` (M68000UM section 8, "Instruction Set
-    /// Summary"; M1-17, #25).
+    /// The rest of the count is the point: `RESET` `$4E70`, `STOP` `$4E72`, TRAPV
+    /// `$4E76` and the `$4E78`/`$4E79` holes are still unimplemented, MOVE to/from
+    /// USP `$4E60`..`$4E6F` is the 16-opcode block #34 landed, and `JSR`/`JMP`
+    /// plus their 72 illegal operand fields are the whole of `$4E80`..`$4EFF`
+    /// (M68000UM section 8, "Instruction Set Summary"; M1-17, #25; M1-26, #34).
     #[test]
     fn the_returns_and_no_operand_misc_are_single_opcodes() {
         assert_eq!(decode(0x4E71), Op::Nop, "NOP");
@@ -1856,6 +1944,7 @@ mod tests {
             (Op::Trap, 0),
             (Op::Link, 0),
             (Op::Unlk, 0),
+            (Op::MoveUsp, 0),
             (Op::Jmp, 0),
             (Op::Jsr, 0),
             (Op::Illegal, 0),
@@ -1874,9 +1963,10 @@ mod tests {
                 Op::Nop | Op::Rte | Op::Rts | Op::Rtr => 1,
                 Op::Trap => 16,
                 Op::Link | Op::Unlk => 8,
+                Op::MoveUsp => 16,
                 Op::Jmp | Op::Jsr => 28,
                 Op::Illegal => 72,
-                Op::Unimplemented => 92,
+                Op::Unimplemented => 76,
                 _ => unreachable!("only the variants above are named"),
             };
             assert_eq!(count, want, "{op:?} in $4E00..=$4EFF");
@@ -2591,9 +2681,12 @@ mod tests {
     /// the three `#imm,<ea>` operations of the `0000` group next to `SUBI`, `ADDI`
     /// and `CMPI`. The EA names the destination, which must be data-alterable,
     /// and the two forms that are not destinations at all — mode `111` register
-    /// `100`, the CCR, and `ss` = `11` — stay [`Op::Unimplemented`] for M1-26
-    /// (#34) rather than being called illegal from here (M68000UM ORI, ANDI,
-    /// EORI; M1-13, #21).
+    /// `100`, the CCR, and `ss` = `11` — are split rather than called illegal from
+    /// here (M68000UM ORI, ANDI, EORI; M1-13, #21). #34 claimed two of the four
+    /// `111/100` rows: `ss` = `00` is `ANDI/ORI/EORI` to CCR and `ss` = `01` the
+    /// same to SR, so they are asserted as [`Op::LogicImmCcr`] and
+    /// [`Op::LogicImmSr`] below; `ss` = `10` and `ss` = `11` at that EA are nothing
+    /// on the 68000 and stay [`Op::Unimplemented`].
     #[test]
     fn ori_andi_eori_decode_and_leave_ccr_sr_alone() {
         for (opcode, want, name) in [
@@ -2614,15 +2707,29 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), want, "{name} (${opcode:04X})");
         }
+        // The mode `111` register `100` rows #34 wired up: `ss` = `00` writes the
+        // CCR and `ss` = `01` the SR (M68000UM "ANDI/ORI/EORI to CCR" and
+        // "… to SR").
+        for (opcode, want, name) in [
+            (0x003Cu16, Op::LogicImmCcr, "ORI.B #imm,CCR"),
+            (0x007C, Op::LogicImmSr, "ORI.W #imm,SR"),
+            (0x023C, Op::LogicImmCcr, "ANDI.B #imm,CCR"),
+            (0x027C, Op::LogicImmSr, "ANDI.W #imm,SR"),
+            (0x0A3C, Op::LogicImmCcr, "EORI.B #imm,CCR"),
+            (0x0A7C, Op::LogicImmSr, "EORI.W #imm,SR"),
+        ] {
+            assert_eq!(decode(opcode), want, "{name} (${opcode:04X})");
+        }
+        // What is left over in the group: `ss` = `11` at a normal EA is not a
+        // size, and `ss` = `10`/`11` at the CCR EA are the two 68020 spellings the
+        // 68000 leaves unassigned (M68000UM ORI, and the note on
+        // [`classify_logic_imm`]).
         for (opcode, name) in [
-            (0x003Cu16, "ORI.B #imm,CCR"),
-            (0x007C, "ORI.W #imm,CCR"),
-            (0x023C, "ANDI.B #imm,CCR"),
-            (0x0A3C, "EORI.B #imm,CCR"),
-            (0x00C0, "ORI with ss = 11: MOVE to SR's space"),
+            (0x00C0u16, "ORI with ss = 11: not a size"),
             (0x02C0, "ANDI with ss = 11"),
             (0x0AC0, "EORI with ss = 11"),
             (0x02FC, "ANDI with ss = 11 at the CCR EA"),
+            (0x00BC, "ORI.L #imm at the CCR EA: a 68020 encoding only"),
         ] {
             assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
         }
@@ -2790,8 +2897,9 @@ mod tests {
 
     /// `NOT` is `0100 0110 ss mmm rrr`, a one-operand read-modify-write, so its EA
     /// must be data-alterable (M68000UM NOT; M1-13, #21). `classify` only routes
-    /// `$4600..=$46BF` to it, so `ss` = `11` — MOVE to SR (`$46C0`, `$46FC`) and
-    /// MOVE to CCR's space, which M1-26 (#34) owns — never reaches it. Every mode
+    /// `$4600..=$46BF` to it, so `ss` = `11` — MOVE to SR (`$46C0`, `$46FC`), which
+    /// M1-26 (#34) landed — never reaches it, and the two assertions at the end of
+    /// the test are what pins that boundary. Every mode
     /// in the legal list but `001` is measured in `NOT.b/w/l`, and mode `111`
     /// register `100` (`#immediate`, `$463C`/`$46BC`) is in no file at all.
     #[test]
@@ -2826,12 +2934,21 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
+        // `ss` = `11` is not NOT's: `classify` routes only `$4600..=$46BF` to it,
+        // and `$46C0`..`$46FF` is MOVE to SR (#34). Asserting the new variant here
+        // rather than an unimplemented probe is what proves NOT's range stops dead
+        // at `$46BF` (M68000UM "MOVE to SR").
         assert_eq!(
             decode(0x46C0),
-            Op::Unimplemented,
-            "NOT is not encoded at ss = 11"
+            Op::MoveToSr,
+            "NOT is not encoded at ss = 11: MOVE to SR D0"
         );
-        assert_eq!(decode(0x46FC), Op::Unimplemented, "MOVE.L #imm,SR");
+        assert_eq!(decode(0x46FC), Op::MoveToSr, "MOVE.W #imm,SR");
+        assert_eq!(
+            decode(0x46C8),
+            Op::Illegal,
+            "MOVE to SR A0: An direct is not one of its source modes"
+        );
     }
 
     /// The `1100` and `1000` groups are not AND's and OR's alone. The corners
@@ -3100,21 +3217,41 @@ mod tests {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
 
-        // `ss` = `11` is outside all three ranges: `$40C0` is MOVE from SR, which
-        // `MOVEfromSR.json.gz` measures at `$40C0`..`$40F9` (M1-26, #34), and
-        // `$42C0`/`$44C0` are unassigned on the 68000.
-        for (opcode, name) in [
+        // `ss` = `11` is outside all three ranges, and #34 landed all four of those
+        // sixths: `$40C0` MOVE from SR, `$44C0` MOVE to CCR, `$46C0` MOVE to SR, and
+        // `$42C0`..`$42FF` — MOVE from CCR — is a 68010 instruction and so ILLEGAL
+        // here rather than unassigned (M68000UM "MOVE from SR", "MOVE to CCR",
+        // "MOVE to SR"; M1-26, #34).
+        for (opcode, want, name) in [
             (
                 0x40C0u16,
+                Op::MoveFromSr,
                 "MOVE from SR D0: the first opcode of MOVEfromSR.json.gz",
             ),
-            (0x40F9, "MOVE from SR (xxx).L"),
-            (0x42C0, "unassigned sixth of CLR’s group"),
-            (0x44C0, "unassigned sixth of NEG’s group"),
-            (0x44FF, "the top of NEG’s group"),
+            (0x40F9, Op::MoveFromSr, "MOVE from SR (xxx).L"),
+            (0x44C0, Op::MoveToCcr, "MOVE to CCR D0"),
+            (0x44FC, Op::MoveToCcr, "MOVE to CCR #imm"),
+            (
+                0x44C8,
+                Op::Illegal,
+                "MOVE to CCR A0: An direct is not a source mode",
+            ),
+            (
+                0x42C0,
+                Op::Illegal,
+                "CLR’s ss = 11 sixth: MOVE from CCR, 68010-only",
+            ),
+            (0x42FF, Op::Illegal, "the top of CLR’s ss = 11 sixth"),
         ] {
-            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+            assert_eq!(decode(opcode), want, "{name} (${opcode:04X})");
         }
+        // The still-unimplemented probe moves to MOVEM’s load half with bit 7
+        // clear, the same anchor `unknown_is_unimplemented_for_now` uses.
+        assert_eq!(
+            decode(0x4C00),
+            Op::Unimplemented,
+            "MOVEM’s group, bit 7 clear"
+        );
     }
 
     /// The `$48??` window is SWAP, EXT, PEA, NBCD and MOVEM (M68000UM SWAP, EXT,

@@ -47,6 +47,7 @@ mod movem;
 mod movep;
 mod muldiv;
 mod shift;
+mod status;
 
 use crate::M68k;
 use crate::bus::Bus;
@@ -145,6 +146,18 @@ impl M68k {
             Op::Andi => self.op_andi(bus, opcode),
             Op::Ori => self.op_ori(bus, opcode),
             Op::Eori => self.op_eori(bus, opcode),
+            // The status-register side of those three immediates and the five
+            // status/USP moves (`$40C0`, `$44C0`, `$46C0`, `$4E60`..`$4E6F`,
+            // `$003C`/`$007C`/`$023C`/`$027C`/`$0A3C`/`$0A7C`): they write SR or
+            // the CCR rather than a data operand, so they live in [`status`] and
+            // go through `set_sr`/`set_ccr`, which is where a change to `S`
+            // switches the active stack (M1-26, #34).
+            Op::LogicImmCcr => self.op_logic_ccr(bus, opcode),
+            Op::LogicImmSr => self.op_logic_sr(bus, opcode),
+            Op::MoveFromSr => self.op_move_from_sr(bus, opcode),
+            Op::MoveToCcr => self.op_move_to_ccr(bus, opcode),
+            Op::MoveToSr => self.op_move_to_sr(bus, opcode),
+            Op::MoveUsp => self.op_move_usp(bus, opcode),
             // `LEA`/`PEA`/`LINK`/`UNLK` (`0100 ddd 111 …`, PEA's half of
             // `0100 1000 01 …` and `$4E50`/`$4E58`): the operand is an address,
             // so they live together in [`address`] and none of them touches a
