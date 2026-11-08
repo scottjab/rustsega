@@ -109,6 +109,17 @@ impl M68k {
             Op::Or => self.op_or(bus, opcode),
             Op::Eor => self.op_eor(bus, opcode),
             Op::Not => self.op_not(bus, opcode),
+            // `NEGX`, `CLR` and `NEG` (`0100 0000`/`0100 0010`/`0100 0100`) are
+            // subtract-from-zero and write-zero, so they live with the subtract
+            // helpers in [`arith`]; `EXT`, `SWAP` and `EXG` (`0100 1000 …` and
+            // `EXG`'s three slots inside `1100`) are register-only and live in
+            // [`logic`].
+            Op::Neg => self.op_neg(bus, opcode),
+            Op::Negx => self.op_negx(bus, opcode),
+            Op::Clr => self.op_clr(bus, opcode),
+            Op::Ext => self.op_ext(bus, opcode),
+            Op::Swap => self.op_swap(bus, opcode),
+            Op::Exg => self.op_exg(bus, opcode),
             Op::Andi => self.op_andi(bus, opcode),
             Op::Ori => self.op_ori(bus, opcode),
             Op::Eori => self.op_eori(bus, opcode),

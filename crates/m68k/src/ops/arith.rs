@@ -1,7 +1,10 @@
 //! Arithmetic instructions: `ADD`, `ADDA`, `ADDI`, `ADDQ`, `ADDX`, and their
-//! subtract twins `SUB`, `SUBA`, `SUBI`, `SUBQ`, `SUBX`; plus the compare and
-//! test class `CMP`, `CMPA`, `CMPI`, `CMPM` and `TST`, which do the same
-//! arithmetic (or simply a read) for the flags alone and store nothing back.
+//! subtract twins `SUB`, `SUBA`, `SUBI`, `SUBQ`, `SUBX`; the compare and test
+//! class `CMP`, `CMPA`, `CMPI`, `CMPM` and `TST`, which do the same arithmetic
+//! (or simply a read) for the flags alone and store nothing back; and the three
+//! single-operand read-modify-writes of the `$4000`/`$4200`/`$4400` opcodes —
+//! `NEGX` and `NEG` are subtracts from zero and `CLR` is `set_logic_flags` with
+//! the 68000's read-before-write kept.
 //!
 //! Opcodes (M68000UM section 8, "Instruction Formats"):
 //!
@@ -24,6 +27,9 @@
 //! | `CMPM` | `1011 xxx 1 ss 001 yyy` | `(Ax)+` − `(Ay)+` → flags, both pointers step |
 //! | `CMPI` | `0000 1100 ss mmm rrr` | `<ea>` − `<#data>` → flags only |
 //! | `TST` | `0100 1010 ss mmm rrr` | read `<ea>` → N/Z, V and C cleared |
+//! | `NEGX` | `0100 0000 ss mmm rrr` | `0 − <ea> − X` → `<ea>`, `Z` sticky |
+//! | `CLR` | `0100 0010 ss mmm rrr` | 0 → `<ea>`, reading it first |
+//! | `NEG` | `0100 0100 ss mmm rrr` | `0 − <ea>` → `<ea>` |
 //!
 //! Flags (M68000UM, "68000 CCR Affected by Instruction Set"). `SUB`, `SUBI` and
 //! `SUBQ` to a data or memory destination set `X = C`, `N`, `Z`, `V`, `C`, with
@@ -36,8 +42,9 @@
 //! The two classes are siblings in more than the opcode map: every handler here
 //! shares [`M68k::resolve_arith_ea`], every flag rule is one helper per direction
 //! ([`M68k::add_flags`]/[`M68k::add_extend_flags`] and
-//! [`M68k::sub_flags`]/[`M68k::sub_extend_flags`]), and the size/field constants
-//! below are named `ALU_*` because both groups read them.
+//! [`M68k::sub_flags`]/[`M68k::sub_extend_flags`]) — which is why `NEG` and
+//! `NEGX` need no arithmetic of their own beyond "minuend zero" — and the
+//! size/field constants below are named `ALU_*` because both groups read them.
 //!
 //! Flags again, for the compare class (M68000UM, "68000 CCR Affected by
 //! Instruction Set"): `CMP`/`CMPA`/`CMPI`/`CMPM` set `N`, `Z`, `V` and `C` and
@@ -48,8 +55,8 @@
 //!
 //! Illegal operands are rejected by [`crate::decode`], not here: `ADD.B`/`SUB.B`
 //! from or to `An`, `ADDQ.B`/`SUBQ.B` to `An`, every non-data destination for
-//! `ADDI`/`SUBI`/`CMPI`, `CMP.B` from `An`, and `TST` of `An`, a PC-relative
-//! operand or an immediate.
+//! `ADDI`/`SUBI`/`CMPI`, `CMP.B` from `An`, and `TST`, `NEGX`, `CLR` and `NEG` of
+//! `An`, a PC-relative operand or an immediate.
 
 use crate::bus::Bus;
 use crate::cpu::M68k;
@@ -625,6 +632,89 @@ impl M68k {
         };
         let value = self.read_ea(bus, src, size);
         self.set_logic_flags(value, size);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `NEG`: `0100 0100 ss mmm rrr` — `0 - <ea> → <ea>` (M68000UM section 8,
+    /// "NEG"; M1-14, #22).
+    pub(crate) fn op_neg(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        self.neg_operand(bus, opcode, false)
+    }
+
+    /// `NEGX`: `0100 0000 ss mmm rrr` — `0 - <ea> - X → <ea>`, with `SUBX`'s
+    /// sticky `Z` (M68000UM section 8, "NEGX"; M1-14, #22).
+    pub(crate) fn op_negx(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        self.neg_operand(bus, opcode, true)
+    }
+
+    /// The `NEG`/`NEGX` body: one data-alterable operand, taken from zero and
+    /// written back to the **same** resolved [`Ea`] — `NEG.W (A0)+` steps `A0`
+    /// once, and `-(A0)` is read and written at the decremented address. That is
+    /// `logic_to_ea` in `ops::logic`, which `NOT` and `EOR` use, with different
+    /// arithmetic.
+    ///
+    /// `extend` selects `NEGX`: the incoming `X` becomes a third subtrahend and
+    /// `Z` goes sticky, exactly as in `SUBX`. Both directions call
+    /// [`M68k::sub_flags`]/[`M68k::sub_extend_flags`] with the operand as the
+    /// subtrahend and zero as the minuend — the one operand order that makes
+    /// "`C` is set unless the operand was zero" (M68000UM "NEG") fall out of the
+    /// borrow rule instead of needing a case of its own, and `$80`/`$8000`/
+    /// `$8000_0000` the only operand that sets `V`.
+    fn neg_operand(&mut self, bus: &mut impl Bus, opcode: u16, extend: bool) -> u32 {
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+        let Some(size) = alu_size(field(opcode, ALU_OP_SHIFT)) else {
+            // `ss` = `11`: `$40C0` is MOVE from SR's sixth (#34) and `$44C0`
+            // unassigned, and `classify` stops both ranges at `$xBF`.
+            return self.op_illegal(bus);
+        };
+
+        let Some(dest) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
+            return self.op_illegal(bus);
+        };
+        let value = self.read_ea(bus, dest, size);
+        let result = if extend {
+            self.sub_extend_flags(value, 0, size)
+        } else {
+            self.sub_flags(value, 0, false, size)
+        };
+        self.write_ea(bus, dest, size, result);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `CLR`: `0100 0010 ss mmm rrr` — zero to `<ea>` (M68000UM section 8,
+    /// "CLR"; M1-14, #22).
+    ///
+    /// `Z` set, `N`, `V` and `C` cleared, `X` unaffected (M68000PM "CLR"), which
+    /// is [`M68k::set_logic_flags`] applied to zero — the rule `MOVE`, `NOT` and
+    /// `TST` share. Nothing is computed from the operand that was there, so the
+    /// operand is read for its bus cycle alone.
+    ///
+    /// Which brings the one thing a plain "write zero" would miss: **on the 68000
+    /// a memory destination is read first** (M68000PM "CLR", which lists the
+    /// 68020's read-free `CLR` as a later-machine difference), so the read is
+    /// resolved once with the write and charged like any other access. The suite
+    /// cannot see this — it compares final state — so
+    /// `clr_to_memory_reads_then_writes` is the test that pins it.
+    pub(crate) fn op_clr(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+        let Some(size) = alu_size(field(opcode, ALU_OP_SHIFT)) else {
+            // `ss` = `11` again: `$42C0..=$42FF` is unassigned on the 68000.
+            return self.op_illegal(bus);
+        };
+
+        let Some(dest) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
+            return self.op_illegal(bus);
+        };
+        // The 68000's dummy read: the value is thrown away, the bus cycle is not.
+        self.read_ea(bus, dest, size);
+        self.set_logic_flags(0, size);
+        self.write_ea(bus, dest, size, 0);
 
         self.advance_opcode(bus);
         0
@@ -1764,5 +1854,261 @@ mod tests {
         assert!(!cpu.flag_c());
         assert!(!cpu.flag_v());
         assert_eq!(cpu.a[0], MEM, "no pointer movement for a plain (An)");
+    }
+
+    /// Every condition code the `NEG`/`CLR` tests below start from, so a rule
+    /// about "cleared" cannot pass by the flag having been clear all along.
+    const NEGC: u16 = SR_N | SR_Z | SR_V | SR_C;
+
+    /// `NEG.B D0` of zero: `0 - 0` borrows nothing, so `C` and `X` are clear and
+    /// `Z` is set — the one operand for which NEG clears the carry (M68000UM
+    /// "NEG": "C is cleared if the source operand is 0, set otherwise"; #22).
+    #[test]
+    fn neg_zero_clears_c() {
+        let (mut cpu, mut bus) = run(0x4400, &[0x4E71]);
+        cpu.d[0] = 0;
+        cpu.set_ccr(NEGC);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0);
+        assert!(cpu.flag_z());
+        assert!(!cpu.flag_c(), "zero negated is the only case with no carry");
+        assert!(!cpu.flag_x(), "NEG sets X from the carry");
+        assert!(!cpu.flag_n());
+        assert!(!cpu.flag_v());
+
+        let (mut cpu, mut bus) = run(0x4400, &[0x4E71]);
+        cpu.d[0] = 1;
+        cpu.set_ccr(0);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0] & 0xFF, 0xFF);
+        assert!(cpu.flag_c(), "and any other operand borrows");
+        assert!(cpu.flag_x());
+    }
+
+    /// `NEG` of the most negative value of each size overflows: the result is
+    /// unchanged, `V` is set, and `C` is set because zero was still borrowed from
+    /// (M68000UM "NEG": "V is set if the operand was $80, $8000 or $80000000";
+    /// the `D7` byte/word/long triple of `NEG.b`/`NEG.w`/`NEG.l`).
+    #[test]
+    fn neg_min_sets_v() {
+        for (opcode, value, mask, name) in [
+            (0x4400u16, 0x80u32, 0xFFu32, "NEG.B $80"),
+            (0x4440, 0x8000, 0xFFFF, "NEG.W $8000"),
+            (0x4480, 0x8000_0000, 0xFFFF_FFFF, "NEG.L $80000000"),
+        ] {
+            let (mut cpu, mut bus) = run(opcode, &[0x4E71]);
+            cpu.d[0] = value;
+            cpu.set_ccr(0);
+
+            cpu.step(&mut bus);
+
+            assert_eq!(cpu.d[0] & mask, value & mask, "{name}: unchanged");
+            assert!(cpu.flag_v(), "{name}: V set");
+            assert!(cpu.flag_c(), "{name}: C set, zero minus a negative carries");
+            assert!(cpu.flag_n(), "{name}: the result is still negative");
+            assert!(!cpu.flag_z());
+
+            // The same test without the overflow, one less than the boundary.
+            let (mut cpu, mut bus) = run(opcode, &[0x4E71]);
+            cpu.d[0] = value - 1;
+            cpu.set_ccr(0);
+
+            cpu.step(&mut bus);
+
+            assert!(!cpu.flag_v(), "{name} minus one: no overflow");
+        }
+    }
+
+    /// `NEGX` is `SUBX` with the subtrahend only: `Z` is sticky (set only by the
+    /// incoming X and result, never *cleared* by a zero result), and X is a third
+    /// subtrahend rather than a carry-in (M68000UM "NEGX" and "SUBX"; #22).
+    #[test]
+    fn negx_z_sticky() {
+        // `$FF - X` with X set is zero: Z was clear, and a zero result must leave
+        // it clear. `NEGX.B D0` is `$4000`; D0 is `$FF`, X is set.
+        let (mut cpu, mut bus) = run(0x4000, &[0x4E71]);
+        cpu.d[0] = 0xFF;
+        cpu.set_ccr(SR_X);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0] & 0xFF, 0x00);
+        assert!(!cpu.flag_z(), "a zero result leaves a clear Z alone");
+        assert!(cpu.flag_c(), "0 - $FF - X borrows");
+        assert!(cpu.flag_x());
+
+        // ... and with Z set going in, the same zero result leaves it set.
+        let (mut cpu, mut bus) = run(0x4000, &[0x4E71]);
+        cpu.d[0] = 0xFF;
+        cpu.set_ccr(SR_X | SR_Z);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0] & 0xFF, 0x00);
+        assert!(cpu.flag_z(), "a zero result leaves a set Z alone");
+
+        // A non-zero result clears Z, which is what makes the stickiness a chain
+        // rule rather than "NEGX never touches Z".
+        let (mut cpu, mut bus) = run(0x4000, &[0x4E71]);
+        cpu.d[0] = 0;
+        cpu.set_ccr(SR_Z);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0] & 0xFF, 0x00);
+        assert!(cpu.flag_z(), "0 - 0 - 0 is zero, so Z stays as it was");
+    }
+
+    /// `CLR.W D0`: `Z` set, `N`/`V`/`C` cleared, `X` untouched (M68000PM "CLR";
+    /// #22). `CLR.B` of the byte that was $FF is `CLR.b`'s first measured case.
+    #[test]
+    fn clr_w_sets_z_keeps_x() {
+        let (mut cpu, mut bus) = run(0x4243, &[0x4E71]);
+        cpu.d[3] = 0x1234_5678;
+        cpu.set_ccr(ALL_FLAGS);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[3], 0x1234_0000, "only the low word is cleared");
+        assert!(cpu.flag_z());
+        assert!(!cpu.flag_n());
+        assert!(!cpu.flag_v());
+        assert!(!cpu.flag_c());
+        assert!(cpu.flag_x(), "CLR leaves X alone");
+    }
+
+    /// The 68000 reads a memory destination before it writes `CLR`'s zero
+    /// (M68000PM "CLR", which lists the 68020's read-free form as a later
+    /// difference). Final state cannot show the difference — a read has no
+    /// architectural effect — so this is the one test here that inspects the bus
+    /// rather than the CPU, through the recording bus below.
+    #[test]
+    fn clr_to_memory_reads_then_writes() {
+        let mut bus = RecordingBus::new();
+        bus.load(PROGRAM, &[0x4258u16, 0x4E71] /* CLR.W (A0)+, NOP */);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        bus.accesses.clear();
+        cpu.a[0] = MEM;
+        bus.poke(MEM, 0xBEEF);
+
+        cpu.step(&mut bus);
+
+        // The access after these two is the prefetch of the word at $1002, which
+        // is why this compares a prefix rather than the whole log.
+        assert_eq!(
+            &bus.accesses[..2],
+            [Access::Read(MEM), Access::Write(MEM)],
+            "CLR.W (A0)+ reads the resolved word and writes it back once, \
+             at the same address, in that order"
+        );
+        assert_eq!(bus.peek(MEM), 0, "the write really is zero");
+    }
+
+    /// `NEG` and `NEGX` are read-modify-writes too: `(An)+` steps exactly once and
+    /// `-(An)` steps exactly once, because the operand is resolved once and both
+    /// halves use the same [`Ea`] (M68000UM "NEG"; #22, and the same property
+    /// `logic_to_ea` pins for AND and OR).
+    #[test]
+    fn neg_to_memory_moves_the_pointer_once() {
+        let (mut cpu, mut bus) = run(0x4458, &[0x4E71]); // NEG.W (A0)+
+        cpu.a[0] = MEM;
+        bus.mem[MEM as usize..MEM as usize + 2].copy_from_slice(&0x0002u16.to_be_bytes());
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[0], MEM + 2, "one step, not two");
+        let stored = u16::from_be_bytes([bus.mem[MEM as usize], bus.mem[MEM as usize + 1]]);
+        assert_eq!(stored, 0xFFFE);
+
+        let (mut cpu, mut bus) = run(0x4060, &[0x4E71]); // NEGX.W -(A0)
+        cpu.a[0] = MEM + 4;
+        bus.mem[(MEM + 2) as usize..(MEM + 4) as usize].copy_from_slice(&0x0001u16.to_be_bytes());
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[0], MEM + 2, "predecrement happens once");
+        let stored = u16::from_be_bytes([bus.mem[(MEM + 2) as usize], bus.mem[(MEM + 3) as usize]]);
+        assert_eq!(stored, 0xFFFF, "0 - 1 - X, X clear");
+    }
+
+    /// What [`RecordingBus`] records: one bus access, in the order the CPU made
+    /// it. `Read` is a read of the bus, `Write` a write, and the address is what
+    /// the CPU asked for before masking.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Access {
+        Read(u32),
+        Write(u32),
+    }
+
+    /// A bus that keeps the addresses it was asked about, which
+    /// [`crate::testbus::TestBus`] deliberately does not: the only way to see a
+    /// read that throws its value away is to count it (see
+    /// `cpu::tests::Ram64k`, the same device for the same reason; #22).
+    struct RecordingBus {
+        mem: Vec<u8>,
+        accesses: Vec<Access>,
+    }
+
+    impl RecordingBus {
+        fn new() -> Self {
+            Self {
+                mem: vec![0; 1 << 20],
+                accesses: Vec::new(),
+            }
+        }
+
+        /// The reset vector the CPU needs: SSP at $000000 and the program at
+        /// [`PROGRAM`].
+        fn load(&mut self, addr: u32, words: &[u16]) {
+            self.poke_long(0, 0x0000_F000);
+            self.poke_long(4, PROGRAM);
+            for (n, word) in words.iter().enumerate() {
+                let where_ = addr + 2 * n as u32;
+                self.mem[where_ as usize] = (word >> 8) as u8;
+                self.mem[where_ as usize + 1] = *word as u8;
+            }
+        }
+
+        fn poke(&mut self, addr: u32, value: u16) {
+            self.mem[addr as usize] = (value >> 8) as u8;
+            self.mem[addr as usize + 1] = value as u8;
+        }
+
+        fn poke_long(&mut self, addr: u32, value: u32) {
+            self.mem[addr as usize..addr as usize + 4].copy_from_slice(&value.to_be_bytes());
+        }
+
+        fn peek(&self, addr: u32) -> u16 {
+            u16::from_be_bytes([self.mem[addr as usize], self.mem[addr as usize + 1]])
+        }
+    }
+
+    impl Bus for RecordingBus {
+        fn read_byte(&mut self, addr: u32) -> u8 {
+            self.accesses.push(Access::Read(addr));
+            self.mem[addr as usize]
+        }
+
+        fn read_word(&mut self, addr: u32) -> u16 {
+            self.accesses.push(Access::Read(addr));
+            let i = addr as usize;
+            u16::from_be_bytes([self.mem[i], self.mem[i + 1]])
+        }
+
+        fn write_byte(&mut self, addr: u32, value: u8) {
+            self.accesses.push(Access::Write(addr));
+            self.mem[addr as usize] = value;
+        }
+
+        fn write_word(&mut self, addr: u32, value: u16) {
+            self.accesses.push(Access::Write(addr));
+            let i = addr as usize;
+            self.mem[i..i + 2].copy_from_slice(&value.to_be_bytes());
+        }
     }
 }

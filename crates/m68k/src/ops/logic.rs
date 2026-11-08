@@ -1,5 +1,8 @@
 //! Logic instructions: `AND`, `OR`, `EOR` and `NOT`, plus the immediate forms
-//! `ANDI`, `ORI` and `EORI` (M1-13, #21).
+//! `ANDI`, `ORI` and `EORI` (M1-13, #21); and the three register-only operations
+//! `EXT`, `SWAP` and `EXG` (M1-14, #22), which live here because they are
+//! mask-and-set-`logic_flags` work (`EXT`, `SWAP`) or no arithmetic at all
+//! (`EXG`), not because of where their opcodes fall.
 //!
 //! Opcodes (M68000UM section 8, "Instruction Formats"):
 //!
@@ -12,6 +15,9 @@
 //! | `ANDI` | `0000 0010 ss mmm rrr` | `<#data>` & `<ea>` → `<ea>` |
 //! | `ORI` | `0000 0000 ss mmm rrr` | `<#data>` \| `<ea>` → `<ea>` |
 //! | `EORI` | `0000 1010 ss mmm rrr` | `<#data>` ^ `<ea>` → `<ea>` |
+//! | `EXT` | `0100 1000 1s 000 rrr` | low byte (`s`=0) / word (`s`=1) of Dn, sign extended → Dn |
+//! | `SWAP` | `0100 1000 0100 0 rrr` | halves of Dn exchanged |
+//! | `EXG` | `1100 xxx 101 000 yyy` | Dxx ↔ Dyy; `101 001`: Ax ↔ Ay; `110 001`: Dxx ↔ Ayy |
 //!
 //! Four shapes cover all seven: [`M68k::logic_alu`] is AND and OR (which differ
 //! only in the operation and the group they live in), [`M68k::logic_to_ea`] is
@@ -35,11 +41,14 @@
 //!
 //! Illegal operands are rejected by [`crate::decode`], not here: an address
 //! register as AND's or OR's byte source, an address register or an immediate as
-//! any destination, and EOR's mode `001`, which CMPM took first.
+//! any destination, EOR's mode `001`, which CMPM took first, and EXG's five
+//! undefined operation/mode pairs — the only operand rule `EXT`, `SWAP` and `EXG`
+//! have is that their registers are registers, which the opcode fields guarantee.
 
 use crate::bus::Bus;
 use crate::cpu::M68k;
-use crate::ea::{Ea, Size};
+use crate::decode::is_exg;
+use crate::ea::{Ea, Size, sign_extend_byte, sign_extend_word};
 use crate::ops::field;
 
 /// Shift of the register field of AND's `1100`, OR's `1000` and EOR's `1011`
@@ -60,6 +69,11 @@ const LOGIC_MODE_TO_EA: u8 = 0b100;
 const EA_MODE_111: u8 = 0b111;
 /// EA register `100` inside mode `111`: immediate.
 const EA_REG_IMMEDIATE: u8 = 0b100;
+/// Bit 6 of an EXT opcode: clear for `EXT.W` (`$4880`+`r`), set for `EXT.L`
+/// (`$48C0`+`r`). EXT's own size bit, named here rather than read through
+/// [`logic_size`] because EXT's two sizes are not the `ss` field's `00`/`01`/`10`
+/// (M68000UM "EXT"; #22).
+const EXT_LONG: u16 = 0x0040;
 
 /// The operation one of the logic handlers performs. AND, OR and EOR are one
 /// shape apart — see [`M68k::logic_alu`] and [`M68k::logic_to_ea`] — so naming
@@ -145,6 +159,95 @@ impl M68k {
         // `write_ea`, which writes one size's worth of the register.
         let result = self.logic_flags(!value, size);
         self.write_ea(bus, dest, size, result);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `EXT.W Dn` (`0100 1000 1000 0 rrr`) and `EXT.L Dn`
+    /// (`0100 1000 1100 0 rrr`): the low byte, or low word, of `Dn` sign extended
+    /// and written back to `Dn` (M68000UM section 8, "EXT"; M1-14, #22).
+    ///
+    /// `size` is read from bit 6 alone, not from [`logic_size`]: EXT's two sizes
+    /// are `0` word and `1` long, so `ss` = `11` — which would be `EXT.L` under
+    /// the `ss` reading — is `$48C0`+`r` and the encoding is complete.
+    ///
+    /// `N` and `Z` come from the sign-extended result at its own size, `V` and `C`
+    /// are cleared and `X` is left alone, i.e. [`M68k::logic_flags`]. The *write*
+    /// is one size wide too, so `EXT.W` leaves the upper word of `Dn` alone rather
+    /// than sign extending all the way to 32 bits: `D5 = $D7AC5E2E` becomes
+    /// `$D7AC002E` (case `4885 [EXT.w D5] 1` of `EXT.w.json.gz`) and `D0 =
+    /// $1234_8000` stays `$1234_0000`, because the byte `D0` extends is `$00`,
+    /// positive however the word above it looks.
+    pub(crate) fn op_ext(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let reg = field(opcode, 0);
+        let source = self.d[usize::from(reg)];
+        let (size, extended) = if opcode & EXT_LONG == 0 {
+            (Size::Word, sign_extend_byte(source as u8))
+        } else {
+            (Size::Long, sign_extend_word(source as u16))
+        };
+        let result = self.logic_flags(extended, size);
+        self.write_ea(bus, Ea::DataReg(reg), size, result);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `SWAP`: `0100 1000 0100 0 rrr` — the low and high halves of `Dn`
+    /// exchanged (M68000UM section 8, "SWAP"; M1-14, #22).
+    ///
+    /// Long size throughout: the operand and the result are the whole register,
+    /// so `N` and `Z` come from the swapped long and `V` and `C` are cleared —
+    /// [`M68k::logic_flags`] again, and no masking is involved.
+    pub(crate) fn op_swap(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let reg = field(opcode, 0);
+        let swapped = self.d[usize::from(reg)].rotate_left(16);
+        let result = self.logic_flags(swapped, Size::Long);
+        self.write_ea(bus, Ea::DataReg(reg), Size::Long, result);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `EXG Rx,Ry`: `1100 xxx 1 ooooo yyy`, the three register-only swaps
+    /// `Dx,Dy`, `Ax,Ay` and `Dx,Ay` (M68000UM section 8, "EXG"; M1-14, #22).
+    ///
+    /// No flag is affected (M68000UM, "68000 CCR Affected by Instruction Set"),
+    /// so this is the one handler in this file that never reaches
+    /// [`M68k::logic_flags`], and both operands are registers, so there is no EA
+    /// to resolve and no bus cycle to charge.
+    ///
+    /// The two registers are read and written through [`M68k::read_ea`] and
+    /// [`M68k::write_ea`] rather than the `d`/`a` arrays because `A7` is
+    /// involved: `EXG D0,A7` (`$C18F`, `EXG.json.gz` case `c18f`) exchanges D0
+    /// with the *active* stack pointer, and `write_ea` is what keeps the stored
+    /// SSP/USP half of A7 in step (`set_an` in `ea.rs`).
+    pub(crate) fn op_exg(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let op_mode = field(opcode, LOGIC_OP_SHIFT);
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let left = field(opcode, LOGIC_REG_SHIFT);
+        let right = field(opcode, 0);
+        // `decode::classify_and` routes only these three pairs, which is what
+        // decides whether each side names a `Dn` or an `An`; `is_exg` is the same
+        // test it used, so the two cannot drift.
+        debug_assert!(
+            is_exg(op_mode, mode),
+            "decode routed opmode {op_mode:b} mode {mode:b} to EXG, which is not one of its three forms"
+        );
+        let (first, second) = match (op_mode, mode) {
+            (0b101, 0b000) => (Ea::DataReg(left), Ea::DataReg(right)),
+            (0b101, 0b001) => (Ea::AddrReg(left), Ea::AddrReg(right)),
+            (0b110, 0b001) => (Ea::DataReg(left), Ea::AddrReg(right)),
+            _ => return self.op_illegal(bus),
+        };
+
+        // Both sides are read before either is written, so a swap of a register
+        // with itself (`EXG D2,D2`, which the suite does run) leaves it alone.
+        let left_value = self.read_ea(bus, first, Size::Long);
+        let right_value = self.read_ea(bus, second, Size::Long);
+        self.write_ea(bus, first, Size::Long, right_value);
+        self.write_ea(bus, second, Size::Long, left_value);
 
         self.advance_opcode(bus);
         0
@@ -550,5 +653,220 @@ mod tests {
         assert!(!cpu.flag_v());
         assert!(!cpu.flag_c());
         assert!(cpu.flag_x());
+    }
+
+    /// `EXT.W D3` (`$4883`): the low *byte*'s sign fills the low word, and the
+    /// upper word is left exactly as it was — `EXT.W` is a word write to a data
+    /// register, not a whole-register one (M68000UM "EXT": "The low-order byte of
+    /// the destination ... extended ... to a word. The upper byte is unaffected";
+    /// every one of the 8065 cases of `EXT.w.json.gz` fits
+    /// `result = (start & 0xFFFF_FF00) | sign_extend_to_16(start & 0xFF)`, e.g.
+    /// `4884 [EXT.w D4] 7` taking `$D84ABFAE` to `$D84AFFAE`; #22).
+    #[test]
+    fn ext_w() {
+        for (start, want, n, z, name) in [
+            (
+                0x1234_8000u32,
+                0x1234_0000,
+                false,
+                true,
+                "the sign comes from the low byte, not from bit 15",
+            ),
+            (
+                0x1234_7FFF,
+                0x1234_FFFF,
+                true,
+                false,
+                "a negative low byte fills the low word",
+            ),
+            (
+                0xD84A_BFAE,
+                0xD84A_FFAE,
+                true,
+                false,
+                "the upper word is left alone",
+            ),
+            (
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+                true,
+                false,
+                "an all-ones register stays as it was",
+            ),
+        ] {
+            let (mut cpu, mut bus) = run(0x4883, &[0x4E71]);
+            cpu.d[3] = start;
+            cpu.set_ccr(ALL_FLAGS);
+
+            cpu.step(&mut bus);
+
+            assert_eq!(cpu.d[3], want, "{name}: D3");
+            assert_eq!(cpu.flag_n(), n, "{name}: N is the low word's sign");
+            assert_eq!(cpu.flag_z(), z, "{name}: Z is the low word's zero");
+            assert!(!cpu.flag_v(), "{name}: V cleared");
+            assert!(!cpu.flag_c(), "{name}: C cleared");
+            assert!(cpu.flag_x(), "{name}: X unaffected");
+        }
+
+        let (mut cpu, mut bus) = run(0x4883, &[0x4E71]);
+        cpu.d[3] = 0x0000_0080;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[3], 0x0000_FF80);
+        assert!(cpu.flag_n(), "N is the low word's sign, not the long's");
+        assert!(!cpu.flag_z());
+
+        let (mut cpu, mut bus) = run(0x4883, &[0x4E71]);
+        cpu.d[3] = 0x1234_0000;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            cpu.d[3], 0x1234_0000,
+            "the size is the word, so zero is zero"
+        );
+        assert!(cpu.flag_z());
+    }
+
+    /// `EXT.L D3` (`$48C3`): the low word's sign fills the upper word, and `N` is
+    /// the long's bit 31 — not the word's. `48c3 [EXT.l D3] 4` takes `$BAFB540A`
+    /// to `$0000540A` and clears `N`, while `48c4 [EXT.l D4] 1` takes
+    /// `$1F558A0A` to `$FFFF8A0A` and sets it (`EXT.l.json.gz`; M68000UM "EXT"; #22).
+    #[test]
+    fn ext_l() {
+        for (start, want, n) in [
+            (0x1234_8000u32, 0xFFFF_8000u32, true),
+            (0x8765_4321, 0x0000_4321, false),
+            (0x1234_7FFF, 0x0000_7FFF, false),
+            (0xFFFF_FFFF, 0xFFFF_FFFF, true),
+        ] {
+            let (mut cpu, mut bus) = run(0x48C3, &[0x4E71]);
+            cpu.d[3] = start;
+            cpu.set_ccr(ALL_FLAGS);
+
+            cpu.step(&mut bus);
+
+            assert_eq!(cpu.d[3], want, "EXT.L ${start:08X}");
+            assert_eq!(cpu.flag_n(), n, "EXT.L ${start:08X}: N is the long's sign");
+            assert!(!cpu.flag_z());
+            assert!(!cpu.flag_v());
+            assert!(!cpu.flag_c());
+            assert!(cpu.flag_x());
+        }
+    }
+
+    /// `SWAP D0` (`$4840`): exchange the halves of the long, flags from the whole
+    /// long. `N` is bit 31 of the result, which is bit 15 of the old low half, so
+    /// a swap can set N out of nowhere as far as the old high half is concerned
+    /// (M68000UM "SWAP": "Condition code N is set according to the result"; the
+    /// `39` case of `SWAP.json.gz`, `$47BDEADA` to `$EADA47BD`; #22).
+    #[test]
+    fn swap_sets_n() {
+        let (mut cpu, mut bus) = run(0x4840, &[0x4E71]);
+        cpu.d[0] = 0x1234_9ABC;
+        cpu.set_ccr(ALL_FLAGS);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0x9ABC_1234);
+        assert!(cpu.flag_n(), "the new top half is negative");
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v());
+        assert!(!cpu.flag_c());
+        assert!(cpu.flag_x(), "X is unaffected");
+
+        let (mut cpu, mut bus) = run(0x4840, &[0x4E71]);
+        cpu.d[0] = 0x0000_0000;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0);
+        assert!(cpu.flag_z(), "swapping zero is still zero");
+
+        // Swapping twice is the identity, including on the flags: this is what
+        // catches a swap that reads a half it did not mean to move.
+        let (mut cpu, mut bus) = run(0x4840, &[0x4840, 0x4E71]);
+        cpu.d[0] = 0xDEAD_BEEF;
+
+        cpu.step(&mut bus);
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_BEEF);
+    }
+
+    /// `EXG` swaps registers and touches nothing else: no flags at all, not even
+    /// N and Z (M68000UM "EXG": "Condition code flags are not affected"; #22).
+    ///
+    /// The three rows are the three forms the manual allows and the suite
+    /// measures — `Dx,Dy` (`$C141`, EXG D0,D1), `Ax,Ay` (`$C149`, EXG A0,A1) and
+    /// `Dx,Ay` (`$C188`, EXG D0,A0). Each is a different pair of registers, so a
+    /// swap that wrote one side to both would fail here rather than pass by
+    /// coincidence.
+    ///
+    /// `1100 xxx 1 ooooo yyy`: `Rx` is bits 11..9 and `Ry` bits 2..0, which every
+    /// case name in `EXG.json.gz` confirms (`c543 [EXG D2, D3]`, `cf8e [EXG D7,
+    /// A6]`, … for all 192 opcodes the suite runs).
+    #[test]
+    fn exg_swaps_and_leaves_the_flags_alone() {
+        // (opcode, whether the first operand is an An, second operand is an An)
+        for (opcode, x_is_a, y_is_a, name) in [
+            (0xC141u16, false, false, "EXG D0,D1"),
+            (0xC149, true, true, "EXG A0,A1"),
+            (0xC188, false, true, "EXG D0,A0"),
+        ] {
+            let (mut cpu, mut bus) = run(opcode, &[0x4E71]);
+            let x = (opcode >> 9) as usize & 7;
+            let y = opcode as usize & 7;
+            let x_before = 0xAAAA_5555 ^ (x as u32);
+            let y_before = 0x1111_2222 ^ (y as u32);
+            match (x_is_a, y_is_a) {
+                (false, false) => {
+                    cpu.d[x] = x_before;
+                    cpu.d[y] = y_before;
+                }
+                (true, true) => {
+                    cpu.a[x] = x_before;
+                    cpu.a[y] = y_before;
+                }
+                (false, true) => {
+                    cpu.d[x] = x_before;
+                    cpu.a[y] = y_before;
+                }
+                (true, false) => unreachable!("EXG Ax,Dy is not an encoding"),
+            }
+            cpu.set_ccr(ALL_FLAGS);
+
+            cpu.step(&mut bus);
+
+            let x_after = if x_is_a { cpu.a[x] } else { cpu.d[x] };
+            let y_after = if y_is_a { cpu.a[y] } else { cpu.d[y] };
+            assert_eq!(x_after, y_before, "{name}: first operand");
+            assert_eq!(y_after, x_before, "{name}: second operand");
+            assert_eq!(cpu.ccr(), ALL_FLAGS, "{name}: no flag changes at all");
+        }
+    }
+
+    /// `EXG D0,A7` (`$C18F`) has to move the *active* stack pointer, and leave the
+    /// other mode's copy where it was: the suite's `ssp` field for this case goes
+    /// from `$00000800` to `$615327CD`, the old D0 (`c18f [EXG D0, A7] 1`), and a
+    /// plain `cpu.a[7] = value` would update only half of what `EXG` just changed
+    /// (M68000UM "EXG", M68000PM 3.5 "Stack Pointer"; #22).
+    #[test]
+    fn exg_d0_a7_moves_the_live_stack_pointer() {
+        let (mut cpu, mut bus) = run(0xC18F, &[0x4E71]);
+        cpu.d[0] = 0x6153_27CD;
+        cpu.set_active_sp(0x0000_0800);
+        let usp_before = cpu.usp;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0x0000_0800, "D0 takes the stack pointer's value");
+        assert_eq!(
+            cpu.ssp, 0x6153_27CD,
+            "the stored stack pointer is the old D0"
+        );
+        assert_eq!(cpu.a[7], 0x6153_27CD, "in supervisor mode A7 mirrors it");
+        assert_eq!(cpu.usp, usp_before, "the other mode's SP is not involved");
     }
 }
