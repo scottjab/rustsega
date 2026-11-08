@@ -219,6 +219,16 @@ pub enum Op {
     /// `EORI #imm,<ea>`, `$0A00 + ss<<6 + <ea>` (M68000UM EORI, #21).
     /// [`Op::Andi`] with a different operation and base opcode.
     Eori,
+    /// Bit test or modify with the bit number in a register: `0000 ddd 1 tt
+    /// eeeeee` — `BTST D3,<ea>`, `BCHG D3,<ea>`, `BCLR`, `BSET` (M68000UM
+    /// BTST/BCHG/BCLR/BSET; M1-20, #28). `tt` is one of the four mnemonics and
+    /// the handler reads it back from the opcode, exactly as [`Op::Shift`] reads
+    /// `i` and `tt`; see [`crate::ops::bit`].
+    BitDynamic,
+    /// The static-form twin of [`Op::BitDynamic`]: `0000 1000 tt eeeeee`, where
+    /// the bit number is the low eight bits of the instruction's first extension
+    /// word instead of a register (M68000UM BTST/BCHG/BCLR/BSET; M1-20, #28).
+    BitStatic,
     /// `NEG <ea>`, `$4400 + ss<<6 + <ea>` with `ss` != `11` (M68000UM NEG,
     /// #22). `0 - <ea>` written back to the same data-alterable operand, so it
     /// is [`Op::Not`]'s shape with [`crate::ops::arith`]'s subtract flags.
@@ -512,6 +522,14 @@ fn classify(opcode: u16) -> Op {
         0x0000..=0x00FF => classify_logic_imm(opcode, Op::Ori),
         0x0200..=0x02FF => classify_logic_imm(opcode, Op::Andi),
         0x0A00..=0x0AFF => classify_logic_imm(opcode, Op::Eori),
+        // The single-bit family, which shares the `0000` group with those three:
+        // `0000 ddd 1 tt eeeeee` (bit number in `Ddd`) and `0000 1000 tt eeeeee`
+        // (bit number in the extension word). Bit 8 set is the whole dynamic half
+        // of the group and nothing else; bit 8 clear with `ddd` = `100` is the
+        // static half, because `ddd` = `000`/`001`/`010`/`101`/`110` with bit 8
+        // clear are ORI/ANDI/SUBI/ADDI/EORI/CMPI and those arms come first (see
+        // [`is_bit_op`]; M1-20, #28).
+        0x0000..=0x0FFF if is_bit_op(opcode) => classify_bit_op(opcode),
         // `1000 ddd ooo eeeeee`: OR, and DIV/SBCD's space.
         0x8000..=0x8FFF => classify_or(opcode),
         // `1100 ddd ooo eeeeee`: AND, and MUL/ABCD/EXG's space.
@@ -1209,6 +1227,77 @@ const SWAP_EXT_BIT7: u16 = 0x0080;
 /// size (`0` word, `1` long) inside MOVEM's half.
 const SWAP_BIT6: u16 = 0x0040;
 
+/// `0000 1000 tt eeeeee`: the `ddd` the static form of the single-bit family
+/// puts where the dynamic form puts its bit-number register (M68000UM "BTST —
+/// Bit Test", "Format").
+const BIT_OP_STATIC_DDD: u16 = 0b100;
+/// Bit 8 of a `$0000`-group opcode: the switch between the two shapes of the
+/// single-bit family, and the bit that separates them from the six immediate
+/// operations of the same group.
+const BIT_OP_NUMBER_BIT: u16 = 0x0100;
+/// Bits 7..6: `tt`, `00` BTST, `01` BCHG, `10` BCLR, `11` BSET. Not a size, so
+/// unlike `ss` it has no `11` hole for another instruction to live in.
+const BIT_OP_MNEMONIC_SHIFT: u32 = 6;
+/// Bit 9: the bottom bit of `ddd`, read with bits 11..10 to tell the static
+/// form's `100` from the immediate operations' `000`/`001`/`010`/`101`/`110`.
+const BIT_OP_REGISTER_SHIFT: u32 = 9;
+
+/// Whether `opcode` is one of the 8192 encodings of the single-bit family,
+/// `0000 ddd 1 tt eeeeee` or `0000 1000 tt eeeeee` (M68000UM BTST/BCHG/BCLR/
+/// BSET; M1-20, #28).
+///
+/// The two shapes are the whole of the `0000` group that is neither an immediate
+/// operation nor MOVEP, and they are recognised apart from both by bit 8: every
+/// immediate (`ORI`, `ANDI`, `SUBI`, `ADDI`, `EORI`, `CMPI`) has bit 8 clear and a
+/// `ddd` of `000`/`001`/`010`/`101`/`110`, so a clear bit 8 with `ddd` = `100`
+/// can only be the static form. `MOVEP` also has bit 8 set, and the mode `001`
+/// half of it is left to M1-25 (#33) by [`classify_bit_op`].
+const fn is_bit_op(opcode: u16) -> bool {
+    opcode & BIT_OP_NUMBER_BIT != 0
+        || (opcode >> BIT_OP_REGISTER_SHIFT) & 0b111 == BIT_OP_STATIC_DDD
+}
+
+/// One opcode of the single-bit family: [`Op::BitDynamic`] or
+/// [`Op::BitStatic`], or `Op::Illegal` / `Op::Unimplemented` for the corners
+/// of it that are not bit operations at all (M68000UM BTST/BCHG/BCLR/BSET;
+/// M1-20, #28).
+///
+/// Three corners, each of which a plain `match` on `tt` would get wrong:
+///
+/// * **Mode `001` is `MOVEP`.** `MOVEP.L D0,(A0)` is `$0108`, whose EA field is
+///   exactly the field `BTST D0,(A0)` would use; M68000PM/AD section 8 spells
+///   bits 7..6 `d1 d0` there, not `tt`. So the whole mode `001` column of this
+///   group — dynamic *and* static — stays [`Op::Unimplemented`] for M1-25 (#33).
+/// * **`BTST` reads, the other three write.** `is_data` is the operand rule of
+///   `TST`, and `is_data_alterable` the one of `NOT`/`CLR`/`NEG`: a modify needs
+///   an alterable destination, so `BCHG D1,d16(PC)` and `BCLR #3,#$1234` are
+///   illegal while `BTST` may have either (M68000PM/AD 2.2.12 gives `BTST` the
+///   whole data column and the other three only the alterable part of it).
+/// * **A `ddd` that is not one of the five immediate registers with bit 8 clear**
+///   can still reach here from the `0x0000..=0x0FFF` arm only as the static
+///   form, so the `ddd` of a bit-8-clear opcode needs no further check.
+fn classify_bit_op(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if mode == 0b001 {
+        return Op::Unimplemented;
+    }
+    let writes = (opcode >> BIT_OP_MNEMONIC_SHIFT) & 0b11 != 0;
+    let ok = if writes {
+        is_data_alterable(mode, reg)
+    } else {
+        is_data(mode, reg)
+    };
+    if !ok {
+        return Op::Illegal;
+    }
+    if opcode & BIT_OP_NUMBER_BIT == 0 {
+        Op::BitStatic
+    } else {
+        Op::BitDynamic
+    }
+}
+
 /// One opcode of the `$0000`/`$0200`/`$0A00` groups: [`Op::Ori`], [`Op::Andi`] or
 /// [`Op::Eori`] — the three `#imm,<ea>` logic operations, which are `ORI`'s
 /// pattern `0000 ddd 0 ss eeeeee` with `ddd` = `000`, `001` and `101` and differ
@@ -1502,9 +1591,11 @@ mod tests {
         // them — `$4E60`..`$4E6F`, between UNLK and RESET.
         assert_eq!(decode(0x4E60), Op::Unimplemented, "just above UNLK");
         // `$0000` was ORI until #21 implemented it (see
-        // `ori_andi_eori_decode_and_leave_ccr_sr_alone`); `$0100` is BTST,
-        // the bit-test half of the same `$0000` group that M1-14 (#22) owns.
-        assert_eq!(decode(0x0100), Op::Unimplemented, "BTST.B D0,D0");
+        // `ori_andi_eori_decode_and_leave_ccr_sr_alone`) and `$0100` was BTST
+        // until #28 implemented the bit operations, so the anchor inside that
+        // group moves to the one encoding of it #28 deliberately left alone:
+        // `$0108` is `MOVEP.L D0,(A0)`, M1-25's (#33), not a bit operation.
+        assert_eq!(decode(0x0108), Op::Unimplemented, "MOVEP.L D0,(A0)");
         // The move groups — bits 15..12 = `0001`, `0010`, `0011` (`MOVE`,
         // `MOVEA`) and `0111` (`MOVEQ`) — left this list with #17, see
         // `move_family_is_not_unimplemented`, so the anchor is a
@@ -1766,16 +1857,22 @@ mod tests {
         // `ss` = `11` is not a size `ADDI` defines and no ticket has claimed
         // it, so it stays loud rather than guessed at.
         assert_eq!(decode(0x06C0), Op::Unimplemented, "ADDI with ss = 11");
-        // Its neighbours in the `0000` group are untouched by this ticket. The
-        // `$04` pattern was one of them until #19 claimed it: `$0400` is SUBI,
-        // see `subi_decodes_and_validates_its_destination`. `$00` and `$02` were
-        // neighbours too until #21 claimed them as ORI and ANDI, so the list is
-        // now the bit tests and CMPI's own size-`11` hole.
+        // Its neighbours in the `0000` group. The `$04` pattern was one of them
+        // until #19 claimed it (SUBI, see
+        // `subi_decodes_and_validates_its_destination`), `$00` and `$02` until #21
+        // claimed them as ORI and ANDI, and the bit operations — `$0100`, `$0500`,
+        // `$0700`, `$0800` and the rest of the group's bit-8-set half — until #28,
+        // which `bit_decodes_both_shapes_and_needs_no_size` and
+        // `bit_modify_ops_need_an_alterable_destination` now cover. So the list is
+        // down to the mode `001` column #28 left for M1-25 (#33): MOVEP, plus the
+        // mode `001` encodings with bit 8 clear that the 68000 does not define.
         for (opcode, name) in [
-            (0x0100u16, "BTST.B #imm,D0"),
-            (0x0500, "BCHG.B #imm,D0"),
-            (0x0700, "the pattern one size above ADDI"),
-            (0x0800, "BTST #imm,D0"),
+            (
+                0x0108u16,
+                "MOVEP.L D0,(A0): mode 001 of this group, not a bit op",
+            ),
+            (0x0908, "the same mode, another bit number register"),
+            (0x0808, "mode 001 with bit 8 clear, unassigned on the 68000"),
         ] {
             assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
         }
@@ -2352,6 +2449,96 @@ mod tests {
             (0x0ABD, "EORI.L #imm,<mode 111 reg 101>"),
         ] {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// All four bit operations in both shapes: `0000 ddd 1 tt eeeeee` is
+    /// [`Op::BitDynamic`] and `0000 1000 tt eeeeee` is [`Op::BitStatic`], for every
+    /// `tt` and every bit-number register (M68000UM BTST/BCHG/BCLR/BSET; M1-20,
+    /// #28).
+    ///
+    /// Walking all four `tt` values is the point. `tt` selects the mnemonic and is
+    /// not a size, so where the immediate operations of this group leave an
+    /// `ss` = `11` hole every 64 opcodes, the bit operations leave none: `$08C0`
+    /// (`BSET #,D0`) has to decode although it is `ORI`'s hole three sizes up, and
+    /// `$0100`/`$0500`/`$0700` — the anchors this ticket moved out of
+    /// `addi_decodes_and_validates_its_destination` and
+    /// `unknown_is_unimplemented_for_now` — decode with it.
+    #[test]
+    fn bit_decodes_both_shapes_and_needs_no_size() {
+        for (tt, name) in [
+            (0b00u16, "BTST"),
+            (0b01, "BCHG"),
+            (0b10, "BCLR"),
+            (0b11, "BSET"),
+        ] {
+            for bit_reg in 0..8u8 {
+                let opcode = 0x0100 | (u16::from(bit_reg) << 9) | (tt << 6) | 0b010;
+                assert_eq!(
+                    decode(opcode),
+                    Op::BitDynamic,
+                    "{name} D{bit_reg},D2 (${opcode:04X})"
+                );
+            }
+            let opcode = 0x0800 | (tt << 6) | 0b010;
+            assert_eq!(decode(opcode), Op::BitStatic, "{name} #,D2 (${opcode:04X})");
+        }
+    }
+
+    /// `BTST` only reads, so it may take the operands the other three may not: an
+    /// immediate and the two PC-relative modes. `BCHG`, `BCLR` and `BSET` write
+    /// the bit back, so those same EAs are illegal for them (M68000PM/AD 2.2.12
+    /// gives `BTST` the whole data column and the other three only its alterable
+    /// part; M68000UM "BTST", "Operation"; M1-20, #28). Mode `001` is none of
+    /// these — it is MOVEP, and `ops::bit::tests::ea_001_is_not_bitop` pins it.
+    #[test]
+    fn bit_modify_ops_need_an_alterable_destination() {
+        // The read-only EAs: `BTST` takes them, a modify does not.
+        for (mode, reg, name) in [
+            (0b111u8, 0b100u8, "#imm"),
+            (0b111, 0b010, "d16(PC)"),
+            (0b111, 0b011, "d8(PC,Xn)"),
+        ] {
+            let ea = (u16::from(mode) << 3) | u16::from(reg);
+            assert_eq!(decode(0x0100 | ea), Op::BitDynamic, "BTST {name}");
+            for tt in [0b01u16, 0b10, 0b11] {
+                let dynamic = 0x0100 | (tt << 6) | ea;
+                let static_ = 0x0800 | (tt << 6) | ea;
+                assert_eq!(
+                    decode(dynamic),
+                    Op::Illegal,
+                    "dynamic modify {name} ({dynamic:#06X})"
+                );
+                assert_eq!(
+                    decode(static_),
+                    Op::Illegal,
+                    "static modify {name} ({static_:#06X})"
+                );
+            }
+        }
+        // Mode `111` register `101` is not an effective address at all, so not
+        // even `BTST` may have it.
+        assert_eq!(
+            decode(0x0100 | (0b111u16 << 3) | 0b101),
+            Op::Illegal,
+            "BTST <mode 111 register 101>"
+        );
+        // And mode `001` is MOVEP's column of the group: neither a bit operation
+        // nor illegal, just not this ticket's (M1-25, #33).
+        for tt in [0b00u16, 0b01, 0b10, 0b11] {
+            let ea = 0b001u16 << 3;
+            assert_eq!(
+                decode(0x0100 | (tt << 6) | ea),
+                Op::Unimplemented,
+                "dynamic, tt = {tt:b}, (A0) ({:04X})",
+                0x0100 | (tt << 6) | ea
+            );
+            assert_eq!(
+                decode(0x0800 | (tt << 6) | ea),
+                Op::Unimplemented,
+                "static, tt = {tt:b}, (A0) ({:04X})",
+                0x0800 | (tt << 6) | ea
+            );
         }
     }
 
