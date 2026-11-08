@@ -22,13 +22,14 @@
 //! [`harness::Mismatch`].
 //!
 //! So every fixture that used to expect an empty mismatch list now expects
-//! [`UNIMPLEMENTED_4E70`] alongside whatever difference it is really testing.
+//! [`UNIMPLEMENTED_4E74`] alongside whatever difference it is really testing.
 //! `BASE` deliberately stays an unimplemented opcode rather than becoming an
 //! implemented one: these tests are about the comparison, not the instruction,
 //! and one identical panic line on every case cannot mask a register, RAM or
-//! cycle difference. It was `4E71` (`NOP`) until #25 implemented `NOP`, which
-//! moved the control to `4E70` (`RESET`, M1-27) — the licence this test alone
-//! has to move its anchor, see `decode::tests::unknown_is_unimplemented_for_now`.
+//! cycle difference. It was `4E71` (`NOP`) until #25 implemented `NOP`, then
+//! `4E70` (`RESET`) until #35 implemented that, which moved the control to
+//! `4E74` — the licence this test alone has to move its anchor, see
+//! `decode::tests::unknown_is_unimplemented_for_now`.
 //!
 //! Cases are written as JSON rather than as struct literals so they go through
 //! the same parse path as the real suite — a field the harness stopped
@@ -56,10 +57,11 @@ const SSP: u32 = 8192;
 /// A whole, real-shaped case for an instruction that changes nothing: `final`
 /// equals `initial`, and `length` is 0. It is the control for every test below.
 ///
-/// `4E70` (`RESET`, M1-27) is still unimplemented, so the state comparison here
-/// passes because the fixture's `final` *is* its `initial` and `step()` touches
-/// no register on the way to the panic — not because the core can do `RESET`. See
-/// the module docs for what that means for the expectations below.
+/// `4E74` is still unimplemented — the hole `$4E70..=$4E77` leaves once RESET,
+/// NOP, RTE, RTS, TRAPV and RTR all have handlers (#35) — so the state
+/// comparison here passes because the fixture's `final` *is* its `initial` and
+/// `step()` touches no register on the way to the panic. See the module docs for
+/// what that means for the expectations below.
 ///
 /// Field names and layout are copied from the pinned suite
 /// (`test-roms/680x0/68000/v1/README.md`): `d0`..`d7`, `a0`..`a6`, `usp`,
@@ -74,38 +76,38 @@ const SSP: u32 = 8192;
 /// to pin that: comparing bus transactions is out of scope for this suite, and
 /// skipping them is what keeps a ~1.4 GB suite cheap to read.
 const BASE: &str = r#"{
-    "name": "4e70 [does nothing] 1",
+    "name": "4e74 [does nothing] 1",
     "initial": {
         "d0": 0, "d1": 1, "d2": 2, "d3": 3, "d4": 4, "d5": 5, "d6": 6, "d7": 7,
         "a0": 16, "a1": 17, "a2": 18, "a3": 19, "a4": 20, "a5": 21, "a6": 22,
         "usp": 16777216, "ssp": 8192, "sr": 9985, "pc": 3072,
-        "prefetch": [20080, 10835],
-        "ram": [[3072, 78], [3073, 112], [3076, 6], [3077, 121]]
+        "prefetch": [20084, 10835],
+        "ram": [[3072, 78], [3073, 116], [3076, 6], [3077, 121]]
     },
     "final": {
         "d0": 0, "d1": 1, "d2": 2, "d3": 3, "d4": 4, "d5": 5, "d6": 6, "d7": 7,
         "a0": 16, "a1": 17, "a2": 18, "a3": 19, "a4": 20, "a5": 21, "a6": 22,
         "usp": 16777216, "ssp": 8192, "sr": 9985, "pc": 3072,
-        "prefetch": [20080, 10835],
-        "ram": [[3072, 78], [3073, 112], [3076, 6], [3077, 121]]
+        "prefetch": [20084, 10835],
+        "ram": [[3072, 78], [3073, 116], [3076, 6], [3077, 121]]
     },
     "length": 0,
     "transactions": [["r", 4, 6, 3076, ".w", 1657]]
 }"#;
 
 /// The one mismatch every fixture below carries in addition to whatever it is
-/// testing: `step()` decodes `4E70`, finds no handler, and panics naming the
+/// testing: `step()` decodes `4E74`, finds no handler, and panics naming the
 /// opcode (`src/ops/mod.rs`), which [`harness::Machine::run`] catches per case
 /// and records as a `panic` mismatch.
 ///
 /// Quoted from an actual run rather than assembled from the `unimplemented!`
 /// call, because the text is the harness's formatting as well as the panic's.
-const UNIMPLEMENTED_4E70: &str = "panic: expected none, got not implemented: m68k opcode 4E70";
+const UNIMPLEMENTED_4E74: &str = "panic: expected none, got not implemented: m68k opcode 4E74";
 
 /// The failure line [`harness::run_cases`] keeps for a lone [`BASE`] case: the
 /// case name it quotes, then nothing but the unimplemented opcode.
 fn unimplemented_base_failure() -> String {
-    format!("case \"4e70 [does nothing] 1\": {UNIMPLEMENTED_4E70}")
+    format!("case \"4e74 [does nothing] 1\": {UNIMPLEMENTED_4E74}")
 }
 
 /// The same control case with `ILLEGAL` (`$4AFC`, M68000PM/AD section 8) as the
@@ -283,7 +285,7 @@ fn identical_states_compare_equal() {
     // comparing.
     assert_eq!(
         run(&base(), harness::Check::StateAndCycles),
-        vec![UNIMPLEMENTED_4E70]
+        vec![UNIMPLEMENTED_4E74]
     );
 }
 
@@ -298,7 +300,7 @@ fn flipping_one_ram_byte_reports_exactly_that_difference() {
         run(&c, harness::Check::State),
         vec![
             "ram[0x00000C04]: expected 0xEE, got 0x06",
-            UNIMPLEMENTED_4E70,
+            UNIMPLEMENTED_4E74,
         ]
     );
 }
@@ -319,9 +321,9 @@ fn one_failure_line_carries_every_difference() {
     assert_eq!(
         failure_lines(vec![c], harness::Check::State),
         vec![format!(
-            "case \"4e70 [does nothing] 1\": d3: expected 0x00001234, got 0x00000003; \
+            "case \"4e74 [does nothing] 1\": d3: expected 0x00001234, got 0x00000003; \
              sr: expected 0x2700, got 0x2701; pc: expected 0x00000C02, got 0x00000C00; \
-             prefetch[1]: expected 0x6789, got 0x2A53; {UNIMPLEMENTED_4E70}"
+             prefetch[1]: expected 0x6789, got 0x2A53; {UNIMPLEMENTED_4E74}"
         )]
     );
 }
@@ -337,13 +339,13 @@ fn only_state_and_cycles_checks_the_cycle_count() {
     // cycle difference.
     assert_eq!(
         run(&c, harness::Check::State),
-        vec![UNIMPLEMENTED_4E70],
+        vec![UNIMPLEMENTED_4E74],
         "State must not report a cycle difference"
     );
 
     // The cycle comparison itself needs a case that *returns*: `run` compares
     // `length` on the `Ok(cycles)` branch and records the panic on the other,
-    // so `4E70` can never reach it. `4AFC` takes the exception and comes back
+    // so `4E74` can never reach it. `4AFC` takes the exception and comes back
     // with 0 clocks, because the entry sequence charges its own 34 into
     // `M68k::cycles` and the instruction-overhead channel is still M1-31's
     // (#39) — see the module docs of `src/ops/mod.rs`.

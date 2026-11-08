@@ -427,6 +427,32 @@ pub enum Op {
     /// bit-field group (`BFSTOP` and friends). The MC68000 has no bit-field
     /// instructions, so all 512 of those encodings decode to [`Op::Illegal`].
     ShiftMemory,
+    /// `TRAPV` — `$4E76` (M68000UM "TRAPV — Trap on Overflow", #35). One opcode,
+    /// no operands: it takes the vector-7 overflow exception with the address of
+    /// the *next* instruction when `V` is set, and does nothing at all when `V`
+    /// is clear — which is why the flag has to be read by the handler, not by
+    /// [`classify`].
+    Trapv,
+    /// `RESET` — `$4E70` (M68000UM "RESET — Reset", #35). Privileged. Resets
+    /// every device behind the bus; the CPU itself keeps running and keeps its
+    /// registers, so this is not [`crate::M68k::reset`].
+    Reset,
+    /// `STOP` — `$4E72` (M68000UM "STOP — Stop the Processor", #35). Privileged.
+    /// One extension word, which becomes the whole of `SR`, and then the CPU
+    /// halts until the next interrupt or reset (see [`crate::M68k::stopped`]).
+    Stop,
+    /// `TAS` — `$4AC0 | <ea>`, byte only (M68000UM "TAS — Test and Set", #35).
+    /// `0100 1010 11 mmm rrr`, so it is the `ss` = `11` sixth of the `TST` group
+    /// that [`Op::Tst`] deliberately leaves alone. Its operand must be
+    /// data-alterable, and `$4AFC` inside the range is `ILLEGAL`.
+    Tas,
+    /// `CHK.W Dn,<ea>` — `0100 ddd 110 mmm rrr` (M68000UM "CHK — Check Data
+    /// Register Against Upper Bound", #35). `Dn` is read, never written; the
+    /// operand takes the same data-alterable set TAS uses, and anything else is
+    /// [`Op::Illegal`]. The `100` neighbour of bits 8..6, `$4100`..`$4F7F`, is
+    /// `CHK.L`, which is a 68020 instruction and so decodes to [`Op::Illegal`]
+    /// here rather than to [`Op::Unimplemented`] — see the note on the decode arm.
+    Chk,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -514,15 +540,25 @@ fn classify(opcode: u16) -> Op {
         // addressing mode — see [`classify_control_jump`] (M68000UM JMP, JSR;
         // M1-17, #25).
         0x4E80..=0x4EFF => classify_control_jump(opcode),
-        // The four one-word members of the `$4E` group. Between them sit
-        // `RESET` `$4E70` (M1-27), `STOP` `$4E72` (M1-26), TRAPV `$4E76` (#20)
-        // and the reserved `$4E78`/`$4E79`, none of which may be pulled in here;
-        // listing the four opcodes rather than a range is what keeps it that way
-        // (M68000UM NOP, RTE, RTS, RTR; M1-17, #25).
+        // `RESET` `$4E70` and `STOP` `$4E72` (M68000UM "RESET — Reset",
+        // "STOP — Stop the Processor"; #35). Neither has an EA field, so neither
+        // can pull in a neighbour: `NOP` at `$4E71` and `RTE` at `$4E73` are
+        // listed on their own lines below, and `$4E74` is unassigned.
+        0x4E70 => Op::Reset,
+        0x4E72 => Op::Stop,
+        // The four one-word members of the `$4E` group. Between them and above
+        // them sit TRAPV `$4E76` (#35, named on its own below) and the reserved
+        // `$4E78`/`$4E79`, none of which may be pulled in here; listing the
+        // opcodes rather than a range is what keeps it that way (M68000UM NOP,
+        // RTE, RTS, RTR; M1-17, #25).
         0x4E71 => Op::Nop,
         0x4E73 => Op::Rte,
         0x4E75 => Op::Rts,
         0x4E77 => Op::Rtr,
+        // `TRAPV` `$4E76`, between `RTS` and `RTR` (M68000UM "TRAPV — Trap on
+        // Overflow"; #35): a `0100 1110` opcode that is neither a control
+        // transfer nor one of the returns.
+        0x4E76 => Op::Trapv,
         // The three move groups: `00ss` with `ss` = `01` byte, `10` long,
         // `11` word. `$0000..=$0FFF` is *not* a move — `ss` = `00` is the
         // ORI/BTST/MOVEP group — so the range starts at `$1000`.
@@ -567,9 +603,16 @@ fn classify(opcode: u16) -> Op {
         // `1011 ddd ooo eeeeee`: CMP, CMPA, CMPM and EOR.
         0xB000..=0xBFFF => classify_cmp(opcode),
         // `0100 1010 ss eeeeee`: TST. `ss` = `11` is the top sixth of `$4Axx`,
-        // `$4AC0..=$4AFF`, which is TAS's (M1-27) and `ILLEGAL` at `$4AFC`, so
-        // the range stops dead at `$4ABF` rather than running to `$4AFF`.
+        // `$4AC0..=$4AFF`, which is TAS's, so the range stops dead at `$4ABF`
+        // rather than running to `$4AFF`.
         0x4A00..=0x4ABF => classify_tst(opcode),
+        // `0100 1010 11 mmm rrr`: `TAS <ea>.B` (M68000UM "TAS — Test and Set";
+        // #35) — the `ss` = `11` sixth that TST leaves over. The split is the
+        // same as everywhere else in the group: an operand the 68000 cannot
+        // alter is [`Op::Illegal`], which covers `ILLEGAL` at `$4AFC` by itself,
+        // because mode `111` sub-mode `100` (immediate) is not one of TAS's
+        // operands either.
+        0x4AC0..=0x4AFF => classify_tas(opcode),
         // `0100 0110 ss eeeeee`: NOT. `ss` = `11` — `$46C0..=$46FF` — is MOVE to
         // CCR and MOVE to SR (#34), so the range stops dead at `$46BF`, exactly
         // as TST's stops before TAS.
@@ -614,6 +657,18 @@ fn classify(opcode: u16) -> Op {
         // this arm can take the top half of `$4C??` whole: `$4C00`..`$4C7F` is
         // unassigned on the 68000 and stays [`Op::Unimplemented`] below it.
         0x4C80..=0x4CFF => classify_movem(opcode),
+        // `0100 ddd 110 mmm rrr`: CHK.W (M68000UM "CHK — Check Data Register
+        // Against Upper Bound", #35). Bits 8..6 = `110` is CHK's alone in the
+        // `0100` group — LEA takes `111`, JMP and JSR are `$4EE8`/`$4EB8`, and
+        // MOVEM's `0100 1d00 1s` leaves bits 8..6 at `010`/`011`, so the two
+        // never meet and the order of the arms is only about readability.
+        0x4000..=0x4FFF if opcode & 0x1C0 == 0x180 => classify_chk(opcode),
+        // Bits 8..6 = `100` in the same group is `CHK.L`, which the 68000 does not
+        // have (M68000UM lists CHK as word only; the long form is 68020). An
+        // instruction the CPU cannot know about is an illegal instruction, not an
+        // unassigned encoding, and `CHK.json.gz` agrees: `$4D00` and friends are
+        // exception cases, not `Unimplemented`.
+        0x4000..=0x4FFF if opcode & 0x1C0 == 0x100 => Op::Illegal,
         // `0000 0000 ss eeeeee`, `0000 0010 ss eeeeee` and `0000 1010 ss eeeeee`:
         // ORI, ANDI and EORI, the three `#imm,<ea>` logic operations. Bit 8 is
         // clear throughout all three ranges, which is what keeps them apart from
@@ -1619,6 +1674,45 @@ fn classify_tst(opcode: u16) -> Op {
     Op::Tst
 }
 
+/// `$4AC0 + <ea>`: `TAS <ea>.B` (M68000UM "TAS — Test and Set").
+///
+/// TAS reads a byte, sets `N`/`Z` from it and writes it back with bit 7 set, so
+/// the operand must be one it can *alter*: exactly [`is_data_alterable`], the
+/// same predicate `TST` uses (M68000UM "TAS" gives the modes as `000, 010, 011,
+/// 100, 101, 110(000, 001)`, which is `TAS.json.gz`'s set of 42 operand fields
+/// out of the 64). An direct, PC-relative and an immediate are illegal, and
+/// `ILLEGAL` at `$4AFC` is mode `111` sub-mode `100` — the immediate — so the
+/// predicate reaches it without a special case.
+fn classify_tas(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if !is_data_alterable(mode, reg) {
+        return Op::Illegal;
+    }
+    Op::Tas
+}
+
+/// CHK takes the operand set TAS takes: a data register or memory, read-only for
+/// our purposes but still an `<ea>` that a byte/word operand can live in
+/// (M68000UM "CHK — Check Data Register Against Upper Bound", "Effective Address
+/// Calculation"; #35). An `An`-direct, PC-relative or immediate source is
+/// therefore [`Op::Illegal`], which is what the ~3100 non-trapping exception
+/// cases of `CHK.json.gz` fetch `$0C` for.
+fn classify_chk(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    // CHK only ever *reads* its operand, so its set is the data *read* set, not
+    // the data-alterable one the `NEG`/`CLR`/`TAS` group uses: `#immediate` and
+    // the three PC-relative forms are all legal operands here (CHK.json.gz runs
+    // them), and only mode `001` — naming a register instead of a value — and
+    // mode `111`/`111`, which is no mode at all, are rejected (M68000UM CHK,
+    // "Effective Address Calculation"; M68000PM/AD 2.2.12 "Data").
+    if mode == AN_DIRECT_MODE || !is_data(mode, reg) {
+        return Op::Illegal;
+    }
+    Op::Chk
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1773,7 +1867,7 @@ mod tests {
         assert_range_decodes_to(0x4E58..=0x4E5F, Op::Unlk);
         assert_eq!(decode(0x4E4F), Op::Trap, "TRAP #15, just below");
         assert_range_decodes_to(0x4E60..=0x4E6F, Op::MoveUsp);
-        assert_eq!(decode(0x4E70), Op::Unimplemented, "RESET, just above");
+        assert_eq!(decode(0x4E70), Op::Reset, "RESET, just above");
     }
 
     /// `LEA <ea>,An` is exactly the 224 opcodes `0100 ddd 111 mmm rrr` at a mode
@@ -1824,14 +1918,23 @@ mod tests {
         assert_eq!(pea, 28, "the opcode count PEA.json.gz covers");
     }
 
-    /// `$4AFC` is `ILLEGAL` (M68000PM/AD section 8).
+    /// `$4AFC` is `ILLEGAL` (M68000PM/AD section 8) — and it is the *only* one:
+    /// the opcode is named by value, not by range.
+    ///
+    /// #35 took the `$4AC0`..`$4AFF` sixth of `$4Axx` for `TAS`, so the two
+    /// neighbours are no longer unclaimed: mode `111` sub-modes `011` and `101`
+    /// are not addressing modes the 68000 has, so `$4AFB` and `$4AFD` are
+    /// `Illegal` too — but as a TAS operand error, which is why `the_tas_window`
+    /// walks the sixth and shows `$4AC8` (`TAS (A0)`) decoding to `Op::Tas`
+    /// between them.
     #[test]
     fn illegal_opcode() {
         assert_eq!(decode(0x4AFC), Op::Illegal);
-        // The opcodes either side of it are not the illegal one: `$4AFB` is
-        // `MOVEM.l (A0)+,D1`-shaped and `$4AFD` is `MOVEM`-shaped too.
-        assert_eq!(decode(0x4AFB), Op::Unimplemented);
-        assert_eq!(decode(0x4AFD), Op::Unimplemented);
+        // The opcodes either side of it are illegal for their own operand
+        // reasons, which is the assertion's point: neither is the named one.
+        assert_eq!(decode(0x4AFB), Op::Illegal, "TAS with an undefined mode");
+        assert_eq!(decode(0x4AFD), Op::Illegal, "TAS with an undefined mode");
+        assert_eq!(decode(0x4AD0), Op::Tas, "TAS (A0), between the two");
     }
 
     /// Until an instruction's ticket lands, its opcodes are unimplemented —
@@ -1843,21 +1946,26 @@ mod tests {
     /// This test is expected to change as instructions land: when `NOP` is
     /// implemented it decodes to its own variant, and the ticket that does it
     /// moves this assertion to an opcode still unimplemented. That licence is
-    /// this test alone (ticket #15). `NOP` itself landed in #25, so the anchor is
-    /// now `RESET`, the next unclaimed opcode up in the `$4E` group.
+    /// this test alone (ticket #15). `NOP` landed in #25 and `RESET`/`STOP` in
+    /// #35, so the anchor is now `$4E74`, the unassigned hole between `RTE`
+    /// (`$4E73`) and `RTS` (`$4E75`).
     #[test]
     fn unknown_is_unimplemented_for_now() {
-        assert_eq!(decode(0x4E70), Op::Unimplemented, "RESET");
+        assert_eq!(decode(0x4E74), Op::Unimplemented, "$4E74: unassigned hole");
         // ... except the traps, which #16 wired up, and which sit right next to
         // NOP in the `$4E` group.
         assert_range_decodes_to(0x4E40..=0x4E4F, Op::Trap);
         assert_eq!(decode(0x4E3F), Op::Unimplemented, "just below the traps");
         // LINK (`$4E50`..`$4E57`) and UNLK (`$4E58`..`$4E5F`) are above the traps
-        // now (#23), and `$4E60`..`$4E6F` above them is MOVE to/from USP (#34), so
-        // the anchor moves again — to `$4E72`, `STOP`, the next opcode in the group
-        // no ticket has claimed (M68000UM "MOVE to/from USP"; M1-26's STOP work is
-        // separate and unlanded).
-        assert_eq!(decode(0x4E72), Op::Unimplemented, "just above MOVE USP");
+        // now (#23), `$4E60`..`$4E6F` above them is MOVE to/from USP (#34), and
+        // `RESET` `$4E70` and `STOP` `$4E72` landed in #35 — so the anchor stays
+        // inside the `$4E` group at `$4E74` and `$4E78`, the two holes nothing has
+        // ever claimed (M68000UM "Instruction Set Summary").
+        assert_eq!(
+            decode(0x4E78),
+            Op::Unimplemented,
+            "$4E78: the reserved hole above RTR"
+        );
         // `$0000` was ORI until #21 implemented it (see
         // `ori_andi_eori_decode_and_leave_ccr_sr_alone`), `$0100` was BTST until
         // #28 implemented the bit operations, and `$0108` was MOVEP until #33
@@ -1919,14 +2027,15 @@ mod tests {
     /// The four no-operand members of the `$4E` group are single opcodes, and
     /// counting the whole `$4E00`..`$4EFF` window is the only way to see that
     /// they took exactly those four: `NOP` `$4E71`, `RTE` `$4E73`, `RTS` `$4E75`
-    /// and `RTR` `$4E77`, and that TRAPV `$4E76` in the middle of them is still
-    /// unimplemented (M1-12, #20 — `RTR` sits directly above it, so this ticket
-    /// cannot take `$4E76` by accident).
+    /// and `RTR` `$4E77`, and that TRAPV `$4E76` in the middle of them is its own
+    /// variant and not one of them (#35 — `RTR` sits directly above TRAPV, so a
+    /// range would have swept the two together).
     ///
-    /// The rest of the count is the point: `RESET` `$4E70`, `STOP` `$4E72`, TRAPV
-    /// `$4E76` and the `$4E78`/`$4E79` holes are still unimplemented, MOVE to/from
-    /// USP `$4E60`..`$4E6F` is the 16-opcode block #34 landed, and `JSR`/`JMP`
-    /// plus their 72 illegal operand fields are the whole of `$4E80`..`$4EFF`
+    /// The rest of the count is the point: `RESET` `$4E70`, `STOP` `$4E72` and
+    /// TRAPV `$4E76` are the three single opcodes #35 landed, the `$4E74` and
+    /// `$4E78`/`$4E79` holes are still unimplemented, MOVE to/from USP
+    /// `$4E60`..`$4E6F` is the 16-opcode block #34 landed, and `JSR`/`JMP` plus
+    /// their 72 illegal operand fields are the whole of `$4E80`..`$4EFF`
     /// (M68000UM section 8, "Instruction Set Summary"; M1-17, #25; M1-26, #34).
     #[test]
     fn the_returns_and_no_operand_misc_are_single_opcodes() {
@@ -1934,13 +2043,18 @@ mod tests {
         assert_eq!(decode(0x4E73), Op::Rte, "RTE");
         assert_eq!(decode(0x4E75), Op::Rts, "RTS");
         assert_eq!(decode(0x4E77), Op::Rtr, "RTR");
-        assert_eq!(decode(0x4E76), Op::Unimplemented, "TRAPV is #20's");
+        assert_eq!(decode(0x4E76), Op::Trapv, "TRAPV, between RTS and RTR");
+        assert_eq!(decode(0x4E70), Op::Reset, "RESET");
+        assert_eq!(decode(0x4E72), Op::Stop, "STOP");
 
         let mut counts = [
             (Op::Nop, 0),
             (Op::Rte, 0),
             (Op::Rts, 0),
             (Op::Rtr, 0),
+            (Op::Trapv, 0),
+            (Op::Reset, 0),
+            (Op::Stop, 0),
             (Op::Trap, 0),
             (Op::Link, 0),
             (Op::Unlk, 0),
@@ -1961,12 +2075,13 @@ mod tests {
         for (op, count) in counts {
             let want = match op {
                 Op::Nop | Op::Rte | Op::Rts | Op::Rtr => 1,
+                Op::Trapv | Op::Reset | Op::Stop => 1,
                 Op::Trap => 16,
                 Op::Link | Op::Unlk => 8,
                 Op::MoveUsp => 16,
                 Op::Jmp | Op::Jsr => 28,
                 Op::Illegal => 72,
-                Op::Unimplemented => 76,
+                Op::Unimplemented => 73,
                 _ => unreachable!("only the variants above are named"),
             };
             assert_eq!(count, want, "{op:?} in $4E00..=$4EFF");
@@ -2556,11 +2671,48 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
-        // The `ss` = `11` sixth of `$4Axx` is TAS's and unclaimed; it stays loud
-        // rather than becoming a TST with an undefined width.
-        assert_range_decodes_to(0x4AC0..=0x4AFB, Op::Unimplemented);
+        // The `ss` = `11` sixth of `$4Axx` is TAS's, and #35 landed it: it never
+        // became a fourth TST width. The whole sixth is walked in
+        // `the_tas_window_is_a_byte_read_modify_write`.
+    }
+
+    /// `TAS` is `0100 1010 11 mmm rrr`, the sixth of `$4Axx` that `TST` stops
+    /// short of: all 64 operand fields, walked, are either `Tas` or an illegal
+    /// one — never `Unimplemented` (M68000UM "TAS — Test and Set"; #35).
+    ///
+    /// 50 of the 64 are data-alterable, which is the count `TAS.json.gz` covers:
+    /// `Dn`, the three address-register-indirect modes, `d16(An)`, `d8(An,Xn)`,
+    /// `abs.W` and `abs.L` — 8 x 6 + 2. The other 14 are An direct, the two
+    /// PC-relative forms, the immediate, and the three undefined sub-modes of
+    /// mode `111` — with `ILLEGAL` at `$4AFC` being the immediate among them.
+    #[test]
+    fn the_tas_window_is_a_byte_read_modify_write() {
+        let mut tas = 0;
+        let mut illegal = 0;
+        for opcode in 0x4AC0u16..=0x4AFF {
+            let mode = ((opcode >> 3) & 0b111) as u8;
+            let reg = (opcode & 0b111) as u8;
+            let alterable = is_data_alterable(mode, reg);
+            let want = if alterable { Op::Tas } else { Op::Illegal };
+            assert_eq!(decode(opcode), want, "${opcode:04X} in TAS's sixth");
+            tas += u8::from(alterable);
+            illegal += u8::from(!alterable);
+        }
+        assert_eq!(tas, 50, "the operand count TAS.json.gz covers");
+        assert_eq!(illegal, 14, "including ILLEGAL at $4AFC");
+        for (opcode, name) in [
+            (0x4AC0u16, "TAS.B D0"),
+            (0x4AD0, "TAS.B (A0)"),
+            (0x4AD9, "TAS.B (A1)+"),
+            (0x4AE1, "TAS.B -(A1)"),
+            (0x4AEA, "TAS.B d16(A2)"),
+            (0x4AF3, "TAS.B d8(A3,Xn)"),
+            (0x4AF8, "TAS.B ($0000).W"),
+            (0x4AF9, "TAS.B ($000000).L"),
+        ] {
+            assert_eq!(decode(opcode), Op::Tas, "{name} (${opcode:04X})");
+        }
         assert_eq!(decode(0x4AFC), Op::Illegal, "ILLEGAL, inside the TAS range");
-        assert_range_decodes_to(0x4AFD..=0x4AFF, Op::Unimplemented);
     }
 
     /// Every opcode has an entry, and the entry is what [`classify`] says it
@@ -3352,7 +3504,54 @@ mod tests {
         // `$4AC0`..`$4AFF` in `TAS.json.gz`.
         assert_eq!(decode(0x487A), Op::Pea, "PEA d16(PC), just below");
         assert_eq!(decode(0x4C00), Op::Unimplemented, "bit 7 clear, just below");
-        assert_eq!(decode(0x4D00), Op::Unimplemented, "bit 8 set, just above");
+        // `$4D00` is above MOVEM rather than part of it, but it is no longer
+        // unassigned: bits 8..6 = `100` in the `0100` group is `CHK.L`, which the
+        // 68000 does not implement (M68000UM lists CHK as word only; the long form
+        // is 68020), so it is an illegal instruction (#35). MOVEM's own window,
+        // which is what this test is about, is untouched.
+        assert_eq!(decode(0x4D00), Op::Illegal, "bit 8 set: CHK.l, 68020-only");
+    }
+
+    /// CHK is `0100 ddd 110 mmm rrr` (M68000UM "CHK — Check Data Register Against
+    /// Upper Bound"; #35). All eight register slots are walked so a stray mask in
+    /// the decode arm shows up as a count failure rather than as 250 opcodes that
+    /// quietly stayed [`Op::Unimplemented`], and the whole of the `0100 ddd 100`
+    /// block below each one is CHK's 68020-only long form, which must be illegal.
+    #[test]
+    fn chk_is_exactly_its_own_opcodes() {
+        let mut chk = 0u16;
+        for dn in 0..8u16 {
+            let base = 0x4000 | (dn << 9);
+            // The data-alterable operand fields, and only those.
+            for mode in 0..8u8 {
+                for reg in 0..8u8 {
+                    let opcode = base | 0x180 | (u16::from(mode) << 3) | u16::from(reg);
+                    let want = if mode != 0b001 && is_data(mode, reg) {
+                        Op::Chk
+                    } else {
+                        Op::Illegal
+                    };
+                    assert_eq!(decode(opcode), want, "chk.w ${opcode:04X}");
+                    chk += u16::from(want == Op::Chk);
+                }
+            }
+            // CHK.l: bits 8..6 = `100`, the `$40`-wide block directly below —
+            // `101` under it is still unassigned and `111` above is LEA.
+            for offset in 0..0x40u16 {
+                let opcode = base | 0x100 | offset;
+                assert_eq!(
+                    decode(opcode),
+                    Op::Illegal,
+                    "chk.l ${opcode:04X} is a 68020 instruction"
+                );
+            }
+        }
+        // 53 operand fields per register: the 48 of modes `000` and `010`..`110`,
+        // plus the five real sub-modes of `111` (abs.W, abs.L, d16(PC), d8(PC,Xn)
+        // and `#immediate` — all of them readable, so all of them legal here),
+        // minus mode `001`'s eight, which name an address register rather than a
+        // value. Times 8 destination registers.
+        assert_eq!(chk, 424, "the CHK opcode count");
     }
 
     /// NBCD is `0100 1000 00 mmm rrr`, the 64 opcodes of this window with both

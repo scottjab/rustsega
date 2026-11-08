@@ -61,6 +61,7 @@
 use crate::bus::Bus;
 use crate::cpu::M68k;
 use crate::ea::{Ea, Size, sign_extend_word};
+use crate::exceptions::EXC_CHK;
 use crate::ops::field;
 use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
 
@@ -637,6 +638,133 @@ impl M68k {
         0
     }
 
+    /// `TAS`: `1001 0110 00 mmm rrr` — read `<ea>` as a byte, set the flags from
+    /// it, and write it back with bit 7 set (M68000UM section 8, "TAS — Test and
+    /// Set"; #35).
+    ///
+    /// Two things distinguish it from the [`M68k::op_tst`] above it, which is
+    /// otherwise the same shape:
+    ///
+    /// * the size is byte-only. `TAS` shares the `$4Axx` field with `TST` but
+    ///   takes the `ss` = `11` slot that `TST` must refuse, so there is no
+    ///   `alu_size` call here — `decode::classify_tas` already rejected every
+    ///   operand mode that cannot be altered, which is why an address register
+    ///   direct or an immediate reaches this file as `Op::Illegal` and never as
+    ///   `Op::Tas`.
+    /// * the read is a read-modify-write, so the same resolved [`Ea`] is read and
+    ///   then written. Resolving twice would step `(A0)+` a second time.
+    ///
+    /// The flags are the `TST` rule — [`M68k::set_logic_flags`], which sets N and
+    /// Z from the value, clears V and C, and leaves X alone — and they are set
+    /// from the value **before** bit 7 is forced, which is what makes `TAS` of
+    /// zero set `Z` while storing `$80`.
+    ///
+    /// The store is an ordinary byte write: M68000UM notes that the write-back is
+    /// not locked against an interrupt, so there is no bus-level special case to
+    /// model here.
+    pub(crate) fn op_tas(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+
+        let Some(ea) = self.resolve_arith_ea(bus, mode, ea_reg, Size::Byte) else {
+            return self.op_illegal(bus);
+        };
+        let value = self.read_ea(bus, ea, Size::Byte);
+        self.set_logic_flags(value, Size::Byte);
+        self.write_ea(bus, ea, Size::Byte, value | 0x0080);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// `CHK.W Dn,<ea>`: `0100 ddd 110 mmm rrr` (M68000UM "CHK — Check Data
+    /// Register Against Upper Bound"; M1-27, #35).
+    ///
+    /// Signed 16-bit comparison of `Dn` against the bound, with three outcomes
+    /// and no write-back at all — `Dn` is read and left exactly as it was:
+    ///
+    /// * `Dn.w < 0` — `N = 1`, [`crate::EXC_CHK`] (vector 6, slot `$18`).
+    /// * `Dn.w > <ea>.w` — `N = 0`, same vector.
+    /// * otherwise — the instruction finishes normally.
+    ///
+    /// The bound test is signed on both sides, so a negative `Dn` traps whatever
+    /// the bound is and never reaches the second comparison.
+    ///
+    /// # Flags
+    ///
+    /// M68000UM calls `C`, `V` and `Z` "undefined" for CHK (only `N` and `X` are
+    /// spelled out: `N` from the trap condition above, `X` unaffected). They are
+    /// not undefined in the data though, and `CHK.json.gz` pins one particular
+    /// choice for each path:
+    ///
+    /// `Z`, `V` and `C` come out **cleared on every path**, trap or not, and `N`
+    /// is written by the two trap paths only — it is what says *why* the trap
+    /// fired. `X` is untouched throughout. The in-range cases are what make this
+    /// visible, because there is no trap to blame for the flags: `CHK D4,D4` with
+    /// `D4.w >= 0` clears an incoming `V` (so it is not "flags untouched"), and
+    /// `CHK (d16, A4),D1` with `D1` below the bound keeps an incoming `N = 1`
+    /// (so it is not `CMP Dn,<ea>` either, which would take `N` from the
+    /// subtraction and `Z` from its being zero). Two thirds of the manual's
+    /// "undefined" is therefore "the ALU result codes get dropped on the floor",
+    /// and the third that survives is `N`.
+    ///
+    /// Which of the two trap reasons fired is what `N` reports, and the negative
+    /// `Dn` test runs first: a negative `Dn` above a *negative* bound traps with
+    /// `N = 1` even though its difference is positive.
+    ///
+    /// # The frame's PC
+    ///
+    /// Unlike a divide, CHK is *not* restarted: the frame carries the address of
+    /// the next instruction, which is why `return_pc` is read from `pc` *after*
+    /// the operand is resolved. Resolving an extension-word mode steps `pc` over
+    /// the extension (see [`M68k::fetch_ext_word`]) but never over the opcode
+    /// itself, so `pc + 2` is the instruction after the whole CHK whatever the
+    /// mode — one word for `d16(An)`, two for `abs.L`.
+    pub(crate) fn op_chk(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let reg = field(opcode, ALU_REG_SHIFT);
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+
+        let Some(src) = self.resolve_arith_ea(bus, mode, ea_reg, Size::Word) else {
+            return self.op_illegal(bus);
+        };
+        // The bound is read before anything is decided: `CHK (A0)+,D0` steps `A0`
+        // once whether or not it traps.
+        let bound = self.read_ea(bus, src, Size::Word);
+        let value = self.d[usize::from(reg)];
+        // Both sides of the compare are the low word, sign-extended, and the
+        // result is only ever 0, positive or negative — no wrap-around to worry
+        // about, which is what lets the two tests below stay plain `if`s.
+        let signed_value = (value as u16) as i16 as i32;
+        let signed_bound = (bound as u16) as i16 as i32;
+
+        // `Z`, `V` and `C` come out clear on every path, `X` never changes, and
+        // only the two trap paths touch `N` — it is what says *why* the trap
+        // fired. The in-range path leaves `N` exactly as it found it, which is
+        // odd but measured: `CHK (d16, A4),D1` with `D1` in range expects a set
+        // `N` carried in from earlier code, while `CHK D4,D4` with `D4.w >= 0`
+        // expects a clear one taken from an incoming `V`.
+        let cleared = self.ccr() & !(SR_N | SR_Z | SR_V | SR_C);
+        let return_pc = self.pc.wrapping_add(2);
+
+        if signed_value < 0 {
+            self.set_ccr(cleared | SR_N);
+            self.exception(bus, EXC_CHK, return_pc);
+            return 0;
+        }
+        if signed_value > signed_bound {
+            self.set_ccr(cleared);
+            self.exception(bus, EXC_CHK, return_pc);
+            return 0;
+        }
+
+        // In range: `CHK` writes nothing back, so clearing the three flags is the
+        // whole rest of it.
+        self.set_ccr(self.ccr() & !(SR_Z | SR_V | SR_C));
+        self.advance_opcode(bus);
+        0
+    }
+
     /// `NEG`: `0100 0100 ss mmm rrr` — `0 - <ea> → <ea>` (M68000UM section 8,
     /// "NEG"; M1-14, #22).
     pub(crate) fn op_neg(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
@@ -863,7 +991,7 @@ impl M68k {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exceptions::EXC_ILLEGAL;
+    use crate::exceptions::{EXC_CHK, EXC_ILLEGAL};
     use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
     use crate::testbus::cpu_with_program;
 
@@ -1854,6 +1982,203 @@ mod tests {
         assert!(!cpu.flag_c());
         assert!(!cpu.flag_v());
         assert_eq!(cpu.a[0], MEM, "no pointer movement for a plain (An)");
+    }
+
+    /// `CHK.W Dd,<ea>` traps with vector 6 and `N = 1` when `Dd.w` is negative.
+    ///
+    /// The negative case comes first and is independent of the bound: M68000UM
+    /// "CHK — Check Data Register Against Upper Bound" makes the test
+    /// `Dd.w < 0 || Dd.w > <ea>.w`, so a negative operand traps against a
+    /// negative bound it is arithmetically *below* (``-1 > -10`` is false in
+    /// unsigned but the signed test still fires on the sign bit alone). The
+    /// frame carries the address of the *next* instruction, so the CHK is not
+    /// restarted, and only `N` is pinned on this path (#35).
+    #[test]
+    fn chk_negative_traps_with_n() {
+        // `CHK.W D1,D0` (`0100 000 110 000 001` = `$4181`): D0.w = `$FFFF` = -1,
+        // D1.w = 10, and the CHK traps on the sign bit before the bound matters.
+        let (mut cpu, mut bus) = run(0x4181, &[0x4E71]);
+        cpu.d[0] = 0x1234_FFFF;
+        cpu.d[1] = 0x0000_000A;
+        cpu.set_ccr(SR_Z | SR_V | SR_C); // N clear: the trap has to set it
+        let sp = cpu.a[7];
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pending_exception, Some(EXC_CHK), "vector 6");
+        assert!(cpu.flag_n(), "N = 1 whenever the operand is negative");
+        assert_eq!(cpu.d[0], 0x1234_FFFF, "CHK never writes its destination");
+        // Frame: SR at the new `sp`, the pushed PC as a long at `sp + 2`, and the
+        // PC is the *next* instruction, `$1000 + 2`.
+        let frame = sp.wrapping_sub(6);
+        assert_eq!(
+            bus.read_long((frame + 2) & crate::bus::ADDR_MASK),
+            PROGRAM + 2,
+            "CHK is not restarted, so the frame carries the next instruction"
+        );
+
+        // An extension-word source must still push the address after the whole
+        // instruction: `CHK.W (A0,D0.w),D1` is `$45AE` plus an index word, four
+        // bytes wide, and `resolve_ea` has already stepped `pc` over it when the
+        // trap is raised.
+        let (mut cpu, mut bus) = run(0x43B0, &[0x0000, 0x4E71]);
+        cpu.a[0] = MEM;
+        cpu.d[0] = 0;
+        cpu.d[1] = 0xFFFF_FFFF;
+        bus.write_word(MEM, 0x0010);
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pending_exception, Some(EXC_CHK));
+        let frame = sp.wrapping_sub(6);
+        assert_eq!(
+            bus.read_long((frame + 2) & crate::bus::ADDR_MASK),
+            PROGRAM + 4,
+            "one extension word counts towards the pushed PC"
+        );
+    }
+
+    /// `CHK.W Dd,<ea>` traps with vector 6 and `N = 0` when `0 <= Dd.w > <ea>.w`.
+    #[test]
+    fn chk_over_bound_traps_without_n() {
+        // `CHK.W D1,D0` with D0.w = 5 and D1.w = 3: in range for unsigned,
+        // over the bound for signed, and N must come out clear even though the
+        // suite hands the case over with every flag set.
+        let (mut cpu, mut bus) = run(0x4181, &[0x4E71]);
+        cpu.d[0] = 0xABCD_0005;
+        cpu.d[1] = 0x0000_0003;
+        cpu.set_ccr(ALL_FLAGS);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pending_exception, Some(EXC_CHK));
+        assert!(!cpu.flag_n(), "N = 0 on the over-bound path");
+        assert_eq!(cpu.d[0], 0xABCD_0005, "destination untouched");
+
+        // Equality is *inside* the bound: `Dd.w > <ea>.w` is strict, so 3 vs 3
+        // falls through to the no-trap path rather than trapping.
+        let (mut cpu, mut bus) = run(0x4181, &[0x4E71]);
+        cpu.d[0] = 3;
+        cpu.d[1] = 3;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pending_exception, None, "Dn.w == bound is in range");
+    }
+
+    /// `CHK.W Dd,<ea>` with `0 <= Dd.w <= <ea>.w` does not trap, advances, and
+    /// leaves the condition codes as `CMP` would: Z and V are "undefined" in
+    /// M68000UM but deterministic in the data, and the pinned suite accepts the
+    /// CMP values (checked against `CHK.json.gz`), so this uses
+    /// [`M68k::sub_flags_no_x`] — `X` is unaffected.
+    #[test]
+    fn chk_in_range_no_trap() {
+        // `CHK.W D1,D0` with D0.w = 2, D1.w = 10: no trap. The flags are *not*
+        // those of `2 - 10`: `Z`, `V` and `C` come out clear and `N` keeps what it
+        // came in with, which is what CHK.json.gz measures (its in-range cases want
+        // `0x00` from an incoming `V`, and `0x18` from an incoming `N | Z`). Both
+        // are asserted below: an incoming `N` survives, `Z`/`V`/`C` do not, and `X`
+        // is never touched. The plain-CMP reading and the plain-do-nothing reading
+        // each get one half of this wrong.
+        let (mut cpu, mut bus) = run(0x4181, &[0x4E71]);
+        cpu.d[0] = 0x0000_0002;
+        cpu.d[1] = 0x0000_000A;
+        cpu.set_ccr(SR_X | SR_N | SR_Z | SR_V | SR_C);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pending_exception, None, "in range: no CHK exception");
+        assert_eq!(cpu.pc, PROGRAM + 2, "the instruction completed");
+        assert_eq!(cpu.d[0], 2, "CHK never writes Dn");
+        assert!(cpu.flag_n(), "N is left alone, set or clear");
+        assert!(!cpu.flag_c(), "C is cleared even though nothing trapped");
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v());
+        assert!(cpu.flag_x(), "X is never touched by CHK");
+
+        // `CHK.W (A0),D0` (`$4190`) reads the bound from memory, word only.
+        let (mut cpu, mut bus) = run(0x4190, &[0x4E71]);
+        cpu.a[0] = MEM;
+        bus.write_word(MEM, 0xFFF0); // -16 as a signed bound
+        cpu.d[0] = 0xFFFF_FFFF; // -1: negative, so it traps either way
+        cpu.step(&mut bus);
+        assert_eq!(cpu.pending_exception, Some(EXC_CHK));
+        assert_eq!(cpu.a[0], MEM, "a plain (An) does not move");
+    }
+
+    /// `TAS.B <ea>` (`$4AC0 | <ea>`) reads the byte, sets N and Z from **that
+    /// byte as read**, clears V and C, leaves X alone, and writes the byte back
+    /// with bit 7 set. Both halves matter: the flags come from the old value and
+    /// the store is the point of the instruction (M68000UM "TAS — Test and Set":
+    /// "N and Z are set according to the operand value ... V and C are cleared;
+    /// X is unaffected"; #35).
+    #[test]
+    fn tas_sets_bit7_and_flags() {
+        // `TAS.B D0` on `$7F`: the write-back is `$FF`, so N is set — and it is
+        // set from the operand's own bit 7 being cleared, which is why this case
+        // is the one that separates "flags from the value read" from "flags
+        // from the value stored".
+        let (mut cpu, mut bus) = run(0x4AC0, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_007F;
+        cpu.set_ccr(SR_Z | SR_V | SR_C); // X clear, and it must stay clear
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_00FF, "bit 7 set, upper 24 bits kept");
+        assert!(
+            !cpu.flag_n(),
+            "N comes from the `$7F` that was read, not the `$FF` that was stored"
+        );
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v(), "V is cleared");
+        assert!(!cpu.flag_c(), "C is cleared");
+        assert!(!cpu.flag_x(), "X is unaffected");
+        assert_eq!(cpu.pc, PROGRAM + 2, "one opcode word, no extension");
+
+        // `TAS.B D0` on zero: Z is set, from the value *read*, even though the
+        // value stored back is `$80` — which is not zero and not negative as a
+        // byte would make N come out set.
+        let (mut cpu, mut bus) = run(0x4AC0, &[0x4E71]);
+        cpu.d[0] = 0xDEAD_FF00;
+        cpu.set_ccr(SR_X | SR_V | SR_C);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.d[0], 0xDEAD_FF80);
+        assert!(cpu.flag_z(), "Z comes from the operand, not the result");
+        assert!(cpu.flag_x(), "X is unaffected, so it stays set here");
+        assert!(!cpu.flag_n(), "N too comes from the operand");
+
+        // `TAS.B (A0)` (`$4AD0`): the byte really is read and really is written
+        // back, at the same address — a read-modify-write, not a store of a
+        // computed value over a stale read. `$4AC8` is not this instruction: mode
+        // `001` is An direct, which `classify_tas` sends to `Op::Illegal`.
+        let (mut cpu, mut bus) = run(0x4AD0, &[0x4E71]);
+        cpu.a[0] = MEM;
+        bus.write_word(MEM, 0x1234);
+        cpu.set_ccr(SR_Z | SR_V | SR_C);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            bus.read_word(MEM),
+            0x9234,
+            "the byte at MEM — the high one, big-endian — is set; the other is left alone"
+        );
+        assert!(
+            !cpu.flag_n(),
+            "N comes from the `$12` read, not the `$92` stored"
+        );
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_c() && !cpu.flag_v());
+        assert_eq!(cpu.a[0], MEM, "a plain (An) does not move");
+
+        // `TAS.B (A0)+` (`$4AD8`) steps the pointer exactly once: one byte read
+        // and the same byte written, so `A0` ends one past the byte, not two.
+        let (mut cpu, mut bus) = run(0x4AD8, &[0x4E71]);
+        cpu.a[0] = MEM;
+        bus.write_word(MEM, 0x0102);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(bus.read_word(MEM), 0x8102, "one byte set, one byte left");
+        assert_eq!(cpu.a[0], MEM + 1, "A0 moved once");
     }
 
     /// Every condition code the `NEG`/`CLR` tests below start from, so a rule
