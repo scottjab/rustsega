@@ -69,6 +69,32 @@ fn muls_file_passes() {
     harness::assert_file_passes("MULS", harness::Check::StateSkipAddressErrors);
 }
 
+/// `DIVU`: `$80C0`–`$80FF` (`1000 ddd 011 eeeeee`). 8065 cases, 3101 of which
+/// take the suite's exception handler at `$0C` — odd operand addresses
+/// (address error, M1-29 #37) and the illegal source EAs — and the remaining
+/// 4964 have to pass, **including the file's one divide-by-zero case**
+/// (`80ef [DIVU (d16, A7), D0] 5745`), which ends at the vector-5 handler
+/// instead and so is not skipped (M1-22, #30).
+///
+/// State only, deliberately: unlike the multiplies, the divides do not run
+/// under `Check::StateAndCycles`. Their timing is data-dependent in a way this
+/// core has not modelled exactly, which #30 leaves to M1-31 (#39/#40) with the
+/// measured residual; see [`div_clocks`] in `ops/muldiv.rs`.
+#[test]
+fn divu_file_passes() {
+    harness::assert_file_passes("DIVU", harness::Check::StateSkipAddressErrors);
+}
+
+/// `DIVS`: `$81C0`–`$81FF` (`1000 ddd 111 eeeeee`), 8065 cases of which 3073
+/// take the suite's exception handler; 4992 to pass. No divide-by-zero case
+/// exists in this file (every one of its 8065 divisors is non-zero), so the
+/// signed trap path is pinned by the unit test in `ops/muldiv.rs` and by
+/// `DIVU` above.
+#[test]
+fn divs_file_passes() {
+    harness::assert_file_passes("DIVS", harness::Check::StateSkipAddressErrors);
+}
+
 /// `MULU`'s cycle count: `step` returns the case's `length` for every case that
 /// does not end in the exception handler.
 #[test]
