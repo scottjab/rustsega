@@ -5,6 +5,12 @@
 //! 11..8 of the opcode, which is why they are one module: `BEQ`, `SBEQ` and
 //! `DBEQ` cannot disagree about what Z means.
 //!
+//! The module also holds the `$4E` control transfers that do not decide anything
+//! — `JMP`, `JSR`, `RTS`, `RTR`, `RTE` and `NOP` (M1-17, #25) — because they move
+//! control the same way: through [`crate::M68k::jump_to`], which discards the
+//! prefetch queue, rather than by sliding the window like every other
+//! instruction does.
+//!
 //! # The base a displacement is measured from
 //!
 //! Every branch displacement in this group is added to `pc + 2` — the address of
@@ -34,7 +40,7 @@
 
 use crate::M68k;
 use crate::bus::Bus;
-use crate::ea::{Ea, Size, sign_extend_byte, sign_extend_word};
+use crate::ea::{Ea, SP_REG, Size, sign_extend_byte, sign_extend_word};
 use crate::ops::field;
 use crate::sr::test_cc;
 
@@ -54,6 +60,12 @@ const WORD_DISPLACEMENT: u8 = 0;
 /// How many bytes wider the instruction is when that word is there, which is how
 /// much further `BSR`'s return address is.
 const WORD_DISPLACEMENT_WIDTH: u32 = 2;
+
+/// One instruction word. It is how far past `pc` the next instruction starts once
+/// the extension words have been popped, which is where `JSR` leaves its return
+/// address (M68000UM "JSR — Jump to Subroutine": "(PC) + instruction size", and
+/// the +2/+4/+6 the whole `JSR.json.gz` measures).
+const INSTRUCTION_WIDTH: u32 = 2;
 
 /// The value `Scc` writes when the condition is true: `$FF`, not `$01`
 /// (M68000UM "Scc — Set Conditional": "if condition FALSE, 0; else, all ones").
@@ -90,7 +102,8 @@ impl M68k {
     ///
     /// The pushed long is the address of the *following instruction*, so it is
     /// `pc + 2` for a byte displacement and `pc + 4` for a word one — the branch
-    /// base plus however wide the displacement was. `RTS` is #33's.
+    /// base plus however wide the displacement was; [`M68k::op_rts`] (#25) is what
+    /// pops it again.
     pub(crate) fn op_bsr(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
         let base = self.branch_base();
         let (disp, wide) = self.branch_displacement(bus, opcode);
@@ -160,6 +173,149 @@ impl M68k {
         0
     }
 
+    /// `JMP <ea>`, `0100 1110 11 mmm rrr` (M68000UM "JMP — Jump"): go to the
+    /// address the operand field *computes*, reading nothing at it.
+    ///
+    /// [`crate::ea::M68k::ea_address`], not `resolve_ea`, for the two reasons
+    /// `LEA` and `PEA` already give: the operand is one of the control modes,
+    /// which `decode` has checked, and the address must not lose its top byte
+    /// (#193). The second is what `JMP.json.gz` is mostly made of — 3636 of its
+    /// 4259 checkable cases end with a `pc` above `$FFFFFF`, from a target the bus
+    /// is never allowed to see. `jump_to` keeps the address whole and masks only
+    /// when it fetches, so `JMP (A0)` with `A0 = $FF000000` sits at `$FF000000`
+    /// and executes the word at `$000000`.
+    pub(crate) fn op_jmp(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let reg = field(opcode, EA_REG_SHIFT);
+        let Some(target) = self.ea_address(bus, mode, reg) else {
+            return self.op_illegal(bus);
+        };
+
+        self.jump_to(bus, target);
+        0
+    }
+
+    /// `JSR <ea>`, `0100 1110 10 mmm rrr` (M68000UM "JSR — Jump to Subroutine"):
+    /// [`M68k::op_jmp`], with the address of the instruction after the call on the
+    /// stack first.
+    ///
+    /// The operand is read *before* `SP` moves, and not the other way round:
+    /// `JSR (A7)` is a legal encoding — 293 of `JSR.json.gz`'s cases use it — and
+    /// once the return address has been pushed `A7` names the byte the callee
+    /// starts at, not the operand the call was given.
+    ///
+    /// The return address is `pc` once the extension words have been popped, so it
+    /// is `+2` for `JSR (A0)`, `+4` for `JSR #$1234.W` and `+6` for
+    /// `JSR.L $123456` — measured over the whole file, those are the only three
+    /// deltas it contains, and every case moves the active stack pointer by
+    /// exactly one long.
+    pub(crate) fn op_jsr(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let reg = field(opcode, EA_REG_SHIFT);
+        let Some(target) = self.ea_address(bus, mode, reg) else {
+            return self.op_illegal(bus);
+        };
+
+        // `ea_address` has popped every extension word by now, so `prefetch[0]`
+        // is the instruction after the call and `pc + 2` is its address.
+        self.push_long(bus, self.pc.wrapping_add(INSTRUCTION_WIDTH));
+        self.jump_to(bus, target);
+        0
+    }
+
+    /// `RTS` `$4E75` (M68000UM "RTS — Return from Subroutine"): pop a long into
+    /// `PC`, and touch nothing else — `RTS.json.gz`'s cases all end with `SR`
+    /// holding what it did before, which is also what separates this from
+    /// [`M68k::op_rtr`] and [`M68k::op_rte`].
+    pub(crate) fn op_rts(&mut self, bus: &mut impl Bus, _opcode: u16) -> u32 {
+        let return_pc = self.pop_return_address(bus);
+        self.jump_to(bus, return_pc);
+        0
+    }
+
+    /// `RTR` `$4E77` (M68000UM "RTR — Return and Restore Condition Code"): a word
+    /// into the CCR, then a long into `PC`.
+    ///
+    /// [`M68k::set_ccr`] takes the five bits it is given and leaves T, S and the
+    /// interrupt mask as they were — so, unlike [`M68k::op_rte`], `RTR` cannot
+    /// change which stack it is popping and the long comes off the same one the
+    /// word did whatever the popped status holds.
+    pub(crate) fn op_rtr(&mut self, bus: &mut impl Bus, _opcode: u16) -> u32 {
+        let status = self.pop_status_word(bus);
+        let return_pc = self.pop_return_address(bus);
+
+        self.set_ccr(status);
+        self.jump_to(bus, return_pc);
+        0
+    }
+
+    /// `RTE` `$4E73` (M68000UM "RTE — Return from Exception"): the whole status
+    /// register, then the return address.
+    ///
+    /// Privileged, and the check comes first: user mode raises
+    /// [`crate::exceptions::EXC_PRIVILEGE`] without moving the stack pointer at
+    /// all, which is what the file's user-mode cases want — popping before the
+    /// check would put a second frame where the first one is read from.
+    ///
+    /// `SR` is written *last*, and that order is the instruction. `set_sr` is what
+    /// swaps `A7` between the two stack pointers, and 1964 of `RTE.json.gz`'s
+    /// cases restore a status word that clears `S`. Popping after that swap takes
+    /// the return address off the user stack, which the real CPU never does: in
+    /// every one of those 1964 cases `usp` is unchanged and `ssp` has moved up by
+    /// exactly the frame's width, with the `pc` the file expects. So the frame is
+    /// read and released on the stack that was active when the instruction began,
+    /// and only then does the mode change.
+    pub(crate) fn op_rte(&mut self, bus: &mut impl Bus, _opcode: u16) -> u32 {
+        if !self.check_supervisor(bus) {
+            return 0;
+        }
+
+        let status = self.pop_status_word(bus);
+        let return_pc = self.pop_return_address(bus);
+
+        self.set_sr(status);
+        self.jump_to(bus, return_pc);
+        0
+    }
+
+    /// `NOP` `$4E71` (M68000UM "NOP — No Operation"): finish the opcode and do
+    /// nothing else.
+    ///
+    /// The queue still has to slide: every one of `NOP.json.gz`'s 8065 cases (none
+    /// of them skipped) ends with `pc` two higher than it started and every
+    /// register alone.
+    pub(crate) fn op_nop(&mut self, bus: &mut impl Bus, _opcode: u16) -> u32 {
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// The long at the top of the active stack, with `A7` moved up past it: the
+    /// return address of `RTS`, and the second half of `RTR`'s and `RTE`'s frame
+    /// (M68000UM RTS/RTR/RTE). [`crate::M68k::push_long`] is the other direction.
+    ///
+    /// Naming the value rather than the width is deliberate twice over.
+    /// [`crate::M68k::pop_word`] already exists and pops the *prefetch queue*,
+    /// which is a different thing for a stack pop to be confused with. And the
+    /// pointer moves through [`crate::M68k::set_active_sp`] rather than
+    /// `write_ea(Ea::AddrReg(SP_REG), …)`, because a word written to an address
+    /// register is *sign extended* (M68000UM section 1, "Address Registers") —
+    /// `RTR`'s pop would leave `A7` at `$0000_0002`.
+    fn pop_return_address(&mut self, bus: &mut impl Bus) -> u32 {
+        let sp = self.a[usize::from(SP_REG)];
+        let value = self.read_l(bus, sp);
+        self.set_active_sp(sp.wrapping_add(Size::Long.bytes()));
+        value
+    }
+
+    /// [`M68k::pop_return_address`]'s word: the status word at the top of the
+    /// active stack, for `RTR` and `RTE`.
+    fn pop_status_word(&mut self, bus: &mut impl Bus) -> u16 {
+        let sp = self.a[usize::from(SP_REG)];
+        let value = self.read_w(bus, sp);
+        self.set_active_sp(sp.wrapping_add(Size::Word.bytes()));
+        value
+    }
+
     /// The address a branch displacement is measured from: `pc + 2`, the address
     /// of the displacement word, captured before anything is popped exactly like
     /// [`crate::ea::M68k::ext_addr`] — except that this one does not mask, because
@@ -201,8 +357,9 @@ const fn condition(opcode: u16) -> u8 {
 mod tests {
     use crate::M68k;
     use crate::bus::Bus;
+    use crate::exceptions::EXC_PRIVILEGE;
     use crate::sr::test_cc;
-    use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
+    use crate::sr::{SR_C, SR_N, SR_S, SR_V, SR_X, SR_Z};
     use crate::testbus::{TestBus, cpu_with_program};
 
     /// Where [`cpu_with_program`] loads the program, so a test can name the
@@ -541,6 +698,208 @@ mod tests {
                 assert_eq!(cpu.d[0] & 0xFF, want, "cc {cc:04b} at SR {sr:04X}");
             }
         }
+    }
+
+    // ---- `JMP`, `JSR`, `RTS`, `RTR`, `RTE` and `NOP` (M1-17, #25) ----
+
+    /// `SR` as [`crate::M68k::reset`] leaves it: supervisor mode, every interrupt
+    /// masked. `SR_RESET`, named here so the return tests can say which bits of
+    /// it they are not allowed to move.
+    const RESET_SR: u16 = 0x2700;
+    /// A stack address for the return frames, clear of `PROGRAM` and `MEM`.
+    const FRAME: u32 = 0x0000_8000;
+    /// A second stack address, for the one test that has to show a denied `RTE`
+    /// never read the user stack: [`FRAME`] is where the SSP is, this is where the
+    /// USP is and both are far from the program.
+    const USER_SP: u32 = 0x0000_9000;
+
+    #[test]
+    fn nop_advances_pc() {
+        let (mut cpu, mut bus) = run(0x4E71, &[0x4E75]); // NOP, RTS
+        let cycles = cpu.cycles;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pc, PROGRAM + 2, "the instruction is one word");
+        assert_eq!(
+            cpu.prefetch,
+            [0x4E75, 0x0000],
+            "and the queue moved with it"
+        );
+        assert_eq!(
+            cpu.cycles - cycles,
+            4,
+            "every one of `NOP.json.gz`'s 8065 cases is billed 4 clocks, which is
+             exactly the one word read `advance_opcode` already charges"
+        );
+        assert_eq!(cpu.sr, RESET_SR, "NOP moves no flag");
+    }
+
+    #[test]
+    fn jsr_then_rts_returns() {
+        // $1000: `JSR.L $2000` (six words-worth: opcode plus absolute long),
+        // $1006: NOP. The subroutine at $2000 is one RTS with a NOP behind it.
+        let (mut cpu, mut bus) = run(0x4EB9, &[0x0000, 0x2000, 0x4E71]);
+        bus.load_words(MEM, &[0x4E75, 0x4E71]);
+
+        cpu.step(&mut bus); // JSR
+
+        assert_eq!(cpu.pc, MEM, "into the subroutine");
+        assert_eq!(
+            cpu.prefetch,
+            [0x4E75, 0x4E71],
+            "queue refilled at the target"
+        );
+        assert_eq!(cpu.ssp, STACK_TOP - 4, "the return address is a long push");
+        assert_eq!(
+            bus.read_long(STACK_TOP - 4),
+            PROGRAM + 6,
+            "past both extension words: `JSR.json.gz` pushes `pc + 2` for its
+             no-extension cases, `+ 4` for the one-word modes and `+ 6` for
+             `JSR.L`, across all 4183 non-exception cases of its 8065"
+        );
+
+        cpu.step(&mut bus); // RTS
+
+        assert_eq!(cpu.pc, PROGRAM + 6, "back in the caller");
+        assert_eq!(
+            cpu.prefetch,
+            [0x4E71, 0x0000],
+            "refilled at the return address"
+        );
+        assert_eq!(cpu.ssp, STACK_TOP, "the long is off the stack again");
+        assert_eq!(cpu.sr, RESET_SR, "RTS moves no flag");
+    }
+
+    #[test]
+    fn jmp_takes_the_address_not_what_is_stored_at_it() {
+        // `JMP (A0)` with a long at the target that is not an address at all:
+        // reading through the operand is what a MOVE does, and that would end up
+        // at $DEADBEEF. A recording bus also pins that nothing is read at the
+        // target but the two queue words.
+        let mut bus = RecordingBus::new();
+        bus.load(PROGRAM, &[0x4ED0, 0xFFFF]); // JMP (A0)
+        bus.poke_long(MEM, 0xDEAD_BEEF);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        cpu.a[0] = MEM;
+        bus.accesses.clear();
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pc, MEM, "the address, not what lives at it");
+        assert_eq!(
+            bus.accesses,
+            vec![Access::ReadWord(MEM), Access::ReadWord(MEM + 2)],
+            "the only reads are the queue refill at the target: the operand is
+             never read, and nothing is fetched before the two queue words"
+        );
+        assert_eq!(cpu.prefetch, [0xDEAD, 0xBEEF]);
+        assert_eq!(cpu.ssp, STACK_TOP, "JMP pushes nothing; that is JSR's job");
+    }
+
+    #[test]
+    fn jump_target_keeps_its_top_byte() {
+        // #193 all over again: the address an EA field computes is a value, not
+        // a bus address. 3636 of `JMP.json.gz`'s 4259 non-exception cases and
+        // 3562 of `JSR.json.gz`'s 4183 end above $FFFFFF, so the target keeps
+        // bits 24..31 in `PC` while the fetch masks them.
+        let (mut cpu, mut bus) = run(0x4ED0, &[0x4E75]); // JMP (A0)
+        cpu.a[0] = 0xFF00_0000 | MEM;
+        bus.load_words(MEM, &[0x4E75, 0x4E71]);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pc, 0xFF00_0000 | MEM, "the whole 32 bit address");
+        assert_eq!(
+            cpu.prefetch,
+            [0x4E75, 0x4E71],
+            "fetched from the masked one"
+        );
+    }
+
+    #[test]
+    fn rtr_restores_ccr_only() {
+        let (mut cpu, mut bus) = run(0x4E77, &[0x4E71]); // RTR
+        cpu.ssp = FRAME;
+        cpu.a[7] = FRAME;
+        // The frame the returns pop is an exception frame laid down backwards:
+        // the status word at SP and the return address as a long at SP+2.
+        bus.write_word(FRAME, 0xFFF1);
+        bus.write_long(FRAME + 2, PROGRAM + 0x200);
+        bus.load_words(PROGRAM + 0x200, &[0x4E71, 0x4E71]);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            cpu.sr,
+            RESET_SR | 0x11,
+            "X and C from the low five bits of $FFF1; T, S and the interrupt mask
+             are still the $2700 the CPU started with, because the high byte of
+             the stacked word is junk that must not reach SR"
+        );
+        assert_eq!(cpu.pc, PROGRAM + 0x200, "then the PC from SP+2");
+        assert_eq!(cpu.ssp, FRAME + 6, "a word and a long, six bytes in all");
+    }
+
+    #[test]
+    fn rte_restores_sr_and_switches_to_user_stack() {
+        let (mut cpu, mut bus) = run(0x4E73, &[0x4E71]); // RTE
+        cpu.ssp = FRAME;
+        cpu.a[7] = FRAME;
+        cpu.usp = 0x0000_9000;
+        bus.write_word(FRAME, 0x000C); // S clear: back to user mode, mask 0, N=Z=C
+        bus.write_long(FRAME + 2, PROGRAM + 0x200);
+        bus.load_words(PROGRAM + 0x200, &[0x4E71, 0x4E71]);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.sr, 0x000C, "all of SR, T and S included");
+        assert!(!cpu.is_supervisor(), "and the mode really changed");
+        assert_eq!(cpu.a[7], 0x0000_9000, "A7 is the USP now");
+        // Measured, not guessed. In all 1964 `RTE.json.gz` cases whose stacked SR
+        // clears S, `ssp = initial.ssp + 6`, `usp` is unchanged, and the case
+        // lists no RAM byte near the USP: the whole six byte frame comes off the
+        // stack that was current when RTE started. Popping the PC from the
+        // *user* stack, as the ticket text suggests, would read $9000 and move
+        // `usp`, and it fails all 1964 of those cases.
+        assert_eq!(cpu.ssp, FRAME + 6, "popped off the supervisor stack");
+        assert_eq!(cpu.usp, 0x0000_9000, "the USP was installed, not read");
+        assert_eq!(cpu.pc, PROGRAM + 0x200);
+        assert_eq!(cpu.prefetch, [0x4E71, 0x4E71], "queue from the popped PC");
+    }
+
+    #[test]
+    fn rte_in_user_mode_is_privilege_violation() {
+        let (mut cpu, mut bus) = run(0x4E73, &[0x4E71]); // RTE
+        bus.write_long(u32::from(EXC_PRIVILEGE) * 4, MEM);
+        let user_sr = RESET_SR & !SR_S;
+        // A user-mode CPU in a state a CPU can actually be in: the mode is
+        // entered through `set_sr`, so `A7` has already moved off the SSP and onto
+        // the USP, and the two pointers are the pair `RTE` is supposed to swap.
+        cpu.set_sr(user_sr);
+        cpu.set_active_sp(USER_SP);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pending_exception, Some(EXC_PRIVILEGE));
+        assert_eq!(cpu.pc, MEM, "vector 8, the slot at $20");
+        assert!(cpu.is_supervisor(), "the exception entered supervisor mode");
+        assert_eq!(
+            cpu.ssp,
+            STACK_TOP - 6,
+            "the fault is raised before anything is popped, so the stack moved by
+             the exception frame and by nothing else"
+        );
+        assert_eq!(cpu.a[7], cpu.ssp, "and A7 followed the swap onto the SSP");
+        assert_eq!(cpu.usp, USER_SP, "the user stack was never read from");
+        assert_eq!(bus.read_word(cpu.ssp), user_sr, "the frame saves user SR");
+        assert_eq!(
+            bus.read_long(cpu.ssp + 2),
+            PROGRAM,
+            "and the address of the RTE itself, so a handler can decode it: see
+             the `crate::exceptions` module docs on which PC a frame carries"
+        );
     }
 
     /// What [`RecordingBus`] records: one bus access, in the order the CPU made

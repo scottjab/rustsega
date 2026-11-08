@@ -274,7 +274,7 @@ pub enum Op {
     Bcc,
     /// `BSR d8`/`BSR d16`: `0110 0001 dddddddd`, `Bcc` with condition code
     /// `0001` and a long push of the return address first (M68000UM "BSR —
-    /// Branch to Subroutine", M1-16, #24). `RTS` is #33's, not this ticket's.
+    /// Branch to Subroutine", M1-16, #24). Its `RTS` arrived with #25.
     Bsr,
     /// `Scc <ea>` — `0101 cccc 11 eeeeee` at every EA mode but `001`, which is
     /// [`Op::Dbcc`] (M68000UM Format V, "Scc — Set Conditional", M1-16, #24).
@@ -286,6 +286,36 @@ pub enum Op {
     /// #24). The `rrr` is the loop counter, and the `eeeeee` that would be the
     /// EA is the first bits of the displacement word instead.
     Dbcc,
+    /// `JMP <ea>` — `0100 1110 11 mmm rrr` (M68000UM "JMP — Jump", M1-17, #25).
+    /// `PC` becomes the address the operand field *computes*, so as with
+    /// [`Op::Lea`] and [`Op::Pea`] the handler reads it through
+    /// [`crate::M68k::ea_address`] and the target keeps the bits the bus would
+    /// drop (#193). Only the [control addresses](crate::ea::is_control) are
+    /// encodable, and `decode` has already rejected the other 36 operand fields.
+    Jmp,
+    /// `JSR <ea>` — `0100 1110 10 mmm rrr` (M68000UM "JSR — Jump to Subroutine",
+    /// M1-17, #25). [`Op::Jmp`]'s operand, and the operand is legal or illegal in
+    /// exactly the same cases, plus a long push of the address of the
+    /// instruction after it.
+    Jsr,
+    /// `RTS` — `$4E75` (M68000UM "RTS — Return from Subroutine", M1-17, #25).
+    /// Pop a long into `PC`; no flag moves.
+    Rts,
+    /// `RTR` — `$4E77` (M68000UM "RTR — Return and Restore Condition Code",
+    /// M1-17, #25). Pop a word into the CCR — five bits, the upper byte of `SR`
+    /// stays as it was — and then a long into `PC`.
+    Rtr,
+    /// `RTE` — `$4E73` (M68000UM "RTE — Return from Exception", M1-17, #25).
+    /// Privileged: user mode raises [`crate::exceptions::EXC_PRIVILEGE`]. The word
+    /// it pops goes into the whole of `SR`, so this is the only instruction so far
+    /// that can move the active stack pointer; then a long into `PC`.
+    Rte,
+    /// `NOP` — `$4E71` (M68000UM "NOP — No Operation", M1-17, #25). Advances
+    /// past the opcode and nothing else. `$4E71` was the
+    /// [`Op::Unimplemented`](Op::Unimplemented) anchor of
+    /// `decode::tests::unknown_is_unimplemented_for_now` until this variant
+    /// landed, which moved that anchor to `RESET` at `$4E70`.
+    Nop,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -363,6 +393,21 @@ fn classify(opcode: u16) -> Op {
         // unassigned, so the two ranges stop where they do.
         0x4E50..=0x4E57 => Op::Link,
         0x4E58..=0x4E5F => Op::Unlk,
+        // `0100 1110 11 mmm rrr` and `0100 1110 10 mmm rrr`: JMP and JSR take
+        // the whole `$4E80..=$4EFF` window between them and differ in one bit of
+        // the operand field, so the window is entered whole and split by the
+        // addressing mode — see [`classify_control_jump`] (M68000UM JMP, JSR;
+        // M1-17, #25).
+        0x4E80..=0x4EFF => classify_control_jump(opcode),
+        // The four one-word members of the `$4E` group. Between them sit
+        // `RESET` `$4E70` (M1-27), `STOP` `$4E72` (M1-26), TRAPV `$4E76` (#20)
+        // and the reserved `$4E78`/`$4E79`, none of which may be pulled in here;
+        // listing the four opcodes rather than a range is what keeps it that way
+        // (M68000UM NOP, RTE, RTS, RTR; M1-17, #25).
+        0x4E71 => Op::Nop,
+        0x4E73 => Op::Rte,
+        0x4E75 => Op::Rts,
+        0x4E77 => Op::Rtr,
         // The three move groups: `00ss` with `ss` = `01` byte, `10` long,
         // `11` word. `$0000..=$0FFF` is *not* a move — `ss` = `00` is the
         // ORI/BTST/MOVEP group — so the range starts at `$1000`.
@@ -1007,6 +1052,38 @@ fn classify_lea(opcode: u16) -> Op {
     }
 }
 
+/// Bit 6 of a `$4E??` opcode: the low bit of the two-bit `op` field that
+/// separates `JSR` (`0100 1110 10 mmm rrr`, `$4E80`, bit clear) from `JMP`
+/// (`0100 1110 11 mmm rrr`, `$4EC0`, bit set). The two are otherwise the same
+/// instruction, and the rest of the `$4E` group leaves bit 6 alone: `LINK`
+/// `$4E50`, `UNLK` `$4E58`, `NOP` `$4E71` and friends are all below `$4E80`.
+const CONTROL_JUMP_JMP_BIT: u16 = 0x0040;
+
+/// One opcode of `$4E80..=$4EFF`: [`Op::Jsr`], [`Op::Jmp`] or [`Op::Illegal`]
+/// (M68000UM JMP and JSR, "Addressing Modes"; M1-17, #25).
+///
+/// [`CONTROL_JUMP_JMP_BIT`] picks the instruction, and both take exactly the
+/// *control* modes `LEA` and `PEA` take — `(An)`, `d16(An)`, `d8(An,Xn)`,
+/// `abs.W`, `abs.L`, `d16(PC)`, `d8(PC,Xn)` — 28 operand fields apiece, which is
+/// the opcode set `JMP.json.gz` and `JSR.json.gz` run over.
+///
+/// The other 36 of each are illegal, including the ones that look most like real
+/// operands: `JMP (A0)+` and `JMP -(A0)` name a stack address, `JMP A0` names a
+/// code address and `JMP #imm` is a number, but the 68000 gives none of them to
+/// a jump (compare [`classify_lea`], which refuses the same fields).
+fn classify_control_jump(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if !is_control(mode, reg) {
+        return Op::Illegal;
+    }
+    if opcode & CONTROL_JUMP_JMP_BIT == 0 {
+        Op::Jsr
+    } else {
+        Op::Jmp
+    }
+}
+
 /// One opcode of the `$4800..=$48FF` window: [`Op::Swap`], [`Op::Ext`],
 /// [`Op::Pea`], or [`Op::Unimplemented`] for MOVEM (M68000UM SWAP, EXT, PEA,
 /// MOVEM; #22, and PEA for M1-15, #23).
@@ -1251,7 +1328,7 @@ mod tests {
     }
 
     /// Until an instruction's ticket lands, its opcodes are unimplemented —
-    /// loudly, not silently. `$4E71` is `NOP`.
+    /// loudly, not silently. `$4E70` is `RESET` (M1-27).
     ///
     /// The `$4E4x` traps are the exception to this in the same group: TRAP is
     /// not an arithmetic instruction but an exception route, and #16 owns it.
@@ -1259,10 +1336,11 @@ mod tests {
     /// This test is expected to change as instructions land: when `NOP` is
     /// implemented it decodes to its own variant, and the ticket that does it
     /// moves this assertion to an opcode still unimplemented. That licence is
-    /// this test alone (ticket #15).
+    /// this test alone (ticket #15). `NOP` itself landed in #25, so the anchor is
+    /// now `RESET`, the next unclaimed opcode up in the `$4E` group.
     #[test]
     fn unknown_is_unimplemented_for_now() {
-        assert_eq!(decode(0x4E71), Op::Unimplemented, "NOP");
+        assert_eq!(decode(0x4E70), Op::Unimplemented, "RESET");
         // ... except the traps, which #16 wired up, and which sit right next to
         // NOP in the `$4E` group.
         assert_range_decodes_to(0x4E40..=0x4E4F, Op::Trap);
@@ -1281,6 +1359,92 @@ mod tests {
         // move-family opcode #17 deliberately left out: MOVEM is group `$48xx`
         // and belongs to M1-10 (#19).
         assert_eq!(decode(0x48E7), Op::Unimplemented, "MOVEM.L #(imm),(A7)-");
+    }
+
+    /// `JMP $4EC0 | <ea>` and `JSR $4E80 | <ea>` over all 64 values of the
+    /// operand field: the manual gives both instructions the control addresses
+    /// and nothing else, so `(An)`, `d16(An)`, `d8(An,Xn)`, `abs.W`, `abs.L`,
+    /// `d16(PC)` and `d8(PC,Xn)` — 28 apiece, the count `JMP.json.gz` and
+    /// `JSR.json.gz` cover — decode, and the other 36 are illegal. `JSR (A0)+`
+    /// is the one worth naming: it is an address in every other instruction that
+    /// takes one, and the 68000 still refuses it here (M68000UM JMP, JSR,
+    /// "Addressing Modes"; M1-17, #25).
+    #[test]
+    fn jmp_and_jsr_take_only_the_control_addresses() {
+        let mut control = 0;
+        for mode in 0..8u8 {
+            for reg in 0..8u8 {
+                let ea = (u16::from(mode) << 3) | u16::from(reg);
+                let want = addresses(mode, reg);
+                control += u8::from(want);
+                assert_eq!(
+                    decode(0x4EC0 | ea),
+                    if want { Op::Jmp } else { Op::Illegal },
+                    "JMP mode {mode:03b} reg {reg:03b}"
+                );
+                assert_eq!(
+                    decode(0x4E80 | ea),
+                    if want { Op::Jsr } else { Op::Illegal },
+                    "JSR mode {mode:03b} reg {reg:03b}"
+                );
+            }
+        }
+        assert_eq!(control, 28, "seven addressing modes x eight registers");
+    }
+
+    /// The four no-operand members of the `$4E` group are single opcodes, and
+    /// counting the whole `$4E00`..`$4EFF` window is the only way to see that
+    /// they took exactly those four: `NOP` `$4E71`, `RTE` `$4E73`, `RTS` `$4E75`
+    /// and `RTR` `$4E77`, and that TRAPV `$4E76` in the middle of them is still
+    /// unimplemented (M1-12, #20 — `RTR` sits directly above it, so this ticket
+    /// cannot take `$4E76` by accident).
+    ///
+    /// The rest of the count is the point: `RESET` `$4E70`, `STOP` `$4E72`, MOVE
+    /// to USP `$4E60`..`$4E67` and the `$4E78`/`$4E79` holes are still
+    /// unimplemented, and `JSR`/`JMP` plus their 72 illegal operand fields are
+    /// the whole of `$4E80`..`$4EFF` (M68000UM section 8, "Instruction Set
+    /// Summary"; M1-17, #25).
+    #[test]
+    fn the_returns_and_no_operand_misc_are_single_opcodes() {
+        assert_eq!(decode(0x4E71), Op::Nop, "NOP");
+        assert_eq!(decode(0x4E73), Op::Rte, "RTE");
+        assert_eq!(decode(0x4E75), Op::Rts, "RTS");
+        assert_eq!(decode(0x4E77), Op::Rtr, "RTR");
+        assert_eq!(decode(0x4E76), Op::Unimplemented, "TRAPV is #20's");
+
+        let mut counts = [
+            (Op::Nop, 0),
+            (Op::Rte, 0),
+            (Op::Rts, 0),
+            (Op::Rtr, 0),
+            (Op::Trap, 0),
+            (Op::Link, 0),
+            (Op::Unlk, 0),
+            (Op::Jmp, 0),
+            (Op::Jsr, 0),
+            (Op::Illegal, 0),
+            (Op::Unimplemented, 0),
+        ];
+        for opcode in 0x4E00u16..=0x4EFF {
+            let op = decode(opcode);
+            let slot = counts
+                .iter_mut()
+                .find(|(want, _)| *want == op)
+                .unwrap_or_else(|| panic!("{op:?} should not appear in the $4E group"));
+            slot.1 += 1;
+        }
+        for (op, count) in counts {
+            let want = match op {
+                Op::Nop | Op::Rte | Op::Rts | Op::Rtr => 1,
+                Op::Trap => 16,
+                Op::Link | Op::Unlk => 8,
+                Op::Jmp | Op::Jsr => 28,
+                Op::Illegal => 72,
+                Op::Unimplemented => 92,
+                _ => unreachable!("only the variants above are named"),
+            };
+            assert_eq!(count, want, "{op:?} in $4E00..=$4EFF");
+        }
     }
 
     /// MOVE, MOVEA and MOVEQ are their own variants, not `Unimplemented`
