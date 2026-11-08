@@ -3231,7 +3231,11 @@ mod tests {
             (0x40F9, Op::MoveFromSr, "MOVE from SR (xxx).L"),
             (0x44C0, Op::MoveToCcr, "MOVE to CCR D0"),
             (0x44FC, Op::MoveToCcr, "MOVE to CCR #imm"),
-            (0x44C8, Op::Illegal, "MOVE to CCR A0: An direct is not a source mode"),
+            (
+                0x44C8,
+                Op::Illegal,
+                "MOVE to CCR A0: An direct is not a source mode",
+            ),
             (
                 0x42C0,
                 Op::Illegal,

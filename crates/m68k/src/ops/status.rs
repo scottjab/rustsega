@@ -356,7 +356,7 @@ mod tests {
             "the low five bits of $1234 are X and Z ($34 & $1F = $14)"
         );
         assert_eq!(
-            cpu.sr & !u16::from(CCR_MASK),
+            cpu.sr & !CCR_MASK,
             RESET_SR & !CCR_MASK,
             "T, S and the mask are untouched by a CCR write"
         );
@@ -374,7 +374,10 @@ mod tests {
         cpu.step(&mut bus);
         assert_eq!(cpu.pending_exception, None);
         assert_eq!(cpu.ccr(), 0x1F, "all five flags, from the low byte");
-        assert_eq!(cpu.sr & (SR_T | SR_INT_MASK), RESET_SR & (SR_T | SR_INT_MASK));
+        assert_eq!(
+            cpu.sr & (SR_T | SR_INT_MASK),
+            RESET_SR & (SR_T | SR_INT_MASK)
+        );
     }
 
     // --- MOVE <ea>,SR ------------------------------------------------------
@@ -396,7 +399,10 @@ mod tests {
         assert_eq!(cpu.pc, MEM, "vector 8");
         assert!(cpu.is_supervisor(), "the exception entered supervisor mode");
         assert_eq!(cpu.ssp, STACK_TOP - 6, "only the exception frame moved");
-        assert_eq!(cpu.usp, USER_SP, "the operand was never resolved on the USP");
+        assert_eq!(
+            cpu.usp, USER_SP,
+            "the operand was never resolved on the USP"
+        );
         // The entry sets S (see `crate::exceptions::M68k::exception`), so the most
         // SR can be after a denied write is `RESET_SR`: mask 7, T clear, and none
         // of the operand's bits.
@@ -441,7 +447,7 @@ mod tests {
         let (mut cpu, mut bus) = run(0x003C, &[0x001F, 0x4E71]); // ORI.B #$1F,CCR
         cpu.step(&mut bus);
         assert_eq!(cpu.ccr(), 0x1F);
-        assert_eq!(cpu.sr & !u16::from(CCR_MASK), RESET_SR & !CCR_MASK);
+        assert_eq!(cpu.sr & !CCR_MASK, RESET_SR & !CCR_MASK);
 
         let (mut cpu, mut bus) = run(0x023C, &[0x003C, 0x4E71]); // ANDI.B #$3C,CCR
         cpu.sr = RESET_SR | SR_N | SR_Z;
