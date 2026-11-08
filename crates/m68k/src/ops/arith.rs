@@ -60,8 +60,8 @@
 
 use crate::bus::Bus;
 use crate::cpu::M68k;
-use crate::exceptions::EXC_CHK;
 use crate::ea::{Ea, Size, sign_extend_word};
+use crate::exceptions::EXC_CHK;
 use crate::ops::field;
 use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
 
@@ -2161,7 +2161,10 @@ mod tests {
             0x9234,
             "the byte at MEM — the high one, big-endian — is set; the other is left alone"
         );
-        assert!(!cpu.flag_n(), "N comes from the `$12` read, not the `$92` stored");
+        assert!(
+            !cpu.flag_n(),
+            "N comes from the `$12` read, not the `$92` stored"
+        );
         assert!(!cpu.flag_z());
         assert!(!cpu.flag_c() && !cpu.flag_v());
         assert_eq!(cpu.a[0], MEM, "a plain (An) does not move");
