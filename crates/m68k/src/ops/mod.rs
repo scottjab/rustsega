@@ -42,6 +42,7 @@ mod bit;
 mod flow;
 mod logic;
 mod move_;
+mod muldiv;
 mod shift;
 
 use crate::M68k;
@@ -124,6 +125,12 @@ impl M68k {
             Op::Ext => self.op_ext(bus, opcode),
             Op::Swap => self.op_swap(bus, opcode),
             Op::Exg => self.op_exg(bus, opcode),
+            // `MULU` and `MULS` (`1100 ddd 011/111 eeeeee`), the other two
+            // instructions AND's group lends its EA field to: one body, and the
+            // only data-dependent clock count in the decoder so far (see
+            // [`muldiv`]).
+            Op::Mulu => self.op_mulu(bus, opcode),
+            Op::Muls => self.op_muls(bus, opcode),
             Op::Andi => self.op_andi(bus, opcode),
             Op::Ori => self.op_ori(bus, opcode),
             Op::Eori => self.op_eori(bus, opcode),
