@@ -257,6 +257,16 @@ pub enum Op {
     /// operands are registers, so there is no EA to validate, and no flag is
     /// affected.
     Exg,
+    /// `MULU <ea>,Dn`: `1100 ddd 011 eeeeee` (M68000UM MULU; M1-21, #29). The
+    /// low words of `Dn` and the source multiply to a long in `Dn`, so the
+    /// operation field carries no size — `011` is the whole instruction, which is
+    /// why AND's `ss` reading of those bits stops being a size here. The source
+    /// is a data EA but never mode `001`, and the cost is data-dependent
+    /// (`38 + 2n`); see [`crate::ops::muldiv`].
+    Mulu,
+    /// `MULS <ea>,Dn`: `1100 ddd 111 eeeeee` (M68000UM MULS; M1-21, #29).
+    /// [`Op::Mulu`] with signed operands and a signed `n` in the timing formula.
+    Muls,
     /// `LEA <ea>,An`, `$4000 + ddd<<9 + 0b111<<6 + <ea>` — the `0100` group's
     /// opcodes with bits 8..6 all set (M68000UM "LEA — Address Register Indirect
     /// and Program", M1-15, #23). The destination is always an address register
@@ -1400,9 +1410,12 @@ mod tests {
         // has no unimplemented opcode left and this anchor moves to `1110`'s
         // shifts (M1-30, #38), the other group next door that is still loud.
         // `0x8FFF` is `DIVS`-shaped (`op_mode 111`), which #21 deliberately left
-        // out of the `1000` group; `0xC0C0` is `MULU`, likewise.
+        // out of the `1000` group and M1-22 (#29's neighbour) still owes; the
+        // `1100` group has no unimplemented corner left to anchor on now that
+        // `0xC0C0` is a real `MULU` (M1-21, #29), so the multiply itself is the
+        // witness that `1100` is not a line-A/line-F opcode.
         assert_eq!(decode(0x8FFF), Op::Unimplemented, "DIVS");
-        assert_eq!(decode(0xC0C0), Op::Unimplemented, "MULU");
+        assert_eq!(decode(0xC0C0), Op::Mulu, "MULU");
         // `1110` is off this test's list entirely: #26 took the register-form
         // shifts and #27 the memory-form ones, so the group has no
         // [`Op::Unimplemented`] left to anchor on. What `$E0C0` decodes to now is
@@ -2608,7 +2621,8 @@ mod tests {
     /// #22 took the EXG lines of this test to [`Op::Exg`] — they are now in
     /// [`exg_decodes_its_three_legal_pairs`] — and replaced their coverage of
     /// "a `1100` corner is not AND" with the MULS opcode `$C1C8` below, which no
-    /// other test names. ABCD, MULU, MULS, SBCD, DIVU and DIVS are unchanged.
+    /// other test names. ABCD, SBCD, DIVU and DIVS are unchanged; MULU and MULS
+    /// are the pair M1-21 (#29) filled in, so they now decode for real.
     #[test]
     #[allow(clippy::needless_range_loop)]
     fn decode_does_not_steal_abcd_mulu() {
@@ -2618,10 +2632,10 @@ mod tests {
         assert_ne!(decode(0xC141), Op::And, "EXG D0,D1");
         assert_eq!(decode(0xC100), Op::Unimplemented, "ABCD.B (A0)+,(A1)+");
         assert_eq!(decode(0xC108), Op::Unimplemented, "ABCD.B -(A0),-(A1)");
-        assert_eq!(decode(0xC0C0), Op::Unimplemented, "MULU D0,D0");
-        assert_eq!(decode(0xC0EE), Op::Unimplemented, "MULU d16(A0),D6");
-        assert_eq!(decode(0xCFC8), Op::Unimplemented, "MULS D0,(A0)");
-        assert_eq!(decode(0xC1C8), Op::Unimplemented, "MULS.W (A0),D0");
+        assert_eq!(decode(0xC0C0), Op::Mulu, "MULU D0,D0");
+        assert_eq!(decode(0xC0EE), Op::Mulu, "MULU d16(A0),D6");
+        assert_eq!(decode(0xCFC8), Op::Muls, "MULS D0,(A0)");
+        assert_eq!(decode(0xC1C8), Op::Muls, "MULS (A0),D0");
         assert_eq!(decode(0x8100), Op::Unimplemented, "SBCD.B (A0)+,(A1)+");
         assert_eq!(decode(0x8108), Op::Unimplemented, "SBCD.B -(A0),-(A1)");
         assert_eq!(decode(0x80C0), Op::Unimplemented, "DIVU D0,D0");
@@ -2635,6 +2649,56 @@ mod tests {
         // EXG's other two homes are in groups AND never touches.
         assert_ne!(decode(0x48C0), Op::And, "EXG-shaped, the $48 group");
         assert_ne!(decode(0x4CC0), Op::And, "EXG-shaped, the $4C group");
+    }
+
+    /// The `1100` group's operation `011` and `111` halves are MULU and MULS over
+    /// every source the pair allows, and nothing else in the group moved:
+    /// ABCD keeps its 128 opcodes and no other opcode of `$C000..=$CFFF` is
+    /// unimplemented (M68000UM MULU, MULS; M1-21, #29).
+    ///
+    /// The EA rule is walked rather than sampled. MULU/MULS take a *data* EA but
+    /// not mode `001` — the ticket says so, and neither `MULU.json.gz` nor
+    /// `MULS.json.gz` encodes an `An` source in any of its 8065 cases — so
+    /// `$C0C8` is illegal, and so are the three registers of mode `111` that are
+    /// not addressing modes at all (M68000UM, "Effective Address Calculation").
+    #[test]
+    fn mulu_and_muls_take_their_half_of_the_c000_group() {
+        for op_mode in [0b011u16, 0b111] {
+            for mode in 0..8u8 {
+                for reg in 0..8u8 {
+                    let opcode =
+                        0xC000u16 | (op_mode << 6) | (u16::from(mode) << 3) | u16::from(reg);
+                    let want = if mode != AN_DIRECT_MODE && is_data(mode, reg) {
+                        if op_mode == 0b011 {
+                            Op::Mulu
+                        } else {
+                            Op::Muls
+                        }
+                    } else {
+                        Op::Illegal
+                    };
+                    assert_eq!(decode(opcode), want, "${opcode:04X}");
+                }
+            }
+        }
+
+        // The other half of the partition: the only opcodes of the group still
+        // waiting for an implementation are ABCD's 128, so MULU and MULS took
+        // their share without disturbing AND, OR, EXG or the illegal corners.
+        let unimplemented: Vec<u16> = (0xC000..=0xCFFF)
+            .filter(|opcode| decode(*opcode) == Op::Unimplemented)
+            .collect();
+        assert_eq!(
+            unimplemented.len(),
+            128,
+            "ABCD is 8 destinations x modes 000 and 001 x 8 registers, and nothing else in the group is unimplemented: {unimplemented:?}"
+        );
+        assert!(
+            unimplemented
+                .iter()
+                .all(|opcode| (opcode >> 6) & 0b111 == 0b100),
+            "every unimplemented opcode of the `1100` group is operation `100`, i.e. ABCD"
+        );
     }
 
     /// `NEG` `$4400`, `NEGX` `$4000` and `CLR` `$4200`, each `+ ss<<6 + <ea>`,
