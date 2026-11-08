@@ -132,8 +132,11 @@ impl M68k {
             // condition code.
             // The shift and rotate group (`1110 ccc d ss i tt rrr`): one handler
             // for all eight mnemonics and three sizes, because the operation is
-            // one loop over a place count (see [`shift`).
+            // one loop over a place count (see [`shift`). Memory-form `ASx.W <ea>`
+            // (`1110 0tt d 11 <ea>`) is the same loop with a word operand and a
+            // count of one, so it lives beside it.
             Op::Shift => self.op_shift(bus, opcode),
+            Op::ShiftMemory => self.op_shift_memory(bus, opcode),
             Op::Lea => self.op_lea(bus, opcode),
             Op::Pea => self.op_pea(bus, opcode),
             Op::Link => self.op_link(bus, opcode),

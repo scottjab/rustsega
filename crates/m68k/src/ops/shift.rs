@@ -1,6 +1,7 @@
-//! Shifts and rotates, register form: `ASL`, `ASR`, `LSL`, `LSR`, `ROL`, `ROR`,
-//! `ROXL`, `ROXR` (M68000UM "ASL, ASR, LSL, LSR", "ROL, ROR", "ROXL, ROXR";
-//! M1-18, #26).
+//! Shifts and rotates: `ASL`, `ASR`, `LSL`, `LSR`, `ROL`, `ROR`, `ROXL`, `ROXR`,
+//! in the register form (M1-18, #26) and the memory form (M1-19, #27) —
+//! M68000UM "ASL, ASR, LSL, LSR", "ROL, ROR", "ROXL, ROXR", and "Instruction
+//! Formats" Format IX for the memory form.
 //!
 //! One encoding covers the eight mnemonics in three sizes, `1110 ccc d ss i tt
 //! rrr`:
@@ -14,17 +15,33 @@
 //! | `tt` | 4..3 | `00` AS, `01` LS, `10` ROX, `11` RO |
 //! | `rrr` | 2..0 | the data register shifted |
 //!
-//! `ss` = `11` is not a fourth size: it is Format IX, memory-form `ASx.w <ea>`, a
-//! different instruction that shares these top four bits. That one is M1-19
-//! (#27), and [`crate::decode`] leaves it
-//! [`Op::Unimplemented`](crate::decode::Op::Unimplemented), so this handler only
-//! ever sees the 3072 register-form encodings and never has to ask.
+//! `ss` = `11` is not a fourth size. It reuses the `ccc` and `i` bits as an
+//! effective address, and what is left is Format IX, `1110 0tt d 11 mmm rrr`,
+//! memory-form `ASx.w <ea>`:
+//!
+//! | Field | Bits | Meaning |
+//! |---|---|---|
+//! | `0` | 11 | `1` would be a 68020 bit-field instruction, which the MC68000 has not got |
+//! | `tt` | 10..9 | the same four pairs, one place higher up |
+//! | `d` | 8 | direction, the same bit as in the register form |
+//! | `11` | 7..6 | `ss` fixed, and the reason there is no size or count field: always a word, always one place |
+//! | `mmm rrr` | 5..0 | the memory operand, which must be alterable |
+//!
+//! [`crate::decode`] applies that last rule and routes what survives to
+//! [`M68k::op_shift_memory`] and the
+//! [`Op::ShiftMemory`](crate::decode::Op::ShiftMemory) tag, so [`Shift::read`]
+//! only ever sees the 3072 register-form encodings and never has to ask. The two
+//! handlers share everything but how they get their operand: [`Shift`] and
+//! [`shift_operand`] are one engine, and the memory form is that engine with the
+//! size fixed to word and the count fixed to one place.
 //!
 //! # The shape of the handler
 //!
 //! [`Shift::read`] turns the opcode into a [`Shift`], [`shift_operand`] performs
 //! it as a pure function of that, the operand and `X`, and [`M68k::op_shift`]
-//! writes the result and the five condition codes back. One bit-at-a-time loop
+//! writes the result and the five condition codes back through
+//! [`M68k::apply_shift_flags`] — the same route [`M68k::op_shift_memory`] takes.
+//! One bit-at-a-time loop
 //! covers all
 //! eight mnemonics and all three sizes because that is what the hardware does —
 //! M68000PM section 6 prices the shift group at `2` clocks *per place* — and
@@ -69,7 +86,8 @@ use crate::ea::Size;
 use crate::ops::field;
 use crate::sr::{SR_C, SR_V, SR_X};
 
-/// Bit 8 `d`: direction, set for the four left-hand mnemonics.
+/// Bit 8 `d`: direction, set for the four left-hand mnemonics. The same bit in
+/// both forms.
 const LEFT_BIT: u16 = 0x0100;
 /// Bit 5 `i`: the count comes from data register `ccc`, not from `ccc` itself.
 const COUNT_IS_REGISTER: u16 = 0x0020;
@@ -90,6 +108,18 @@ const IMMEDIATE_EIGHT: u32 = 8;
 /// turn.
 const REGISTER_COUNT_MASK: u32 = 63;
 
+/// `tt` of the memory form sits at bits 10..9, where the register form keeps it at
+/// bits 4..3 (M68000UM "Instruction Formats", Format IX).
+const MEMORY_KIND_SHIFT: u32 = 9;
+
+/// The memory form has no count field — the three bits it would occupy are the top
+/// of the addressing mode — so it always moves exactly one place.
+const MEMORY_SHIFT_PLACES: u32 = 1;
+
+/// Bit 3: the mode half of an effective-address field, which is where the memory
+/// form's operand starts; bit 0 is its register half.
+const EA_MODE_SHIFT: u32 = 3;
+
 /// Which pair of mnemonics `tt` selects.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -104,7 +134,22 @@ enum Kind {
     Rotate,
 }
 
-/// One register-form shift or rotate, read out of the opcode.
+impl Kind {
+    /// `tt`, the two-bit pair selector, once it has been shifted down: bits 4..3
+    /// of a register shift, bits 10..9 of a memory one.
+    const fn read(bits: u16) -> Self {
+        match bits {
+            0b00 => Self::Arithmetic,
+            0b01 => Self::Logical,
+            0b10 => Self::RotateExtend,
+            _ => Self::Rotate,
+        }
+    }
+}
+
+/// One shift or rotate: [`Shift::read`] builds the register form's, and
+/// [`M68k::op_shift_memory`] builds the memory form's with the size and count
+/// fixed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Shift {
     kind: Kind,
@@ -124,12 +169,7 @@ impl Shift {
         let size = Size::from_bits((opcode >> SIZE_SHIFT) & FIELD_2_BITS)?;
         let immediate = u32::from(field(opcode, COUNT_SHIFT));
         Some(Self {
-            kind: match (opcode >> TYPE_SHIFT) & FIELD_2_BITS {
-                0b00 => Kind::Arithmetic,
-                0b01 => Kind::Logical,
-                0b10 => Kind::RotateExtend,
-                _ => Kind::Rotate,
-            },
+            kind: Kind::read((opcode >> TYPE_SHIFT) & FIELD_2_BITS),
             left: opcode & LEFT_BIT != 0,
             size,
             count: if opcode & COUNT_IS_REGISTER != 0 {
@@ -281,25 +321,73 @@ impl M68k {
             0
         };
         let Some(shift) = Shift::read(opcode, count) else {
-            // `ss` = `11`: memory-form `ASx.w <ea>`, which `decode` holds back
-            // for M1-19 (#27). Unreachable by construction, and loud rather than
-            // silently wrong if that ever stops being true.
+            // `ss` = `11` is memory-form `ASx.w <ea>`, which `decode` routes to
+            // [`M68k::op_shift_memory`] instead. Unreachable by construction, and
+            // loud rather than silently wrong if that ever stops being true.
             return self.op_illegal(bus);
         };
         let reg = usize::from(field(opcode, 0));
 
-        let shifted = shift_operand(shift, self.d[reg], self.sr & SR_X != 0);
+        let shifted = shift_operand(shift, self.d[reg], self.flag_x());
+        self.apply_shift_flags(shifted, shift.size);
+        self.d[reg] = (self.d[reg] & !shift.size.mask()) | shifted.result;
 
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// Memory-form `ASx.w <ea>`: `1110 0tt d 11 mmm rrr` — the same eight mnemonics
+    /// on a **word** in memory, always moved exactly **one** place (M68000UM
+    /// "Instruction Formats", Format IX; M1-19, #27).
+    ///
+    /// There is no second shift engine here. This builds the [`Shift`] the opcode
+    /// names, with `Size::Word` and [`MEMORY_SHIFT_PLACES`], and runs it through
+    /// [`shift_operand`] and [`M68k::apply_shift_flags`] exactly like the register
+    /// form, so the flag rules cannot drift between the two: `X` follows `C` for
+    /// `ASx`/`LSx`, stays untouched for `ROx`, and is part of the ring for `ROXx`.
+    ///
+    /// Like `NEG` and `ADD Dn,<ea>` this is a read-modify-write: the operand is
+    /// resolved once and both halves use that [`Ea`], so `ASL.W (A0)+` steps `A0`
+    /// once and writes back to the address it read (#13). [`crate::decode`] rejected
+    /// every EA field that is not alterable memory, so a `None` from `resolve_ea`
+    /// means the two disagree; the illegal route is there for the release build.
+    ///
+    /// Clocks: the read and the write charge their own bus cycles, as everywhere
+    /// else in this module. Format IX is priced differently from the register form
+    /// in M68000PM section 1; charging that exactly is M1-31 (#39/#40)'s.
+    pub(crate) fn op_shift_memory(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let mode = field(opcode, EA_MODE_SHIFT);
+        let ea_reg = field(opcode, 0);
+        let shift = Shift {
+            kind: Kind::read((opcode >> MEMORY_KIND_SHIFT) & FIELD_2_BITS),
+            left: opcode & LEFT_BIT != 0,
+            size: Size::Word,
+            count: MEMORY_SHIFT_PLACES,
+        };
+
+        let Some(dest) = self.resolve_ea(bus, mode, ea_reg, shift.size) else {
+            return self.op_illegal(bus);
+        };
+        let value = self.read_ea(bus, dest, shift.size);
+        let shifted = shift_operand(shift, value, self.flag_x());
+        self.apply_shift_flags(shifted, shift.size);
+        self.write_ea(bus, dest, shift.size, shifted.result);
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// Write a [`Shifted`] to the condition code register: `C` always, `X` only
+    /// when the operation produced one (a `ROx`, and anything at a count of zero,
+    /// leave `X` alone), `V` from `ASL`'s sign test alone, and `N`/`Z` from the
+    /// result at the operation's own size.
+    fn apply_shift_flags(&mut self, shifted: Shifted, size: Size) {
         self.set_flag(SR_C, shifted.carry);
         if let Some(extend) = shifted.extend {
             self.set_flag(SR_X, extend);
         }
         self.set_flag(SR_V, shifted.overflow);
-        self.set_nz(shifted.result, shift.size);
-        self.d[reg] = (self.d[reg] & !shift.size.mask()) | shifted.result;
-
-        self.advance_opcode(bus);
-        0
+        self.set_nz(shifted.result, size);
     }
 }
 
@@ -307,7 +395,7 @@ impl M68k {
 mod tests {
     use super::*;
     use crate::sr::{SR_N, SR_Z};
-    use crate::testbus::TestBus;
+    use crate::testbus::{TestBus, cpu_with_program};
 
     /// The five condition code bits.
     const CC: u16 = SR_X | SR_N | SR_Z | SR_V | SR_C;
@@ -606,5 +694,136 @@ mod tests {
         let lsr_w_d5 = by(4, false, 0b01, 0b01) & !0b111 | 0b101;
         cpu.op_shift(&mut TestBus::new(), lsr_w_d5);
         assert_eq!(cpu.d[5], 0x1234_0567, "LSR.W #4 of $5678 is $567");
+    }
+
+    // ---- memory form: `1110 0tt d 11 eeeeee` (M1-19, #27) ----
+
+    /// `1110 0tt d 11 eeeeee`, the memory form, in pieces. `tt` selects the same
+    /// pair of mnemonics as in the register form but sits at bits 10..9, bit 8 is
+    /// still the direction, and the count field is gone: `ss` = `11` means the low
+    /// six bits are the effective address, the size is always word and the count
+    /// is always one (M68000UM "Instruction Formats", Format IX).
+    fn mem_op(kind: u8, left: bool, ea: u8) -> u16 {
+        // `tt` at `MEMORY_KIND_SHIFT` (bits 10..9), not bits 4..3 as in the
+        // register form; `ss` = `11` at bits 7..6 marks the memory form.
+        0xE000
+            | (u16::from(kind) << MEMORY_KIND_SHIFT)
+            | (u16::from(left) << 8)
+            | 0b11 << 6
+            | u16::from(ea)
+    }
+
+    /// `ASx.W (A0)`: the operand is the word `A0` points at, so `eeeeee` is
+    /// mode `010`, register `000`.
+    const EA_A0_IND: u8 = 0b010 << 3;
+    /// `ASx.W (A0)+`, for the read-modify-write test.
+    const EA_A0_POST: u8 = 0b011 << 3;
+
+    /// Where the operand of the memory-form tests lives: clear of the program at
+    /// `$1000` and of the stack at `$10000`.
+    const OPERAND: u32 = 0x0000_2000;
+
+    /// Run one memory-form instruction over the word at [`OPERAND`], which starts
+    /// at `value`, with `X` set to `x`. Returns the word memory holds afterwards
+    /// and the five condition codes.
+    fn run_memory(opcode: u16, value: u16, x: bool) -> (u16, u16) {
+        let (mut cpu, mut bus) = cpu_with_program(&[opcode, 0x4E71]);
+        cpu.a[0] = OPERAND;
+        cpu.set_flag(SR_X, x);
+        bus.load_words(OPERAND, &[value]);
+        cpu.step(&mut bus);
+        (bus.read_word(OPERAND), cpu.sr & CC)
+    }
+
+    /// Memory-form `ASL`: word size, one place, and the operand is memory — so
+    /// this is where a shift first moves real bus traffic, and `TestBus` is big
+    /// endian: the byte at `$2000` is the high byte of the word at `$2000`.
+    #[test]
+    fn asl_memory_word() {
+        let asl_a0 = mem_op(0b00, true, EA_A0_IND);
+
+        let (value, flags) = run_memory(asl_a0, 0xFFFE, false);
+        assert_eq!(value, 0xFFFC, "ASL.W (A0) of $FFFE");
+        assert_eq!(
+            flags,
+            SR_N | SR_C | SR_X,
+            "the sign went out and N comes from the result"
+        );
+
+        let (value, flags) = run_memory(asl_a0, 0x8000, false);
+        assert_eq!(value, 0x0000, "ASL.W (A0) of $8000 is zero");
+        assert_eq!(
+            flags,
+            SR_Z | SR_V | SR_C | SR_X,
+            "and the sign changed, so V is set"
+        );
+
+        let (mut cpu, mut bus) = cpu_with_program(&[asl_a0, 0x4E71]);
+        cpu.a[0] = OPERAND;
+        bus.load_words(OPERAND, &[0xFFFE]);
+        cpu.step(&mut bus);
+        assert_eq!(
+            &bus.mem[OPERAND as usize..OPERAND as usize + 2],
+            &[0xFF, 0xFC],
+            "the word goes back big endian, high byte at the operand address"
+        );
+    }
+
+    /// Memory-form `ROR`: the width-bit rotate, so the bit that leaves the low
+    /// end enters the sign and `X` is outside the ring — here `X` starts set and
+    /// the rotate pushes a zero out, which must leave `X` alone while clearing `C`.
+    #[test]
+    fn ror_memory_word() {
+        let ror_a0 = mem_op(0b11, false, EA_A0_IND);
+
+        let (value, flags) = run_memory(ror_a0, 0x0002, true);
+        assert_eq!(value, 0x0001, "ROR.W (A0) of $2");
+        assert_eq!(
+            flags, SR_X,
+            "C takes the zero that rotated out; X, which a ROx never writes, stayed set"
+        );
+
+        let (value, flags) = run_memory(ror_a0, 0x0001, false);
+        assert_eq!(value, 0x8000, "ROR.W (A0) of $1 is the sign");
+        assert_eq!(flags, SR_N | SR_C, "with C set and X still clear");
+    }
+
+    /// Memory-form `ROXR`: `X` is part of the ring, so it comes in at the sign and
+    /// the bit that leaves the low end becomes the new `X`.
+    #[test]
+    fn roxr_memory_word_with_x() {
+        let roxr_a0 = mem_op(0b10, false, EA_A0_IND);
+
+        let (value, flags) = run_memory(roxr_a0, 0x0000, true);
+        assert_eq!(
+            value, 0x8000,
+            "ROXR.W (A0) of $0 with X set pulls X into the sign"
+        );
+        assert_eq!(flags, SR_N, "and both X and C take the zero that left");
+
+        let (value, flags) = run_memory(roxr_a0, 0x0001, false);
+        assert_eq!(value, 0x0000, "ROXR.W (A0) of $1 with X clear is zero");
+        assert_eq!(flags, SR_Z | SR_C | SR_X, "with C and X both set");
+    }
+
+    /// The memory form is a read-modify-write: one resolve, so `(A0)+` steps once
+    /// and the word is written back to the address that was read (M68000UM
+    /// "Address Register Indirect with Postincrement"; the same property #22 pins
+    /// for `NEG` and #21 for `AND`).
+    #[test]
+    fn memory_form_postincrement_steps_the_pointer_once() {
+        let asr_a0_post = mem_op(0b00, false, EA_A0_POST);
+        let (mut cpu, mut bus) = cpu_with_program(&[asr_a0_post, 0x4E71]);
+        cpu.a[0] = OPERAND;
+        bus.load_words(OPERAND, &[0x8000]);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[0], OPERAND + 2, "(A0)+ steps exactly once");
+        assert_eq!(
+            bus.read_word(OPERAND),
+            0xC000,
+            "at the address that was read"
+        );
     }
 }

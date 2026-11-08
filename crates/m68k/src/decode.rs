@@ -35,7 +35,7 @@
 //! | `1011` | `CMP`, `CMPA`, `CMPM`, `EOR` |
 //! | `1100` | `AND`, `MUL`, `ABCD`, `EXG` |
 //! | `1101` | `ADD`, `ADDA`, `ADDX` |
-//! | `1110` | shifts and rotates |
+//! | `1110` | shifts and rotates: `ss` != `11` is the register form, `1110 0ttd 11 <ea>` is memory-form `ASx.W`, and `1110 1…` is the 68020 bit-field group (illegal on the 68000) |
 //! | `1111` | line F (`1111` emulator) — reserved on the 68000 like `1010`: [`crate::exceptions::EXC_ILLEGAL`] |
 //!
 //! The whole map is documented here because every instruction ticket reads it
@@ -65,7 +65,7 @@
 //! as it lands — the pattern has to say which field of the opcode is the EA
 //! field, which is only knowable per instruction.
 
-use crate::ea::{Size, is_control, is_data, is_data_alterable};
+use crate::ea::{Size, is_control, is_data, is_data_alterable, is_memory_alterable};
 use std::sync::OnceLock;
 
 /// What a decoded opcode means: which handler runs, or why none can.
@@ -324,8 +324,21 @@ pub enum Op {
     /// see [`crate::ops::shift`].
     ///
     /// `ss` = `11` is not the fourth size: it is Format IX, memory-form
-    /// `ASx.w <ea>`, which stays [`Op::Unimplemented`] for M1-19 (#27).
+    /// `ASx.W <ea>` ([`Op::ShiftMemory`]), or the 68020 bit-field group, which the
+    /// MC68000 does not have ([`Op::Illegal`]).
     Shift,
+    /// Memory-form `ASx.W <ea>` — `1110 0tt d 11 mmm rrr` (M68000UM "Instruction
+    /// Formats", Format IX, and "ASL, ASR, LSL, LSR"; M1-19, #27). One variant for
+    /// all eight mnemonics because `tt` and `d` are fields the handler reads, just
+    /// as in [`Op::Shift`]; what differs is that the operand is always a **word**,
+    /// always shifted exactly **one** place, and must be alterable memory — which
+    /// [`crate::ea::is_memory_alterable`] applies here, so `$E0C0` (`ASx.W D0`)
+    /// never reaches a handler.
+    ///
+    /// The other half of `ss` = `11`, `1110 1tt d 11 mmm rrr`, is the 68020's
+    /// bit-field group (`BFSTOP` and friends). The MC68000 has no bit-field
+    /// instructions, so all 512 of those encodings decode to [`Op::Illegal`].
+    ShiftMemory,
 }
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
@@ -511,20 +524,46 @@ fn classify(opcode: u16) -> Op {
     }
 }
 
-/// One opcode of the `1110` shift group: [`Op::Shift`] for the 3072 register-form
-/// encodings, and [`Op::Unimplemented`] for the 448 that are `ss` = `11`.
+/// One opcode of the `1110` shift group, which has three parts and no
+/// [`Op::Unimplemented`] left in it (M1-18 #26 and M1-19 #27):
 ///
-/// `ss` = `11` is not a size. In Format IX those two bits select an addressing
-/// mode, and `1110 ddd 11 iiii ii` is `ASx.W <ea>` — a different instruction, with
-/// its own count encoding and a memory operand, which is M1-19 (#27). Leaving it
-/// unimplemented is what lets [`crate::ops::shift`] treat `ss` as a size field
-/// without checking.
+/// * `1110 ccc d ss i tt rrr` with `ss` != `11` — [`Op::Shift`], the 3072
+///   register-form encodings.
+/// * `1110 0tt d 11 mmm rrr` — [`Op::ShiftMemory`], memory-form `ASx.W <ea>`
+///   (M68000UM "Instruction Formats", Format IX), for the 336 encodings whose EA
+///   field is [`is_memory_alterable`]: the four register-indirect modes, the
+///   indexed mode and the two absolutes — 42 of the field's 64 combinations. The
+///   other 176 are `Dn`, `An`, `#imm`, the two PC-relative absolutes and the three
+///   mode words the MC68000 does not define; none of them is writable memory, so
+///   `ASx.W` has no `Dn` form and they are illegal instructions.
+/// * `1110 1tt d 11 mmm rrr` — [`Op::Illegal`]. Bit 11 with `ss` = `11` is the
+///   68020 bit-field group, which the MC68000 does not implement, so all 512 of
+///   those encodings raise the illegal-instruction exception rather than waiting
+///   for a ticket that will never arrive on this machine.
+///
+/// `ss` = `11` is not a size: in Format IX those two bits are the top of the
+/// addressing-mode field. Splitting them out here is what lets
+/// [`crate::ops::shift`] treat `ss` as a size field for [`Op::Shift`] without
+/// checking.
 fn classify_shift(opcode: u16) -> Op {
-    if (opcode >> 6) & 0b11 == 0b11 {
-        return Op::Unimplemented;
+    if (opcode >> 6) & 0b11 != 0b11 {
+        return Op::Shift;
     }
-    Op::Shift
+    if opcode & BIT_FIELD_BIT != 0 {
+        return Op::Illegal;
+    }
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    if is_memory_alterable(mode, reg) {
+        Op::ShiftMemory
+    } else {
+        Op::Illegal
+    }
 }
+
+/// Bit 11 of a `1110` opcode with `ss` = `11`: set and the encoding is one of the
+/// 68020 bit-field instructions, not memory-form `ASx.W` (see [`classify_shift`]).
+const BIT_FIELD_BIT: u16 = 0x0800;
 
 /// One opcode of the `0001`/`0010`/`0011` move groups: [`Op::Move`],
 /// [`Op::Movea`] or [`Op::Illegal`], with the EA validity rules applied here so
@@ -1275,17 +1314,46 @@ mod tests {
         // out of the `1000` group; `0xC0C0` is `MULU`, likewise.
         assert_eq!(decode(0x8FFF), Op::Unimplemented, "DIVS");
         assert_eq!(decode(0xC0C0), Op::Unimplemented, "MULU");
-        // `1110`'s anchor survived #26 by three bits: the register-form shifts
-        // are `Op::Shift` now, and only memory-form `ASx.W <ea>` (`ss` = `11`)
-        // is still unimplemented, for M1-19 (#27). See [`shift_group_decodes`].
-        assert_eq!(decode(0xE0C0), Op::Unimplemented, "ASR.W <ea>");
+        // `1110` is off this test's list entirely: #26 took the register-form
+        // shifts and #27 the memory-form ones, so the group has no
+        // [`Op::Unimplemented`] left to anchor on. What `$E0C0` decodes to now is
+        // pinned by [`shift_group_decodes`], next door.
+    }
+
+    /// `1110 1tt d 11 mmm rrr` — bit 11 set *and* `ss` = `11` — is the 68020's
+    /// bit-field group (`BFSTOP`, `BFOEXT`, …). The MC68000 has no bit-field
+    /// instructions, so all 512 of these encodings are illegal instructions
+    /// (vector 3, [`crate::exceptions::EXC_ILLEGAL`]) rather than instructions the
+    /// core has not written yet (M1-19, #27).
+    ///
+    /// The eight `$xxC0`-`$xxFF` blocks are the whole set, not `$E8C0..=$EFFF`: bit
+    /// 11 alone is a shift count of 4 or 5 (`$E900` is `ASL.B #4,D0`), because in
+    /// the register form `1110 ccc d ss i tt rrr` bit 11 is the top of `ccc`.
+    #[test]
+    fn bitfield_opcodes_are_illegal() {
+        for block_start in (0xE8C0..=0xEFC0).step_by(0x100) {
+            assert_range_decodes_to(block_start..=block_start + 0x3F, Op::Illegal);
+        }
+        assert_eq!(decode(0xE8C0), Op::Illegal, "the first bit-field opcode");
+        assert_eq!(decode(0xEFFF), Op::Illegal, "the last bit-field opcode");
+        assert_eq!(
+            decode(0xE900),
+            Op::Shift,
+            "ASL.B #4,D0: with `ss` != 11 bit 11 is a shift count, not a bit field"
+        );
+        // And the memory-form half, bit 11 clear, is the one that is real: the same
+        // EA field, one bit away from $E8C0.
+        assert_eq!(decode(0xE0D0), Op::ShiftMemory, "ASR.W (A0)");
     }
 
     /// The `1110` group is the eight register-form shift and rotate mnemonics in
-    /// three sizes: `1110 ccc d ss i tt rrr` with `ss` != `11`, which is 3072 of
-    /// the group's 4096 opcodes (M68000UM "ASL, ASR, LSL, LSR"; M1-18, #26). The
-    /// other 1024 are `ss` = `11`: Format IX, memory-form `ASx.W <ea>`, M1-19
-    /// (#27).
+    /// three sizes — `1110 ccc d ss i tt rrr` with `ss` != `11`, 3072 of the
+    /// group's 4096 opcodes (M68000UM "ASL, ASR, LSL, LSR"; M1-18, #26) — plus the
+    /// `ss` = `11` half, which since M1-19 (#27) is memory-form `ASx.W <ea>` where
+    /// the EA is alterable memory and illegal everywhere else: the EA field of
+    /// Format IX has 42 alterable modes of its 64, giving 4 kinds * 2 directions *
+    /// 42 = 336 [`Op::ShiftMemory`] encodings, 176 illegal `ASx.W`s and 512
+    /// illegal 68020 bit-field opcodes (see [`bitfield_opcodes_are_illegal`]).
     #[test]
     fn shift_group_decodes() {
         // Real encodings, read off the suite's own case names.
@@ -1298,10 +1366,24 @@ mod tests {
         // the `$E0xx` block are all register form...
         assert_range_decodes_to(0xE000..=0xE0BF, Op::Shift);
         // ...and `11` is not a size but the addressing-mode field of a completely
-        // different instruction.
-        assert_range_decodes_to(0xE0C0..=0xE0FF, Op::Unimplemented);
-        assert_range_decodes_to(0xE4C0..=0xE4FF, Op::Unimplemented);
-        assert_range_decodes_to(0xEFC0..=0xEFFF, Op::Unimplemented);
+        // different instruction: memory-form `ASx.W <ea>` over alterable memory.
+        assert_eq!(decode(0xE0D0), Op::ShiftMemory, "ASR.W (A0)");
+        assert_eq!(decode(0xE1D8), Op::ShiftMemory, "ASL.W (A0)+");
+        assert_eq!(decode(0xE6D1), Op::ShiftMemory, "ROR.W (A1)");
+        assert_eq!(decode(0xE5F8), Op::ShiftMemory, "ROXL.W (xxx).W");
+        assert_eq!(decode(0xE0E8), Op::ShiftMemory, "ASR.W d16(A0)");
+        assert_eq!(
+            decode(0xE0C0),
+            Op::Illegal,
+            "ASx.W D0: not a memory operand"
+        );
+        assert_eq!(
+            decode(0xE0C8),
+            Op::Illegal,
+            "ASx.W A0: not a memory operand"
+        );
+        assert_eq!(decode(0xE0FA), Op::Illegal, "ASx.W d16(PC)");
+        assert_eq!(decode(0xE0FC), Op::Illegal, "ASx.W #imm");
 
         let group = 0xE000u16..=0xEFFF;
         let shifts = group.clone().filter(|op| decode(*op) == Op::Shift).count();
@@ -1309,10 +1391,15 @@ mod tests {
             shifts, 3072,
             "3 sizes * 2 directions * 4 kinds * 8 counts * 2 count sources * 8 registers"
         );
+        let memory = group
+            .clone()
+            .filter(|op| decode(*op) == Op::ShiftMemory)
+            .count();
+        assert_eq!(memory, 336, "4 kinds * 2 directions * 42 alterable modes");
         assert_eq!(
-            group.into_iter().count() - shifts,
-            1024,
-            "memory-form ASx.W"
+            group.into_iter().count() - shifts - memory,
+            688,
+            "176 ASx.W with a non-memory operand, plus 512 bit-field opcodes"
         );
     }
 
