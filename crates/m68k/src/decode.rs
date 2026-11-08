@@ -279,6 +279,20 @@ pub enum Op {
     /// [`Op::Divu`] signed throughout: the quotient truncates toward zero and
     /// the remainder takes the sign of the dividend.
     Divs,
+    /// `ABCD` `Dy,Dx` and `ABCD -(Ay),-(Ax)`: `1100 ddd 100 0m yyy` (M68000UM
+    /// ABCD; M1-23, #31). `Dy + Dx + X → Dx`, one byte, decimal-corrected. Like
+    /// [`Op::Addx`] the two operand forms share a variant and bit 3 of the
+    /// opcode says which one [`crate::ops::bcd`] has been handed.
+    Abcd,
+    /// `SBCD` `Dy,Dx` and `SBCD -(Ay),-(Ax)`: `1000 ddd 100 0m yyy` (M68000UM
+    /// SBCD; M1-23, #31). `Dx - Dy - X → Dx`, one byte, decimal-corrected —
+    /// [`Op::Abcd`] from the subtract side of the `$80??` group.
+    Sbcd,
+    /// `NBCD <ea>`: `0100 1000 00 mmm rrr` (M68000UM NBCD; M1-23, #31).
+    /// `0 - <ea> - X → <ea>`, one byte, in place: NEG's operand rule (a
+    /// data-alterable EA) at the bottom of the `$48??` window, which is why
+    /// [`classify_swap_ext_pea`] splits that window on bit 6 as well as bit 7.
+    Nbcd,
     /// `LEA <ea>,An`, `$4000 + ddd<<9 + 0b111<<6 + <ea>` — the `0100` group's
     /// opcodes with bits 8..6 all set (M68000UM "LEA — Address Register Indirect
     /// and Program", M1-15, #23). The destination is always an address register
@@ -993,8 +1007,7 @@ fn classify_cmp(opcode: u16) -> Op {
     }
 }
 
-/// One opcode of the `1100` group: [`Op::And`], [`Op::Exg`], or
-/// [`Op::Unimplemented`] for the one corner of the group ABCD still owns.
+/// One opcode of the `1100` group: [`Op::And`], [`Op::Exg`] or [`Op::Abcd`].
 ///
 /// AND is `1100 ddd ooo eeeeee` with `ooo` = `000`/`001`/`010` for
 /// `AND <ea>,Dn` and `100`/`101`/`110` for `AND Dn,<ea>` (M68000UM AND, #21).
@@ -1003,7 +1016,7 @@ fn classify_cmp(opcode: u16) -> Op {
 /// ```text
 /// MULU   1100 ddd 011 eeeeee    #29
 /// MULS   1100 ddd 111 eeeeee    #29
-/// ABCD   1100 ddd 100 00 m yyy  M1-16
+/// ABCD   1100 ddd 100 0m yyy    M1-23, #31
 /// EXG    1100 xxx 101 000 yyy   #22, and 101 001 and 110 001
 /// ```
 ///
@@ -1039,9 +1052,15 @@ fn classify_and(opcode: u16) -> Op {
             op
         };
     }
-    let abcd = op_mode == 0b100 && mode <= AN_DIRECT_MODE;
-    if abcd {
-        return Op::Unimplemented;
+    // ABCD is operation `100` at the two register-pair modes and nothing else:
+    // mode `000` is `ABCD Dy,Dx` and mode `001` is `ABCD -(Ay),-(Ax)`, with the
+    // `ddd`/`yyy` fields read as `Ax`/`Ay` there rather than as a destination and
+    // a source (M68000UM ABCD; M1-23, #31). Every other mode `000`-`001` opcode
+    // of operation `100` would be `AND.B` into a register the instruction does
+    // not have, so the 128 opcodes ABCD takes are exactly the 128 that stop
+    // being AND.
+    if op_mode == 0b100 && mode <= AN_DIRECT_MODE {
+        return Op::Abcd;
     }
     // EXG, the slot #21 reserved for this ticket: `101`/`000` is `EXG Dx,Dy`
     // (`c140`), `101`/`001` is `EXG Ax,Ay` (`c94a`) and `110`/`001` is
@@ -1064,14 +1083,14 @@ pub(crate) const fn is_exg(op_mode: u8, mode: u8) -> bool {
     (op_mode == 0b101 && mode <= 0b001) || (op_mode == 0b110 && mode == 0b001)
 }
 
-/// One opcode of the `1000` group: [`Op::Or`], [`Op::Divu`], [`Op::Divs`], or
-/// [`Op::Unimplemented`] for SBCD's corner of it.
+/// One opcode of the `1000` group: [`Op::Or`], [`Op::Divu`], [`Op::Divs`] or
+/// [`Op::Sbcd`].
 ///
 /// ```text
 /// OR     1000 ddd ooo eeeeee    operation 000 / 001 / 010 and 100 / 101 / 110
 /// DIVU   1000 ddd 011 eeeeee    M1-22, #30
 /// DIVS   1000 ddd 111 eeeeee    M1-22, #30
-/// SBCD   1000 ddd 100 00 m yyy  M1-16
+/// SBCD   1000 ddd 100 0m yyy    M1-23, #31
 /// ```
 ///
 /// Unlike [`classify_and`], only operation `100` loses its mode-`000` case: OR
@@ -1101,8 +1120,10 @@ fn classify_or(opcode: u16) -> Op {
             op
         };
     }
+    // SBCD, exactly as ABCD is in [`classify_and`]: operation `100` loses its two
+    // register-pair modes to the decimal subtract (M68000UM SBCD; M1-23, #31).
     if op_mode == 0b100 && mode <= AN_DIRECT_MODE {
-        return Op::Unimplemented;
+        return Op::Sbcd;
     }
     classify_and_or(opcode, op_mode, Op::Or)
 }
@@ -1230,12 +1251,13 @@ fn classify_control_jump(opcode: u16) -> Op {
 }
 
 /// One opcode of the `$4800..=$48FF` window: [`Op::Swap`], [`Op::Ext`],
-/// [`Op::Pea`], or [`Op::Unimplemented`] for MOVEM (M68000UM SWAP, EXT, PEA,
-/// MOVEM; #22, and PEA for M1-15, #23).
+/// [`Op::Pea`], [`Op::Nbcd`], or [`Op::Unimplemented`] for MOVEM (M68000UM SWAP,
+/// EXT, PEA, NBCD, MOVEM; #22, PEA for M1-15, #23, and NBCD for M1-23, #31).
 ///
-/// The window holds four instructions:
+/// The window holds five instructions:
 ///
 /// ```text
+/// NBCD    0100 1000 00 mmm rrr     this window, bits 7 and 6 clear
 /// SWAP    0100 1000 0100 0 rrr      this window, mode `000` with bit 6 set
 /// EXT     0100 1000 1s 00 0 rrr     this window, mode `000` with bit 7 set
 /// PEA     0100 1000 01 mmm rrr     M1-15 (#23), mode != `000`
@@ -1257,10 +1279,12 @@ fn classify_control_jump(opcode: u16) -> Op {
 /// instructions rather than unimplemented opcodes, exactly as an illegal mode in
 /// any other instruction's EA field is.
 ///
-/// `$4800`..`$483F` — bit 7 clear, bit 6 clear — is unassigned on the 68000: PEA
-/// needs bit 6 set, and all 28 of its opcodes in `PEA.json.gz` have it. Those
-/// stay unimplemented rather than called illegal, as `$4AFC` — the one documented
-/// `ILLEGAL` — is handled separately.
+/// `$4800`..`$483F` — bit 7 clear, bit 6 clear — is `NBCD <ea>`, not unassigned
+/// space: PEA needs bit 6 set, and all 28 of its opcodes in `PEA.json.gz` have
+/// it. NBCD takes a byte read-modify-write operand, so its EA field has to pass
+/// [`is_data_alterable`] exactly as [`classify_single_operand`]'s does; the two
+/// agree, and `NBCD.json.gz` runs exactly those 8 modes over its 8065 cases
+/// (M68000UM NBCD; M1-23, #31).
 fn classify_swap_ext_pea(opcode: u16) -> Op {
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
@@ -1272,7 +1296,14 @@ fn classify_swap_ext_pea(opcode: u16) -> Op {
             Op::Unimplemented
         }
     } else if opcode & SWAP_BIT6 == 0 {
-        Op::Unimplemented
+        // NBCD's half: a byte read-modify-write, so the EA has to name somewhere
+        // a byte can be written — the same rule NEG and CLR use (M68000UM NBCD,
+        // destination "data alterable"; M1-23, #31).
+        if is_data_alterable(mode, reg) {
+            Op::Nbcd
+        } else {
+            Op::Illegal
+        }
     } else if mode == 0 {
         Op::Swap
     } else if is_control(mode, reg) {
@@ -1462,11 +1493,13 @@ mod tests {
         // shifts (M1-30, #38), the other group next door that is still loud.
         // The `1000` group's anchor used to be `$8FFF`, a `DIVS`-shaped opcode
         // #21 deliberately left unimplemented for M1-22 (#30). DIVU and DIVS now
-        // decode, so the anchor moves to SBCD — the group's one corner still
-        // waiting on M1-16. `1100` had an anchor of its own until M1-21 (#29)
-        // decoded `$C0C0` for real, so the multiply now says "not line A, not
-        // line F" in its place.
-        assert_eq!(decode(0x8100), Op::Unimplemented, "SBCD");
+        // decode, and M1-23 (#31) took the group's last corner, so `1000` and
+        // `1100` have no unimplemented opcode left to anchor on either: the two
+        // that used to be it say "not line A, not line F" by decoding to SBCD and
+        // ABCD. `1100` had an anchor of its own until M1-21 (#29) decoded `$C0C0`
+        // for real.
+        assert_eq!(decode(0x8100), Op::Sbcd, "SBCD");
+        assert_eq!(decode(0xC100), Op::Abcd, "ABCD");
         assert_eq!(
             decode(0x8FFF),
             Op::Illegal,
@@ -2687,8 +2720,8 @@ mod tests {
         assert_ne!(decode(0xC100), Op::And, "ABCD.B (A0)+,(A1)+");
         assert_ne!(decode(0xC0C0), Op::And, "MULU D0,D0");
         assert_ne!(decode(0xC141), Op::And, "EXG D0,D1");
-        assert_eq!(decode(0xC100), Op::Unimplemented, "ABCD.B (A0)+,(A1)+");
-        assert_eq!(decode(0xC108), Op::Unimplemented, "ABCD.B -(A0),-(A1)");
+        assert_eq!(decode(0xC100), Op::Abcd, "ABCD.B (A0)+,(A1)+");
+        assert_eq!(decode(0xC108), Op::Abcd, "ABCD.B -(A0),-(A1)");
         assert_eq!(decode(0xC0C0), Op::Mulu, "MULU D0,D0");
         assert_eq!(decode(0xC0EE), Op::Mulu, "MULU (d16,A6),D0");
         assert_eq!(decode(0xC1C0), Op::Muls, "MULS D0,D0");
@@ -2699,8 +2732,8 @@ mod tests {
         // illegal instruction rather than merely unimplemented.
         assert_eq!(decode(0xCFC8), Op::Illegal, "MULS (A0),D7");
         assert_eq!(decode(0xC1C8), Op::Illegal, "MULS (A0),D0");
-        assert_eq!(decode(0x8100), Op::Unimplemented, "SBCD.B (A0)+,(A1)+");
-        assert_eq!(decode(0x8108), Op::Unimplemented, "SBCD.B -(A0),-(A1)");
+        assert_eq!(decode(0x8100), Op::Sbcd, "SBCD.B (A0)+,(A1)+");
+        assert_eq!(decode(0x8108), Op::Sbcd, "SBCD.B -(A0),-(A1)");
         // DIVU and DIVS are M1-22 (#30): they used to be the group's two
         // unimplemented corners named here, and now decode for real. SBCD is
         // unchanged, and `0x8FC8` is mode `001`, which a divide cannot take.
@@ -2749,22 +2782,28 @@ mod tests {
             }
         }
 
-        // The other half of the partition: the only opcodes of the group still
-        // waiting for an implementation are ABCD's 128, so MULU and MULS took
-        // their share without disturbing AND, OR, EXG or the illegal corners.
-        let unimplemented: Vec<u16> = (0xC000..=0xCFFF)
-            .filter(|opcode| decode(*opcode) == Op::Unimplemented)
+        // The other half of the partition, which M1-23 (#31) closed: ABCD took
+        // its 128 opcodes of operation `100`, so the `1100` group now has no
+        // unimplemented opcode at all and MULU/MULS, AND, OR, EXG and the illegal
+        // corners cannot have swallowed anything on the way.
+        let abcd: Vec<u16> = (0xC000..=0xCFFF)
+            .filter(|opcode| decode(*opcode) == Op::Abcd)
             .collect();
         assert_eq!(
-            unimplemented.len(),
+            abcd.len(),
             128,
-            "ABCD is 8 destinations x modes 000 and 001 x 8 registers, and nothing else in the group is unimplemented: {unimplemented:?}"
+            "ABCD is 8 destinations x modes 000 and 001 x 8 registers: {abcd:?}"
         );
         assert!(
-            unimplemented
-                .iter()
-                .all(|opcode| (opcode >> 6) & 0b111 == 0b100),
-            "every unimplemented opcode of the `1100` group is operation `100`, i.e. ABCD"
+            abcd.iter().all(|opcode| (opcode >> 6) & 0b111 == 0b100),
+            "every ABCD opcode of the `1100` group is operation `100`"
+        );
+        assert_eq!(
+            (0xC000..=0xCFFF)
+                .filter(|opcode| decode(*opcode) == Op::Unimplemented)
+                .count(),
+            0,
+            "the `1100` group's last corner, ABCD, decoded in #31"
         );
     }
 
@@ -2802,11 +2841,12 @@ mod tests {
         }
 
         // The rest of the partition: 424 DIVU + 424 DIVS + their 176 illegal
-        // corners; SBCD's 128 are all that is left unimplemented; and nothing
-        // else of the group became a divide or a new illegal corner.
+        // corners; SBCD's 128, which M1-23 (#31) decoded, are all that was left;
+        // and nothing else of the group became a divide or a new illegal corner.
         let mut divu = 0;
         let mut divs = 0;
         let mut div_illegal = 0;
+        let mut sbcd = 0;
         let unimplemented: Vec<u16> = (0x8000..=0x8FFF)
             .filter(|opcode| match decode(*opcode) {
                 Op::Divu => {
@@ -2821,6 +2861,10 @@ mod tests {
                     if matches!((opcode >> 6) & 0b111, 0b011 | 0b111) {
                         div_illegal += 1;
                     }
+                    false
+                }
+                Op::Sbcd => {
+                    sbcd += 1;
                     false
                 }
                 Op::Unimplemented => true,
@@ -2843,15 +2887,12 @@ mod tests {
             "the illegal corners are 11 per field per destination (mode `001` x8 + invalid mode `111` x3), x 2 fields"
         );
         assert_eq!(
-            unimplemented.len(),
-            128,
-            "SBCD is 8 destinations x modes 000 and 001 x 8 registers: {unimplemented:?}"
+            sbcd, 128,
+            "SBCD is 8 destinations x modes 000 and 001 x 8 registers"
         );
         assert!(
-            unimplemented
-                .iter()
-                .all(|opcode| (opcode >> 6) & 0b111 == 0b100 && (opcode >> 3) & 0b111 <= 0b001),
-            "every unimplemented opcode of the `1000` group is SBCD"
+            unimplemented.is_empty(),
+            "SBCD was the `1000` group's last corner and M1-23 (#31) decoded it: {unimplemented:?}"
         );
         assert_eq!(decode(0x8140), Op::Or, "OR.W D0,D1 — SBCD's neighbour");
         assert_eq!(
@@ -2974,15 +3015,53 @@ mod tests {
             ),
             (0x48D0, "MOVEM.L #reglist,(A0): measured in MOVEM.l.json.gz"),
             (0x4CC0, "MOVEM.L #reglist,-(A0) in the $4C half"),
-            // Bit 6 clear, bit 7 clear: unassigned on the 68000. PEA is
-            // `0100 1000 01 mmm rrr`, so `$4800` is not `PEA` with a missing
-            // destination, and it stays loudly unimplemented rather than
-            // illegal.
-            (0x4800, "unassigned: bit 6 and bit 7 clear"),
-            (0x4807, "the same, at r=7"),
         ] {
             assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
         }
+    }
+
+    /// NBCD is `0100 1000 00 mmm rrr`, the 64 opcodes of this window with both
+    /// bit 6 and bit 7 clear — the space this decoder used to call unassigned —
+    /// and it takes `NEG`'s operand set, a data-alterable EA (M68000UM NBCD,
+    /// "Effective Address Calculation"; M1-23, #31).
+    ///
+    /// The 64 are walked, not sampled: `$4800..=$483F` splits 51 ways into legal
+    /// operands and 13 into illegal ones — mode `001`'s 8, which names a register
+    /// rather than a byte in memory, and mode `111`'s `d16(PC)`, `d8(PC,Xn)`,
+    /// `#immediate` and the three sub-modes that are not addressing modes at all.
+    /// Bit 6 or bit 7 set is SWAP, EXT, PEA or MOVEM and must stay there.
+    #[test]
+    fn nbcd_is_the_low_quarter_of_the_48_window() {
+        for opcode in 0x4800u16..=0x483F {
+            let mode = ((opcode >> 3) & 0b111) as u8;
+            let reg = (opcode & 0b111) as u8;
+            let want = if is_data_alterable(mode, reg) {
+                Op::Nbcd
+            } else {
+                Op::Illegal
+            };
+            assert_eq!(decode(opcode), want, "${opcode:04X}");
+        }
+        assert_eq!(decode(0x4801), Op::Nbcd, "NBCD D1");
+        // `NBCD (A0)` is legal and `NBCD A0` is not: the byte is read and written
+        // back, and `An` cannot be a data destination.
+        assert_eq!(decode(0x4810), Op::Nbcd, "NBCD (A0)");
+        assert_eq!(decode(0x4808), Op::Illegal, "NBCD A0 — mode 001");
+        assert_eq!(decode(0x4838), Op::Nbcd, "NBCD (A7).W: mode 111, reg 000");
+        assert_eq!(decode(0x4839), Op::Nbcd, "NBCD abs.L: mode 111, reg 001");
+        assert_eq!(
+            decode(0x483A),
+            Op::Illegal,
+            "NBCD d16(PC) — a mode 111 sub-mode that is not alterable"
+        );
+        // Bit 6 or bit 7 set is not NBCD: SWAP, EXT, PEA and MOVEM keep the rest.
+        assert_eq!(decode(0x4840), Op::Swap, "SWAP, one bit of NBCD away");
+        assert_eq!(decode(0x4880), Op::Ext, "EXT, two bits of NBCD away");
+        assert_ne!(
+            decode(0x4900),
+            Op::Nbcd,
+            "NBCD is the $48 window only, not bit 8 clear"
+        );
     }
 
     /// `EXG` is operation `101` at mode `000` (`Dx,Dy`) or `001` (`Ax,Ay`) and

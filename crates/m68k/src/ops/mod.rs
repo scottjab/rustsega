@@ -38,6 +38,7 @@
 
 mod address;
 mod arith;
+mod bcd;
 mod bit;
 mod flow;
 mod logic;
@@ -133,6 +134,12 @@ impl M68k {
             Op::Muls => self.op_muls(bus, opcode),
             Op::Divu => self.op_divu(bus, opcode),
             Op::Divs => self.op_divs(bus, opcode),
+            // `ABCD`, `SBCD` and `NBCD` (`1100`/`1000` operation `100` and
+            // `$4800`..`$483F`): binary arithmetic with a decimal correction, so
+            // they share one module and one flag rule (see [`bcd`]).
+            Op::Abcd => self.op_abcd(bus, opcode),
+            Op::Sbcd => self.op_sbcd(bus, opcode),
+            Op::Nbcd => self.op_nbcd(bus, opcode),
             Op::Andi => self.op_andi(bus, opcode),
             Op::Ori => self.op_ori(bus, opcode),
             Op::Eori => self.op_eori(bus, opcode),
