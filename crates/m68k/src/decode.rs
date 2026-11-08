@@ -1414,13 +1414,78 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
+        // `ss` = `11` is not a size: it is Scc/DBcc, which the two `$51C8`-style
+        // entries here used to defer to the branch ticket (#24). Note that both
+        // of them are mode `001` and therefore `DBcc`, not the `Scc -(A0)` the
+        // old comment claimed.
+        assert_eq!(
+            decode(0x51C8),
+            Op::Dbcc,
+            "DBcc.F D0 — mode 001, not Scc -(A0)"
+        );
+        assert_eq!(decode(0x51CC), Op::Dbcc, "DBcc.F D4 — mode 001");
+        assert_eq!(decode(0x50C0), Op::Scc, "Scc.T D0 — mode 000");
+    }
+
+    /// `0101 cccc 11 eeeeee` is M68000UM Format V, the conditional group, and its
+    /// two instructions are told apart by one field of the EA word: mode `001` is
+    /// `DBcc`, whose "register" is the loop counter and whose remaining EA bits
+    /// are the 16-bit displacement, and every other mode is `Scc`. Bit 8 is part
+    /// of the condition code here, not a `SUBQ` marker, which is why `$50C8` and
+    /// `$51C8` are the same instruction (M68000UM Format V, "DBcc", "Scc";
+    /// M1-16, #24).
+    #[test]
+    fn scc_and_dbcc_split_the_0101_group_on_ea_mode_001() {
         for (opcode, name) in [
-            (0x51C8u16, "Scc.EQ -(A0) — the branch ticket"),
-            (0x51CC, "DBRA D1,d16 — the branch ticket"),
-            (0x50C0, "bit 8 clear with ss = 11: defined by nobody yet"),
+            (0x50C8u16, "DBcc.T D0 — bit 8 clear, mode 001"),
+            (0x51C8, "DBcc.F D0 — cc 0001, still mode 001"),
+            (0x5DC8, "DBcc.LT D0"),
+            (0x5FCF, "DBcc.LE D7 — the last encoding of the family"),
         ] {
-            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+            assert_eq!(decode(opcode), Op::Dbcc, "{name} (${opcode:04X})");
         }
+        for (opcode, name) in [
+            (0x50C0u16, "Scc.T D0 — one bit of the EA below DBcc"),
+            (0x51C0, "Scc.F D0 — bit 8 set is still Scc"),
+            (0x57D0, "Scc.EQ (A0)"),
+            (0x5F39, "Scc.LE ($0000).L — mode 111, reg 001"),
+            (0x5FC1, "Scc.LE -(A1) — mode 100"),
+        ] {
+            assert_eq!(decode(opcode), Op::Scc, "{name} (${opcode:04X})");
+        }
+        // `Scc` writes a byte, so the modes that cannot be written are illegal
+        // exactly as they are for `CLR` (#22) — and mode `001` never reaches the
+        // rule, because `DBcc` took it first.
+        for (opcode, name) in [
+            (0x5732u16, "Scc.EQ d16(PC): not a destination"),
+            (0x5734, "Scc.EQ #imm: immediates are source-only"),
+            (
+                0x573E,
+                "Scc.EQ with mode 111, reg 111: no such address mode",
+            ),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+    }
+
+    /// The whole `0110` group is branches — `0110 cccc dddddddd` — and the low
+    /// byte is a displacement, not an effective address, so no encoding of it is
+    /// illegal: `$6000` is `BRA` with a zero displacement (a displacement word
+    /// follows) and `$60FF` is `BRA #-1`, not a long branch (M68000UM Format VI,
+    /// "BRA", "BSR", "Bcc"; M1-16, #24).
+    #[test]
+    fn bcc_bra_bsr_take_the_whole_6000_group() {
+        for opcode in 0x6000u16..=0x6FFF {
+            let want = if (opcode >> 8) & 0b1111 == 0b0001 {
+                Op::Bsr
+            } else {
+                Op::Bcc
+            };
+            assert_eq!(decode(opcode), want, "${opcode:04X}");
+        }
+        assert_eq!(decode(0x60FE), Op::Bcc, "BRA.B #-2, the self loop");
+        assert_eq!(decode(0x67FC), Op::Bcc, "Bcc.EQ.B #-4");
+        assert_eq!(decode(0x6100), Op::Bsr, "BSR with a zero byte displacement");
     }
 
     /// The `1001` group splits the same way as `1101`: operation modes
@@ -1528,10 +1593,10 @@ mod tests {
     }
 
     /// `SUBQ` is `0101 ddd 1 ss eeeeee` with `ss` != `11`, its quick data in
-    /// bits 11..9 and data `000` meaning 8. `Scc`/`DBcc` (bit 8 set with
-    /// `ss` = `11`) stay unimplemented for the branch ticket, as does the
-    /// `bit 8 clear, ss = 11` encoding `ADDQ` left alone too (M68000UM Format V,
-    /// "SUBQ", and the operation-code-map appendix; M1-11, #19).
+    /// bits 11..9 and data `000` meaning 8. `ss` = `11` is not a size at all —
+    /// `Scc`/`DBcc` take the whole of it, both bit-8 halves — and is pinned by
+    /// `scc_and_dbcc_split_the_0101_group_on_ea_mode_001` (M68000UM Format V,
+    /// "SUBQ", and the operation-code-map appendix; M1-11, #19, M1-16, #24).
     #[test]
     fn subq_decodes_and_validates_its_destination() {
         for (opcode, name) in [
@@ -1553,13 +1618,9 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
-        for (opcode, name) in [
-            (0x51C8u16, "Scc.EQ -(A0) — the branch ticket"),
-            (0x51CC, "DBRA D1,d16 — the branch ticket"),
-            (0x50C0, "bit 8 clear with ss = 11: defined by nobody yet"),
-        ] {
-            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
-        }
+        assert_eq!(decode(0x51C8), Op::Dbcc, "DBcc.F D0 — mode 001");
+        assert_eq!(decode(0x51CC), Op::Dbcc, "DBcc.F D4 — mode 001");
+        assert_eq!(decode(0x50C0), Op::Scc, "Scc.T D0 — mode 000");
     }
 
     /// The `1011` group splits on the operation-mode field in bits 8..6:

@@ -38,6 +38,7 @@
 
 mod address;
 mod arith;
+mod flow;
 mod logic;
 mod move_;
 

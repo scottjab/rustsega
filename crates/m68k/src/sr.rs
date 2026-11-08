@@ -84,3 +84,86 @@ impl M68k {
         self.set_flag(SR_C, false);
     }
 }
+
+/// Tests for `test_cc`, the condition-code table this module owns (M1-16, #24).
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// N, Z, V and C of `bits`, the four low bits read one per flag, so a test
+    /// can walk all sixteen flag combinations with `bits in 0..=0xF`.
+    fn ccr_from(bits: u16) -> u16 {
+        let n = (bits & 0b1000) >> 3;
+        let z = (bits & 0b0100) >> 2;
+        let v = (bits & 0b0010) >> 1;
+        let c = bits & 0b0001;
+        n * SR_N | z * SR_Z | v * SR_V | c * SR_C
+    }
+
+    /// All sixteen condition codes, each checked against every combination of
+    /// N, V, Z and C — 256 assertions from the ticket's table (M68000PM section
+    /// 8, "CONDITION CODES"). The expectations are written per mnemonic, which
+    /// is what makes the GE/LT and GT/LE pairs — the ones a hand-rolled table
+    /// gets backwards — visible.
+    #[test]
+    fn condition_table() {
+        let codes: [(u8, &str, fn(bool, bool, bool, bool) -> bool); 16] = [
+            (0b0000, "T", |_n, _z, _v, _c| true),
+            (0b0001, "F", |_n, _z, _v, _c| false),
+            (0b0010, "HI", |_n, z, _v, c| !c && !z),
+            (0b0011, "LS", |_n, z, _v, c| c || z),
+            (0b0100, "CC", |_n, _z, _v, c| !c),
+            (0b0101, "CS", |_n, _z, _v, c| c),
+            (0b0110, "NE", |_n, z, _v, _c| !z),
+            (0b0111, "EQ", |_n, z, _v, _c| z),
+            (0b1000, "VC", |_n, _z, v, _c| !v),
+            (0b1001, "VS", |_n, _z, v, _c| v),
+            (0b1010, "PL", |n, _z, _v, _c| !n),
+            (0b1011, "MI", |n, _z, _v, _c| n),
+            (0b1100, "GE", |n, _z, v, _c| n == v),
+            (0b1101, "LT", |n, _z, v, _c| n != v),
+            (0b1110, "GT", |n, z, v, _c| !z && n == v),
+            (0b1111, "LE", |n, z, v, _c| z || n != v),
+        ];
+
+        for bits in 0..=0xFu16 {
+            let sr = ccr_from(bits);
+            let n = bits & 8 != 0;
+            let z = bits & 4 != 0;
+            let v = bits & 2 != 0;
+            let c = bits & 1 != 0;
+            for (cc, name, expect) in codes {
+                assert_eq!(
+                    test_cc(cc, sr),
+                    expect(n, z, v, c),
+                    "{name} (cc {cc:04b}) at N{n} V{v} Z{z} C{c}"
+                );
+                // A code is four bits, so a stray upper nibble must not reach a
+                // different arm: `cc | 0xF0` is the same condition.
+                assert_eq!(
+                    test_cc(cc | 0xF0, sr),
+                    expect(n, z, v, c),
+                    "{name} ignores the bits above the condition field"
+                );
+            }
+        }
+    }
+
+    /// A condition test reads N, Z, V and C and nothing else: setting X, T, S
+    /// and the whole interrupt mask changes no answer (`SR_MASK` keeps those
+    /// bits real, so this is a question about `test_cc`, not about the SR).
+    #[test]
+    fn condition_test_ignores_the_other_sr_bits() {
+        let others = SR_X | SR_T | SR_S | SR_INT_MASK;
+        for bits in 0..=0xFu16 {
+            for cc in 0..=0xFu8 {
+                let plain = ccr_from(bits);
+                assert_eq!(
+                    test_cc(cc, plain),
+                    test_cc(cc, plain | others),
+                    "cc {cc:04b} at SR {plain:04X}"
+                );
+            }
+        }
+    }
+}
