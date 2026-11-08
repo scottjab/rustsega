@@ -35,9 +35,9 @@
 //!
 //! The to-CCR and to-SR forms of the three immediates are *not* here: `ORI
 //! #imm,CCR` (`$003C`), `ANDI #imm,CCR` (`$023C`), `EORI #imm,CCR` (`$0A3C`) and
-//! the `ss` = `11` move-to-SR encodings are M1-26 (#34)'s, and
-//! [`crate::decode`] leaves them [`crate::decode::Op::Unimplemented`] so no
-//! handler here can be reached with them.
+//! the word forms `$007C`, `$027C`, `$0A7C` are M1-26 (#34)'s and live in
+//! [`crate::ops::status`], which reuses [`LogicOp`] to combine the operand with
+//! the status register.
 //!
 //! Illegal operands are rejected by [`crate::decode`], not here: an address
 //! register as AND's or OR's byte source, an address register or an immediate as
@@ -79,7 +79,7 @@ const EXT_LONG: u16 = 0x0040;
 /// shape apart — see [`M68k::logic_alu`] and [`M68k::logic_to_ea`] — so naming
 /// the operation is enough to cover three instructions with two functions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LogicOp {
+pub(super) enum LogicOp {
     And,
     Or,
     Eor,
@@ -89,11 +89,27 @@ impl LogicOp {
     /// Combine two operands. All three operations are commutative, which is what
     /// lets AND's two directions pass their operands in whichever order they
     /// fell to hand.
-    const fn apply(self, lhs: u32, rhs: u32) -> u32 {
+    pub(super) const fn apply(self, lhs: u32, rhs: u32) -> u32 {
         match self {
             LogicOp::And => lhs & rhs,
             LogicOp::Or => lhs | rhs,
             LogicOp::Eor => lhs ^ rhs,
+        }
+    }
+
+    /// The operation an `ANDI`/`ORI`/`EORI` opcode names, read back from bits
+    /// 11..9: `000` ORI, `001` ANDI, `101` EORI (M68000UM section 8, "Instruction
+    /// Formats"). [`M68k::logic_imm`] does not need it — its three entry points
+    /// already named the operation — but the to-CCR and to-SR forms of #34 share
+    /// one handler and so ask the opcode (see [`crate::ops::status`]).
+    pub(super) const fn from_imm(opcode: u16) -> Self {
+        match (opcode >> LOGIC_REG_SHIFT) & 0b111 {
+            0b000 => LogicOp::Or,
+            0b001 => LogicOp::And,
+            // `0b101`, the only value `classify_logic_imm` lets through besides
+            // the two above; anything else is `Op::Unimplemented` and never gets
+            // a handler called.
+            _ => LogicOp::Eor,
         }
     }
 }
