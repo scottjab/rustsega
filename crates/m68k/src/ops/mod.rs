@@ -43,6 +43,7 @@ mod bit;
 mod flow;
 mod logic;
 mod move_;
+mod movem;
 mod muldiv;
 mod shift;
 
@@ -161,6 +162,10 @@ impl M68k {
             Op::BitStatic => self.op_bit_static(bus, opcode),
             Op::Lea => self.op_lea(bus, opcode),
             Op::Pea => self.op_pea(bus, opcode),
+            // `MOVEM` (`0100 1d00 1s eeeeee`), the register-list transfer that
+            // shares the `$48??` window with SWAP/EXT/PEA/NBCD and takes the whole
+            // top half of `$4C??` to itself (see [`movem`]).
+            Op::Movem => self.op_movem(bus, opcode),
             Op::Link => self.op_link(bus, opcode),
             Op::Unlk => self.op_unlk(bus, opcode),
             // The branch/condition group: `0110 cccc dddddddd` (`Bcc`, `BRA`,

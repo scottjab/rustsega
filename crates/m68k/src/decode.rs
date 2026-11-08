@@ -65,7 +65,7 @@
 //! as it lands — the pattern has to say which field of the opcode is the EA
 //! field, which is only knowable per instruction.
 
-use crate::ea::{Size, is_control, is_data, is_data_alterable, is_memory_alterable};
+use crate::ea::{Size, is_control, is_data, is_data_alterable, is_memory_alterable, is_movem_ea};
 use std::sync::OnceLock;
 
 /// What a decoded opcode means: which handler runs, or why none can.
@@ -304,6 +304,15 @@ pub enum Op {
     /// operand rule with the result pushed onto the stack instead of written to a
     /// register; see [`classify_swap_ext_pea`] for how the window splits.
     Pea,
+    /// `MOVEM <list>,<ea>` and `MOVEM <ea>,<list>`: `0100 1d00 1s eeeeee` plus a
+    /// register-list extension word (M68000UM "MOVEM — Move Multiple Registers",
+    /// M1-24, #32). One variant for both directions because `d` is the opcode bit
+    /// that picks them and the handler reads it back, exactly as [`Op::Move`]'s
+    /// handlers re-read their size; `s` is a width, not a [`Size`], because MOVEM has
+    /// no byte form. The operand is [`crate::ea::is_movem_ea`] — the control
+    /// addresses plus `-(An)` when storing and `(An)+` when loading — and see
+    /// [`classify_swap_ext_pea`] for how the `$48??` window splits around it.
+    Movem,
     /// `LINK An,d16`, `$4E50 + r` (M68000UM "LINK — Link Address Register",
     /// M1-15, #23). Push `An`, make `An` point at what it pushed, then move the
     /// stack pointer over `d16` of local space: one extension word, no EA field.
@@ -551,6 +560,12 @@ fn classify(opcode: u16) -> Op {
         // this window is the one place a group is entered whole and then split by
         // EA field — see [`classify_swap_ext_pea`], #22 and #23.
         0x4800..=0x48FF => classify_swap_ext_pea(opcode),
+        // `0100 1100 1s mmm rrr`: MOVEM's other half, `0100 1d00 1s eeeeee` with
+        // `d` set — memory to registers (M68000UM MOVEM; M1-24, #32). Nothing else
+        // in the `0100` group uses bit 11 with bits 9 and 8 clear, which is why
+        // this arm can take the top half of `$4C??` whole: `$4C00`..`$4C7F` is
+        // unassigned on the 68000 and stays [`Op::Unimplemented`] below it.
+        0x4C80..=0x4CFF => classify_movem(opcode),
         // `0000 0000 ss eeeeee`, `0000 0010 ss eeeeee` and `0000 1010 ss eeeeee`:
         // ORI, ANDI and EORI, the three `#imm,<ea>` logic operations. Bit 8 is
         // clear throughout all three ranges, which is what keeps them apart from
@@ -1289,11 +1304,13 @@ fn classify_swap_ext_pea(opcode: u16) -> Op {
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
     if opcode & SWAP_EXT_BIT7 != 0 {
-        // MOVEM's half: only EXT lives here today, and only at mode `000`.
+        // MOVEM's half: EXT is all of it that is not MOVEM, and EXT is mode `000`
+        // alone. Every other mode of this half is the register-list instruction,
+        // legal or illegal by its operand (#32).
         if mode == 0 {
             Op::Ext
         } else {
-            Op::Unimplemented
+            classify_movem(opcode)
         }
     } else if opcode & SWAP_BIT6 == 0 {
         // NBCD's half: a byte read-modify-write, so the EA has to name somewhere
@@ -1312,6 +1329,34 @@ fn classify_swap_ext_pea(opcode: u16) -> Op {
         Op::Illegal
     }
 }
+
+/// `0100 1d00 1s eeeeee`: MOVEM, both directions (M68000UM "MOVEM — Move Multiple
+/// Registers"; M1-24, #32).
+///
+/// Bit 10 is the direction — clear is registers to memory, which is the `$48??`
+/// window this shares with SWAP/EXT/PEA/NBCD, and set is memory to registers, the
+/// `$4C??` one — and bit 6 the width, word or long. The EA field is then
+/// [`is_movem_ea`]: the control modes plus `-(An)` for a store and `(An)+` for a
+/// load. Everything else the field can name — `Dn`, `An`, `#imm`, `d16(PC)` and
+/// its friends in mode `111` above `011`, and either stack mode going the wrong way
+/// — is an illegal instruction, and that is what the two suite files never run:
+/// across their 8065 cases each they use modes `010`, `011`, `100`, `101`, `110`
+/// and `111000`..`111011`, with `011` appearing only where `d` is set and `100`
+/// only where it is clear.
+fn classify_movem(opcode: u16) -> Op {
+    let mode = ((opcode >> 3) & 0b111) as u8;
+    let reg = (opcode & 0b111) as u8;
+    let store = opcode & MOVEM_DIRECTION_BIT == 0;
+    if is_movem_ea(store, mode, reg) {
+        Op::Movem
+    } else {
+        Op::Illegal
+    }
+}
+
+/// Bit 10 of a MOVEM opcode: the manual's `d`, set when the registers come *from*
+/// memory (`$4C80`) and clear when they go *to* it (`$4880`).
+const MOVEM_DIRECTION_BIT: u16 = 0x0400;
 
 /// Bit 7 of a `$48??` opcode: set for EXT (and MOVEM), clear for SWAP (and PEA).
 const SWAP_EXT_BIT7: u16 = 0x0080;
@@ -1646,7 +1691,7 @@ mod tests {
     /// `PEA <ea>` is exactly the 28 opcodes `0100 1000 01 mmm rrr` at a mode it
     /// can address — bit 6 set, bit 7 clear — and so neither SWAP/EXT (mode
     /// `000`) nor MOVEM (bit 7) nor the unassigned `$4800`..`$483F` (M68000UM
-    /// PEA; M1-15, #23). See [`swap_ext_and_pea_decode_and_leave_movem_alone`].
+    /// PEA; M1-15, #23). See [`swap_ext_and_pea_decode_movem_owns_the_rest`].
     #[test]
     fn pea_is_exactly_its_own_opcodes() {
         let mut pea = 0;
@@ -1701,10 +1746,17 @@ mod tests {
         assert_eq!(decode(0x0108), Op::Unimplemented, "MOVEP.L D0,(A0)");
         // The move groups — bits 15..12 = `0001`, `0010`, `0011` (`MOVE`,
         // `MOVEA`) and `0111` (`MOVEQ`) — left this list with #17, see
-        // `move_family_is_not_unimplemented`, so the anchor is a
-        // move-family opcode #17 deliberately left out: MOVEM is group `$48xx`
-        // and belongs to M1-10 (#19).
-        assert_eq!(decode(0x48E7), Op::Unimplemented, "MOVEM.L #(imm),(A7)-");
+        // `move_family_is_not_unimplemented`, and MOVEM left it with #32. The anchor
+        // is the opcode immediately beside MOVEM's load window — `$4C00`, MOVEM's
+        // `0100 1d00 1s` pattern with bit 7 clear — which the pinned suite confirms
+        // nothing uses: no `4c00` case appears in `MOVEM.l.json.gz`, `CHK.json.gz` or
+        // `TAS.json.gz`. `$48E7`, the anchor here up to #32, is
+        // `MOVEM.L #reglist,-(A7)` and decodes.
+        assert_eq!(
+            decode(0x4C00),
+            Op::Unimplemented,
+            "MOVEM's group, bit 7 clear"
+        );
     }
 
     /// `JMP $4EC0 | <ea>` and `JSR $4E80 | <ea>` over all 64 values of the
@@ -2974,19 +3026,21 @@ mod tests {
         }
     }
 
-    /// The `$48??` window is SWAP, EXT, PEA and MOVEM (M68000UM SWAP, EXT, PEA,
-    /// MOVEM; M1-14 #22 and M1-15 #23), and what separates them is the EA mode
-    /// field: mode `000` is SWAP (bit 7 clear) or EXT (bit 7 set, bit 6 the
-    /// size), a control mode with bit 7 clear is PEA, and anything else is MOVEM
-    /// and stays [`Op::Unimplemented`].
+    /// The `$48??` window is SWAP, EXT, PEA, NBCD and MOVEM (M68000UM SWAP, EXT,
+    /// PEA, NBCD, MOVEM; M1-14 #22, M1-15 #23 and M1-23 #31), and what separates
+    /// them is the EA mode field: mode `000` is SWAP (bit 7 clear) or EXT (bit 7
+    /// set, bit 6 the size), a control mode with bit 7 clear is PEA, and anything
+    /// else with bit 7 set is MOVEM — which #32 landed, so those opcodes are
+    /// [`Op::Movem`] now rather than the [`Op::Unimplemented`] this test used to
+    /// pin them at.
     ///
     /// The PEA and MOVEM opcodes below are read off the pinned suite, not
     /// invented: `PEA.json.gz` runs `$4850`..`$4857`, `$4868`..`$486F` and
     /// `$4870`..`$487B`, `MOVEM.w.json.gz` runs `$4890`.. and `MOVEM.l.json.gz`
-    /// runs `$48D0`.., so this test is what stops SWAP, EXT and now PEA from
+    /// runs `$48D0`.., so this test is what stops SWAP, EXT and PEA from
     /// swallowing the first opcode of M1-24 (#32) along the way.
     #[test]
-    fn swap_ext_and_pea_decode_and_leave_movem_alone() {
+    fn swap_ext_and_pea_decode_movem_owns_the_rest() {
         for (opcode, want, name) in [
             (0x4840u16, Op::Swap, "SWAP D0"),
             (0x4847, Op::Swap, "SWAP D7"),
@@ -3014,10 +3068,63 @@ mod tests {
                 "MOVEM.W #reglist,-(A0): measured in MOVEM.w.json.gz",
             ),
             (0x48D0, "MOVEM.L #reglist,(A0): measured in MOVEM.l.json.gz"),
-            (0x4CC0, "MOVEM.L #reglist,-(A0) in the $4C half"),
+            (0x4CD8, "MOVEM.L #reglist,(A0)+ in the $4C half"),
         ] {
-            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+            assert_eq!(decode(opcode), Op::Movem, "{name} (${opcode:04X})");
         }
+    }
+
+    /// The whole MOVEM opcode set, walked: `0100 1d00 1s eeeeee` is both halves of
+    /// bit 7 — `$4880`..`$48FF` (registers to memory) and `$4C80`..`$4CFF` (memory
+    /// to registers) — and in each half the operand is [`is_movem_ea`]: the control
+    /// modes plus `-(An)` when storing and `(An)+` when loading.
+    ///
+    /// The two windows are the ones with neighbours to lose: mode `000` of the
+    /// `$48` half is EXT (`$4880`..`$4887`, `$48C0`..`$48C7`, which is why the
+    /// store half below skips `mode == 0`), `$4C00`..`$4C7F` is the unassigned
+    /// space above it, and the stack mode going the wrong way is an illegal
+    /// instruction rather than an unimplemented opcode (M68000UM MOVEM,
+    /// "Addressing Modes"; M1-24, #32).
+    #[test]
+    fn movem_is_exactly_its_own_opcodes() {
+        let mut movem = 0;
+        for opcode in 0x4880u16..=0x48FF {
+            let mode = ((opcode >> 3) & 0b111) as u8;
+            let reg = (opcode & 0b111) as u8;
+            let want = if mode == 0 {
+                Op::Ext
+            } else if is_movem_ea(true, mode, reg) {
+                Op::Movem
+            } else {
+                Op::Illegal
+            };
+            assert_eq!(decode(opcode), want, "store ${opcode:04X}");
+            movem += u8::from(want == Op::Movem);
+        }
+        for opcode in 0x4C80u16..=0x4CFF {
+            let mode = ((opcode >> 3) & 0b111) as u8;
+            let reg = (opcode & 0b111) as u8;
+            let want = if is_movem_ea(false, mode, reg) {
+                Op::Movem
+            } else {
+                Op::Illegal
+            };
+            assert_eq!(decode(opcode), want, "load ${opcode:04X}");
+            movem += u8::from(want == Op::Movem);
+        }
+        // 36 operand fields (the 28 control modes plus the one stack mode of the
+        // direction) x 2 sizes x 2 directions.
+        assert_eq!(movem, 144, "the MOVEM opcode count");
+
+        // The neighbours are not MOVEM either: PEA's top opcode just below `$4880`,
+        // and either side of `$4C80`..`$4CFF` the space left once MOVEM's
+        // `0100 1d00 1s` pattern is taken — bit 7 clear, or bit 8 set. Neither is
+        // MOVEM, and neither is anything else that lives near it: `TAS`, the closest
+        // still-unclaimed occupant of the `0100` group (M1-27, #36), is
+        // `$4AC0`..`$4AFF` in `TAS.json.gz`.
+        assert_eq!(decode(0x487A), Op::Pea, "PEA d16(PC), just below");
+        assert_eq!(decode(0x4C00), Op::Unimplemented, "bit 7 clear, just below");
+        assert_eq!(decode(0x4D00), Op::Unimplemented, "bit 8 set, just above");
     }
 
     /// NBCD is `0100 1000 00 mmm rrr`, the 64 opcodes of this window with both
