@@ -54,6 +54,166 @@
 //! same machine. `decode` therefore accepts every operand MOVEM can address and
 //! this handler never rejects one for an empty list.
 
+use crate::M68k;
+use crate::bus::{ADDR_MASK, Bus};
+use crate::ea::{Ea, Size, sign_extend_word};
+use crate::ops::field;
+
+/// Bit 10 of a MOVEM opcode, the manual's `d`: clear is registers to memory
+/// (`$4880`), set is memory to registers (`$4C80`). The same bit
+/// [`crate::decode::classify_movem`] reads to pick the operand rule.
+const TO_MEMORY_BIT: u16 = 0x0400;
+/// Bit 6, the manual's `s`: set is a long transfer, clear a word. MOVEM has one
+/// bit here rather than the usual two because it has no byte form.
+const LONG_SIZE_BIT: u16 = 0x0040;
+/// EA mode `011`: `(An)+`, the load direction's stack mode.
+const MODE_POST_INCREMENT: u8 = 0b011;
+/// EA mode `100`: `-(An)`, the store direction's stack mode, and the reason the
+/// register list has two orders.
+const MODE_PRE_DECREMENT: u8 = 0b100;
+/// The number of registers a MOVEM list can name: one mask bit each.
+const LIST_BITS: u32 = 16;
+
+impl M68k {
+    /// `MOVEM <list>,<ea>` and `MOVEM <ea>,<list>` (`0100 1d00 1s eeeeee`): the
+    /// registers named by the list word, transferred in order to or from `n`
+    /// consecutive words or longs at the operand (M68000UM MOVEM; M1-24, #32).
+    ///
+    /// [`crate::decode`] has already rejected the operands MOVEM cannot encode, so
+    /// the one way [`M68k::ea_address`] can decline here is a decoder/handler
+    /// disagreement, turned into an illegal instruction the way [`M68k::op_lea`]
+    /// turns it. Nothing moves a condition code, and the clock count is 0: the
+    /// bus cycles are charged by the transfers themselves and the instruction's
+    /// own 4/8/12-clock table is M1-31's (#39/#40).
+    pub(crate) fn op_movem(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
+        let to_memory = opcode & TO_MEMORY_BIT == 0;
+        let size = if opcode & LONG_SIZE_BIT == 0 {
+            Size::Word
+        } else {
+            Size::Long
+        };
+        let mode = field(opcode, 3);
+        let reg = field(opcode, 0);
+
+        // The register list is the instruction's first extension word, so it is
+        // popped before the operand's own displacement words — the order
+        // `movem_reads_the_list_before_the_displacement` pins.
+        let mask = self.fetch_ext_word(bus);
+        let Some(base) = self.movem_ea(bus, mode, reg) else {
+            return self.op_illegal(bus);
+        };
+
+        // A store through `-(An)` is the one transfer that reads the list
+        // backwards and the only one that walks down instead of up.
+        let reversed = to_memory && mode == MODE_PRE_DECREMENT;
+        let step = size.bytes();
+        let mut count: u32 = 0;
+        for bit in 0..LIST_BITS {
+            if mask & (1 << bit) == 0 {
+                continue;
+            }
+            let addr = if reversed {
+                base.wrapping_sub(step * (count + 1))
+            } else {
+                base.wrapping_add(step * count)
+            };
+            let register = movem_list_ea(bit as u8, reversed);
+            if to_memory {
+                let value = self.read_ea(bus, register, size);
+                self.write_ea(bus, Ea::Mem(addr & ADDR_MASK), size, value);
+            } else {
+                let raw = self.read_ea(bus, Ea::Mem(addr & ADDR_MASK), size);
+                // Every word loaded back is sign extended to 32 bits, the data
+                // registers included (M68000UM MOVEM, "Note"), and a long is
+                // written whole. `Size::Long` on the write is therefore the point,
+                // not an approximation of the transfer width: it is what keeps
+                // `write_ea` from merging the load into the register's upper half
+                // and what keeps the stack pointer's stored mirror in step.
+                let value = if size == Size::Word {
+                    sign_extend_word(raw as u16)
+                } else {
+                    raw
+                };
+                self.write_ea(bus, register, Size::Long, value);
+            }
+            count += 1;
+        }
+
+        // Where a walk upward from the operand ends up: the address after the last
+        // transfer for every mode but the predecrement store, which walks down.
+        let end_of_walk = base.wrapping_add(step * count);
+
+        // The address register moves once, at the end: `-(An)` to the last address
+        // it wrote, `(An)+` past the last it read, and not at all for any other
+        // operand — including a list that named this very register, whose loaded
+        // value this update overwrites. Both orders are measured; see the module
+        // docs, and note that `decode` guarantees a store never sees mode `011`
+        // and a load never sees mode `100`.
+        match mode {
+            MODE_PRE_DECREMENT => {
+                self.write_ea(
+                    bus,
+                    Ea::AddrReg(reg),
+                    Size::Long,
+                    base.wrapping_sub(step * count),
+                );
+            }
+            MODE_POST_INCREMENT => {
+                self.write_ea(bus, Ea::AddrReg(reg), Size::Long, end_of_walk);
+            }
+            _ => {}
+        }
+
+        if !to_memory {
+            // The extra word read after the last register, at the address the walk
+            // ended at: see the module docs for what it is and what it can and
+            // cannot change.
+            self.read_w(bus, end_of_walk & ADDR_MASK);
+        }
+
+        self.advance_opcode(bus);
+        0
+    }
+
+    /// The address a MOVEM operand names, without the `(An)+` / `-(An)` register
+    /// update — see the module docs for why [`M68k::resolve_ea`] is the wrong
+    /// helper for this instruction.
+    ///
+    /// The two stack modes are the whole difference: [`M68k::ea_address`] refuses
+    /// them, as it must for `LEA` and `PEA`, and for MOVEM they are simply `An`
+    /// read directly, the update having been deferred to the end of the transfer.
+    /// Like `ea_address` the result is the address *as computed*, unmasked; the
+    /// transfers mask on the way to the bus and `An` keeps all 32 bits (#193).
+    fn movem_ea(&mut self, bus: &mut impl Bus, mode: u8, reg: u8) -> Option<u32> {
+        if matches!(mode, MODE_POST_INCREMENT | MODE_PRE_DECREMENT) {
+            return Some(self.a[usize::from(reg)]);
+        }
+        self.ea_address(bus, mode, reg)
+    }
+}
+
+/// The register a MOVEM list word names at `bit`, as an [`Ea`] so the transfer
+/// reuses the EA layer's register reads and its `An`-writes-through-the-stack-
+/// pointer rule.
+///
+/// Normally bit 0 is `D0` up to bit 7 `D7` and bit 8 `A0` up to bit 15 `A7`.
+/// Reversed — a store through `-(An)` — both runs are turned end for end: bit 0 is
+/// `A7`, bit 7 `A0`, bit 8 `D7`, bit 15 `D0` (M68000UM MOVEM, "Note"; measured, as
+/// the module docs describe).
+const fn movem_list_ea(bit: u8, reversed: bool) -> Ea {
+    if reversed {
+        if bit < 8 {
+            Ea::AddrReg(7 - bit)
+        } else {
+            Ea::DataReg(15 - bit)
+        }
+    } else if bit < 8 {
+        Ea::DataReg(bit)
+    } else {
+        Ea::AddrReg(bit - 8)
+    }
+}
+
 /// Tests for `MOVEM` (M1-24, #32).
 ///
 /// The opcodes below are read off `MOVEM.w.json.gz` and `MOVEM.l.json.gz` rather
@@ -70,9 +230,11 @@ mod tests {
     /// Where [`cpu_with_program`] loads the program, so a test can name the
     /// address `pc` should reach.
     const PROGRAM: u32 = 0x0000_1000;
-    /// A data address every memory test can use, clear of the program and of the
-    /// stack the predecrement tests push onto.
+    /// A data address every memory test can use, clear of the program.
     const MEM: u32 = 0x0000_2000;
+
+    /// The stack the `-(A7)` and `(A7)+` tests start from, clear of both.
+    const STACK: u32 = 0x0000_4000;
 
     /// Every condition code as one CCR value, for "this instruction leaves the
     /// flags alone" tests.
@@ -112,7 +274,7 @@ mod tests {
             sp - 12,
             "A7 is the stack pointer, so its stored half moves with it (#17's trap)"
         );
-        assert_eq!(cpu.pc, PROGRAM + 6);
+        assert_eq!(cpu.pc, PROGRAM + 4, "opcode and one extension word");
     }
 
     /// `MOVEM.W (A0)+,D0-D1` is `$4C98`: every word loaded back is sign extended
@@ -141,7 +303,7 @@ mod tests {
     /// that zero extended would show up as `$0000_xxxx`.
     #[test]
     fn movem_w_mem_to_regs_sign_extends_an() {
-        let (mut cpu, mut bus) = run(0x4C91, &[0x0200, 0x4E71]);
+        let (mut cpu, mut bus) = run(0x4C90, &[0x0200, 0x4E71]);
         bus.write_long(MEM, 0xFFFE_0000);
         cpu.a[0] = MEM;
         cpu.a[1] = 0xAAAA_AAAA;
@@ -179,8 +341,11 @@ mod tests {
     /// empty list is not an illegal instruction.
     ///
     /// The load half is the update-by-`n` rule run with `n = 0`, so `A0` does not
-    /// move. The suite has no empty-list load case to pin that; the store half
-    /// above does pin the empty list itself.
+    /// move. The suite has no empty-list case in a stack mode, so the `-(A7)` and
+    /// `(A7)+` halves below are reasoned rather than measured: an empty list walks
+    /// zero registers, and the register update is the walk (`An - n * width`, `An +
+    /// n * width`), so `SP` cannot move either. If a real 68000 pre-decrements even
+    /// for an empty list, this test is where that would be argued.
     #[test]
     fn movem_empty_mask() {
         let (mut cpu, mut bus) = run(0x48D0, &[0x0000, 0x4E71]);
@@ -191,7 +356,7 @@ mod tests {
 
         assert_eq!(bus.read_long(MEM), 0xDEAD_BEEF, "nothing was written");
         assert_eq!(cpu.a[0], MEM);
-        assert_eq!(cpu.pc, PROGRAM + 6, "the list word is still consumed");
+        assert_eq!(cpu.pc, PROGRAM + 4, "the list word is still consumed");
 
         let (mut cpu, mut bus) = run(0x4CD8, &[0x0000, 0x4E71]);
         bus.write_long(MEM, 0xDEAD_BEEF);
@@ -200,6 +365,19 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(cpu.a[0], MEM, "an empty list moves An nowhere");
+
+        // The same in both stack modes, where "did not move" is the interesting
+        // claim: `MOVEM.W #$0,-(A7)` is `$48A7` and `MOVEM.W #$0,(A7)+` is `$4CDF`.
+        let (mut cpu, mut bus) = run(0x48A7, &[0x0000, 0x4E71]);
+        cpu.a[7] = STACK;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.a[7], STACK, "a store of nothing does not move SP");
+        assert_eq!(bus.read_word(STACK - 2), 0, "and writes nothing to free up");
+
+        let (mut cpu, mut bus) = run(0x4CDF, &[0x0000, 0x4E71]);
+        cpu.a[7] = STACK;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.a[7], STACK, "neither does a load of nothing");
     }
 
     /// The reversed order of a `-(An)` store, on a list whose two readings name
@@ -228,11 +406,11 @@ mod tests {
 
     /// The same list word at any other operand is read the normal way round, so the
     /// reversal really is a property of the mode and not of the instruction:
-    /// `MOVEM.L #$0103,(A0)` is `$48D0` and stores `D0`, `D1`, `A0` upward from the
+    /// `MOVEM.L #$0103,(A1)` is `$48D1` and stores `D0`, `D1`, `A0` upward from the
     /// operand (905 cases of `$48Dx` in `MOVEM.l.json.gz`).
     #[test]
     fn movem_stores_in_normal_mask_order_otherwise() {
-        let (mut cpu, mut bus) = run(0x48D0, &[0x0103, 0x4E71]);
+        let (mut cpu, mut bus) = run(0x48D1, &[0x0103, 0x4E71]);
         cpu.d[0] = 0x1111_1111;
         cpu.d[1] = 0x2222_2222;
         cpu.a[0] = 0x3333_3333;
@@ -305,13 +483,13 @@ mod tests {
 
     /// `MOVEM` is the only instruction that reaches the two stack modes without
     /// [`crate::M68k::resolve_ea`], so pin the order of the extension words too:
-    /// for `MOVEM.W d16(A0),D0` — `$4C90` — the list comes first at `pc+2` and the
+    /// for `MOVEM.L d16(A0),D0` — `$4CE8` — the list comes first at `pc+2` and the
     /// displacement second at `pc+4`, because `ea_address` is handed the queue
     /// after the list has been popped. Swapping the two reads is exactly what a
     /// `d16(An)` source catches.
     #[test]
     fn movem_reads_the_list_before_the_displacement() {
-        let (mut cpu, mut bus) = run(0x4C90, &[0x0001, 0x0010, 0x4E71]);
+        let (mut cpu, mut bus) = run(0x4CE8, &[0x0001, 0x0010, 0x4E71]);
         bus.write_long(MEM + 0x10, 0x1234_5678);
         bus.write_long(MEM, 0xDEAD_BEEF);
         cpu.a[0] = MEM;
@@ -319,7 +497,11 @@ mod tests {
         cpu.step(&mut bus);
 
         assert_eq!(cpu.d[0], 0x1234_5678, "read from A0 + $10");
-        assert_eq!(bus.read_long(MEM), 0xDEAD_BEEF, "A0 itself is not the source");
+        assert_eq!(
+            bus.read_long(MEM),
+            0xDEAD_BEEF,
+            "A0 itself is not the source"
+        );
     }
 
     /// `TestBus` records nothing, and the one MOVEM behaviour that leaves no trace

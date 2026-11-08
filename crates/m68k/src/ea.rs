@@ -317,6 +317,19 @@ pub(crate) const fn is_control(mode: u8, reg: u8) -> bool {
     )
 }
 
+/// Can `MOVEM` use `(mode, reg)`? The [`is_control`] addresses, plus the one stack
+/// mode that suits the direction: `-(An)` when registers go *to* memory, `(An)+`
+/// when they come *from* it (M68000UM "MOVEM", "Addressing Modes"; M1-24, #32).
+///
+/// The direction is included because the two halves of MOVEM's opcode differ
+/// here and nothing else does: `MOVEM.L D0,-(A0)` is a store and legal, while
+/// `MOVEM.L -(A0),D0` is not an instruction at all. `Dn`, `An` and `#imm` are
+/// absent by way of [`is_control`] — a register list has one address for many
+/// registers, so it needs memory.
+pub(crate) const fn is_movem_ea(store: bool, mode: u8, reg: u8) -> bool {
+    is_control(mode, reg) || (store && mode == 0b100) || (!store && mode == 0b011)
+}
+
 /// Can an instruction *write* an operand at `(mode, reg)`?
 ///
 /// True for Dn, An, the address register indirect group and the absolute forms.
