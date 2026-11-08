@@ -43,6 +43,7 @@ mod bit;
 mod flow;
 mod logic;
 mod move_;
+mod movem;
 mod muldiv;
 mod shift;
 
