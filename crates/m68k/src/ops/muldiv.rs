@@ -389,4 +389,245 @@ mod tests {
             assert_eq!(cycles, want, "MULU <mode {mode:b} reg {reg:b}>,D0");
         }
     }
+
+    // ---------------------------------------------------------------- DIV
+    //
+    // `DIVU`/`DIVS` share this file with the multiplies (they share its opcode
+    // group's neighbour, its word-read source and its abort semantics).
+    // Semantics measured against `DIVU.json.gz` / `DIVS.json.gz`; the cycle
+    // model at the end is an approximation and says so (M1-22, #30).
+
+    const DIVU: u16 = 0b011;
+    const DIVS: u16 = 0b111;
+
+    /// `1000 ddd ooo mmm rrr` (M68000UM DIVU / DIVS).
+    const fn div(op_mode: u16, dst: u16, mode: u16, reg: u16) -> u16 {
+        0x8000 | (dst << 9) | (op_mode << 6) | (mode << 3) | reg
+    }
+
+    /// `DIVx D1,D0` with `dividend` in D0 and `divisor` in D1, stepped once.
+    /// Returns the CPU and `step`'s clock count, like [`multiply`].
+    fn divide(op_mode: u16, dividend: u32, divisor: u32) -> (M68k, u32) {
+        let (mut cpu, mut bus) = cpu_with_program(&[div(op_mode, 0, 0b000, 1)]);
+        cpu.d[0] = dividend;
+        cpu.d[1] = divisor;
+        let cycles = cpu.step(&mut bus);
+        (cpu, cycles)
+    }
+
+    /// `DIVU` of the ticket's example: 100 / 7 is quotient 14 and remainder 2,
+    /// and they are packed quotient-low, remainder-high (M68000UM DIVU:
+    /// "the least significant word contains the quotient, the most significant
+    /// word contains the remainder").
+    #[test]
+    fn divu_basic() {
+        let (cpu, _) = divide(DIVU, 100, 7);
+        assert_eq!(cpu.d[0], 0x0002_000E, "quotient 14 low, remainder 2 high");
+        assert!(!cpu.flag_n());
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v(), "a divide that fits clears V");
+        assert!(!cpu.flag_c());
+    }
+
+    /// A quotient of zero sets `Z`, and the remainder still occupies the top of
+    /// the destination: the flags come from the quotient alone, never from the
+    /// packed long.
+    #[test]
+    fn divu_zero_quotient_sets_z() {
+        let (cpu, _) = divide(DIVU, 3, 7);
+        assert_eq!(cpu.d[0], 0x0003_0000, "3 / 7 = 0 remainder 3");
+        assert!(cpu.flag_z());
+        assert!(!cpu.flag_n());
+        assert!(!cpu.flag_v());
+    }
+
+    /// `N` is bit 15 of the quotient — of the quotient, not of the packed long,
+    /// whose bit 15 and bit 31 are something else entirely.
+    #[test]
+    fn div_flags_come_from_the_quotient() {
+        // Remainder negative, quotient positive: bit 31 of the result is set.
+        let (cpu, _) = divide(DIVS, -7, 2);
+        assert!(cpu.flag_n(), "bit 15 of the quotient (-3) is set");
+        // Quotient 1 with a negative remainder: the packed long is negative and
+        // `N` is still clear.
+        let (cpu, _) = divide(DIVS, -7, -4);
+        assert_eq!(cpu.d[0], 0xFFFF_0001, "-7 / -4 = 1 remainder -3");
+        assert!(!cpu.flag_n());
+    }
+
+    /// `DIVS` truncates toward zero and the **remainder takes the sign of the
+    /// dividend** (M68000UM DIVS: "the sign of the remainder is the sign of the
+    /// dividend"). The ticket's example is -7 / 2 = -3 remainder -1.
+    #[test]
+    fn divs_negative_remainder_sign() {
+        let (cpu, _) = divide(DIVS, -7, 2);
+        assert_eq!(cpu.d[0], 0xFFFF_FFFD, "-7 / 2 = -3 remainder -1");
+        assert!(cpu.flag_n());
+        assert!(!cpu.flag_z());
+        assert!(!cpu.flag_v());
+        assert!(!cpu.flag_c());
+
+        // The other three sign combinations: the quotient rounds toward zero
+        // and the remainder follows the dividend, never the divisor.
+        let (cpu, _) = divide(DIVS, 7, 2);
+        assert_eq!(cpu.d[0], 0x0001_0003, "7 / 2 = 3 remainder 1");
+        let (cpu, _) = divide(DIVS, 7, -2);
+        assert_eq!(cpu.d[0], 0x0001_FFFD, "7 / -2 = -3 remainder 1");
+        let (cpu, _) = divide(DIVS, -7, -2);
+        assert_eq!(cpu.d[0], 0xFFFF_0003, "-7 / -2 = 3 remainder -1");
+    }
+
+    /// Overflow — the quotient does not fit a word — leaves `Dn` **untouched**,
+    /// sets `V`, clears `C`, and leaves `N`, `Z` and `X` exactly as they were.
+    /// The manual calls `N` and `Z` undefined here; the chip is specific, and
+    /// this is what it does: over every `DIVU`/`DIVS` case of the pinned suite
+    /// whose operands can be evaluated (1567 + 2479), a divide whose true
+    /// quotient exceeds a word leaves all three unchanged.
+    #[test]
+    fn divu_overflow_sets_v_keeps_dn() {
+        let (mut cpu, mut bus) = cpu_with_program(&[div(DIVU, 0, 0b000, 1)]);
+        cpu.sr |= ALL_FLAGS;
+        cpu.d[0] = 0x0001_0001;
+        cpu.d[1] = 1;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.d[0], 0x0001_0001, "D0 is not written on overflow");
+        assert!(cpu.flag_v());
+        assert!(!cpu.flag_c(), "overflow sets V and clears C");
+        assert!(cpu.flag_n(), "N is left alone");
+        assert!(cpu.flag_z(), "Z is left alone");
+        assert!(cpu.flag_x(), "X is unaffected");
+
+        // The same divide one below the overflow point writes normally and
+        // clears V: `N`/`Z` then come from the quotient.
+        let (cpu, _) = divide(DIVU, 0xFFFF, 1);
+        assert_eq!(cpu.d[0], 0x0000_FFFF, "65535 / 1 fits");
+        assert!(!cpu.flag_v());
+        assert!(cpu.flag_n(), "bit 15 of the quotient 0xFFFF");
+    }
+
+    /// `-2^31 / -1` is overflow (the true quotient is 2^31, which needs 18 bits
+    /// for a signed word) and must not panic: no `abs()` and no negation of a
+    /// 32-bit `MIN` anywhere in the divide (Rust would wrap or panic on it).
+    #[test]
+    fn divs_overflow_min_int_by_minus_one() {
+        let (mut cpu, mut bus) = cpu_with_program(&[div(DIVS, 0, 0b000, 1)]);
+        cpu.sr |= ALL_FLAGS;
+        cpu.d[0] = 0x8000_0000;
+        cpu.d[1] = 0xFFFF;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.d[0], 0x8000_0000, "D0 untouched");
+        assert!(cpu.flag_v());
+        assert!(!cpu.flag_c());
+        assert!(cpu.flag_n() && cpu.flag_z(), "N and Z left alone");
+
+        // One below the cliff, `(-2^31 + 1) / -1` fits and is a normal divide.
+        let (cpu, _) = divide(DIVS, 0x8000_0001, 0xFFFF);
+        assert_eq!(cpu.d[0], 0x0000_7FFF, "quotient 0x7FFF, remainder 0");
+        assert!(!cpu.flag_v());
+    }
+
+    /// Divide by zero is exception vector 5 — the long at `$14` — and the frame
+    /// carries **the address of the divide itself**, not of the next
+    /// instruction, because the 68000 restarts a faulted divide (M68000UM
+    /// "Division by Zero"). The ticket guessed "next instruction"; the suite
+    /// says otherwise:
+    ///
+    /// `80ef [DIVU (d16, A7), D0] 5745` starts at `$000C00`, its divisor word at
+    /// `$0000F0` is zero, and the frame it pushes holds `$000C00`.
+    ///
+    /// The condition codes end up cleared except `X`: that case goes from SR
+    /// `$271D` (X,N,Z,C set) to `$2710` (X only).
+    #[test]
+    fn div_by_zero_traps_vector_5() {
+        const HANDLER: u32 = 0x0000_2000;
+        for op_mode in [DIVU, DIVS] {
+            let (mut cpu, mut bus) = cpu_with_program(&[div(op_mode, 0, 0b000, 1)]);
+            bus.write_long(0x14, HANDLER);
+            cpu.sr |= ALL_FLAGS;
+            cpu.d[0] = 0xDEAD_BEEF;
+            cpu.d[1] = 0;
+            let sp = cpu.a[7];
+            cpu.step(&mut bus);
+
+            assert_eq!(cpu.pending_exception, Some(crate::EXC_DIV_ZERO));
+            assert_eq!(cpu.pc, HANDLER, "the vector-5 handler ran");
+            assert_eq!(cpu.a[7], sp - 6, "a group 1 frame was pushed");
+            assert_eq!(
+                bus.read_long(sp - 4),
+                0x0000_1000,
+                "the frame holds the divide's own address, not pc + 2 (op {op_mode:03b})"
+            );
+            assert_eq!(
+                Bus::read_word(&mut bus, sp - 6) & ALL_FLAGS,
+                ALL_FLAGS,
+                "the frame's SR is the SR as it was before the trap"
+            );
+            assert_eq!(cpu.d[0], 0xDEAD_BEEF, "the divide wrote nothing");
+            assert!(!cpu.flag_n() && !cpu.flag_z() && !cpu.flag_v() && !cpu.flag_c());
+            assert!(cpu.flag_x(), "X survives the trap");
+        }
+    }
+
+    /// The source EA is resolved and read before the destination is written, on
+    /// every path: a side-effecting source moves once even when the divide then
+    /// overflows or traps (the same rule [`super::M68k::op_mul`] follows, and
+    /// the suite's divide-by-zero case reads `$0000F0` before pushing its frame).
+    #[test]
+    fn div_source_steps_once_on_every_path() {
+        for (dividend, divisor, want_d0) in [
+            (100u32, 7u32, 0x0002_000E),    // normal
+            (0x0001_0001, 1, 0x0001_0001),  // overflow: Dn untouched
+        ] {
+            let (mut cpu, mut bus) = cpu_with_program(&[div(DIVU, 0, 0b011, 0)]);
+            bus.load_words(DATA, &[u16::try_from(divisor).unwrap(), 0]);
+            cpu.a[0] = DATA;
+            cpu.d[0] = dividend;
+            cpu.step(&mut bus);
+            assert_eq!(cpu.d[0], want_d0, "{dividend:#X} / {divisor:#X}");
+            assert_eq!(cpu.a[0], DATA + 2, "A0 moved once (op {divisor:#X})");
+        }
+
+        // And on the trap path.
+        let (mut cpu, mut bus) = cpu_with_program(&[div(DIVS, 0, 0b011, 0)]);
+        bus.write_long(0x14, 0x0000_2000);
+        bus.load_words(DATA, &[0, 0]);
+        cpu.a[0] = DATA;
+        cpu.d[0] = 1;
+        cpu.step(&mut bus);
+        assert_eq!(cpu.a[0], DATA + 2, "a trapped divide still consumed its operand");
+    }
+
+    /// The `DIVU` cost model: `108 + 2n` with `n` the set bits of the quotient,
+    /// so the manual's 140-clock worst case is `108 + 2*16` and the cheapest
+    /// divide is 108. Approximation — see [`div_clocks`].
+    #[test]
+    fn divu_timing_examples() {
+        for (dividend, want) in [
+            (0x0000_0000u32, 108), // quotient 0: no set bits
+            (0x0000_0001, 110),    // one set bit
+            (0x0000_00FF, 124),    // eight
+            (0x0000_5555, 124),    // 0x5555 has eight set bits too
+            (0x0000_FFFF, 140),    // the manual's worst case
+        ] {
+            let (_, cycles) = divide(DIVU, dividend, 1);
+            assert_eq!(cycles, want, "DIVU ${dividend:08X}/1");
+        }
+    }
+
+    /// The `DIVS` cost model: `126 + 2n` with `n` the bit-transition count of
+    /// the quotient (the signed divider skips runs of equal bits, the same shape
+    /// [`muls_iterations`] charges a multiply), anchored on the manual's
+    /// 158-clock worst case: `126 + 2*16`.
+    #[test]
+    fn divs_timing_examples() {
+        for (dividend, want) in [
+            (0x0000_0000i32, 126), // quotient 0: no transitions at all
+            (0x0000_0001, 130),    // one set bit, two transitions
+            (0x0000_5555, 158),    // alternating bits: the worst case
+            (-1, 128),             // quotient -1 = 0xFFFF: a single transition
+        ] {
+            let (_, cycles) = divide(DIVS, dividend as u32, 1);
+            assert_eq!(cycles, want, "DIVS ${dividend:#X}/1");
+        }
+    }
 }

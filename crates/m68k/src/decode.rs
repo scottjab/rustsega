@@ -2664,8 +2664,12 @@ mod tests {
         assert_eq!(decode(0xC1C8), Op::Illegal, "MULS (A0),D0");
         assert_eq!(decode(0x8100), Op::Unimplemented, "SBCD.B (A0)+,(A1)+");
         assert_eq!(decode(0x8108), Op::Unimplemented, "SBCD.B -(A0),-(A1)");
-        assert_eq!(decode(0x80C0), Op::Unimplemented, "DIVU D0,D0");
-        assert_eq!(decode(0x8FC8), Op::Unimplemented, "DIVS D0,(A0)");
+        // DIVU and DIVS are M1-22 (#30): they used to be the group's two
+        // unimplemented corners named here, and now decode for real. SBCD is
+        // unchanged, and `0x8FC8` is mode `001`, which a divide cannot take.
+        assert_eq!(decode(0x80C0), Op::Divu, "DIVU D0,D0");
+        assert_eq!(decode(0x81C0), Op::Divs, "DIVS D0,D0");
+        assert_eq!(decode(0x8FC8), Op::Illegal, "DIVS (A0),D7 — An is not a source");
         // The other side of the same line: the `1000` group has no EXG, so
         // operation `101` into a data register is an ordinary OR — and `1100`'s
         // operation `110` with mode `010`, one bit from EXG's `001`, is an
@@ -2721,6 +2725,91 @@ mod tests {
                 .all(|opcode| (opcode >> 6) & 0b111 == 0b100),
             "every unimplemented opcode of the `1100` group is operation `100`, i.e. ABCD"
         );
+    }
+
+    /// The `1000` group's operation `011` and `111` halves are DIVU and DIVS
+    /// over every source the pair allows, SBCD keeps its 128 opcodes at
+    /// operation `100`, and OR keeps everything else — the whole group is walked
+    /// so the three cannot drift into each other (M68000UM DIVU, DIVS, SBCD, OR;
+    /// M1-22, #30).
+    ///
+    /// The divides take a *data* EA but not mode `001` — the source is a word
+    /// read, and `An` has no word to read — and not the three registers of mode
+    /// `111` that are not addressing modes at all, exactly like MULU/MULS in
+    /// [`mulu_and_muls_take_their_half_of_the_c000_group`]. Neither
+    /// `DIVU.json.gz` nor `DIVS.json.gz` encodes an `An` source in its 8065
+    /// cases, so the suite cannot contradict the rejection.
+    #[test]
+    fn divu_and_divs_take_their_half_of_the_8000_group() {
+        for op_mode in [0b011u16, 0b111] {
+            for mode in 0..8u8 {
+                for reg in 0..8u8 {
+                    let opcode =
+                        0x8000u16 | (op_mode << 6) | (u16::from(mode) << 3) | u16::from(reg);
+                    let want = if mode != AN_DIRECT_MODE && is_data(mode, reg) {
+                        if op_mode == 0b011 {
+                            Op::Divu
+                        } else {
+                            Op::Divs
+                        }
+                    } else {
+                        Op::Illegal
+                    };
+                    assert_eq!(decode(opcode), want, "${opcode:04X}");
+                }
+            }
+        }
+
+        // The partition of the whole group: 45 DIVU + 45 DIVS + their 38 illegal
+        // corners = the two operation fields; SBCD's 128 are all that is left
+        // unimplemented; and nothing else became a divide or an illegal corner.
+        let mut divu = 0;
+        let mut divs = 0;
+        let mut illegal = 0;
+        let unimplemented: Vec<u16> = (0x8000..=0x8FFF)
+            .filter(|opcode| match decode(*opcode) {
+                Op::Divu => {
+                    divu += 1;
+                    false
+                }
+                Op::Divs => {
+                    divs += 1;
+                    false
+                }
+                Op::Illegal => {
+                    illegal += 1;
+                    false
+                }
+                Op::Unimplemented => true,
+                other => {
+                    assert_eq!(other, Op::Or, "${opcode:04X} is OR or nothing");
+                    false
+                }
+            })
+            .collect();
+        assert_eq!(divu, 45, "DIVU is operation 011 over the 45 data EA fields");
+        assert_eq!(divs, 45, "DIVS is operation 111 over the same 45 fields");
+        assert_eq!(
+            unimplemented.len(),
+            128,
+            "SBCD is 8 destinations x modes 000 and 001 x 8 registers: {unimplemented:?}"
+        );
+        assert!(
+            unimplemented
+                .iter()
+                .all(|opcode| (opcode >> 6) & 0b111 == 0b100 && (opcode >> 3) & 0b111 <= 0b001),
+            "every unimplemented opcode of the `1000` group is SBCD"
+        );
+        // 19 of each divide operation field are the mode `001` and dead-mode-
+        // `111` corners the first loop pinned one by one; the remaining illegal
+        // opcodes of the group are OR's own (M68000UM OR, destination "data
+        // alterable", #21) and did not move.
+        assert!(
+            illegal > 38,
+            "the divide corners alone are 38, and OR contributes its own: {illegal}"
+        );
+        assert_eq!(decode(0x8140), Op::Or, "OR.W D0,D1 — SBCD's neighbour");
+        assert_eq!(decode(0x8148), Op::Illegal, "OR.W D1,(A0) — An is not writable");
     }
 
     /// `NEG` `$4400`, `NEGX` `$4000` and `CLR` `$4200`, each `+ ss<<6 + <ea>`,
