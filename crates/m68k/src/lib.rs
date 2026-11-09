@@ -31,6 +31,7 @@ mod exceptions;
 mod interrupts;
 mod ops;
 mod sr;
+mod trace;
 
 /// Always compiled, not `#[cfg(test)]`: integration tests under
 /// `crates/m68k/tests/` and other crates need `m68k::testbus::TestBus` too.
@@ -42,6 +43,7 @@ pub use cpu::{M68k, RESET_CYCLES};
 pub use disasm::disassemble;
 pub use ea::{Ea, Size};
 pub use exceptions::{
-    EXC_CHK, EXC_DIV_ZERO, EXC_ILLEGAL, EXC_PRIVILEGE, EXC_TRAPV, TRAP_VECTOR_BASE, trap_vector,
+    EXC_CHK, EXC_DIV_ZERO, EXC_ILLEGAL, EXC_PRIVILEGE, EXC_TRACE, EXC_TRAPV, TRAP_VECTOR_BASE,
+    trap_vector,
 };
 pub use sr::{CCR_MASK, SR_C, SR_INT_MASK, SR_MASK, SR_N, SR_RESET, SR_S, SR_T, SR_V, SR_X, SR_Z};

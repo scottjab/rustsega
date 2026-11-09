@@ -245,6 +245,9 @@ impl M68k {
     /// [`M68k::step`]).
     pub(crate) fn op_illegal(&mut self, bus: &mut impl Bus) -> u32 {
         let faulting_pc = self.pc;
+        // An instruction that never executed leaves nothing to trace, so this
+        // route also calls [`M68k::suppress_trace`] (M68000UM section 6.3.8).
+        self.suppress_trace();
         self.exception(bus, EXC_ILLEGAL, faulting_pc);
         0
     }
