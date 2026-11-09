@@ -16,7 +16,7 @@
 //! the case's `final.ram`. Not compared: the per-access bus trace in the case's
 //! `transactions` (explicitly out of scope for M1-03, and skipping it is what
 //! keeps a 1.4 GB suite, 195 MB gzipped on disk, cheap to read). The clock
-//! count (`length`) is compared only under [`Check::StateAndCycles`].
+//! count (`length`) is compared only by the modes where [`Check::checks_cycles`] is set.
 //!
 //! # Layout
 //!
@@ -98,6 +98,33 @@ pub enum Check {
     /// exception handling the core does not have yet (address errors are
     /// M1-29, #37). Instruction tickets use this until then.
     StateSkipAddressErrors,
+    /// [`Check::StateAndCycles`] with the exception cases left out: the two
+    /// independent axes of the variants above, combined. Added by M1-31a (#39),
+    /// whose cycle work lands on files that #223 has not yet moved to full
+    /// state checking — a cycle ticket must not have to take exception
+    /// handling with it, and a timing ticket must not weaken a file by dropping
+    /// back to [`Check::StateSkipAddressErrors`].
+    StateAndCyclesSkipAddressErrors,
+}
+
+impl Check {
+    /// Whether this mode compares the clock count `step` returned against the
+    /// case's `length`.
+    fn checks_cycles(self) -> bool {
+        matches!(
+            self,
+            Self::StateAndCycles | Self::StateAndCyclesSkipAddressErrors
+        )
+    }
+
+    /// Whether this mode leaves the exception cases out (see
+    /// [`is_address_error_case`]).
+    fn skips_address_errors(self) -> bool {
+        matches!(
+            self,
+            Self::StateSkipAddressErrors | Self::StateAndCyclesSkipAddressErrors
+        )
+    }
 }
 
 /// One test case: a starting state, one instruction, the state expected after
@@ -359,7 +386,7 @@ impl Machine {
         compare_ram(&mut self.bus, &case.final_state.ram, &mut mismatches);
         match outcome {
             Ok(cycles) => {
-                if check == Check::StateAndCycles {
+                if check.checks_cycles() {
                     check_number(
                         &mut mismatches,
                         "cycles",
@@ -582,7 +609,7 @@ fn run_cases_on(machine: &mut Machine, cases: &[TestCase], check: Check) -> Repo
         failures: Vec::new(),
     };
     for case in cases {
-        if check == Check::StateSkipAddressErrors && is_address_error_case(case) {
+        if check.skips_address_errors() && is_address_error_case(case) {
             report.skipped += 1;
             continue;
         }

@@ -147,8 +147,12 @@ impl Ea {
 ///
 /// M68000UM, Appendix C "Instruction Timing": the indexed forms carry 2
 /// internal clock cycles beyond the access itself, because the index register
-/// has to be read and added before the bus cycle can start. TODO(M1-31a, #39):
-/// confirm against the SingleStepTests cycle counts.
+/// has to be read and added before the bus cycle can start. Confirmed against
+/// the SingleStepTests by M1-31a (#39): `1d32 [MOVE.B (d8, A2, Xn), -(A6)] 8033`
+/// is 18 = 4 prefetch + 4 extension word + 2 here + 4 read + 4 write.
+///
+/// `LEA`/`PEA` pay 2 more again on top of this, because their operand *is* the
+/// calculation — see [`crate::ops::address`].
 const INDEX_CALC_CLOCKS: u64 = 2;
 
 /// Sign extend a 16-bit value to 32 bits (`0x8000` -> `0xFFFF_8000`).
@@ -167,11 +171,13 @@ pub(crate) const fn sign_extend_byte(value: u8) -> u32 {
 
 /// Extra internal clocks charged by the `-(An)` address calculation.
 ///
-/// M68000UM, Appendix C "Instruction Timing": predecrement EAs carry 2 internal
+/// M68000UM, Appendix C "Instruction Timing": a predecrement carries 2 internal
 /// clock cycles beyond the access itself, because the decrement has to complete
-/// before the bus cycle can start. TODO(M1-31a, #39): confirm against the
-/// SingleStepTests cycle counts and add the remaining internal-clock
-/// differences (`(An)+` with A7 and the register indirect pair).
+/// before the access can start. Confirmed against the SingleStepTests by
+/// M1-31a (#39), including the half of the rule that is easy to get wrong: only
+/// the *source* predecrement pays, so `MOVE.B -(A0),D0` is 10 and
+/// `MOVE.B D0,-(A0)` is 8 — see [`EaUse`] and
+/// [`M68k::resolve_ea_write`].
 const PREDEC_CALC_CLOCKS: u64 = 2;
 
 /// Increment or decrement [`M68k::a`] applies for `(An)+` / `-(An)`.
@@ -372,6 +378,22 @@ pub(crate) const fn is_memory_alterable(mode: u8, reg: u8) -> bool {
     is_memory(mode, reg) && is_alterable(mode, reg)
 }
 
+/// Which side of an instruction an EA field is, which is what decides whether
+/// the `-(An)` address calculation is charged (see [`M68k::resolve_ea_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EaUse {
+    /// The operand is an input. Its address has to exist before the access that
+    /// reads it, so a predecrement costs [`PREDEC_CALC_CLOCKS`].
+    Source,
+    /// The operand is the instruction's result location. Its predecrement is
+    /// free: `MOVE` and the `X` instructions do the decrement in the write
+    /// cycle, which is why `MOVE.B D0,-(A0)` is 8 clocks and
+    /// `MOVE.B -(A0),D0` is 10 (M68000UM, Appendix C "Instruction Timing"), and
+    /// `ADDX.B -(A0),-(A1)` carries one 2-clock calculation for two
+    /// predecrements even though `-(A1)` is read as well as written.
+    Destination,
+}
+
 impl M68k {
     /// Resolve an EA to an [`Ea`], applying the `(An)+` / `-(An)` register
     /// update as a side effect and consuming the mode's extension words.
@@ -402,6 +424,37 @@ impl M68k {
         reg: u8,
         size: Size,
     ) -> Option<Ea> {
+        self.resolve_ea_for(bus, mode, reg, size, EaUse::Source)
+    }
+
+    /// Resolve the EA field an instruction writes its result to.
+    ///
+    /// Identical to [`M68k::resolve_ea`] except that a predecrement is not
+    /// charged the 2 internal clocks — [`EaUse::Destination`] says why. `MOVE`
+    /// and `ADDX`/`SUBX` take the decremented address and write it, and the
+    /// suite charges them 2 clocks less than the read side of the same mode
+    /// (`MOVE.B D0,-(A0)` is 8, `1902 [MOVE.B D2, -(A4)]` of
+    /// `MOVE.b.json.gz`): only the source predecrement pays.
+    pub(crate) fn resolve_ea_write(
+        &mut self,
+        bus: &mut impl Bus,
+        mode: u8,
+        reg: u8,
+        size: Size,
+    ) -> Option<Ea> {
+        self.resolve_ea_for(bus, mode, reg, size, EaUse::Destination)
+    }
+
+    /// The shared body of [`M68k::resolve_ea`] and [`M68k::resolve_ea_write`];
+    /// `use_` is why those two differ, and is documented on [`EaUse`].
+    fn resolve_ea_for(
+        &mut self,
+        bus: &mut impl Bus,
+        mode: u8,
+        reg: u8,
+        size: Size,
+        use_: EaUse,
+    ) -> Option<Ea> {
         let r = usize::from(reg);
         match mode {
             0b000 => Some(Ea::DataReg(reg)),
@@ -418,9 +471,12 @@ impl M68k {
             }
             0b100 => {
                 // Predecrement: the register moves first, then the new value is
-                // the address, and the calculation itself costs 2 clocks.
+                // the address, and reading it costs 2 clocks for that
+                // calculation — a write to it does not (see [`EaUse`]).
                 self.set_an(reg, self.a[r].wrapping_sub(ea_step(reg, size)));
-                self.cycles += PREDEC_CALC_CLOCKS;
+                if use_ == EaUse::Source {
+                    self.cycles += PREDEC_CALC_CLOCKS;
+                }
                 Some(Ea::Mem(self.a[r] & ADDR_MASK))
             }
             // 101 d16(An): one extension word, sign extended, added to An
@@ -1077,6 +1133,27 @@ mod tests {
         cpu.resolve_ea(&mut bus, AN_POST, 1, Size::Long);
         cpu.resolve_ea(&mut bus, DN, 1, Size::Long);
         assert_eq!(cpu.cycles, 0, "(An)+ and Dn charge no extra clocks");
+    }
+
+    /// The write side of the same mode is free: `1902 [MOVE.B D2, -(A4)] 8037`
+    /// of `MOVE.b.json.gz` expects 8 clocks for a byte move into `-(An)` — one
+    /// prefetch and one write, no address calculation — while the same mode as a
+    /// source is 10 (see [`predec_charges_two_extra_clocks`]).
+    #[test]
+    fn predec_as_a_write_destination_charges_nothing() {
+        let mut cpu = M68k::new();
+        cpu.a[1] = 0x2004;
+
+        let mut bus = Ram::new();
+        let ea = cpu
+            .resolve_ea_write(&mut bus, AN_PRE, 1, Size::Long)
+            .unwrap();
+        assert_eq!(ea, Ea::Mem(0x2000), "the register still moves");
+        assert_eq!(cpu.a[1], 0x2000);
+        assert_eq!(
+            cpu.cycles, 0,
+            "but the decrement rides in the write cycle, so nothing is charged"
+        );
     }
 
     #[test]

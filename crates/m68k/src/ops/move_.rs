@@ -66,7 +66,7 @@
 use crate::M68k;
 use crate::bus::Bus;
 use crate::decode::MOVEQ_BIT8;
-use crate::ea::{Ea, Size, sign_extend_byte};
+use crate::ea::{Ea, EaUse, Size, sign_extend_byte};
 use crate::ops::field;
 
 /// Shift of MOVE's size field, bits 13..12 (`01` byte, `11` word, `10` long).
@@ -108,14 +108,15 @@ impl M68k {
 
         let src_mode = field(opcode, SRC_MODE_SHIFT);
         let src_reg = field(opcode, 0);
-        let Some(src) = self.resolve_move_ea(bus, src_mode, src_reg, size) else {
+        let Some(src) = self.resolve_move_ea(bus, src_mode, src_reg, size, EaUse::Source) else {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, size);
 
         let dest_reg = field(opcode, DEST_REG_SHIFT);
         let dest_mode = field(opcode, DEST_MODE_SHIFT);
-        let Some(dest) = self.resolve_move_ea(bus, dest_mode, dest_reg, size) else {
+        let Some(dest) = self.resolve_move_ea(bus, dest_mode, dest_reg, size, EaUse::Destination)
+        else {
             return self.op_illegal(bus);
         };
         self.write_ea(bus, dest, size, value);
@@ -143,7 +144,7 @@ impl M68k {
 
         let src_mode = field(opcode, SRC_MODE_SHIFT);
         let src_reg = field(opcode, 0);
-        let Some(src) = self.resolve_move_ea(bus, src_mode, src_reg, size) else {
+        let Some(src) = self.resolve_move_ea(bus, src_mode, src_reg, size, EaUse::Source) else {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, size);
@@ -179,13 +180,26 @@ impl M68k {
     /// Resolve one operand field of a move instruction, which [`crate::decode`]
     /// has already validated.
     ///
+    /// `use_` picks the read or the write resolve, and with it whether a
+    /// `-(An)` pays its address-calculation clock (see [`EaUse`]).
+    ///
     /// [`M68k::resolve_ea`] declines only a field that decoding rejects — an
     /// invalid mode, or a byte access to an An — so `None` here means decode and
     /// this handler disagree. The debug assert makes that loud in tests and the
     /// illegal-instruction route is what a release build takes, rather than
     /// executing an instruction with a half-resolved operand.
-    fn resolve_move_ea(&mut self, bus: &mut impl Bus, mode: u8, reg: u8, size: Size) -> Option<Ea> {
-        let ea = self.resolve_ea(bus, mode, reg, size);
+    fn resolve_move_ea(
+        &mut self,
+        bus: &mut impl Bus,
+        mode: u8,
+        reg: u8,
+        size: Size,
+        use_: EaUse,
+    ) -> Option<Ea> {
+        let ea = match use_ {
+            EaUse::Source => self.resolve_ea(bus, mode, reg, size),
+            EaUse::Destination => self.resolve_ea_write(bus, mode, reg, size),
+        };
         debug_assert!(
             ea.is_some(),
             "decode let an invalid move operand through: mode {mode:b} reg {reg:b} {size:?}"
