@@ -1,18 +1,26 @@
-//! Decimal adjust, complement and the flag fiddles (M2-13, #56).
+//! The misc group: decimal adjust, the flag fiddles, `NEG`, the `I`/`R`
+//! transfers, `RRD`/`RLD`, `HALT`, `DI`/`EI` and `IM n` (M2-13, #56).
 //!
 //! ```text
-//! 0x27  DAA   4      0x37  SCF   4
-//! 0x2F  CPL   4      0x3F  CCF   4
+//! 0x27  DAA    4      0xED 57/5F  LD A,I/R   9
+//! 0x2F  CPL    4      0xED 67/6F  RRD/RLD   18
+//! 0x37  SCF    4      0x76        HALT       4
+//! 0x3F  CCF    4      0xF3/FB     DI/EI      4
+//! 0xED 44+    NEG    8      0xED 46/56/5E  IM 0/1/2  8
+//! 0xED 47/4F  LD I/R,A          9
 //! ```
 //!
-//! None of them reads memory, so each is a flag write plus
-//! [`Z80::latch_flags`]; `S`, `Z` and `P/V` are never in play for the three
-//! single-byte flag instructions, which is why they mask only the bits they
-//! actually compute.
+//! `DAA`, `CPL`, `SCF`, `CCF`, `NEG` and the register transfers read no memory,
+//! so each is a flag write plus [`Z80::latch_flags`] - or, for the four that
+//! move no flag at all, [`Z80::clear_latches`]. `RRD`/`RLD` are the only members
+//! that touch the bus, and `HALT`/`DI`/`EI`/`IM n` are the only members with
+//! state beyond the register set.
 
 use crate::alu8::sub_flags;
 use crate::rot::ALL_FLAGS;
-use crate::{FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_X, FLAG_Y, FLAG_Z, SZXY_PARITY, Z80};
+use crate::{
+    FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_X, FLAG_Y, FLAG_Z, SZXY_PARITY, Z80, Z80Bus,
+};
 
 impl Z80 {
     /// `DAA` (`27`): 4 T-states.
@@ -196,6 +204,46 @@ impl Z80 {
         let value = self.r();
         self.ld_a_ir(value)
     }
+
+    /// `RRD` (`ED 67`) and `RLD` (`ED 6F`): 18 T-states.
+    ///
+    /// A four-nibble rotate through the accumulator: the byte at `HL` and the
+    /// low nibble of `A` are the two ends of a 12-bit shift register, and
+    /// `left` says which way it turns (Z80UM 2.2, `RRD`/`RLD`). Only the low
+    /// nibble of `A` moves, but the flags - and so `X`/`Y` and `P/V` - are all
+    /// taken from the whole of the new `A`, `H` and `N` are cleared, `C`
+    /// survives, and `wz` ends up at `HL + 1`: the address the write left the
+    /// CPU pointing at.
+    fn rotate_digit(&mut self, bus: &mut impl Z80Bus, left: bool) -> u32 {
+        let address = self.hl();
+        let memory = bus.read(address);
+        let a = self.a();
+        let (value, stored) = if left {
+            ((a & 0xF0) | (memory >> 4), (memory << 4) | (a & 0x0F))
+        } else {
+            ((a & 0xF0) | (memory & 0x0F), (memory >> 4) | (a << 4))
+        };
+        bus.write(address, stored);
+        self.set_a(value);
+        let flags = SZXY_PARITY[usize::from(value)];
+        self.update_flags(
+            FLAG_S | FLAG_Z | FLAG_X | FLAG_Y | FLAG_PV | FLAG_H | FLAG_N,
+            flags,
+        );
+        self.set_wz(address.wrapping_add(1));
+        self.latch_flags();
+        18
+    }
+
+    /// `RRD` (`ED 67`): right rotate - the byte at `HL` moves up into `A`.
+    pub(crate) fn rrd(&mut self, bus: &mut impl Z80Bus) -> u32 {
+        self.rotate_digit(bus, false)
+    }
+
+    /// `RLD` (`ED 6F`): left rotate - `A`'s low nibble moves down into `HL`.
+    pub(crate) fn rld(&mut self, bus: &mut impl Z80Bus) -> u32 {
+        self.rotate_digit(bus, true)
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +388,51 @@ mod tests {
         assert_eq!(cpu.ld_r_a(), 9);
         assert_eq!(cpu.r(), 0xA5, "LD R,A writes bit 7 too");
         assert_eq!(cpu.f(), before, "LD R,A moves no flag either");
+    }
+
+    /// `RLD` turns the 12-bit register left: `A`'s low nibble goes down into the
+    /// low nibble of `(HL)`, `(HL)`'s high nibble comes up into `A`, and the
+    /// other nibble of `A` is untouched. `RRD` turns it back.
+    #[test]
+    fn rld_rotates_nibbles() {
+        let mut bus = RamBus::at(0x0100, &[0xED, 0x6F]).with_byte(0x8000, 0x82);
+        let mut cpu = Z80::new();
+        cpu.set_pc(0x0100);
+        cpu.set_flags(0);
+        cpu.set_a(0xF3);
+        cpu.set_hl(0x8000);
+
+        assert_eq!(cpu.step(&mut bus), 18);
+
+        assert_eq!(
+            cpu.a(),
+            0xF8,
+            "0x3 from A's low nibble went down, 0x8 came up"
+        );
+        assert_eq!(bus.writes, vec![(0x8000, 0x23)]);
+        assert_eq!(cpu.hl(), 0x8000, "HL itself never moves");
+        assert_eq!(cpu.wz(), 0x8001, "wz is the address the write left behind");
+        assert_eq!(
+            cpu.f(),
+            FLAG_S | FLAG_X | FLAG_Y,
+            "S/X/Y from the new A, P/V = parity(0xF8) = odd = clear, H and N cleared"
+        );
+
+        let mut bus = RamBus::at(0x0100, &[0xED, 0x67]).with_byte(0x8000, 0x39);
+        let mut cpu = Z80::new();
+        cpu.set_pc(0x0100);
+        cpu.set_flags(0);
+        cpu.set_a(0xF3);
+        cpu.set_hl(0x8000);
+
+        assert_eq!(cpu.step(&mut bus), 18);
+
+        assert_eq!(
+            cpu.a(),
+            0xF9,
+            "the low nibble of (HL) comes up on a right rotate"
+        );
+        assert_eq!(bus.writes, vec![(0x8000, 0x33)]);
     }
 
     /// `CPL` complements `A`, forces `H` and `N`, takes `X`/`Y` from the new

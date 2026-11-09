@@ -325,6 +325,10 @@ impl Z80 {
             0x4F => self.ld_r_a(),
             0x57 => self.ld_a_i(),
             0x5F => self.ld_a_r(),
+            // `RRD`/`RLD` (M2-13, #56): 18 T-states, and the only members of the
+            // misc group that touch memory.
+            0x67 => self.rrd(bus),
+            0x6F => self.rld(bus),
             _ if ed_is_defined(op) => {
                 self.unimplemented(&format!("ED {op:02X} (x{} y{} z{})", x(op), y(op), z(op)))
             }
