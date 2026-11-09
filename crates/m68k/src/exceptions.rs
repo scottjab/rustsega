@@ -30,7 +30,7 @@
 //! | [`EXC_TRAPV`] | 7 | `$1C` | all 4095 exception cases in `TRAPV.json.gz` fetch `$1C` |
 //! | [`EXC_PRIVILEGE`] | 8 | `$20` | **not covered by the suite** — every case in every file runs in supervisor mode (`sr & $2000` set in all 8065 `TRAP.json.gz` cases, and `RESET`, `MOVEtoUSP`, `MOVEfromUSP` and friends have no exception cases at all), so no case can show which slot a privilege violation fetches. Chosen as the slot after [`EXC_TRAPV`], which is where both the ticket's map and the measured `CHK`/`TRAPV`/divide-by-zero sequence put it |
 //! | — | 9 | `$24` | trace: M1-30 (#38) |
-//! | — | 24, 25..31 | `$60`, `$64`–`$7C` | spurious and level 1–7 autovectors: M1-28 (#36) |
+//! | — | 24, 25..31 | `$60`, `$64`–`$7C` | spurious and level 1–7 autovectors: M1-28 (#36), taken by [`crate::interrupts`] |
 //! | [`trap_vector`] | 32 + n | `$80 + 4 * n` | all 8065 `TRAP.json.gz` cases: `4e40` reads `$80`, `4e42` reads `$88`, `4e4f` reads `$BC` |
 //!
 //! The three slots the suite pins are one slot above where some Genesis

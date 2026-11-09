@@ -24,8 +24,9 @@
 //!   pointer *immediately* — including the writes that make `S` and `T` come from
 //!   the operand, like `ORI #imm,SR`. Nothing here may read the interrupt mask
 //!   early and reuse it: whether an `SR` write unmasks a pending interrupt is
-//!   M1-28 (#36)'s question, and it is answered by looking at `self.sr` after the
-//!   instruction, so a cached copy would be a latent bug.
+//!   answered at the next interrupt sample (M1-28, #36, [`crate::interrupts`]),
+//!   which reads `self.sr` *after* the instruction, so a cached copy would be a
+//!   latent bug.
 //! * `S` and `T` are *results* of the five SR-writing instructions, not the
 //!   operand's `N`/`Z`-style flags: [`M68k::set_logic_flags`] is not used, since
 //!   it would clear `V` and `C` that the operand sets.
