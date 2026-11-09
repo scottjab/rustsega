@@ -354,8 +354,10 @@ impl M68k {
     /// the new status word, not a separate state the operand could override.
     ///
     /// The halt itself is what [`crate::M68k::stopped`] is for: `step` returns
-    /// early while it is set. Nothing clears it yet — the wake-up path is #36,
-    /// which owns STOP and HALT's interrupt side together.
+    /// early while it is set, and the only thing that clears it is an interrupt
+    /// level above the mask `STOP` just wrote — the mask the frame is entered
+    /// with is the new one, and `RTE` brings the old one back (M1-28, #36,
+    /// [`crate::interrupts`]).
     ///
     /// Privileged, like RESET: a denied STOP writes no `SR` and halts nothing.
     pub(crate) fn op_stop(&mut self, bus: &mut impl Bus, _opcode: u16) -> u32 {
@@ -1070,9 +1072,9 @@ mod tests {
 
     /// `STOP` (`$4E72`, `#imm`) writes the extension word into the whole of `SR`
     /// and halts the CPU until the next interrupt or reset — which this ticket
-    /// only halts *for*; the wake-up is #36. `SR` goes in through `set_sr`, so a
-    /// STOP that clears `S` swaps `A7` to the USP the way `MOVE to SR` does
-    /// (M68000UM "STOP — Stop the Processor"; #35).
+    /// only halts *for*; [`crate::interrupts`] (#36) is what wakes it. `SR` goes
+    /// in through `set_sr`, so a STOP that clears `S` swaps `A7` to the USP the
+    /// way `MOVE to SR` does (M68000UM "STOP — Stop the Processor"; #35).
     #[test]
     fn stop_loads_sr_and_halts_until_interrupt() {
         let (mut cpu, mut bus) = run(0x4E72, &[0x0003, 0x4E71]); // STOP #$0003
@@ -1086,7 +1088,8 @@ mod tests {
 
         // While stopped a `step` runs no instruction: `pc`, `SR` and the memory
         // at the queue front are untouched, and it reports clocks rather than 0
-        // (the wake path is #36, so this is the whole of the halted behaviour).
+        // (no IPL is asserted here, so the wake path of #36 has nothing to wake
+        // for and this is the whole of the halted behaviour).
         let before = cpu.clone();
         assert_eq!(cpu.step(&mut bus), STOPPED_CLOCKS);
         assert_eq!(cpu.pc, before.pc, "no instruction ran");

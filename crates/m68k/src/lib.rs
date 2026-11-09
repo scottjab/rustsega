@@ -26,6 +26,7 @@ mod cpu;
 mod decode;
 mod ea;
 mod exceptions;
+mod interrupts;
 mod ops;
 mod sr;
 

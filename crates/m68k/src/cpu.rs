@@ -33,8 +33,9 @@ pub(crate) const BUS_CYCLE_CLOCKS: u64 = 4;
 const HALTED_CLOCKS: u32 = 4;
 
 /// Clocks for a `step` taken while `STOP` has the CPU halted, the same stand-in
-/// as [`HALTED_CLOCKS`] for the same reason: the processor is not executing, and
-/// #36 owns the interrupt side of STOP where the real number will come from.
+/// as [`HALTED_CLOCKS`] for the same reason: the processor is not executing. The
+/// step that *wakes* up is not charged this — it charges the interrupt
+/// acknowledge and entry (M1-28, #36, [`crate::interrupts`]).
 pub(crate) const STOPPED_CLOCKS: u32 = 4;
 
 /// How far ahead of [`M68k::pc`] the prefetch queue has already read, in bytes.
@@ -123,6 +124,13 @@ pub struct M68k {
     pub prefetch: [u16; 2],
     /// Interrupt level currently asserted on the IPL pins, 0..=7. 0 = none.
     pub ipl: u8,
+    /// The IPL level the previous sample saw, 0..=7.
+    ///
+    /// [`crate::interrupts`] is the only reader: level 7 is the NMI, and it is
+    /// taken on the edge *into* 7, so the CPU has to remember what the pins read
+    /// last time to avoid re-acknowledging a line someone is simply holding
+    /// high (M68000UM section 6 "Interrupt Processing", M1-28 #36).
+    pub(crate) ipl_sampled: u8,
     /// True while the CPU is stopped by the `STOP` instruction.
     pub stopped: bool,
     /// True while the HALT pin is asserted (the CPU stops accessing the bus).
@@ -163,6 +171,7 @@ impl M68k {
             sr: 0,
             prefetch: [0; 2],
             ipl: 0,
+            ipl_sampled: 0,
             stopped: false,
             halted: false,
             pending_exception: None,
@@ -184,6 +193,9 @@ impl M68k {
         self.pc = 0;
         self.prefetch = [0; 2];
         self.ipl = 0;
+        // The pins are sampled again after the reset, so a level 7 that is
+        // still sitting there counts as a fresh edge (#36).
+        self.ipl_sampled = 0;
         self.stopped = false;
         self.halted = false;
         self.pending_exception = None;
@@ -219,6 +231,10 @@ impl M68k {
     /// discards the queue and refills it from the handler, which is
     /// [`crate::exceptions`] and what [`M68k::step`]'s `bus` argument is for
     /// (M1-08, #16).
+    ///
+    /// Before an opcode is decoded the interrupt pins are sampled
+    /// ([`M68k::check_interrupts`], M1-28 #36), and a taken interrupt is the
+    /// whole of that step: no decode, no operand, no instruction clocks.
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
         if self.halted {
             // HALT asserted: the CPU stops accessing the bus and re-samples the
@@ -230,9 +246,15 @@ impl M68k {
         }
 
         if self.stopped {
-            // STOP left the CPU halted: no fetch, no decode, no opcode. Nothing
-            // clears `stopped` yet — the interrupt and reset wake-up paths are
-            // #36 — so a stopped CPU just burns these clocks forever.
+            // STOP left the CPU halted: no fetch, no decode, no opcode. `STOP`
+            // waits for an interrupt, so the pins are still sampled, and a
+            // request above the mask both clears `stopped` and is entered like
+            // any other interrupt (M1-28, #36). With no request there is
+            // nothing to do but burn these clocks.
+            if self.check_interrupts(bus) {
+                self.stopped = false;
+                return 0;
+            }
             self.cycles += u64::from(STOPPED_CLOCKS);
             return STOPPED_CLOCKS;
         }
@@ -240,6 +262,13 @@ impl M68k {
         // One step, at most one exception: what the previous step recorded is
         // history by now.
         self.pending_exception = None;
+
+        // Interrupts are taken here, between instructions, and nothing below
+        // this point runs when one is taken: the queue is thrown away by the
+        // exception entry and the clocks are the entry's (M1-28, #36).
+        if self.check_interrupts(bus) {
+            return 0;
+        }
 
         let opcode = self.prefetch[0];
         let used = self.run_op(bus, crate::decode::decode(opcode), opcode);
