@@ -393,12 +393,15 @@ mod tests {
         cpu.d[7] = 0xD7D7_D7D7;
         cpu.a[0] = 0xA0A0_A0A0;
         cpu.a[6] = 0xA6A6_A6A6;
-        cpu.a[7] = 0xA7A7_A7A7;
+        // Even, because a `MOVEM.L` push from an odd stack pointer is an address
+        // error and writes nothing at all (#37, M1-29); this test is about the
+        // order the list is pushed in.
+        cpu.a[7] = 0xA7A7_A7A0;
         let sp = cpu.a[7];
 
         cpu.step(&mut bus);
 
-        assert_eq!(bus.read_long(sp - 4), 0xA7A7_A7A7, "bit 0 is A7 here");
+        assert_eq!(bus.read_long(sp - 4), sp, "bit 0 is A7 here");
         assert_eq!(bus.read_long(sp - 8), 0xA6A6_A6A6, "bit 1 is A6");
         assert_eq!(bus.read_long(sp - 12), 0xD7D7_D7D7, "bit 8 is D7");
         assert_eq!(cpu.a[0], 0xA0A0_A0A0, "A0 is not in the list at all");

@@ -1299,20 +1299,24 @@ mod tests {
     /// the core (M68000UM, "Absolute Addressing Mode" and "Data Organization").
     #[test]
     fn abs_l() {
-        // MOVE.L abs.L, D0 (0x2039) with the long $00012345.
-        let (mut cpu, mut bus) = cpu_with_program(&[0x2039, 0x0001, 0x2345, 0x4E71]);
-        bus.write_long(0x0001_2345, 0xDEAD_BEEF);
+        // MOVE.L abs.L, D0 (0x2039) with the long $00012344.
+        //
+        // The operand address is even: a long access at an odd address is an
+        // address error (#37, M1-29) and would never reach the read this test is
+        // about. Nothing else here moves the two words apart by one.
+        let (mut cpu, mut bus) = cpu_with_program(&[0x2039, 0x0001, 0x2344, 0x4E71]);
+        bus.write_long(0x0001_2344, 0xDEAD_BEEF);
 
         let ea = cpu
             .resolve_ea(&mut bus, ABSOLUTE, ABS_L, Size::Long)
             .expect("abs.L resolves");
 
-        assert_eq!(ea, Ea::Mem(0x0001_2345));
+        assert_eq!(ea, Ea::Mem(0x0001_2344));
         assert_eq!(cpu.read_ea(&mut bus, ea, Size::Long), 0xDEAD_BEEF);
         assert_eq!(cpu.pc, PROGRAM_BASE + 4, "both extension words consumed");
         assert_eq!(
             cpu.prefetch,
-            [0x2345, 0x4E71],
+            [0x2344, 0x4E71],
             "the queue slid two words past them, so the next instruction still starts in the right place"
         );
     }
