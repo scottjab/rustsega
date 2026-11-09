@@ -13,6 +13,7 @@
 mod alu16;
 mod alu8;
 mod bitops;
+mod block;
 mod decode;
 mod flow;
 mod ld16;

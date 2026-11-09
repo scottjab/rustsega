@@ -286,6 +286,12 @@ impl Z80 {
             // of `ED` included. Bit 3 says which way round they are, `0` being
             // `SBC`; `ed 42` is `SBC HL,BC` and `ed 4a` is `ADC HL,BC`.
             0x42 | 0x4a | 0x52 | 0x5a | 0x62 | 0x6a | 0x72 | 0x7a => self.adc_sbc_hl_rr(op),
+            // Block transfer and search (M2-11, #54): `LDI`/`LDD`/`LDIR`/`LDDR`
+            // and `CPI`/`CPD`/`CPIR`/`CPDR`. Bit 0 of the opcode is which of the
+            // two halves of the group it is, so the pairs fall out of the mask
+            // rather than another opcode list.
+            0xA0 | 0xA8 | 0xB0 | 0xB8 => self.block_transfer(bus, op),
+            0xA1 | 0xA9 | 0xB1 | 0xB9 => self.block_search(bus, op),
             // `RETI` (ED 4D) and `RETN` (ED 45) with its six documented mirrors
             // (M2-10, #53). The mirrors are `ED 55`/`5D`/`65`/`6D`/`75`/`7D`.
             0x4D => self.reti(bus),
