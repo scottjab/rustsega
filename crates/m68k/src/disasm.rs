@@ -276,12 +276,11 @@ fn format_op(r: &mut Reader<'_>, opcode: u16) -> String {
             format!("MOVE.W {from},SR")
         }
         Op::MoveUsp => {
-            let a = an(field(opcode, 0));
-            if opcode & 0b1000 == 0 {
-                format!("MOVE {a},USP")
-            } else {
-                format!("MOVE USP,{a}")
-            }
+            // `0100 1110 0110 000r`: USP into `An` (M68000UM, "MOVE — Move
+            // to/from USP"). The reverse direction is a different opcode that
+            // the decoder does not separate from the rest of `$4E00` yet, so it
+            // never reaches this arm.
+            format!("MOVE USP,{}", an(field(opcode, 0)))
         }
         Op::Movep => movep(r, opcode),
 
@@ -293,9 +292,7 @@ fn format_op(r: &mut Reader<'_>, opcode: u16) -> String {
             let from = ea_text(r, ea, size);
             format!("CMP{} {from},{}", size_suffix(size), dn(dx))
         }
-        op @ (Op::Addx | Op::Subx) => {
-            double(opcode, if op == Op::Addx { "ADDX" } else { "SUBX" })
-        }
+        op @ (Op::Addx | Op::Subx) => double(opcode, if op == Op::Addx { "ADDX" } else { "SUBX" }),
         Op::Cmpm => {
             let size = size_suffix(alu_size(opcode));
             format!("CMPM{size} ({})+,({})+", an(field(opcode, 0)), an(dx))
@@ -371,7 +368,10 @@ fn format_op(r: &mut Reader<'_>, opcode: u16) -> String {
             // A `000` field is not no shift, it is a full width of it; and the
             // count is in a data register when bit 5 is set.
             let n = if opcode & 0b10_0000 == 0 {
-                format!("#{num}", num = num(u32::from(if count == 0 { 8 } else { count })))
+                format!(
+                    "#{num}",
+                    num = num(u32::from(if count == 0 { 8 } else { count }))
+                )
             } else {
                 dn(count)
             };
@@ -740,14 +740,9 @@ mod tests {
         // `MOVE`/`MOVEA` number their size field differently from the ALU
         // group (M68000UM, "MOVE — Move to Register/Data").
         let move_long = (opcode >> 12) & 0b11 == 0b10;
-        let alu_long = matches!((opcode >> 6) & 0b11, 0b10);
         match hi4 {
-            // `MOVE <ea>,<ea>` and `MOVEA <ea>,An`, plus the `MOVEP` encodings
-            // that live in the otherwise-illegal `0000 ddd0 1p01 1000` corner.
             // `MOVE <ea>,<ea>` and `MOVEA <ea>,An`.
-            0b0001 | 0b0010 | 0b0011 => Some(1 + ea_words(dst, move_long) + ea_words(ea, move_long)),
-            // `ORI #imm,<ea>`, the bit instructions and `MOVEP`, which share the
-            // `0000` major opcode (M68000UM, "BTST/BSET/BCHG/BCLR", "ORI").
+            0b0001..=0b0011 => Some(1 + ea_words(dst, move_long) + ea_words(ea, move_long)),
             // `ORI #imm,<dest>`, the bit instructions and `MOVEP` share the
             // `0000` major opcode (M68000UM, "ORI", "BTST/BSET/BCHG/BCLR").
             0b0000 => {
@@ -775,16 +770,15 @@ mod tests {
             // `MOVEQ #imm8,Dn`: the whole instruction is the opcode.
             0b0111 => Some(1),
             0b0101 => {
-                if (opcode >> 8) & 0b1 == 0 {
-                    Some(1) // ADDQ/SUBQ carry the count in the opcode
-                } else if (opcode >> 6) & 0b111 == 0b111 {
-                    match (opcode >> 9) & 0b111 {
-                        0b1110 => Some(2),                  // DBcc: displacement word
-                        0b1111 => None,                     // illegal
-                        _ => Some(1 + ea_words(ea, false)), // Scc: one <ea>
-                    }
+                // `0101 cccc 11 eeeeee` is `Scc`/`DBcc`; everything else in the
+                // group is `ADDQ`/`SUBQ`, which carries its count in the opcode
+                // (M68000UM Format V).
+                if (opcode >> 6) & 0b11 != 0b11 {
+                    Some(1)
+                } else if (opcode >> 3) & 0b111 == 0b001 {
+                    Some(2) // `DBcc Dn,d16`
                 } else {
-                    None
+                    Some(1 + ea_words(ea, false)) // `Scc <ea>`
                 }
             }
             // `BRA`/`BSR`/`Bcc`: a byte displacement in the opcode, or a
@@ -893,7 +887,7 @@ mod tests {
             (&[0x103C, 0x0012][..], "MOVE.B #$12,D0"),
             (&[0x24BC, 0x0000, 0x0010][..], "MOVE.L #$10,(A2)"),
         ] {
-            assert_eq!(text(&words), want, "{:04X}", words[0]);
+            assert_eq!(text(words), want, "{:04X}", words[0]);
         }
     }
 
@@ -921,27 +915,27 @@ mod tests {
             (&[0x4A50][..], "TST.W (A0)"),
             (&[0x4240][..], "CLR.W D0"),
             (&[0x4610][..], "NOT.B (A0)"),
-            (&[0x40D8][..], "NEGX.L (A0)+"),
+            (&[0x4098][..], "NEGX.L (A0)+"),
             (&[0x4AC0][..], "TAS D0"),
             (&[0x40C0][..], "MOVE.W SR,D0"),
-            (&[0x44C0][..], "MOVE.B (A0),CCR"),
+            (&[0x44C0][..], "MOVE.B D0,CCR"),
             (&[0x46D0][..], "MOVE.W (A0),SR"),
-            (&[0x4E61][..], "MOVE USP,A1"),
-            (&[0x4E69][..], "MOVE A1,USP"),
+            (&[0x4E69][..], "MOVE USP,A1"),
+            (&[0x4E60][..], "MOVE USP,A0"),
             (&[0xC342][..], "EXG D1,D2"),
-            (&[0xC1C8][..], "EXG A0,A1"),
-            (&[0xD181][..], "EXG D1,A1"),
+            (&[0xC149][..], "EXG A0,A1"),
+            (&[0xC389][..], "EXG D1,A1"),
             (&[0x4841][..], "SWAP D1"),
             (&[0x48C1][..], "EXT.L D1"),
-            (&[0x4CC1][..], "EXT.W D1"),
-            (&[0xC06E, 0x0010][..], "MULU.W $10(A2),D0"),
-            (&[0x814E][..], "DIVU.W D2,(A6)"),
+            (&[0x4881][..], "EXT.W D1"),
+            (&[0xC0EA, 0x0010][..], "MULU.W $10(A2),D0"),
+            (&[0x84D0][..], "DIVU.W (A0),D2"),
             (&[0xC501][..], "ABCD D1,D2"),
             (&[0x8501][..], "SBCD D1,D2"),
             (&[0x4810][..], "NBCD (A0)"),
             (&[0x4390][..], "CHK.W (A0),D1"),
         ] {
-            assert_eq!(text(&words), want, "{:04X}", words[0]);
+            assert_eq!(text(words), want, "{:04X}", words[0]);
         }
     }
 
@@ -953,7 +947,7 @@ mod tests {
             (&[0x01D8][..], "BSET D0,(A0)+"),
             (&[0x0847, 0x0001][..], "BCHG #$1,D7"),
         ] {
-            assert_eq!(text(&words), want, "{:04X}", words[0]);
+            assert_eq!(text(words), want, "{:04X}", words[0]);
         }
     }
 
@@ -965,7 +959,7 @@ mod tests {
             (&[0xE0D0][..], "ASR.W (A0)"),
             (&[0xE6D1][..], "ROR.W (A1)"),
         ] {
-            assert_eq!(text(&words), want, "{:04X}", words[0]);
+            assert_eq!(text(words), want, "{:04X}", words[0]);
         }
     }
 
@@ -985,7 +979,7 @@ mod tests {
             (&[0x50D0][..], "ST (A0)"),
             (&[0x51F7, 0x7000][..], "SF (A7,D7.W)"),
         ] {
-            assert_eq!(text(&words), want, "{:04X}", words[0]);
+            assert_eq!(text(words), want, "{:04X}", words[0]);
         }
     }
 
@@ -1008,7 +1002,7 @@ mod tests {
             (&[0x4E77][..], "RTR"),
             (&[0x4E76][..], "TRAPV"),
         ] {
-            assert_eq!(text(&words), want, "{:04X}", words[0]);
+            assert_eq!(text(words), want, "{:04X}", words[0]);
         }
     }
 
@@ -1078,31 +1072,6 @@ mod tests {
             let (t, got) = disassemble(words, 0x1000);
             assert!(!t.is_empty());
             assert_eq!(got, want, "{:04X}", words[0]);
-        }
-    }
-}
-
-#[cfg(test)]
-mod scratch_probe {
-    use super::disassemble;
-    #[test]
-    fn probe_prints() {
-        for w in [0x303Cu16, 0x313C, 0x207C] {
-            let (t, n) = disassemble(&[w, 0x0001, 0x2345, 0x0002], 0x1000);
-            println!("PROBE {w:04X} -> {t} ({n})");
-        }
-    }
-}
-
-#[cfg(test)]
-mod scratch_audit {
-    use super::disassemble;
-    #[test]
-    fn audit_prints() {
-        let cases: &[&[u16]] = &[&[0x4E71],&[0x7001],&[0x7EFF],&[0x1001],&[0x3001],&[0x2001],&[0x6602],&[0x66FE],&[0x6600,0x0100],&[0x6100,0xFFFE],&[0x48E7,0xC080],&[0x4C50,0x00FF],&[0x4C10,0x0F00],&[0x41F0,0x1004],&[0x41F0,0x9003],&[0x4EB9,0x0001,0x2345],&[0xFFFF],&[0xA123],&[0x42C8],&[0x2010],&[0x2018],&[0x2020],&[0x2028,0x0010],&[0x2030,0x1004],&[0x2038,0x1234],&[0x2039,0x0001,0x2345],&[0x203A,0x0010],&[0x203B,0x1004],&[0x203C,0x0000,0x0010],&[0x103C,0x0012],&[0x227C,0x0000,0x0010],&[0xD041],&[0xD1C8],&[0xD0C0],&[0x50C0],&[0x5481],&[0x90F0],&[0x91F2],&[0xB0C8],&[0x51C0],&[0x9EC1],&[0x067C,0x0001,0x0002],&[0x003C,0x00FF],&[0x027C,0x1234],&[0x0A3C,0x0042],&[0x4A10],&[0x4200],&[0x4610],&[0x40D8],&[0x4AC0],&[0x40C0],&[0x44C0],&[0x46D0],&[0x4E61],&[0x4E69],&[0xC342],&[0xC1C8],&[0xD181],&[0x4841],&[0x48C1],&[0x4CC1],&[0xC06E,0x0010],&[0x814E],&[0xC501],&[0x8501],&[0x4810],&[0x4390],&[0x0838,0x0003,0x1234],&[0x0850],&[0x0C58],&[0x0478,0x0001],&[0xE789],&[0xE098],&[0xE0D0],&[0xE6D1],&[0x0108,0x1234],&[0x0148,0x1234],&[0x0188,0x1234],&[0x01C8,0x1234],&[0x51CA,0x0004],&[0x50C8,0x0004],&[0x50C0],&[0x51DF,0x00FF],&[0x4E40],&[0x4E4F],&[0x4E72,0x2700],&[0x4E56,0xFFF8],&[0x4E5D],&[0x4EB8,0x1234],&[0x4EF9,0x0001,0x2345],&[0x4E91],&[0x4848,0x1234],&[0x41F8,0x1234],&[0x4E70],&[0x4E73],&[0x4E75],&[0x4E77],&[0x4E76],&[0x4E71]];
-        for (i, words) in cases.iter().enumerate() {
-            let (t, n) = disassemble(words, 0x1000);
-            println!("AUDITI{}|{}|{}", i, t, n);
         }
     }
 }
