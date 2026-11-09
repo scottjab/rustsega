@@ -3,9 +3,15 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateSkipAddressErrors`], the same one the add, subtract
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`], the same one the add, subtract
 //! and compare classes use: the cases that end in the suite's exception handler
 //! are left to M1-29 (#37) — see [`harness::is_address_error_case`] and #185.
+//!
+//! The clock half of that check is #225's, and it is the add class's rule with
+//! no exceptions: `arith::alu_op_clocks` (see `tests/adds.rs`). `EOR` is
+//! read-modify-write only, so its memory cases are already exact and only its
+//! `Dn` and `#imm` ones pay; `NOT` needed nothing — every case of `NOT.b/w/l`
+//! was already exact once `one_operand_clocks` covered it.
 //!
 //! The suite ships no `ANDI.*`, `ORI.*` or `EORI.*` file for the `#imm,<ea>`
 //! forms; only `ANDItoCCR`, `ANDItoSR`, `ORItoCCR`, `ORItoSR`, `EORItoCCR` and
@@ -41,58 +47,58 @@ mod harness;
 /// plus the `$0200`-`$023F` `ANDI.B` cases.
 #[test]
 fn and_b_file_passes() {
-    harness::assert_file_passes("AND.b", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("AND.b", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `AND.W`: operation `001` (`AND <ea>,Dn`) and `101` (`AND Dn,<ea>`), plus
 /// `$0240`-`$027F` `ANDI.W`.
 #[test]
 fn and_w_file_passes() {
-    harness::assert_file_passes("AND.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("AND.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `AND.L`: operation `010` and `110`, plus `$0280`-`$02BF` `ANDI.L`.
 #[test]
 fn and_l_file_passes() {
-    harness::assert_file_passes("AND.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("AND.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `OR.B`: `$8000`-`$803F`/`$8100`-`$813F`-style, plus the `$0000`-`$003F`
 /// `ORI.B` cases.
 #[test]
 fn or_b_file_passes() {
-    harness::assert_file_passes("OR.b", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("OR.b", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `OR.W`: operation `001` and `101`, plus `$0040`-`$007F` `ORI.W`.
 #[test]
 fn or_w_file_passes() {
-    harness::assert_file_passes("OR.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("OR.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `OR.L`: operation `010` and `110`, plus `$0080`-`$00BF` `ORI.L`.
 #[test]
 fn or_l_file_passes() {
-    harness::assert_file_passes("OR.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("OR.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `EOR.B`: `$B100`-`$B13F`-style `1011 ddd 100 eeeeee` with every mode but
 /// `001`, plus the `$0A00`-`$0A3F` `EORI.B` cases.
 #[test]
 fn eor_b_file_passes() {
-    harness::assert_file_passes("EOR.b", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("EOR.b", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `EOR.W`: operation `101`, plus `$0A40`-`$0A7F` `EORI.W`.
 #[test]
 fn eor_w_file_passes() {
-    harness::assert_file_passes("EOR.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("EOR.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `EOR.L`: operation `110`, plus `$0A80`-`$0ABF` `EORI.L`.
 #[test]
 fn eor_l_file_passes() {
-    harness::assert_file_passes("EOR.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("EOR.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `NOT.B`: `$4600`-`$463F`. The three `NOT` files hold no immediate case at
@@ -100,19 +106,19 @@ fn eor_l_file_passes() {
 /// nowhere here either.
 #[test]
 fn not_b_file_passes() {
-    harness::assert_file_passes("NOT.b", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NOT.b", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `NOT.W`: `$4640`-`$467F`.
 #[test]
 fn not_w_file_passes() {
-    harness::assert_file_passes("NOT.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NOT.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `NOT.L`: `$4680`-`$46BF`.
 #[test]
 fn not_l_file_passes() {
-    harness::assert_file_passes("NOT.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NOT.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// The twelve file names above are what the suite ships, so a rename fails here

@@ -91,6 +91,51 @@ pub(crate) const fn one_operand_clocks(size: Size, ea: Ea) -> u32 {
     }
 }
 
+/// Clocks the two-operand ALU instructions (`ADD`, `SUB` and their `#imm`/`Q`
+/// forms, and via [`crate::ops::logic`] `AND`, `OR` and `EOR`) pay on top of
+/// their bus traffic: a long operation is two passes of [`ALU_PASS_CLOCKS`], and
+/// every memory access the operand pair performs hides one.
+///
+/// That is the one rule the M68000UM section 8 totals reduce to once the bus
+/// cycles the core already charges are subtracted, and it covers both
+/// directions: a long `<ea>,Dn` is 2 over for a memory source (its read covers
+/// one pass) and 4 over for a register, `An` or `#imm` source (which cover
+/// neither), while a long read-modify-write — `ADD.L D0,(A0)`, `ADDI.L`,
+/// `ADDQ.L`, `EOR.L` — does two accesses, is covered twice over, and pays
+/// nothing. Byte and word operands are a single pass and pay nothing anywhere;
+/// that is why those files were already exact.
+///
+/// Measured over every non-exception case of the pinned `ADD.b/w/l`,
+/// `ADDA.w/l`, `SUB.b/w/l`, `SUBA.w/l`, `AND.b/w/l`, `OR.b/w/l` and `EOR.b/w/l`
+/// suites for #225.
+pub(crate) const fn alu_op_clocks(size: Size, accesses: u32) -> u32 {
+    match size {
+        Size::Long => (2 * ALU_PASS_CLOCKS).saturating_sub(accesses * ALU_PASS_CLOCKS),
+        Size::Byte | Size::Word => 0,
+    }
+}
+
+/// The bus accesses a *source* operand performs: one for a memory read, none for
+/// a register and none for an immediate, which [`crate::ea`] already fetched off
+/// the queue (see [`crate::ea::Ea::Imm`] and [`M68k::read_ea`]).
+pub(crate) const fn source_accesses(ea: Ea) -> u32 {
+    match ea {
+        Ea::Mem(_) => 1,
+        Ea::DataReg(_) | Ea::AddrReg(_) | Ea::Imm(_) => 0,
+    }
+}
+
+/// The bus accesses a *destination* operand performs: a read then a write for a
+/// memory location, none for a register. The `Dn op <ea> → <ea>` half of every
+/// two-operand ALU instruction is why these count two where
+/// [`source_accesses`] counts one, and it is what makes them exact.
+pub(crate) const fn dest_accesses(ea: Ea) -> u32 {
+    match ea {
+        Ea::Mem(_) => 2,
+        Ea::DataReg(_) | Ea::AddrReg(_) | Ea::Imm(_) => 0,
+    }
+}
+
 /// Shift of the register field of the `1101`/`1001` groups and of `ADDQ`/
 /// `SUBQ`'s data field, bits 11..9.
 const ALU_REG_SHIFT: u32 = 9;
@@ -151,6 +196,7 @@ impl M68k {
             return self.op_illegal(bus);
         };
 
+        let pass_clocks;
         if op_mode & ALU_MODE_TO_EA == 0 {
             // ADD <ea>,Dn: the source first, so `(A0)+` steps once.
             let Some(src) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
@@ -159,6 +205,7 @@ impl M68k {
             let value = self.read_ea(bus, src, size);
             let result = self.add_flags(value, self.d[usize::from(reg)], false, size);
             self.write_ea(bus, Ea::DataReg(reg), size, result);
+            pass_clocks = alu_op_clocks(size, source_accesses(src));
         } else {
             // ADD Dn,<ea>: one read-modify-write of the resolved destination.
             // Resolving the EA twice would step `(A0)+` twice, so it is
@@ -170,10 +217,11 @@ impl M68k {
             let value = self.read_ea(bus, dest, size);
             let result = self.add_flags(source, value, false, size);
             self.write_ea(bus, dest, size, result);
+            pass_clocks = alu_op_clocks(size, dest_accesses(dest));
         }
 
         self.advance_opcode(bus);
-        0
+        pass_clocks
     }
 
     /// `ADDA.W` (`1101 aaa 011 mmm rrr`) and `ADDA.L` (`1101 aaa 111 mmm rrr`).
@@ -208,7 +256,16 @@ impl M68k {
         self.write_ea(bus, Ea::AddrReg(reg), Size::Long, sum);
 
         self.advance_opcode(bus);
-        0
+        // `ADDA.W` pays for the sign extension as well as the long add in every
+        // mode, memory included, so the operand's accesses do not hide it: 4
+        // clocks flat. `ADDA.L` needs no extension pass and so follows the
+        // two-pass rule of [`alu_op_clocks`] like `ADDA`'s plain-`ADD` sibling.
+        // Measured over `ADDA.w` and `ADDA.l` (#225).
+        if size == Size::Word {
+            2 * ALU_PASS_CLOCKS
+        } else {
+            alu_op_clocks(size, source_accesses(src))
+        }
     }
 
     /// `ADDX`: `1101 xxx 1 ss 00 m yyy`, `ss != 11`.
@@ -231,23 +288,31 @@ impl M68k {
             let result = self.add_extend_flags(left, right, size);
             self.write_ea(bus, Ea::DataReg(dest), size, result);
             self.advance_opcode(bus);
-            return 0;
+            // Two registers, so no bus access covers the long add's passes; the
+            // byte and word forms pay nothing ([`alu_op_clocks`], #225).
+            return alu_op_clocks(size, 0);
         }
 
         // Memory mode: `-(Ay)` is resolved and read before `-(Ax)`, so
         // `ADDX.B -(A0),-(A0)` adds the byte to itself with both pointers
-        // moving once, and each `Ea` is only resolved once.
+        // moving once, and each `Ea` is only resolved once. The destination is
+        // resolved as a write: its predecrement happens in the write cycle, so
+        // only `-(Ay)` pays the address calculation ([`crate::ea::EaUse`], and
+        // what all 3 sizes of `ADDX.<mem>` measure once it is done that way).
         let Some(src_ea) = self.resolve_arith_ea(bus, EA_PREDEC, src, size) else {
             return self.op_illegal(bus);
         };
         let left = self.read_ea(bus, src_ea, size);
-        let Some(dest_ea) = self.resolve_arith_ea(bus, EA_PREDEC, dest, size) else {
+        let Some(dest_ea) = self.resolve_arith_ea_write(bus, EA_PREDEC, dest, size) else {
             return self.op_illegal(bus);
         };
         let right = self.read_ea(bus, dest_ea, size);
         let result = self.add_extend_flags(left, right, size);
         self.write_ea(bus, dest_ea, size, result);
 
+        // The three accesses of the memory form — read `-(Ay)`, read `-(Ax)`,
+        // write `-(Ax)` — cover its ALU passes, so nothing is added here even at
+        // long (#225).
         self.advance_opcode(bus);
         0
     }
@@ -282,7 +347,7 @@ impl M68k {
         self.write_ea(bus, dest, size, result);
 
         self.advance_opcode(bus);
-        0
+        alu_op_clocks(size, dest_accesses(dest))
     }
 
     /// `ADDQ`: `0101 ddd 0 ss mmm rrr`, `ddd` = 1..8 and `000` meaning 8.
@@ -305,7 +370,15 @@ impl M68k {
             let sum = self.a[usize::from(ea_reg)].wrapping_add(data);
             self.write_ea(bus, Ea::AddrReg(ea_reg), Size::Long, sum);
             self.advance_opcode(bus);
-            return 0;
+            // Measured over `ADD.w` and `ADD.l`, which is where the suite puts
+            // `ADDQ` cases: the word form pays for the width pass on top of the
+            // long add, the long form for the add alone. There is no bus access
+            // to hide either (#225).
+            return if size == Size::Word {
+                2 * ALU_PASS_CLOCKS
+            } else {
+                ALU_PASS_CLOCKS
+            };
         }
 
         let Some(dest) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
@@ -316,7 +389,7 @@ impl M68k {
         self.write_ea(bus, dest, size, result);
 
         self.advance_opcode(bus);
-        0
+        alu_op_clocks(size, dest_accesses(dest))
     }
 
     /// `SUB`: `1001 ddd ooo mmm rrr`.
@@ -338,6 +411,7 @@ impl M68k {
             return self.op_illegal(bus);
         };
 
+        let pass_clocks;
         if op_mode & ALU_MODE_TO_EA == 0 {
             // SUB <ea>,Dn: the source is read first, so `(A0)+` steps once, and
             // the register is the minuend.
@@ -347,6 +421,7 @@ impl M68k {
             let value = self.read_ea(bus, src, size);
             let result = self.sub_flags(value, self.d[usize::from(reg)], false, size);
             self.write_ea(bus, Ea::DataReg(reg), size, result);
+            pass_clocks = alu_op_clocks(size, source_accesses(src));
         } else {
             // SUB Dn,<ea>: one read-modify-write of the resolved destination.
             // Resolving the EA twice would step `(A0)+` twice, so it is resolved
@@ -359,10 +434,11 @@ impl M68k {
             let value = self.read_ea(bus, dest, size);
             let result = self.sub_flags(subtrahend, value, false, size);
             self.write_ea(bus, dest, size, result);
+            pass_clocks = alu_op_clocks(size, dest_accesses(dest));
         }
 
         self.advance_opcode(bus);
-        0
+        pass_clocks
     }
 
     /// `SUBA.W` (`1001 aaa 011 mmm rrr`) and `SUBA.L` (`1001 aaa 111 mmm rrr`).
@@ -399,7 +475,13 @@ impl M68k {
         self.write_ea(bus, Ea::AddrReg(reg), Size::Long, difference);
 
         self.advance_opcode(bus);
-        0
+        // As for [`M68k::op_adda`]: the word form pays the sign-extension pass in
+        // every mode, the long form follows [`alu_op_clocks`] (#225).
+        if size == Size::Word {
+            2 * ALU_PASS_CLOCKS
+        } else {
+            alu_op_clocks(size, source_accesses(src))
+        }
     }
 
     /// `SUBX`: `1001 xxx 1 ss 00 m yyy`, `ss != 11`.
@@ -424,17 +506,22 @@ impl M68k {
             let result = self.sub_extend_flags(subtrahend, minuend, size);
             self.write_ea(bus, Ea::DataReg(dest), size, result);
             self.advance_opcode(bus);
-            return 0;
+            // The register form of `ADDX`, including its 4 clocks for `SUBX.L`
+            // (see [`alu_op_clocks]).
+            return alu_op_clocks(size, 0);
         }
 
         // Memory mode: `-(Ay)` is resolved and read before `-(Ax)`, so
         // `SUBX.B -(A0),-(A0)` subtracts the byte from itself with both pointers
-        // moving once, and each `Ea` is only resolved once.
+        // moving once, and each `Ea` is only resolved once. As in `ADDX`, the
+        // destination is resolved as a write so its predecrement is free
+        // ([`crate::ea::EaUse`]), and its three accesses cover its ALU passes,
+        // so nothing is added after `advance_opcode` (#225).
         let Some(src_ea) = self.resolve_arith_ea(bus, EA_PREDEC, src, size) else {
             return self.op_illegal(bus);
         };
         let subtrahend = self.read_ea(bus, src_ea, size);
-        let Some(dest_ea) = self.resolve_arith_ea(bus, EA_PREDEC, dest, size) else {
+        let Some(dest_ea) = self.resolve_arith_ea_write(bus, EA_PREDEC, dest, size) else {
             return self.op_illegal(bus);
         };
         let minuend = self.read_ea(bus, dest_ea, size);
@@ -475,7 +562,7 @@ impl M68k {
         self.write_ea(bus, dest, size, result);
 
         self.advance_opcode(bus);
-        0
+        alu_op_clocks(size, dest_accesses(dest))
     }
 
     /// `SUBQ`: `0101 ddd 1 ss mmm rrr`, `ddd` = 1..8 and `000` meaning 8.
@@ -494,11 +581,16 @@ impl M68k {
 
         if mode == EA_MODE_AN {
             // Always a 32-bit subtract from An, whatever `ss` says, and no flag
-            // is touched — which is why this cannot reuse `sub_flags`.
+            // is touched — which is why this cannot reuse `sub_flags`. Timing
+            // too is the `ADDQ` rule, not the operand one: see [`M68k::op_addq`].
             let difference = self.a[usize::from(ea_reg)].wrapping_sub(data);
             self.write_ea(bus, Ea::AddrReg(ea_reg), Size::Long, difference);
             self.advance_opcode(bus);
-            return 0;
+            return if size == Size::Word {
+                2 * ALU_PASS_CLOCKS
+            } else {
+                ALU_PASS_CLOCKS
+            };
         }
 
         let Some(dest) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
@@ -509,7 +601,7 @@ impl M68k {
         self.write_ea(bus, dest, size, result);
 
         self.advance_opcode(bus);
-        0
+        alu_op_clocks(size, dest_accesses(dest))
     }
 
     /// `CMP`: `1011 ddd 0ss mmm rrr`.
@@ -1020,6 +1112,25 @@ impl M68k {
         debug_assert!(
             ea.is_some(),
             "decode let an invalid add operand through: mode {mode:b} reg {reg:b} {size:?}"
+        );
+        ea
+    }
+
+    /// The write side of [`M68k::resolve_arith_ea`], for the instruction that
+    /// resolves the location it stores to: `ADDX`/`SUBX` in their `-(Ay),-(Ax)`
+    /// form. See [`crate::ea::EaUse`] for why that one costs 2 clocks less than
+    /// reading the same mode (#225).
+    fn resolve_arith_ea_write(
+        &mut self,
+        bus: &mut impl Bus,
+        mode: u8,
+        reg: u8,
+        size: Size,
+    ) -> Option<Ea> {
+        let ea = self.resolve_ea_write(bus, mode, reg, size);
+        debug_assert!(
+            ea.is_some(),
+            "decode let an invalid add destination through: mode {mode:b} reg {reg:b} {size:?}"
         );
         ea
     }
