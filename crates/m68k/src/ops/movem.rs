@@ -53,6 +53,14 @@
 //! `MOVEM.l.json.gz` case `48d0 [MOVEM.l #, (A0)] 6460` starts and ends with the
 //! same machine. `decode` therefore accepts every operand MOVEM can address and
 //! this handler never rejects one for an empty list.
+//!
+//! # Cycles
+//!
+//! Nothing extra, including the extra read above: `read_w` and `write_w` charge
+//! the word cycles of each register in the list, and the total they reach is
+//! M68000UM section 8's `8/12 + n`-style MOVEM figure for every mode. Both
+//! `MOVEM.w` and `MOVEM.l` pass cycle checking unchanged when M1-31b (#40)
+//! flipped them.
 
 use crate::M68k;
 use crate::bus::{ADDR_MASK, Bus};

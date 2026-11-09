@@ -3,7 +3,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateSkipAddressErrors`], the same one the logic and shift
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`], the same one the logic and shift
 //! classes use: the cases that end in the suite's exception handler are left to
 //! M1-29 (#37) — see [`harness::is_address_error_case`] and #185.
 //!
@@ -23,23 +23,23 @@ mod harness;
 /// `BTST`: `BTST.json.gz`, 8065 cases.
 #[test]
 fn btst_file_passes() {
-    harness::assert_file_passes("BTST", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("BTST", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `BCHG`: `BCHG.json.gz`, 8065 cases.
 #[test]
 fn bchg_file_passes() {
-    harness::assert_file_passes("BCHG", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("BCHG", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `BCLR`: `BCLR.json.gz`, 8065 cases.
 #[test]
 fn bclr_file_passes() {
-    harness::assert_file_passes("BCLR", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("BCLR", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `BSET`: `BSET.json.gz`, 8065 cases.
 #[test]
 fn bset_file_passes() {
-    harness::assert_file_passes("BSET", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("BSET", harness::Check::StateAndCyclesSkipAddressErrors);
 }

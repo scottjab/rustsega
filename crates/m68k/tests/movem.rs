@@ -1,7 +1,7 @@
 //! `MOVEM` in the pinned 680x0 suite: `MOVEM.w` and `MOVEM.l` (M1-24, #32).
 //!
 //! One test per suite file, in the style of `bcd.rs`, checked with
-//! [`harness::Check::StateSkipAddressErrors`]. These two files are the heaviest
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`]. These two files are the heaviest
 //! users of that skip in the whole suite: 3784 of `MOVEM.w`'s and 3842 of
 //! `MOVEM.l`'s 8065 cases end in the suite's exception handler because their
 //! operand address is odd, and a word or long access there is an address error
@@ -34,13 +34,13 @@ mod harness;
 /// `d` picking the direction (M68000UM MOVEM).
 #[test]
 fn movem_w_file_passes() {
-    harness::assert_file_passes("MOVEM.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MOVEM.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `MOVEM.l`: the same with bit 6 set, `$48D0`..`$48F9` and `$4CD0`..`$4CFB`.
 #[test]
 fn movem_l_file_passes() {
-    harness::assert_file_passes("MOVEM.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MOVEM.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// The two file names above are what the suite ships, so a rename fails here

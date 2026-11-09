@@ -78,9 +78,15 @@ const DIV_MAX_ITERATIONS: u32 = 16;
 /// measured over all 2469 overflowing cases of `DIVU.json.gz`. See
 /// [`div_overflow_clocks`].
 const DIVU_OVERFLOW_CLOCKS: u32 = 10;
-/// A `DIVS` that overflows: 16 (or 18) clocks, same measurement over 3753 cases
-/// of `DIVS.json.gz`. See [`div_overflow_clocks`].
+/// A `DIVS` that overflows with a **positive** dividend: 16 clocks, same
+/// measurement. See [`div_overflow_clocks`].
 const DIVS_OVERFLOW_CLOCKS: u32 = 16;
+/// A `DIVS` that overflows with a **negative** dividend: 18 clocks. The sign of
+/// the dividend, and not of the divisor, is what splits the suite's 3753
+/// overflowing `DIVS` cases — 18 for every one of the 1850 whose dividend is
+/// negative and 16 for every one of the 1903 whose dividend is positive,
+/// whichever way round the divisor's sign goes (M1-31b, #40).
+const DIVS_OVERFLOW_NEGATIVE_CLOCKS: u32 = 18;
 
 /// `n` for MULU: the number of set bits in the source word (M68000UM section 8,
 /// "MULU — Multiply Unsigned": `38 + 2n`, `n` counted over the source operand).
@@ -158,7 +164,16 @@ fn divide_32_by_16(dividend: u32, divisor: u16, signed: bool) -> Option<(u16, u1
 ///   `DIVU` quotients appear at two different costs, so the divider also depends
 ///   on the dividend or on the order the walk runs in.
 ///
-/// `divu_timing_examples` and `divs_timing_examples` pin the shape that ships.
+/// The measured shape of the law, from M1-31b (#40): a divide that finishes is
+/// `4 + 2n +` the source's own addressing time, with `n` from **42 to 63** for
+/// `DIVU` and **61 to 74** for `DIVS` (measured over the 613 and 333 `Dn`-source
+/// cases that neither take the suite's exception handler nor overflow). This
+/// model does not reach those bounds: it is off by -46..=+16 and -26..=+16
+/// clocks. `bit_length` and `count_ones` of the quotient, of the remainder, of
+/// the divisor and of the dividend's high word were each measured as a sole
+/// predictor, and each leaves 31 or more distinct residuals per bucket: the
+/// divider's `n` needs the walk itself, not a count of the answer (#238).
+////// `divu_timing_examples` and `divs_timing_examples` pin the shape that ships.
 const fn div_clocks(signed: bool, quotient: u16) -> u32 {
     if signed {
         DIVS_BASE_CLOCKS + MUL_ITERATION_CLOCKS * muls_iterations(quotient)
@@ -170,16 +185,17 @@ const fn div_clocks(signed: bool, quotient: u16) -> u32 {
 /// A divide that overflows never walks the quotient at all, and the suite says
 /// so in clocks: every one of its 2469 overflowing `DIVU` cases costs 10 clocks
 /// on top of the source's own access, and every one of its 3753
-/// overflowing `DIVS` cases 16 or 18 — this core charges the lower, the spread
-/// being one for M1-31 (#39/#40) to split rather than guess at here. It is the
-/// only number in this file measured from the chip's timing rather than from the
-/// manual, and it says an aborted divide is roughly a *tenth* of the cost of the
-/// divide it gave up on.
-const fn div_overflow_clocks(signed: bool) -> u32 {
-    if signed {
-        DIVS_OVERFLOW_CLOCKS
-    } else {
+/// overflowing `DIVS` cases 16 or 18 depending on the sign of the dividend
+/// ([`DIVS_OVERFLOW_NEGATIVE_CLOCKS`]). It is the only number in this file
+/// measured from the chip's timing rather than from the manual, and it says an
+/// aborted divide is roughly a *tenth* of the cost of the divide it gave up on.
+const fn div_overflow_clocks(signed: bool, dividend: u32) -> u32 {
+    if !signed {
         DIVU_OVERFLOW_CLOCKS
+    } else if (dividend as i32) < 0 {
+        DIVS_OVERFLOW_NEGATIVE_CLOCKS
+    } else {
+        DIVS_OVERFLOW_CLOCKS
     }
 }
 
@@ -341,7 +357,7 @@ impl M68k {
                 self.set_flag(SR_V, true);
                 self.set_flag(SR_C, false);
                 self.advance_opcode(bus);
-                div_overflow_clocks(signed) - OPCODE_CLOCKS
+                div_overflow_clocks(signed, dividend) - OPCODE_CLOCKS
             }
         }
     }
@@ -708,8 +724,10 @@ mod tests {
         assert!(cpu.flag_v());
         assert!(!cpu.flag_c());
         assert_eq!(
-            clocks, 16,
-            "16 clocks for the aborted `DIVS` (18 on some operands)"
+            clocks, 18,
+            "18 clocks for the aborted `DIVS`: the dividend is negative, and the
+             sign of the dividend is what splits the suite's 3753 overflowing
+             `DIVS` cases between 16 and 18 (`DIVS_OVERFLOW_NEGATIVE_CLOCKS`)"
         );
         assert!(cpu.flag_n() && cpu.flag_z(), "N and Z left alone");
 

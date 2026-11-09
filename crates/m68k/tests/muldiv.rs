@@ -5,7 +5,7 @@
 //! cannot finish yet: 3073 of `MULU` and 3122 of `MULS` end in the suite's
 //! exception handler (`harness::is_address_error_case`), because an odd
 //! operand address has to raise address error — M1-29 (#37). Those are left out
-//! by [`harness::Check::StateSkipAddressErrors`], exactly as the add, logic and
+//! by [`harness::Check::StateAndCyclesSkipAddressErrors`], exactly as the add, logic and
 //! shift classes do, and the remaining 4992 / 4943 cases have to pass.
 //!
 //! # Why the cycle tests are separate
@@ -59,14 +59,14 @@ mod harness;
 /// take the suite's exception handler.
 #[test]
 fn mulu_file_passes() {
-    harness::assert_file_passes("MULU", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MULU", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `MULS`: `$C1C0`–`$C1FF` (`1100 ddd 111 eeeeee`), 8065 cases of which 3122
 /// take the suite's exception handler.
 #[test]
 fn muls_file_passes() {
-    harness::assert_file_passes("MULS", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MULS", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `DIVU`: `$80C0`–`$80FF` (`1000 ddd 011 eeeeee`). 8065 cases, 3101 of which
@@ -76,10 +76,12 @@ fn muls_file_passes() {
 /// (`80ef [DIVU (d16, A7), D0] 5745`), which ends at the vector-5 handler
 /// instead and so is not skipped (M1-22, #30).
 ///
-/// State only, deliberately: unlike the multiplies, the divides do not run
-/// under `Check::StateAndCycles`. Their timing is data-dependent in a way this
-/// core has not modelled exactly, which #30 leaves to M1-31 (#39/#40) with the
-/// measured residual; see [`div_clocks`] in `ops/muldiv.rs`.
+/// State only, deliberately: `DIVU`'s overflow path is exact (10 clocks over the
+/// source's own access, every one of the file's 2469 overflowing cases), but a
+/// divide that *finishes* is not — see the measurement in `div_clocks`. Over the
+/// cases that finish, `length` is `4 + 2n` plus the source's own time with `n`
+/// from 42 to 63, and nothing measured so far predicts `n` from the operands
+/// (#238).
 #[test]
 fn divu_file_passes() {
     harness::assert_file_passes("DIVU", harness::Check::StateSkipAddressErrors);
@@ -90,6 +92,11 @@ fn divu_file_passes() {
 /// exists in this file (every one of its 8065 divisors is non-zero), so the
 /// signed trap path is pinned by the unit test in `ops/muldiv.rs` and by
 /// `DIVU` above.
+///
+/// State only, for `DIVU`'s reason: the sign of the dividend now makes the
+/// overflowing cases exact (16 and 18 clocks, `DIVS_OVERFLOW_NEGATIVE_CLOCKS`),
+/// and a divide that finishes is `4 + 2n` with `n` from 61 to 74 and no rule yet
+/// for `n` (#238).
 #[test]
 fn divs_file_passes() {
     harness::assert_file_passes("DIVS", harness::Check::StateSkipAddressErrors);

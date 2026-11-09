@@ -55,16 +55,22 @@
 //! # Clocks
 //!
 //! M68000UM section 8 gives `ABCD` and `SBCD` 6 clocks register form and 18
-//! memory form (plus 4 for each `An` movement), and `NBCD` 8 for `Dn` and
-//! 14..22 by source mode. These handlers return `0`, like every other ALU module
-//! in this core: the bus helpers and the EA layer already self-charge their own
-//! clocks, and who owns which part of an instruction's total is M1-31 (#39/#40),
-//! not this ticket. The three files therefore run under
-//! `Check::StateSkipAddressErrors`, which does not compare `length`.
+//! memory form, and `NBCD` 6 for `Dn` and 12..20 by source mode. Both handlers
+//! add [`bcd_clocks`] to what the bus helpers and the EA layer already charged:
+//! one [`ALU_PASS_CLOCKS`] pass — the `+6`/`+0x60` decimal correction is a pass
+//! of its own on a 16-bit ALU — with every bus access the operands performed
+//! covering it. A register pair performs none, so it pays the 2; the
+//! `-(Ay),-(Ax)` form reads twice and writes once, and pays nothing.
+//!
+//! The memory form therefore needs the destination resolved as a write
+//! ([`M68k::resolve_ea_write`]), exactly as `ADDX`/`SUBX` do: its `-(Ax)`
+//! decrement belongs to the write cycle and costs no address calculation, and
+//! without that the pair charges 20 where the suite says 18 (M1-31b, #40).
 
 use crate::M68k;
 use crate::bus::Bus;
 use crate::ea::{Ea, Size};
+use crate::ops::arith::{ALU_PASS_CLOCKS, dest_accesses};
 use crate::ops::field;
 use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
 
@@ -176,7 +182,7 @@ impl M68k {
         self.set_bcd_flags(answer);
         self.write_ea(bus, dest, Size::Byte, u32::from(answer.result));
         self.advance_opcode(bus);
-        0
+        bcd_clocks(dest_accesses(dest))
     }
 
     /// `ABCD` and `SBCD` as one body: `subtract` picks `Dx - Dy - X` over
@@ -197,23 +203,27 @@ impl M68k {
                 return self.op_illegal(bus);
             };
             let right = self.read_ea(bus, src_ea, Size::Byte) as u8;
-            let Some(dest_ea) = self.resolve_ea(bus, AN_PRE, dest, Size::Byte) else {
+            // Resolved as a write: only `-(Ay)` pays the address calculation, so
+            // that `ABCD.B -(A0),-(A1)` measures 18 and not 20.
+            let Some(dest_ea) = self.resolve_ea_write(bus, AN_PRE, dest, Size::Byte) else {
                 return self.op_illegal(bus);
             };
             let left = self.read_ea(bus, dest_ea, Size::Byte) as u8;
             let answer = bcd_operate(left, right, self.flag_x(), subtract);
             self.set_bcd_flags(answer);
             self.write_ea(bus, dest_ea, Size::Byte, u32::from(answer.result));
+            self.advance_opcode(bus);
+            // Read twice and written once, so the correction's pass is covered.
+            bcd_clocks(2)
         } else {
             let left = self.d[usize::from(dest)] as u8;
             let right = self.d[usize::from(src)] as u8;
             let answer = bcd_operate(left, right, self.flag_x(), subtract);
             self.set_bcd_flags(answer);
             self.write_ea(bus, Ea::DataReg(dest), Size::Byte, u32::from(answer.result));
+            self.advance_opcode(bus);
+            bcd_clocks(0)
         }
-
-        self.advance_opcode(bus);
-        0
     }
 
     /// The five condition codes of a packed decimal answer.
@@ -231,6 +241,18 @@ impl M68k {
         self.set_flag(SR_V, answer.overflow);
         self.set_flag(SR_Z, answer.result == 0 && z_before);
     }
+}
+
+/// Clocks a packed-decimal instruction pays on top of its bus traffic: one
+/// [`ALU_PASS_CLOCKS`] for the decimal correction, less one for every bus access
+/// the operands performed, which hides it.
+///
+/// So the register forms of `ABCD`, `SBCD` and `NBCD` are 6 clocks (the 4 of the
+/// fetch plus this 2), and every memory form of the three is exact on its
+/// accesses alone: 18 for `ABCD`/`SBCD`'s `-(Ay),-(Ax)` and 12..20 for `NBCD`
+/// (M68000UM section 8, measured over all three suite files by M1-31b, #40).
+const fn bcd_clocks(accesses: u32) -> u32 {
+    ALU_PASS_CLOCKS.saturating_sub(accesses * ALU_PASS_CLOCKS)
 }
 
 /// `ABCD`/`SBCD`'s byte: `left + right + X` or `left - right - X`, whichever the

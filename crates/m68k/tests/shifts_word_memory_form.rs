@@ -20,7 +20,7 @@ mod harness;
 use harness::Check;
 
 fn file_passes(name: &str) {
-    harness::assert_file_passes(name, Check::StateSkipAddressErrors);
+    harness::assert_file_passes(name, Check::StateAndCyclesSkipAddressErrors);
 }
 
 #[test]
