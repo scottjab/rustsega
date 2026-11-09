@@ -44,7 +44,7 @@
 //! M1-31 (#39/#40).
 
 use crate::bus::Bus;
-use crate::cpu::M68k;
+use crate::cpu::{M68k, OPCODE_CLOCKS};
 use crate::ea::{Ea, Size, sign_extend_word};
 use crate::exceptions::EXC_DIV_ZERO;
 use crate::ops::field;
@@ -53,63 +53,13 @@ use crate::sr::{SR_C, SR_N, SR_V, SR_Z};
 /// Clocks a multiply costs whatever its operands are: the fetch, the operand
 /// read, the 16-iteration array and the long write-back (M68000UM section 8,
 /// "MULU"/"MULS", "Execution Clocks [..]: 38 + 2n"). The `[..]` in the manual
-/// is the execution time alone; `+ 2n` covers the data-dependent part and the
-/// addressing time is added separately by [`ea_clocks`].
+/// is the execution time alone and `+ 2n` the data-dependent part. The
+/// addressing time is not added here: [`M68k::read_ea`] charged it when it did
+/// the access, and [`M68k::op_mul`] takes the opcode fetch out of the total for
+/// the same reason (M1-31, #39).
 const MUL_BASE_CLOCKS: u32 = 38;
 /// Clocks each iteration of the multiply array costs: `2n` in the formula above.
 const MUL_ITERATION_CLOCKS: u32 = 2;
-
-/// One 16-bit bus access: 4 clocks (M68000UM Appendix C, "Bus Timings").
-const BUS_ACCESS: u32 = 4;
-/// One extension word read from the instruction stream: one access.
-const EXTENSION_WORD: u32 = 4;
-/// The internal calculation an index byte needs on top of the access: the 68000
-/// spends 5 clocks on an index where `An` indirect spends 4 (M68000UM
-/// Appendix D, indexed addressing). `ea::INDEX_CALC_CLOCKS` is the same 2 for the
-/// instructions whose EA [`M68k::resolve_ea`] prices; a multiply has no size
-/// field for that path to work off, so it prices its own EA here.
-const INDEX_CALC: u32 = 2;
-/// What `-(An)` costs over a plain access: the decrement is an internal cycle,
-/// as it is in `ea::PREDEC_CALC_CLOCKS`.
-const PREDEC_CALC: u32 = 2;
-
-/// Clocks a word-read source effective address costs on top of the
-/// instruction's own cost: the same table for a multiply and for a divide, which
-/// both read one word from an EA in the same way.
-///
-/// Measured mode by mode against every non-exception case of `MULU.json.gz` and
-/// `MULS.json.gz`: `length - (38 + 2n)` is exactly this constant for each mode,
-/// in both files and with no scatter (see `tests/muldiv.rs`). It is the same
-/// 4-clocks-per-access / 4-per-extension-word / 2-per-index-calculation model
-/// [`crate::ea`] charges ADD and MOVE through; `MULU`/`MULS` have no size field,
-/// so the group cannot share that calculation and this table is the result.
-///
-/// Mode `001` cannot reach a multiply: [`crate::decode`] decodes it to
-/// [`crate::decode::Op::Illegal`] (#29).
-const fn ea_clocks(mode: u8, reg: u8) -> u32 {
-    match mode {
-        // `Dn`: the operand is already in the register file.
-        0b000 => 0,
-        // `(An)+`'s register update is free; `-(An)`'s is not (ea.rs charges the
-        // same difference for the sized instructions).
-        0b010 => BUS_ACCESS,
-        0b011 => BUS_ACCESS,
-        0b100 => BUS_ACCESS + PREDEC_CALC,
-        0b101 => EXTENSION_WORD + BUS_ACCESS,
-        0b110 => EXTENSION_WORD + BUS_ACCESS + INDEX_CALC,
-        0b111 => match reg {
-            0b000 => EXTENSION_WORD + BUS_ACCESS,
-            0b001 => 2 * EXTENSION_WORD + BUS_ACCESS,
-            0b010 => EXTENSION_WORD + BUS_ACCESS,
-            0b011 => EXTENSION_WORD + BUS_ACCESS + INDEX_CALC,
-            // `#imm`: the extension word *is* the operand, so one access, not two.
-            _ => EXTENSION_WORD,
-        },
-        // Mode `001` is all that is left, and it cannot get here: see the note
-        // above. `0` rather than a `todo!()` on a path the decoder closes.
-        _ => 0,
-    }
-}
 
 /// The worst case of each divide, from M68000UM "68000 Programmers Interface"
 /// ("Divide Instructions": DIVU 68/70/140, DIVS 74/76/158 — typical, 64-bit
@@ -197,7 +147,7 @@ fn divide_32_by_16(dividend: u32, divisor: u16, signed: bool) -> Option<(u16, u1
 /// **This is an approximation, which is as far as #30 takes it**: M1-31 (#39 and
 /// #40) owns the divider's real clock law. Measured over the 4964 `DIVU` and
 /// 4992 `DIVS` cases of the pinned suite that do not end in its exception
-/// handler, with the source's own [`ea_clocks`] taken back out:
+/// handler, with the source's own access taken back out:
 ///
 /// * every cost is a multiple of 2;
 /// * a completed divide is 38..=136 for `DIVU` and 120..=154 for `DIVS` — both
@@ -219,7 +169,7 @@ const fn div_clocks(signed: bool, quotient: u16) -> u32 {
 
 /// A divide that overflows never walks the quotient at all, and the suite says
 /// so in clocks: every one of its 2469 overflowing `DIVU` cases costs 10 clocks
-/// on top of the source's own [`ea_clocks`], and every one of its 3753
+/// on top of the source's own access, and every one of its 3753
 /// overflowing `DIVS` cases 16 or 18 — this core charges the lower, the spread
 /// being one for M1-31 (#39/#40) to split rather than guess at here. It is the
 /// only number in this file measured from the chip's timing rather than from the
@@ -280,7 +230,11 @@ impl M68k {
         self.write_ea(bus, Ea::DataReg(reg), Size::Long, result);
         self.set_logic_flags(result, Size::Long);
         self.advance_opcode(bus);
-        MUL_BASE_CLOCKS + MUL_ITERATION_CLOCKS * iterations + ea_clocks(mode, ea_reg)
+        // The manual's `38 + 2n` counts the opcode fetch, which `advance_opcode`
+        // has just charged and which no EA of this instruction paid for, and the
+        // source EA charged itself in `read_ea` — so the handler hands back the
+        // documented total less the fetch (M1-31, #39).
+        MUL_BASE_CLOCKS - OPCODE_CLOCKS + MUL_ITERATION_CLOCKS * iterations
     }
 
     /// `DIVU <ea>,Dn` — unsigned 32/16 divide (M68000UM DIVU; M1-22, #30).
@@ -375,7 +329,9 @@ impl M68k {
                 // the result being the quotient).
                 self.set_logic_flags(u32::from(quotient), Size::Word);
                 self.advance_opcode(bus);
-                div_clocks(signed, quotient) + ea_clocks(mode, ea_reg)
+                // Less the opcode fetch, as in [`M68k::op_mul`]; the source EA
+                // charged itself.
+                div_clocks(signed, quotient) - OPCODE_CLOCKS
             }
             None => {
                 // Overflow. `V` set and `C` cleared; `N`, `Z` and `X` are left
@@ -385,7 +341,7 @@ impl M68k {
                 self.set_flag(SR_V, true);
                 self.set_flag(SR_C, false);
                 self.advance_opcode(bus);
-                div_overflow_clocks(signed) + ea_clocks(mode, ea_reg)
+                div_overflow_clocks(signed) - OPCODE_CLOCKS
             }
         }
     }

@@ -3,7 +3,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateSkipAddressErrors`]: these are the first files the
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`]: these are the first files the
 //! core runs real memory traffic through the EA layer on, and the cases that
 //! end in the suite's exception handler are left to M1-29 (#37) — see
 //! [`harness::is_address_error_case`] and #185 for what that predicate really
@@ -21,37 +21,37 @@ mod harness;
 /// `MOVE.B`: `$0001`-`$1FFF`, byte size, destination mode `001` illegal.
 #[test]
 fn move_b_file_passes() {
-    harness::assert_file_passes("MOVE.b", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MOVE.b", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `MOVE.W`: `$3000`-`$3FFF` minus the MOVEA encodings.
 #[test]
 fn move_w_file_passes() {
-    harness::assert_file_passes("MOVE.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MOVE.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `MOVE.L`: `$2000`-`$2FFF` minus the MOVEA encodings.
 #[test]
 fn move_l_file_passes() {
-    harness::assert_file_passes("MOVE.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MOVE.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `MOVEA.W`: destination mode `001` in the word group, word only.
 #[test]
 fn movea_w_file_passes() {
-    harness::assert_file_passes("MOVEA.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MOVEA.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `MOVEA.L`: destination mode `001` in the long group.
 #[test]
 fn movea_l_file_passes() {
-    harness::assert_file_passes("MOVEA.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MOVEA.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `MOVEQ`: `$7000`-`$7FFF`, with bit 8 set an illegal instruction on the 68000.
 #[test]
 fn moveq_file_passes() {
-    harness::assert_file_passes("MOVE.q", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("MOVE.q", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// The six file names above are the ones the suite actually ships, so a rename

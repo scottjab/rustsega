@@ -65,6 +65,32 @@ use crate::exceptions::EXC_CHK;
 use crate::ops::field;
 use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
 
+/// Clocks one pass of the 68000 ALU costs: the ALU is 16 bits wide, so an
+/// operand or a result that is a long is a pass of its own, and a pass that no
+/// bus cycle overlaps is 2 clocks.
+///
+/// Not a number the manual states in this form — M68000UM section 8 gives
+/// per-instruction totals. What the totals leave after their bus cycles are
+/// subtracted is this constant times a number of passes, measured over every
+/// non-exception case of the pinned `SingleStepTests` files for M1-31a (#39).
+/// [`one_operand_clocks`] is the count for the one-operand group; the byte and
+/// word forms of every group here need nothing, which is why their `.b`/`.w`
+/// files pass unchanged.
+pub(crate) const ALU_PASS_CLOCKS: u32 = 2;
+
+/// Clocks a one-operand ALU instruction (`NEG`, `NEGX`, `CLR`, `NOT`) pays on
+/// top of its bus traffic: one long pass when the operand is a register, and
+/// nothing when it is memory, whose read-then-write cycles hide the pass.
+///
+/// Measured: `NEG.l`/`NEGX.l`/`CLR.l`/`NOT.l` against `Dn` are 2 over (6 clocks,
+/// 4 of them the fetch), and every memory case of those files is already exact.
+pub(crate) const fn one_operand_clocks(size: Size, ea: Ea) -> u32 {
+    match (size, ea) {
+        (Size::Long, Ea::DataReg(_)) => ALU_PASS_CLOCKS,
+        _ => 0,
+    }
+}
+
 /// Shift of the register field of the `1101`/`1001` groups and of `ADDQ`/
 /// `SUBQ`'s data field, bits 11..9.
 const ALU_REG_SHIFT: u32 = 9;
@@ -512,7 +538,15 @@ impl M68k {
         self.sub_flags_no_x(value, self.d[usize::from(reg)], false, size);
 
         self.advance_opcode(bus);
-        0
+        // A long compare is one ALU pass the bus cycles do not cover: 2 clocks,
+        // in every addressing mode except `#imm` (`ADD.l` and friends, which
+        // also write a result, pay it only for a source that is not read from
+        // memory — see [`ALU_PASS_CLOCKS]`). `CMP.b`/`CMP.w` are already exact.
+        if size == Size::Long {
+            ALU_PASS_CLOCKS
+        } else {
+            0
+        }
     }
 
     /// `CMPA.W` (`1011 aaa 011 mmm rrr`) and `CMPA.L` (`1011 aaa 111 mmm rrr`).
@@ -548,7 +582,10 @@ impl M68k {
         self.sub_flags_no_x(subtrahend, self.a[usize::from(reg)], false, Size::Long);
 
         self.advance_opcode(bus);
-        0
+        // One long pass, and `CMPA.W` does not escape it either: the compare is
+        // long whatever the operand size, so all 10 modes of `CMPA.W` and
+        // `CMPA.L` measure 2 over ([`ALU_PASS_CLOCKS`], M1-31a #39).
+        ALU_PASS_CLOCKS
     }
 
     /// `CMPM`: `1011 xxx 1 ss 001 yyy`, `(Ay)+` compared against `(Ax)+`.
@@ -811,7 +848,7 @@ impl M68k {
         self.write_ea(bus, dest, size, result);
 
         self.advance_opcode(bus);
-        0
+        one_operand_clocks(size, dest)
     }
 
     /// `CLR`: `0100 0010 ss mmm rrr` — zero to `<ea>` (M68000UM section 8,
@@ -845,7 +882,7 @@ impl M68k {
         self.write_ea(bus, dest, size, 0);
 
         self.advance_opcode(bus);
-        0
+        one_operand_clocks(size, dest)
     }
 
     /// Add `src` and `dst` at `size`, fold `extend` in as a carry-in, set

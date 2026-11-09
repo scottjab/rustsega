@@ -2,7 +2,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateSkipAddressErrors`], the same one `NEG`/`CLR`/`EXG`
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`], the same one `NEG`/`CLR`/`EXG`
 //! use: the cases that end in the suite's exception handler are left to M1-29
 //! (#37) — see [`harness::is_address_error_case`] and #185.
 //!
@@ -31,27 +31,27 @@ mod harness;
 /// `LEA <ea>,An`: `$41C0`..`$4FFF` with bits 8..6 all set, no flag affected.
 #[test]
 fn lea_file_passes() {
-    harness::assert_file_passes("LEA", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("LEA", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `PEA <ea>`: PEA's half of the `$48??` window (`$4840`+EA at any mode but
 /// `000`, which is `SWAP`), pushing the computed address rather than its contents.
 #[test]
 fn pea_file_passes() {
-    harness::assert_file_passes("PEA", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("PEA", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `LINK An,#d16`: `$4E50`+`r`, the frame-pointer prologue.
 #[test]
 fn link_file_passes() {
-    harness::assert_file_passes("LINK", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("LINK", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `UNLINK An` — the suite's `UNLINK.json.gz`, which is `$4E58`+`r`: the frame
 /// teardown that reverses `LINK`.
 #[test]
 fn unlk_file_passes() {
-    harness::assert_file_passes("UNLINK", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("UNLINK", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// The four file names above are what the suite ships for this ticket, so a

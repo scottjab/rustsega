@@ -331,17 +331,16 @@ impl M68k {
     /// Privileged, and the check comes first: a denied RESET pulses nothing.
     ///
     /// The 132 clocks are the manual's figure (M68000UM appendix "Instruction
-    /// Timing"). They are returned rather than left to the self-charging helpers
-    /// because RESET makes no bus access of its own for those to charge — but see
-    /// the TODO on [`M68k::step`] about which clock total wins, which is M1-31
-    /// (#39).
+    /// Timing") and include the opcode fetch, which [`M68k::advance_opcode`]
+    /// charges; RESET makes no other bus access, so the handler hands back the
+    /// rest (M1-31, #39).
     pub(crate) fn op_reset(&mut self, bus: &mut impl Bus, _opcode: u16) -> u32 {
         if !self.check_supervisor(bus) {
             return 0;
         }
         bus.reset_devices();
         self.advance_opcode(bus);
-        RESET_CLOCKS
+        RESET_CLOCKS - crate::cpu::OPCODE_CLOCKS
     }
 
     /// `STOP` `$4E72 <word>` (M68000UM "STOP — Stop the Processor"): load the
@@ -1001,7 +1000,11 @@ mod tests {
         cpu.set_ccr(ALL_FLAGS & !SR_V);
         let before = cpu.clone();
 
-        assert_eq!(cpu.step(&mut bus), 0);
+        assert_eq!(
+            cpu.step(&mut bus),
+            crate::cpu::OPCODE_CLOCKS,
+            "a not-taken TRAPV costs its opcode fetch and nothing else"
+        );
 
         assert_eq!(cpu.pending_exception, None, "V clear, so no exception");
         assert_eq!(cpu.pc, PROGRAM + 2, "past the opcode");
@@ -1079,7 +1082,11 @@ mod tests {
     fn stop_loads_sr_and_halts_until_interrupt() {
         let (mut cpu, mut bus) = run(0x4E72, &[0x0003, 0x4E71]); // STOP #$0003
 
-        assert_eq!(cpu.step(&mut bus), 0);
+        assert_eq!(
+            cpu.step(&mut bus),
+            2 * crate::cpu::OPCODE_CLOCKS,
+            "STOP is two words, and each is one fetch"
+        );
 
         assert_eq!(cpu.sr, 0x0003, "the whole SR, not just the CCR");
         assert!(!cpu.is_supervisor(), "so bit 13 of the operand is the mode");

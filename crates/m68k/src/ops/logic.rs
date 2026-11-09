@@ -177,7 +177,7 @@ impl M68k {
         self.write_ea(bus, dest, size, result);
 
         self.advance_opcode(bus);
-        0
+        crate::ops::arith::one_operand_clocks(size, dest)
     }
 
     /// `EXT.W Dn` (`0100 1000 1000 0 rrr`) and `EXT.L Dn`
@@ -266,7 +266,9 @@ impl M68k {
         self.write_ea(bus, second, Size::Long, left_value);
 
         self.advance_opcode(bus);
-        0
+        // The swap is one long ALU pass, 2 clocks over the fetch: every one of
+        // the 8 forms of `EXG.json.gz` is 6 (M1-31a, #39).
+        crate::ops::arith::ALU_PASS_CLOCKS
     }
 
     /// The `1100`/`1000` shape: bit 8 of the operation field picks the
