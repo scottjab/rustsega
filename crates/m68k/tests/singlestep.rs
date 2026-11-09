@@ -345,21 +345,22 @@ fn only_state_and_cycles_checks_the_cycle_count() {
 
     // The cycle comparison itself needs a case that *returns*: `run` compares
     // `length` on the `Ok(cycles)` branch and records the panic on the other,
-    // so `4E74` can never reach it. `4AFC` takes the exception and comes back
-    // with 0 clocks, because the entry sequence charges its own 34 into
-    // `M68k::cycles` and the instruction-overhead channel is still M1-31's
-    // (#39) — see the module docs of `src/ops/mod.rs`.
+    // so `4E74` can never reach it. `4AFC` takes the exception, and since
+    // M1-31a (#39) `step` reports the whole clock cost of the step, so it comes
+    // back with the 34 the entry sequence charged into `M68k::cycles`.
+    const ENTRY: u32 = 34;
     let mut returns = illegal_case();
+    returns.length = ENTRY;
     assert_eq!(
         run(&returns, harness::Check::StateAndCycles),
         Vec::<String>::new(),
-        "the case's `length: 0` is what the step returns, so StateAndCycles is clean"
+        "the step's 34 clocks are what `length` says, so StateAndCycles is clean"
     );
     returns.length = 4;
     assert_eq!(run(&returns, harness::Check::State), Vec::<String>::new());
     assert_eq!(
         run(&returns, harness::Check::StateAndCycles),
-        vec!["cycles: expected 4, got 0"],
+        vec!["cycles: expected 4, got 34"],
         "only StateAndCycles reports it"
     );
 }

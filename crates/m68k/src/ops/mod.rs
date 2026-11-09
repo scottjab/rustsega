@@ -9,13 +9,16 @@
 //! `bus: &mut impl Bus` as soon as they touch memory — TRAP and the illegal
 //! routes do, so both take it here.
 //!
-//! A handler returns the 68k clocks the instruction cost. [`M68k::step`] adds
-//! that to [`M68k::cycles`] once, so a handler must not also charge the clocks
-//! it returns; the self-charging bus helpers (`read_w` and friends) and the EA
-//! layer's internal clocks are the exception, and how those three numbers add
-//! up is M1-31 (#39/#40)'s business, not this module's. That is why the
-//! exception handlers below return 0: the entry sequence they run charges its
-//! own 34 clocks (see [`crate::exceptions`]).
+//! Bus accessors (`read_w` and friends) and the EA layer's internal clocks
+//! charge [`M68k::cycles`] themselves. A handler returns only what none of that
+//! has paid for yet — the ALU and address-calculation clocks of
+//! [`crate::ops::arith`], [`crate::ops::move_`] and friends — and
+//! [`M68k::step`] adds them to [`M68k::cycles`] once, so a handler must not also
+//! charge what it returns, and must not count the opcode fetch or the operand
+//! words either ([`crate::cpu::OPCODE_CLOCKS`]). `step` then reports the step's
+//! whole clock cost, which is what `TestCase.length` compares against (#39).
+//! That is why the exception handlers below return 0: the entry sequence they
+//! run charges its own 34 clocks (see [`crate::exceptions`]).
 //!
 //! # The exception path
 //!
