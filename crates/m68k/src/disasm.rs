@@ -183,7 +183,12 @@ fn ea_text(r: &mut Reader<'_>, ea: u8, size: Option<Size>) -> String {
 /// and the index (M68000UM, "Index Extended").
 fn indexed(r: &mut Reader<'_>, base: String) -> String {
     let brief = r.word();
-    let d8 = num(u32::from(brief & 0xFF));
+    // A zero displacement is not written: `MOVEM (A0,D1.W),-(A7)` reads better
+    // in a trace than `$0(A0,D1.W)`, and it is how the assembler takes it back.
+    let d8 = match brief & 0xFF {
+        0 => String::new(),
+        n => num(u32::from(n)),
+    };
     format!("{d8}({base},{})", index(brief))
 }
 
@@ -239,10 +244,20 @@ fn format_op(r: &mut Reader<'_>, opcode: u16) -> String {
             format!("MOVE{} {from},{to}", size_suffix(size))
         }
         Op::Movea => {
-            // A `MOVEA` immediate is a word however wide the instruction is
-            // (M68000UM MOVEA: it is sign-extended to the long form).
-            let from = ea_text(r, ea, Some(Size::Word));
-            format!("MOVEA{} {from},{}", size_suffix(move_size(opcode)), an(dx))
+            // `MOVEA` sizes itself with bit 8, not with the `MOVE` size field
+            // (M68000UM, "MOVEA"). Its immediate follows that size: the
+            // `MOVEA.l.json.gz` cases advance PC by six.
+            let size = if (opcode >> 12) & 0b11 == 0b11 {
+                if opcode & 0x0100 == 0 {
+                    Size::Word
+                } else {
+                    Size::Long
+                }
+            } else {
+                move_size(opcode).unwrap_or(Size::Long)
+            };
+            let from = ea_text(r, ea, Some(size));
+            format!("MOVEA{} {from},{}", size_suffix(Some(size)), an(dx))
         }
         Op::Moveq => {
             let imm = num(u32::from(opcode & 0xFF));
@@ -448,13 +463,13 @@ fn alu(r: &mut Reader<'_>, opcode: u16, op: Op, ea: u8, dx: u8) -> String {
     format!("{name}{suffix} {left},{right}")
 }
 
-/// `ADDA`/`SUBA`/`CMPA`, printed the way the manual writes them — as `ADD`,
-/// `SUB` and `CMP` with a size, and an address register destination.
+/// `ADDA`/`SUBA`/`CMPA`: the address-register-only forms of the ALU group, which
+/// keep their own mnemonic (M68000UM, "ADDA/SUBA/CMPA").
 fn adda(r: &mut Reader<'_>, opcode: u16, op: Op, ea: u8) -> String {
     let name = match op {
-        Op::Adda => "ADD",
-        Op::Suba => "SUB",
-        _ => "CMP",
+        Op::Adda => "ADDA",
+        Op::Suba => "SUBA",
+        _ => "CMPA",
     };
     // Op mode `011` is the word form and `111` the long one, so bit 8 alone
     // tells them apart (M68000UM ADDA/SUBA/CMPA).
@@ -474,10 +489,15 @@ fn adda(r: &mut Reader<'_>, opcode: u16, op: Op, ea: u8) -> String {
 /// `ADDX`/`SUBX`: bit 3 set is `-(Ay),-(Ax)`, clear is `Dy,Dx`.
 fn double(opcode: u16, name: &str) -> String {
     let suffix = size_suffix(alu_size(opcode));
+    // Bit 3 picks the register pair form from the stack form, which is written
+    // with the `-()` decoration (M68000UM ADDX/SUBX).
     let (left, right) = if opcode & 0b1000 == 0 {
         (dn(field(opcode, 0)), dn(field(opcode, 9)))
     } else {
-        (an(field(opcode, 0)), an(field(opcode, 9)))
+        (
+            format!("-({})", an(field(opcode, 0))),
+            format!("-({})", an(field(opcode, 9))),
+        )
     };
     format!("{name}{suffix} {left},{right}")
 }
@@ -487,12 +507,12 @@ fn double(opcode: u16, name: &str) -> String {
 /// even though it prints second-to-last.
 fn immediate_alu(r: &mut Reader<'_>, opcode: u16, op: Op, ea: u8) -> String {
     let name = match op {
-        Op::Addi => "ADD",
-        Op::Subi => "SUB",
-        Op::Andi => "AND",
-        Op::Ori => "OR",
-        Op::Eori => "EOR",
-        _ => "CMP",
+        Op::Addi => "ADDI",
+        Op::Subi => "SUBI",
+        Op::Andi => "ANDI",
+        Op::Ori => "ORI",
+        Op::Eori => "EORI",
+        _ => "CMPI",
     };
     let size = alu_size(opcode);
     let imm = immediate(r, size);
@@ -519,7 +539,7 @@ fn logic_imm(r: &mut Reader<'_>, opcode: u16, reg: &str) -> String {
 fn quick(op: Op, opcode: u16) -> String {
     let name = if op == Op::Addq { "ADDQ" } else { "SUBQ" };
     let n = field(opcode, 9);
-    let value = num(u32::from(if n == 0 { 8 } else { n }));
+    let value = format!("#{}", num(u32::from(if n == 0 { 8 } else { n })));
     let to = if field(opcode, 3) == 0b001 {
         an(field(opcode, 0))
     } else {
@@ -627,9 +647,7 @@ fn reg_list(mask: u16, reversed: bool) -> String {
         runs(&mut out, 'D', &d);
     }
     if !a.is_empty() {
-        if !out.is_empty() {
-            out.push('/');
-        }
+        // `push_run` separates each run with `/`, including the first `An` run.
         runs(&mut out, 'A', &a);
     }
     out
@@ -715,23 +733,45 @@ mod tests {
     /// the encoder table here is the only other place the rule is written.
     fn reference_size_words(opcode: u16) -> Option<usize> {
         let ea = (opcode & 0x3F) as u8;
-        let dst = ((opcode >> 6) & 0x3F) as u8;
+        // `MOVE` splits its destination over two fields: mode in bits 8..6,
+        // register in bits 11..9.
+        let dst = ((((opcode >> 6) & 0b111) << 3) | ((opcode >> 9) & 0b111)) as u8;
         let hi4 = opcode >> 12;
         // `MOVE`/`MOVEA` number their size field differently from the ALU
         // group (M68000UM, "MOVE — Move to Register/Data").
-        let move_long = matches!((opcode >> 12) & 0b11, 0b01);
+        let move_long = (opcode >> 12) & 0b11 == 0b10;
         let alu_long = matches!((opcode >> 6) & 0b11, 0b10);
         match hi4 {
             // `MOVE <ea>,<ea>` and `MOVEA <ea>,An`, plus the `MOVEP` encodings
             // that live in the otherwise-illegal `0000 ddd0 1p01 1000` corner.
-            0b0000 | 0b0001 | 0b0010 => {
-                if (opcode & 0x01F8) == 0x0008 {
-                    Some(2) // MOVEP: one displacement word
+            // `MOVE <ea>,<ea>` and `MOVEA <ea>,An`.
+            0b0001 | 0b0010 | 0b0011 => Some(1 + ea_words(dst, move_long) + ea_words(ea, move_long)),
+            // `ORI #imm,<ea>`, the bit instructions and `MOVEP`, which share the
+            // `0000` major opcode (M68000UM, "BTST/BSET/BCHG/BCLR", "ORI").
+            // `ORI #imm,<dest>`, the bit instructions and `MOVEP` share the
+            // `0000` major opcode (M68000UM, "ORI", "BTST/BSET/BCHG/BCLR").
+            0b0000 => {
+                if opcode & 0x0100 != 0 {
+                    if ea >> 3 == 0b001 {
+                        Some(2) // MOVEP: one displacement word
+                    } else {
+                        Some(1 + ea_words(ea, false)) // bit number in a Dn
+                    }
+                } else if (opcode & 0x0F00) == 0x0800 {
+                    Some(2 + ea_words(ea, false)) // bit number word
                 } else {
-                    Some(1 + ea_words(dst, move_long) + ea_words(ea, move_long))
+                    // ORI: the immediate, then `mode 111 / reg 100` naming
+                    // `CCR`/`SR`, which adds no word of its own.
+                    let long = (opcode >> 6) & 0b11 == 0b10;
+                    let dest = if ea == 0b111100 {
+                        0
+                    } else {
+                        ea_words(ea, long)
+                    };
+                    Some(1 + ea_words(0b111100, long) + dest)
                 }
             }
-            0b0011 => Some(1 + ea_words(ea, true)),
+            // `$3xxx` is `MOVE.W <ea>,<dst>`, the same shape as the other sizes.
             // `MOVEQ #imm8,Dn`: the whole instruction is the opcode.
             0b0111 => Some(1),
             0b0101 => {
@@ -807,8 +847,8 @@ mod tests {
 
     #[test]
     fn movem_load_prints_the_list_after_the_operand() {
-        assert_eq!(text(&[0x4C50, 0x00FF]), "MOVEM.L (A1),D0-D7");
-        assert_eq!(text(&[0x4C10, 0x0F00]), "MOVEM.W (A0),A0-A3");
+        assert_eq!(text(&[0x4CD1, 0x00FF]), "MOVEM.L (A1),D0-D7");
+        assert_eq!(text(&[0x4C90, 0x0F00]), "MOVEM.W (A0),A0-A3");
     }
 
     #[test]
@@ -816,7 +856,7 @@ mod tests {
         let (t, n) = disassemble(&[0x41F0, 0x1004], 0x1000);
         assert_eq!(t, "LEA $4(A0,D1.W),A0");
         assert_eq!(n, 2);
-        assert_eq!(text(&[0x41F0, 0x9003]), "LEA $3(A0,A1.L),A0");
+        assert_eq!(text(&[0x41F0, 0x9803]), "LEA $3(A0,A1.L),A0");
     }
 
     #[test]
@@ -851,7 +891,7 @@ mod tests {
             (&[0x203B, 0x1004][..], "MOVE.L $4(PC,D1.W),D0"),
             (&[0x203C, 0x0000, 0x0010][..], "MOVE.L #$10,D0"),
             (&[0x103C, 0x0012][..], "MOVE.B #$12,D0"),
-            (&[0x227C, 0x0000, 0x0010][..], "MOVE.L #$10,(A2)"),
+            (&[0x24BC, 0x0000, 0x0010][..], "MOVE.L #$10,(A2)"),
         ] {
             assert_eq!(text(&words), want, "{:04X}", words[0]);
         }
@@ -865,21 +905,21 @@ mod tests {
     fn arithmetic_and_logic_print_size_and_both_operands() {
         for (words, want) in [
             (&[0xD041][..], "ADD.W D1,D0"),
-            (&[0xD1C8][..], "ADD.L (A0)+,A0"),
-            (&[0xD0C0][..], "ADD.L D0,(A0)"),
-            (&[0x50C0][..], "ADDQ.L #$8,A0"),
-            (&[0x5481][..], "SUBQ.B #$4,D1"),
-            (&[0x90F0][..], "SUBA.W (A0),A0"),
-            (&[0x91F2][..], "SUBA.L (A2),A0"),
-            (&[0xB0C8][..], "CMPA.L (A0),A0"),
-            (&[0x51C0][..], "SUBX.L -(A0),-(A0)"),
-            (&[0x9EC1][..], "CMPM.L (A1)+,(A4)+"),
-            (&[0x067C, 0x0001, 0x0002][..], "CMPI.L #$10002,SR"),
+            (&[0xD1D8][..], "ADDA.L (A0)+,A0"),
+            (&[0xD190][..], "ADD.L D0,(A0)"),
+            (&[0x5088][..], "ADDQ.L #$8,A0"),
+            (&[0x5901][..], "SUBQ.B #$4,D1"),
+            (&[0x90D0][..], "SUBA.W (A0),A0"),
+            (&[0x91D2][..], "SUBA.L (A2),A0"),
+            (&[0xB1D0][..], "CMPA.L (A0),A0"),
+            (&[0x9188][..], "SUBX.L -(A0),-(A0)"),
+            (&[0xB989][..], "CMPM.L (A1)+,(A4)+"),
+            (&[0x0C58, 0x1234][..], "CMPI.W #$1234,(A0)+"),
             (&[0x003C, 0x00FF][..], "ORI.B #$FF,CCR"),
             (&[0x027C, 0x1234][..], "ANDI.W #$1234,SR"),
             (&[0x0A3C, 0x0042][..], "EORI.B #$42,CCR"),
-            (&[0x4A10][..], "TST.W (A0)"),
-            (&[0x4200][..], "CLR.W D0"),
+            (&[0x4A50][..], "TST.W (A0)"),
+            (&[0x4240][..], "CLR.W D0"),
             (&[0x4610][..], "NOT.B (A0)"),
             (&[0x40D8][..], "NEGX.L (A0)+"),
             (&[0x4AC0][..], "TAS D0"),
@@ -909,9 +949,9 @@ mod tests {
     fn bit_instructions_print_the_bit_number_or_register() {
         for (words, want) in [
             (&[0x0838, 0x0003, 0x1234][..], "BTST #$3,$1234"),
-            (&[0x0850][..], "BTST (A0),D0"),
-            (&[0x0C58][..], "BSET (A0)+,D0"),
-            (&[0x0478, 0x0001][..], "BCHG.B #$1,D7"),
+            (&[0x0110][..], "BTST D0,(A0)"),
+            (&[0x01D8][..], "BSET D0,(A0)+"),
+            (&[0x0847, 0x0001][..], "BCHG #$1,D7"),
         ] {
             assert_eq!(text(&words), want, "{:04X}", words[0]);
         }
@@ -921,7 +961,7 @@ mod tests {
     fn shifts_print_count_and_direction() {
         for (words, want) in [
             (&[0xE789][..], "LSL.L #$3,D1"),
-            (&[0xE098][..], "ASR.W D0,D4"),
+            (&[0xE064][..], "ASR.W D0,D4"),
             (&[0xE0D0][..], "ASR.W (A0)"),
             (&[0xE6D1][..], "ROR.W (A1)"),
         ] {
@@ -942,8 +982,8 @@ mod tests {
         for (words, want) in [
             (&[0x51CA, 0x0004][..], "DBF D2,$001006"),
             (&[0x50C8, 0x0004][..], "DBT D0,$001006"),
-            (&[0x50C0][..], "ST (A0)"),
-            (&[0x51DF, 0x00FF][..], "SF (A7,D7.W)"),
+            (&[0x50D0][..], "ST (A0)"),
+            (&[0x51F7, 0x7000][..], "SF (A7,D7.W)"),
         ] {
             assert_eq!(text(&words), want, "{:04X}", words[0]);
         }
@@ -959,9 +999,9 @@ mod tests {
             (&[0x4E5D][..], "UNLK A5"),
             (&[0x4EB8, 0x1234][..], "JSR $1234"),
             (&[0x4EF9, 0x0001, 0x2345][..], "JMP $012345"),
-            (&[0x4E91][..], "JMP (A1)"),
-            (&[0x4848, 0x1234][..], "PEA $1234"),
-            (&[0x41F8, 0x1234][..], "PEA.W $1234"),
+            (&[0x4ED1][..], "JMP (A1)"),
+            (&[0x4878, 0x1234][..], "PEA $1234"),
+            (&[0x4879, 0x0001, 0x2345][..], "PEA $012345"),
             (&[0x4E70][..], "RESET"),
             (&[0x4E73][..], "RTE"),
             (&[0x4E75][..], "RTS"),
@@ -1044,20 +1084,12 @@ mod tests {
 
 #[cfg(test)]
 mod scratch_probe {
-    use crate::decode;
+    use super::disassemble;
     #[test]
     fn probe_prints() {
-        for op in [0x0850u16, 0x0C58, 0x0478, 0x9EC1, 0x41F8, 0x4848, 0x4C50, 0x4E91, 0x4CD1, 0x4C90, 0xB989, 0x4878, 0x41D0, 0x0110, 0x01D8, 0x0C58] {
-            println!(
-                "${op:04X} -> {:?}  hi4={:04b} ddd={:03b} b8={} b76={:02b} mode={:03b} reg={:03b}",
-                decode::decode(op),
-                op >> 12,
-                (op >> 9) & 7,
-                (op >> 8) & 1,
-                (op >> 6) & 3,
-                (op >> 3) & 7,
-                op & 7,
-            );
+        for w in [0x303Cu16, 0x313C, 0x207C] {
+            let (t, n) = disassemble(&[w, 0x0001, 0x2345, 0x0002], 0x1000);
+            println!("PROBE {w:04X} -> {t} ({n})");
         }
     }
 }
