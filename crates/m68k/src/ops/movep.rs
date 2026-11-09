@@ -101,7 +101,7 @@ impl M68k {
 mod tests {
     use crate::M68k;
     use crate::bus::Bus;
-    use crate::sr::{SR_C, SR_INT_MASK, SR_N, SR_S, SR_T, SR_V, SR_X, SR_Z};
+    use crate::sr::{SR_C, SR_INT_MASK, SR_N, SR_S, SR_V, SR_X, SR_Z};
     use crate::testbus::{TestBus, cpu_with_program};
 
     /// Where [`cpu_with_program`] loads the program, so a test can name the
@@ -226,8 +226,8 @@ mod tests {
 
     /// MOVEP is a move: no condition code moves, in either direction and at
     /// either width, even out of an `SR` that has everything set. The check
-    /// covers the whole `SR`, so the upper byte — trace, mode and interrupt
-    /// mask — has to stay put as well.
+    /// covers the whole `SR`, so the upper byte — mode and interrupt mask — has
+    /// to stay put as well.
     #[test]
     fn movep_changes_no_flags() {
         for opcode in [
@@ -240,7 +240,11 @@ mod tests {
             poke(&mut bus, MEM, &[0x11, 0x22, 0x33, 0x44]);
             cpu.a[0] = MEM;
             cpu.a[1] = MEM;
-            cpu.set_sr(SR_T | SR_S | SR_INT_MASK | ALL_FLAGS);
+            // `SR.T` is deliberately not in here: since #38 it is a live trace
+            // enable, so setting it would take the trace exception and this test
+            // is not about trace (see [`crate::trace`]). Every other bit of the
+            // `SR`, flags and upper byte included, is still set and still checked.
+            cpu.set_sr(SR_S | SR_INT_MASK | ALL_FLAGS);
             let sr = cpu.sr;
 
             cpu.step(&mut bus);

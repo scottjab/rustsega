@@ -157,6 +157,18 @@ pub struct M68k {
     /// the field is what the frame is built from, which is why it is plain CPU
     /// data rather than something only tests can see.
     pub pending_exception: Option<u8>,
+    /// True once a route that does not trace has run in the instruction
+    /// [`M68k::step`] is executing: illegal instruction / line A / line F, a
+    /// privilege violation, or an address error ([`crate::trace`], M68000UM
+    /// section 6.3.8).
+    ///
+    /// CPU state rather than a return value because the routes set it from deep
+    /// inside a handler while the trace decision is taken by `step` once that
+    /// handler returns; and it cannot be read back out of
+    /// [`M68k::pending_exception`], because
+    /// [`crate::EXC_ADDRESS_ERROR`] and [`crate::EXC_ILLEGAL`] are numerically
+    /// the same vector (see [`crate::address_error`]).
+    pub(crate) trace_suppressed: bool,
     /// Running total of 68k clocks consumed since the last [`M68k::reset`].
     /// Bus accesses charge themselves (see [`M68k::read_w`]), and
     /// [`M68k::step`] will add instruction cycles as they land; the scheduler
@@ -190,6 +202,7 @@ impl M68k {
             ird: 0,
             pending_address_error: None,
             pending_exception: None,
+            trace_suppressed: false,
             cycles: 0,
         }
     }
@@ -216,6 +229,7 @@ impl M68k {
         self.ird = 0;
         self.pending_address_error = None;
         self.pending_exception = None;
+        self.trace_suppressed = false;
         self.cycles = 0;
         self.set_sr(SR_RESET);
 
@@ -291,12 +305,22 @@ impl M68k {
         // The group 0 frame's IRD is this word, whoever faults later (#37);
         // see [`M68k::ird`].
         self.ird = opcode;
+        // Trace is decided from the T bit as it stands *before* the instruction
+        // runs, so an instruction that sets T is not traced and one that clears
+        // T still is (M68000UM section 6.3.8, [`crate::trace`]). The suppression
+        // record is cleared here too: it belongs to the instruction that set it.
+        let traced = self.trace_armed();
+        self.trace_suppressed = false;
         let used = self.run_op(bus, crate::decode::decode(opcode), opcode);
         // An address error raised by any access the opcode performed is entered
         // here, after the access layer stopped letting the instruction reach the
         // bus (M1-29, #37). It is not an early return: the entry has already
         // thrown the queue away and moved `pc` to the handler by then.
         self.take_address_error(bus);
+        // Then the trace exception for the instruction that has just completed —
+        // after any group 2 trap it took, and before the next step's interrupt
+        // check (M68000UM section 6.3.8, [`crate::trace`]).
+        self.take_trace(bus, traced);
         // TODO(M1-31, #39): this is the one place instruction clocks enter
         // `cycles`, but the bus helpers and the EA layer's internal clocks
         // (`INDEX_CALC_CLOCKS`, `PREDEC_CALC_CLOCKS`) already self-charge, so

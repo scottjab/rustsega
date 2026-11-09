@@ -29,7 +29,7 @@
 //! | [`EXC_CHK`] | 6 | `$18` | 4272 of the 7389 exception cases in `CHK.json.gz` fetch `$18` (the rest are illegal-EA cases fetching `$0C`) |
 //! | [`EXC_TRAPV`] | 7 | `$1C` | all 4095 exception cases in `TRAPV.json.gz` fetch `$1C` |
 //! | [`EXC_PRIVILEGE`] | 8 | `$20` | **not covered by the suite** — every case in every file runs in supervisor mode (`sr & $2000` set in all 8065 `TRAP.json.gz` cases, and `RESET`, `MOVEtoUSP`, `MOVEfromUSP` and friends have no exception cases at all), so no case can show which slot a privilege violation fetches. Chosen as the slot after [`EXC_TRAPV`], which is where both the ticket's map and the measured `CHK`/`TRAPV`/divide-by-zero sequence put it |
-//! | — | 9 | `$24` | trace: M1-30 (#38) |
+//! | [`EXC_TRACE`] | 9 | `$24` | **not covered by the suite** either: no case in the 125 files starts with `sr & $8000` set (checked over all 1 000 060 cases), so nothing fetches the trace vector. The slot is the hardware map's — M68000UM "Exception Vector Memory Map", the group 2 slot between privilege violation and the spurious-interrupt slot |
 //! | — | 24, 25..31 | `$60`, `$64`–`$7C` | spurious and level 1–7 autovectors: M1-28 (#36), taken by [`crate::interrupts`] |
 //! | [`trap_vector`] | 32 + n | `$80 + 4 * n` | all 8065 `TRAP.json.gz` cases: `4e40` reads `$80`, `4e42` reads `$88`, `4e4f` reads `$BC` |
 //!
@@ -126,6 +126,14 @@ pub const EXC_TRAPV: u8 = 7;
 /// The one vector number here that the pinned suite cannot pin (see the module
 /// docs); raised by [`M68k::check_supervisor`].
 pub const EXC_PRIVILEGE: u8 = 8;
+
+/// Trace exception, slot `$000024`: taken at the end of an instruction that
+/// started with `SR.T` set ([`crate::trace`], M68000UM section 6.3.8).
+///
+/// See [`EXC_DIV_ZERO`] for why the constant lives here rather than with the
+/// code that takes it, and the module docs for why the number is the slot
+/// address over four.
+pub const EXC_TRACE: u8 = 9;
 
 /// The slot TRAP #0 uses; TRAP #n uses [`TRAP_VECTOR_BASE`] + n, i.e. the long
 /// at `$000080 + 4 * n`. Measured over all sixteen traps in `TRAP.json.gz`.
@@ -243,6 +251,9 @@ impl M68k {
             return true;
         }
         let faulting_pc = self.pc;
+        // The second of the two "the instruction never ran" routes in M68000UM
+        // section 6.3.8: a denied instruction is not the instruction that traces.
+        self.suppress_trace();
         self.exception(bus, EXC_PRIVILEGE, faulting_pc);
         false
     }

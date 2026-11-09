@@ -254,6 +254,10 @@ impl M68k {
         let Some(fault) = self.pending_address_error.take() else {
             return;
         };
+        // The faulting access did not happen and the instruction did not complete
+        // (M68000UM "Address Error"), so there is no completed instruction left to
+        // trace. This is an inference, not a ticket rule: see [`crate::trace`].
+        self.suppress_trace();
         self.address_error(bus, fault);
 
         // Double fault: M68000UM section 6 "Exception Processing" — a second
