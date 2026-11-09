@@ -36,6 +36,8 @@
             pkgs.git
             pkgs.ripgrep
             pkgs.jq
+            # For linting the shell scripts in scripts/ (`shellcheck scripts/*.sh`).
+            pkgs.shellcheck
             pkgs.curl
             pkgs.unzip
             pkgs.pkg-config
