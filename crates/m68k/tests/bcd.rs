@@ -3,7 +3,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateSkipAddressErrors`], the same one the add, subtract
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`], the same one the add, subtract
 //! and multiply classes use. It is a formality for these three files — none of
 //! their 3 x 8065 cases reaches the suite's exception handler, because no BCD
 //! operand address in the suite is odd (M1-29, #37) — but it is the check every
@@ -34,20 +34,20 @@ mod harness;
 /// (`1100 ddd 100 0m yyy`).
 #[test]
 fn abcd_file_passes() {
-    harness::assert_file_passes("ABCD", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("ABCD", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `SBCD`: `$8100`-`$8107`/`$8108`-`$810F` and the same for every destination
 /// (`1000 ddd 100 0m yyy`).
 #[test]
 fn sbcd_file_passes() {
-    harness::assert_file_passes("SBCD", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("SBCD", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `NBCD`: `$4800`-`$483F` (`0100 1000 00 mmm rrr`).
 #[test]
 fn nbcd_file_passes() {
-    harness::assert_file_passes("NBCD", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NBCD", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// The three file names above are what the suite ships, so a rename fails here
