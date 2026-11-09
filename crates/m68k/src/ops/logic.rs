@@ -49,6 +49,7 @@ use crate::bus::Bus;
 use crate::cpu::M68k;
 use crate::decode::is_exg;
 use crate::ea::{Ea, Size, sign_extend_byte, sign_extend_word};
+use crate::ops::arith::{ALU_PASS_CLOCKS, alu_op_clocks, dest_accesses, source_accesses};
 use crate::ops::field;
 
 /// Shift of the register field of AND's `1100`, OR's `1000` and EOR's `1011`
@@ -268,7 +269,7 @@ impl M68k {
         self.advance_opcode(bus);
         // The swap is one long ALU pass, 2 clocks over the fetch: every one of
         // the 8 forms of `EXG.json.gz` is 6 (M1-31a, #39).
-        crate::ops::arith::ALU_PASS_CLOCKS
+        ALU_PASS_CLOCKS
     }
 
     /// The `1100`/`1000` shape: bit 8 of the operation field picks the
@@ -293,7 +294,9 @@ impl M68k {
             self.write_ea(bus, Ea::DataReg(reg), size, result);
 
             self.advance_opcode(bus);
-            return 0;
+            // The long ALU operation, less whatever the source's bus accesses
+            // cover of it — the same rule `arith::op_add` uses (#225).
+            return alu_op_clocks(size, source_accesses(src));
         }
 
         self.logic_to_ea(bus, opcode, op)
@@ -321,7 +324,10 @@ impl M68k {
         self.write_ea(bus, dest, size, result);
 
         self.advance_opcode(bus);
-        0
+        // A memory destination is read and written, so both long passes are
+        // covered and only a `Dn` destination pays — see `arith::alu_op_clocks`
+        // and, for `EOR`, `NOT` and the `#imm` forms, the same rule in #225.
+        alu_op_clocks(size, dest_accesses(dest))
     }
 
     /// The three `#imm,<ea>` immediates. `op` is the operation; the base opcode
@@ -352,7 +358,7 @@ impl M68k {
         self.write_ea(bus, dest, size, result);
 
         self.advance_opcode(bus);
-        0
+        alu_op_clocks(size, dest_accesses(dest))
     }
 
     /// Mask `result` to `size`, set `N` and `Z` from it, clear `V` and `C`, leave
