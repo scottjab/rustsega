@@ -384,12 +384,17 @@ impl Z80 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FLAG_C;
 
     /// A bus that reads back a fixed program, so a test can name the exact bytes
     /// an instruction is made of and see what `step()` did with them.
     struct Program {
         ram: Vec<u8>,
         reads: Vec<u16>,
+        /// Memory writes, in order. `DD CB d op` on `(IX + d)` is the first
+        /// instruction in this file that writes; before it the bus could afford
+        /// to be read-only.
+        writes: Vec<(u16, u8)>,
     }
 
     impl Program {
@@ -399,6 +404,7 @@ mod tests {
             Self {
                 ram,
                 reads: Vec::new(),
+                writes: Vec::new(),
             }
         }
     }
@@ -409,8 +415,9 @@ mod tests {
             self.ram[usize::from(addr)]
         }
 
-        fn write(&mut self, _addr: u16, _value: u8) {
-            panic!("no instruction implemented so far should write");
+        fn write(&mut self, addr: u16, value: u8) {
+            self.writes.push((addr, value));
+            self.ram[usize::from(addr)] = value;
         }
 
         fn io_read(&mut self, _port: u16) -> u8 {
@@ -542,15 +549,22 @@ mod tests {
     #[test]
     fn dd_cb_counts_the_prefix_and_cb_but_not_the_operands() {
         // `DD CB d op` is 4 bytes but only 2 M1 fetches, which is the R total of
-        // 2 the suite's `dd cb __ 00` files expect. The displacement is read
-        // before the opcode.
+        // 2 the suite's `dd cb __ 00` cases expect. The displacement is read
+        // before the opcode, and both come before the operand the opcode names:
+        // `0x06` is `RLC (IX + d)` with `z = 6`, and with `IX` at 0 that operand
+        // is the byte at `0x0004`, the fifth byte of the program below. So the
+        // read log is the whole instruction in fetch order, and the write is the
+        // read-modify-write of that byte.
         let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0xDD, 0xCB, 0x7F, 0x06]);
-        let message = caught(|| cpu.step(&mut bus)).expect_err("DD CB is not implemented");
+        let mut bus = Program::new(&[0xDD, 0xCB, 0x04, 0x06, 0x81]);
+
+        assert_eq!(cpu.step(&mut bus), 23, "RLC (IX + d) is 23 T-states");
+
         assert_eq!(cpu.r(), 2);
         assert_eq!(cpu.pc(), 4);
-        assert_eq!(bus.reads, vec![0, 1, 2, 3]);
-        assert!(message.contains("DD CB 7F 06"), "{message}");
+        assert_eq!(bus.reads, vec![0, 1, 2, 3, 4]);
+        assert_eq!(bus.writes, vec![(4, 0x03)], "0x81 left, bit 7 back into bit 0");
+        assert!(cpu.get_flag(FLAG_C), "bit 7 of 0x81 shifted out into C");
     }
 
     #[test]
