@@ -24,6 +24,27 @@ pub const RESET_CYCLES: u32 = 132;
 /// one bus cycle, so 4 clocks; a long is two word accesses, so 8.
 pub(crate) const BUS_CYCLE_CLOCKS: u64 = 4;
 
+/// One opcode fetch: the word [`M68k::advance_opcode`] pops off the queue is one
+/// bus cycle, so 4 clocks.
+///
+/// Every execution time in M68000UM appendix "Instruction Timing" counts that
+/// fetch (`NOP` is 4), and [`M68k::step`] charges it through the queue, so a
+/// handler returning a documented total hands back the total **less** these 4
+/// rather than the whole of it (M1-31, #39).
+pub(crate) const OPCODE_CLOCKS: u32 = BUS_CYCLE_CLOCKS as u32;
+
+/// Clocks charged to [`M68k::cycles`] between `start` and `now`, the form
+/// [`M68k::step`] returns.
+///
+/// `cycles` is a running total that outlives one instruction, so what a step
+/// cost is the difference rather than the value: the bus accessors and the EA
+/// layer's internal cycles self-charge into `cycles`, so the difference is
+/// exactly this step's traffic plus whatever the handler added back (M1-31, #39).
+#[inline]
+fn step_clocks(start: u64, now: u64) -> u32 {
+    (now - start) as u32
+}
+
 /// Clocks [`M68k::step`] reports for a step taken while the HALT pin is
 /// asserted, until M1-31 (#39) times the interrupt-acknowledge sequence.
 /// Clocks for a `step` taken while HALT is asserted.
@@ -267,6 +288,7 @@ impl M68k {
     /// ([`M68k::check_interrupts`], M1-28 #36), and a taken interrupt is the
     /// whole of that step: no decode, no operand, no instruction clocks.
     pub fn step(&mut self, bus: &mut impl Bus) -> u32 {
+        let start = self.cycles;
         if self.halted {
             // HALT asserted: the CPU stops accessing the bus and re-samples the
             // interrupt pins. The real cost is the interrupt-acknowledge
@@ -284,7 +306,7 @@ impl M68k {
             // nothing to do but burn these clocks.
             if self.check_interrupts(bus) {
                 self.stopped = false;
-                return 0;
+                return step_clocks(start, self.cycles);
             }
             self.cycles += u64::from(STOPPED_CLOCKS);
             return STOPPED_CLOCKS;
@@ -298,7 +320,7 @@ impl M68k {
         // this point runs when one is taken: the queue is thrown away by the
         // exception entry and the clocks are the entry's (M1-28, #36).
         if self.check_interrupts(bus) {
-            return 0;
+            return step_clocks(start, self.cycles);
         }
 
         let opcode = self.prefetch[0];
@@ -321,14 +343,13 @@ impl M68k {
         // after any group 2 trap it took, and before the next step's interrupt
         // check (M68000UM section 6.3.8, [`crate::trace`]).
         self.take_trace(bus, traced);
-        // TODO(M1-31, #39): this is the one place instruction clocks enter
-        // `cycles`, but the bus helpers and the EA layer's internal clocks
-        // (`INDEX_CALC_CLOCKS`, `PREDEC_CALC_CLOCKS`) already self-charge, so
-        // once a handler returns a total that includes them this would
-        // double-count. No handler returns non-zero clocks today, so nothing
-        // can double-count yet; the timing tickets settle which number wins.
+        // A handler returns only the clocks nothing else charged for: its own
+        // execution overhead. Every bus access and every EA-layer internal cycle
+        // has already self-charged into `cycles`, so adding the handler's number
+        // and returning the step's delta is what makes `step` report the whole
+        // cost of the step without counting an access twice (M1-31, #39).
         self.cycles += u64::from(used);
-        used
+        step_clocks(start, self.cycles)
     }
 
     /// Mask `value` with [`SR_MASK`] and store it in SR, swapping the stack
@@ -1096,9 +1117,9 @@ mod tests {
             let (mut cpu, mut bus) = cpu_at_opcode(opcode);
             let before = cpu.clone();
             assert_eq!(
-                cpu.step(&mut bus),
-                0,
-                "{name}: the entry sequence charges its own 34 clocks, so the handler still returns none"
+                u64::from(cpu.step(&mut bus)),
+                crate::exceptions::EXCEPTION_ENTRY_CLOCKS,
+                "{name}: the whole step is the entry sequence, which charges its own 34 clocks"
             );
             assert_eq!(
                 cpu.pending_exception,
@@ -1193,10 +1214,14 @@ mod tests {
     /// from `pc` or decoded `prefetch[1]` would panic instead of routing.
     #[test]
     fn step_runs_the_instruction_at_the_front_of_the_queue() {
-        use crate::exceptions::EXC_ILLEGAL;
+        use crate::exceptions::{EXC_ILLEGAL, EXCEPTION_ENTRY_CLOCKS};
         let (mut cpu, mut bus) = cpu_at_opcode(0x4E74);
         cpu.prefetch = [0xA000, 0x4E74];
-        assert_eq!(cpu.step(&mut bus), 0);
+        assert_eq!(
+            u64::from(cpu.step(&mut bus)),
+            EXCEPTION_ENTRY_CLOCKS,
+            "an illegal opcode costs the exception entry, which is the whole step"
+        );
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
 
         // And the same opcode written into memory at `pc` is still not what it
@@ -1204,7 +1229,7 @@ mod tests {
         let (mut cpu, mut bus) = cpu_at_opcode(0xA000);
         bus.mem[PROGRAM_BASE as usize] = 0x4E;
         bus.mem[PROGRAM_BASE as usize + 1] = 0x74;
-        assert_eq!(cpu.step(&mut bus), 0);
+        assert_eq!(u64::from(cpu.step(&mut bus)), EXCEPTION_ENTRY_CLOCKS);
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
     }
 

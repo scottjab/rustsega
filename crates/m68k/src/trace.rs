@@ -312,8 +312,9 @@ mod tests {
 
         assert_eq!(
             cpu.step(&mut bus),
-            0,
-            "the next step runs the handler, not the stopped-clock path"
+            crate::cpu::OPCODE_CLOCKS,
+            "the next step runs the handler, not the stopped-clock path: it costs \
+             the opcode fetch, not the stopped stand-in"
         );
         assert_eq!(cpu.pc, TRACE_HANDLER + 2);
     }
