@@ -37,7 +37,7 @@ const fn force_bit(value: u8, bit: u8, on: bool) -> u8 {
 }
 
 impl Z80 {
-    /// `BIT b,r` (`CB 40`-`7F`, `z != 6`): 8 T-states.
+    /// `BIT b,r` (`CB 40`-`7F`): 8 T-states, or 12 for `z == 6`.
     ///
     /// `y(op)` is the bit number and `z(op)` the operand slot. The test is the
     /// only output: nothing is written back, and `wz` does not move
@@ -90,8 +90,8 @@ impl Z80 {
         self.update_flags(BIT_VALID, flags);
     }
 
-    /// `RES b,r` and `SET b,r` (`CB 80`-`BF` and `CB C0`-`FF`, `z != 6`):
-    /// 8 T-states, and no flag bit moves.
+    /// `RES b,r` and `SET b,r` (`CB 80`-`BF` and `CB C0`-`FF`): 8 T-states and
+    /// no flag bit moves, in either form.
     ///
     /// `x(op) == 3` sets the bit and `2` clears it. Neither form feeds `q`
     /// either: `cb 80`-`cb ff` have `final.q == 0` in all 1000 cases of each.
