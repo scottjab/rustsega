@@ -538,7 +538,15 @@ impl M68k {
         self.sub_flags_no_x(value, self.d[usize::from(reg)], false, size);
 
         self.advance_opcode(bus);
-        0
+        // A long compare is one ALU pass the bus cycles do not cover: 2 clocks,
+        // in every addressing mode except `#imm` (`ADD.l` and friends, which
+        // also write a result, pay it only for a source that is not read from
+        // memory — see [`ALU_PASS_CLOCKS]`). `CMP.b`/`CMP.w` are already exact.
+        if size == Size::Long {
+            ALU_PASS_CLOCKS
+        } else {
+            0
+        }
     }
 
     /// `CMPA.W` (`1011 aaa 011 mmm rrr`) and `CMPA.L` (`1011 aaa 111 mmm rrr`).
@@ -574,7 +582,10 @@ impl M68k {
         self.sub_flags_no_x(subtrahend, self.a[usize::from(reg)], false, Size::Long);
 
         self.advance_opcode(bus);
-        0
+        // One long pass, and `CMPA.W` does not escape it either: the compare is
+        // long whatever the operand size, so all 10 modes of `CMPA.W` and
+        // `CMPA.L` measure 2 over ([`ALU_PASS_CLOCKS`], M1-31a #39).
+        ALU_PASS_CLOCKS
     }
 
     /// `CMPM`: `1011 xxx 1 ss 001 yyy`, `(Ay)+` compared against `(Ax)+`.

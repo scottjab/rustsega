@@ -3,9 +3,11 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateSkipAddressErrors`], the same one the add and subtract
-//! classes use: the cases that end in the suite's exception handler are left to
-//! M1-29 (#37) — see [`harness::is_address_error_case`] and #185.
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`] — state *and* `step`'s
+//! clock total (M1-31a, #39) — except `CMP.l`, which is still
+//! [`harness::Check::StateSkipAddressErrors`]; the cases that end in the suite's
+//! exception handler are left to M1-29 (#37) — see
+//! [`harness::is_address_error_case`] and #185.
 //!
 //! The suite ships no `CMPI.*` or `CMPM.*` file. Neither instruction is
 //! untested by this binary: their cases live in `CMP.b`, `CMP.w` and `CMP.l`,
@@ -25,16 +27,21 @@ mod harness;
 /// `$B108`-`$B10F`-style `CMPM.B` cases.
 #[test]
 fn cmp_b_file_passes() {
-    harness::assert_file_passes("CMP.b", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("CMP.b", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `CMP.W`: `$B040`-`$B07F`, `$0C40`-`$0C7F`, `$B148`-`$B14F`-style.
 #[test]
 fn cmp_w_file_passes() {
-    harness::assert_file_passes("CMP.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("CMP.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `CMP.L`: `$B080`-`$B0BF`, `$0C80`-`$0CBF`, `$B188`-`$B18F`-style.
+///
+/// State only: with the long-compare pass the `CMP` handler adds, every
+/// addressing mode but `#imm` is exact, and the `CMPI.l` and CMPM cases that
+/// share this file split two ways (some want 2 more, others 2 fewer), so their
+/// rule is not settled yet. Tracked with #39.
 #[test]
 fn cmp_l_file_passes() {
     harness::assert_file_passes("CMP.l", harness::Check::StateSkipAddressErrors);
@@ -44,13 +51,13 @@ fn cmp_l_file_passes() {
 /// are sign-extended before the 32-bit compare.
 #[test]
 fn cmpa_w_file_passes() {
-    harness::assert_file_passes("CMPA.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("CMPA.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `CMPA.L`: operation `111`, the bit-8-set half of the group CMPM also lives in.
 #[test]
 fn cmpa_l_file_passes() {
-    harness::assert_file_passes("CMPA.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("CMPA.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// The five file names above are what the suite ships, so a rename fails here
