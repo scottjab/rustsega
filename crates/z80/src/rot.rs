@@ -38,7 +38,7 @@ const SHIFT_SRL: u8 = 7;
 /// except `SRA`, which duplicates bit 7 so a negative value stays negative, and
 /// the undocumented `SLL`, which duplicates a 1 ("The Undocumented Z80
 /// Documented", Sean Young).
-fn shift_byte(kind: u8, value: u8, carry_in: u8) -> (u8, u8) {
+pub(crate) fn shift_byte(kind: u8, value: u8, carry_in: u8) -> (u8, u8) {
     // The bit leaving at the top is what `C` gets on every leftward operation;
     // the one leaving at the bottom is what `C` gets on every rightward one.
     let out_left = (value >> 7) & 1;
@@ -73,14 +73,14 @@ fn accum_flags(result: u8, carry_out: u8) -> u8 {
 const ACCUM_VALID: u8 = FLAG_C | FLAG_H | FLAG_N | FLAG_X | FLAG_Y;
 
 /// A `CB` shift claims every flag bit, so nothing of the old `F` survives.
-const ALL_FLAGS: u8 = 0xFF;
+pub(crate) const ALL_FLAGS: u8 = 0xFF;
 
 /// The flag byte a `CB` rotate or shift leaves: `S`, `Z`, `P/V` (parity) and
 /// `X`/`Y` from the result - which is what [`SZXY_PARITY`] is for - `C` the bit
 /// that shifted out, and `H` and `N` clear (UM0080 flag notes for `RLC` and
 /// friends: S, Z, P/V set from the result, H and N reset, C set according to the
 /// bit shifted out).
-fn shift_flags(result: u8, carry_out: u8) -> u8 {
+pub(crate) fn shift_flags(result: u8, carry_out: u8) -> u8 {
     SZXY_PARITY[usize::from(result)] | carry_out
 }
 

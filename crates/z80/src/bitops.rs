@@ -12,6 +12,164 @@
 //! `z` is also a destination, so the result lands in memory *and* in register
 //! `z`. `BIT` has no destination at all.
 
+use crate::decode::{x, y, z, IndexMode};
+use crate::rot::{shift_byte, shift_flags, ALL_FLAGS};
+use crate::{FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_X, FLAG_Y, FLAG_Z, Z80, Z80Bus};
+
+/// The flag bits `BIT` establishes: everything except `C`, which it leaves
+/// alone. `N` is in here because `BIT` clears it, and a bit that is `valid` but
+/// absent from the new flag byte is what `Z80::update_flags` clears with.
+const BIT_VALID: u8 = FLAG_S | FLAG_Z | FLAG_PV | FLAG_H | FLAG_N | FLAG_X | FLAG_Y;
+
+/// `BIT b,(IX+d)`: 20 T-states, three fewer than the write-back forms below.
+const T_BIT_INDEXED: u32 = 20;
+/// `RES`/`SET`/rotate on `(IX+d)`: 23 T-states, the most any `CB` group reaches.
+const T_WRITE_INDEXED: u32 = 23;
+
+/// The byte that `bit` of `value` leaves when forced to `on`: what `RES` clears
+/// and `SET` sets.
+const fn force_bit(value: u8, bit: u8, on: bool) -> u8 {
+    if on {
+        value | (1 << bit)
+    } else {
+        value & !(1 << bit)
+    }
+}
+
+impl Z80 {
+    /// `BIT b,r` (`CB 40`-`7F`, `z != 6`): 8 T-states.
+    ///
+    /// `y(op)` is the bit number and `z(op)` the operand slot. The test is the
+    /// only output: nothing is written back, and `wz` does not move
+    /// (`cb 40`-`7f`: 1000 cases each leave `wz` where they found it).
+    pub(crate) fn bit_test(&mut self, bus: &mut impl Z80Bus, op: u8) -> u32 {
+        let slot = z(op);
+        if slot == 6 {
+            return self.bit_ind_hl(bus, op);
+        }
+        let value = self.reg_slot(slot);
+        // For a register operand the X/Y source is the register's own value,
+        // which is the byte the bit came from.
+        self.apply_bit_flags(y(op), value, value);
+        self.latch_flags();
+        8
+    }
+
+    /// `BIT b,(HL)` (`CB 46`, `CB 4E`, `CB 56`, `CB 5E`, `CB 66`, `CB 6E`,
+    /// `CB 76`, `CB 7E`): 12 T-states, a read with no write.
+    ///
+    /// The undocumented `X`/`Y` come from the high byte of `wz` - the MEMPTR -
+    /// and not from the tested byte and not from `HL` itself. Of the 64000
+    /// `cb 46` cases the suite ships, every one matches `wz`'s high byte, and
+    /// 6001 of them contradict `HL`'s.
+    fn bit_ind_hl(&mut self, bus: &mut impl Z80Bus, op: u8) -> u32 {
+        let value = bus.read(self.hl());
+        let xy = (self.wz() >> 8) as u8;
+        self.apply_bit_flags(y(op), value, xy);
+        self.latch_flags();
+        12
+    }
+
+    /// Lay the `BIT` flags over `F`: `Z` and `P/V` set together when the tested
+    /// bit is clear, `S` from the tested bit when `b` is 7 and clear for every
+    /// other `b`, `H` set, `N` clear, `C` untouched, `X`/`Y` from `xy`.
+    ///
+    /// UM0080's `BIT` flag notes say S2 is "set or reset as specified by the bit
+    /// tested" and P/V is "same as Z"; the S-only-for-bit-7 reading is what the
+    /// suite shows - `cb 78` with a negative byte sets `S`, `cb 40` with the
+    /// same byte clears it.
+    fn apply_bit_flags(&mut self, bit: u8, value: u8, xy: u8) {
+        let tested = (value >> bit) & 1 != 0;
+        let mut flags = FLAG_H | (xy & (FLAG_X | FLAG_Y));
+        if !tested {
+            flags |= FLAG_Z | FLAG_PV;
+        }
+        if tested && bit == 7 {
+            flags |= FLAG_S;
+        }
+        self.update_flags(BIT_VALID, flags);
+    }
+
+    /// `RES b,r` and `SET b,r` (`CB 80`-`BF` and `CB C0`-`FF`, `z != 6`):
+    /// 8 T-states, and no flag bit moves.
+    ///
+    /// `x(op) == 3` sets the bit and `2` clears it. Neither form feeds `q`
+    /// either: `cb 80`-`cb ff` have `final.q == 0` in all 1000 cases of each.
+    pub(crate) fn res_set(&mut self, bus: &mut impl Z80Bus, op: u8) -> u32 {
+        if z(op) == 6 {
+            return self.res_set_ind_hl(bus, op);
+        }
+        let slot = z(op);
+        let value = self.reg_slot(slot);
+        self.set_reg_slot(slot, force_bit(value, y(op), x(op) == 3));
+        self.clear_latches();
+        8
+    }
+
+    /// `RES b,(HL)` / `SET b,(HL)` (`z == 6`): 15 T-states, a read-modify-write
+    /// at `HL`, still no flags.
+    fn res_set_ind_hl(&mut self, bus: &mut impl Z80Bus, op: u8) -> u32 {
+        let addr = self.hl();
+        let value = bus.read(addr);
+        bus.write(addr, force_bit(value, y(op), x(op) == 3));
+        self.clear_latches();
+        15
+    }
+
+    /// `DD CB d op` / `FD CB d op`: the rotate/shift, `BIT`, `RES` and `SET`
+    /// groups working on the byte at `IX + d` / `IY + d`.
+    ///
+    /// All four groups live in this one function because they share the two
+    /// rules that make the space peculiar, and splitting them would split each
+    /// rule in two:
+    ///
+    /// * `wz` ends at the effective address, and every access goes through it.
+    /// * `BIT` is a pure read at 20 T-states; the other three are
+    ///   read-modify-writes at 23 T-states.
+    ///
+    /// The displacement was already fetched by the caller, in the order the
+    /// hardware reads it (`d` then `op`), which is what `R` and the suite's
+    /// `dd cb __ __` traces require.
+    pub(crate) fn index_cb(
+        &mut self,
+        bus: &mut impl Z80Bus,
+        mode: IndexMode,
+        disp: u8,
+        op: u8,
+    ) -> u32 {
+        let addr = self.indexed_address(mode, disp);
+        let value = bus.read(addr);
+        if x(op) == 1 {
+            // `BIT b,(IX+d)`: exactly the `(HL)` form's flags, and the X/Y
+            // source is the high byte of the effective address, which `wz` has
+            // just been left at.
+            self.apply_bit_flags(y(op), value, (addr >> 8) as u8);
+            self.latch_flags();
+            return T_BIT_INDEXED;
+        }
+        let result = if x(op) == 0 {
+            let (result, carry_out) = shift_byte(y(op), value, u8::from(self.get_flag(FLAG_C)));
+            self.update_flags(ALL_FLAGS, shift_flags(result, carry_out));
+            self.latch_flags();
+            result
+        } else {
+            self.clear_latches();
+            force_bit(value, y(op), x(op) == 3)
+        };
+        bus.write(addr, result);
+        if z(op) != 6 {
+            // Undocumented, and the reason this space cannot be the `CB` one
+            // with a different address: the result is also copied into register
+            // `z` (`Z80 FAQ` 3.7, "BIT/RES/SET (IX+d)"; the suite's
+            // `dd cb __ 00` and `fd cb __ 38`-`3f` files show the memory byte
+            // and the register holding the same new value in all 1000 cases of
+            // each, while `z = 6` leaves every register alone).
+            self.set_reg_slot(z(op), result);
+        }
+        T_WRITE_INDEXED
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::testutil::RamBus;
@@ -94,9 +252,10 @@ mod tests {
         const PC: u16 = 0x0100;
         let (mut cpu, mut bus) = cpu_at(PC, &[0xCB, 0x46]);
         cpu.set_hl(0x9100);
-        // 0x2A has bit 3 set and bit 5 clear; `HL`'s own high byte 0x91 has
-        // neither, so an implementation reading `HL` fails both assertions.
-        cpu.set_wz(0x2A5C);
+        // 0x08 has bit 3 set and bit 5 clear; `HL`'s own high byte 0x91 has
+        // neither, so an implementation taking X/Y from `HL` fails both
+        // assertions below.
+        cpu.set_wz(0x085C);
         bus = bus.with_byte(0x9100, 0xFE);
 
         assert_eq!(
@@ -111,7 +270,7 @@ mod tests {
         assert!(!cpu.get_flag(FLAG_Y), "Y is bit 5 of wz's high byte");
         assert_eq!(bus.peek(0x9100), 0xFE, "BIT does not write back");
         assert_eq!(bus.writes, Vec::new());
-        assert_eq!(cpu.wz(), 0x2A5C, "BIT b,(HL) leaves wz where it found it");
+        assert_eq!(cpu.wz(), 0x085C, "BIT b,(HL) leaves wz where it found it");
         assert_eq!(bus.reads, vec![PC, PC + 1, 0x9100]);
     }
 
@@ -142,11 +301,11 @@ mod tests {
         assert_eq!(cpu.wz(), 0x1234, "RES/SET must not disturb wz");
     }
 
-    /// `RES b,(HL)` (`CB A6`): a read-modify-write at `HL`, 15 T-states.
+    /// `RES b,(HL)` (`CB 9E`): a read-modify-write at `HL`, 15 T-states.
     #[test]
     fn res_hl_writes_memory() {
         const PC: u16 = 0x0200;
-        let (mut cpu, mut bus) = cpu_at(PC, &[0xCB, 0xA6]);
+        let (mut cpu, mut bus) = cpu_at(PC, &[0xCB, 0x9E]);
         cpu.set_hl(0x9100);
         cpu.set_flags(FLAG_C | FLAG_H | FLAG_N);
         bus = bus.with_byte(0x9100, 0x8A);
@@ -164,9 +323,9 @@ mod tests {
         assert_eq!(cpu.h(), 0x91, "HL itself is not the destination");
         assert_eq!(bus.reads, vec![PC, PC + 1, 0x9100]);
 
-        // `SET 3,(HL)` (`CB D6`) is the same instruction with the bit the other
+        // `SET 3,(HL)` (`CB DE`) is the same instruction with the bit the other
         // way, including the flags.
-        let (mut cpu, mut bus) = cpu_at(PC, &[0xCB, 0xD6]);
+        let (mut cpu, mut bus) = cpu_at(PC, &[0xCB, 0xDE]);
         cpu.set_hl(0x9100);
         bus = bus.with_byte(0x9100, 0x82);
 

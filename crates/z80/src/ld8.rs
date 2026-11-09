@@ -49,13 +49,21 @@ impl Z80 {
     /// `wz == base + d` (`dd 46`, `fd 77`, `dd 36`: 1000 cases each). The
     /// displacement is signed, so `d = 0xFE` reaches two bytes below the base.
     pub(crate) fn index_address(&mut self, bus: &mut impl Z80Bus, mode: IndexMode) -> u16 {
-        let disp = i16::from(self.fetch_byte(bus) as i8);
+        let disp = self.fetch_byte(bus);
+        self.indexed_address(mode, disp)
+    }
+
+    /// The `(IX+d)` / `(IY+d)` address of an already-fetched displacement byte,
+    /// with `wz` left at that address exactly as [`Z80::index_address`] leaves
+    /// it. `DD CB d op` needs this because the hardware reads `d` before the
+    /// opcode, so the address is known before the operation is.
+    pub(crate) fn indexed_address(&mut self, mode: IndexMode, disp: u8) -> u16 {
         let base = match mode {
             IndexMode::Hl => self.hl(),
             IndexMode::Ix => self.ix(),
             IndexMode::Iy => self.iy(),
         };
-        let addr = base.wrapping_add(disp as u16);
+        let addr = base.wrapping_add(i16::from(disp as i8) as u16);
         self.set_wz(addr);
         addr
     }

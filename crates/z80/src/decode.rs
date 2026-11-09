@@ -90,6 +90,12 @@ pub fn q(op: u8) -> u8 {
 /// The register index in the `r[]` table: `B, C, D, E, H, L, (HL), A`.
 ///
 /// Index 6 is `(HL)`, so callers must handle that one as a memory access.
+//
+// The two panics that named operands with this table were the `CB` and
+// `DD CB` ones, and both are real instructions as of M2-09 (#52). The
+// main-space panic (M2-13, #56) is the next caller; until then only
+// `decomposition_matches_the_reference` below reads it.
+#[allow(dead_code)]
 pub const REG_TABLE: [&str; 8] = ["B", "C", "D", "E", "H", "L", "(HL)", "A"];
 
 /// Is this an `ED` opcode that is actually defined?
@@ -240,14 +246,10 @@ impl Z80 {
             // Rotates and shifts (M2-08, #51): `y` is the operation, `z` the
             // operand slot with 6 meaning the memory at `HL`.
             0x00..=0x3F => self.rot_shift(bus, op),
-            // `BIT`/`RES`/`SET` (M2-09, #52).
-            _ => self.unimplemented(&format!(
-                "CB {op:02X} (x{} y{} z{}, {})",
-                x(op),
-                y(op),
-                z(op),
-                REG_TABLE[z(op) as usize]
-            )),
+            // `BIT`/`RES`/`SET` (M2-09, #52): `y` is the bit number, `z` the
+            // operand slot, and `x` says which of the three it is.
+            0x40..=0x7F => self.bit_test(bus, op),
+            0x80..=0xFF => self.res_set(bus, op),
         }
     }
 
@@ -362,14 +364,7 @@ impl Z80 {
     fn exec_index_cb(&mut self, bus: &mut impl Z80Bus, mode: IndexMode) -> u32 {
         let disp = self.fetch_byte(bus);
         let op = self.fetch_byte(bus);
-        self.unimplemented(&format!(
-            "{} CB {disp:02X} {op:02X} (x{} y{} z{}, rot, {})",
-            mode.prefix(),
-            x(op),
-            y(op),
-            z(op),
-            REG_TABLE[z(op) as usize]
-        ))
+        self.index_cb(bus, mode, disp, op)
     }
 
     /// The single exit for a space we have not implemented yet.
