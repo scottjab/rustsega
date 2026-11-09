@@ -205,6 +205,10 @@ impl Z80 {
             0x05 | 0x0D | 0x15 | 0x1D | 0x25 | 0x2D | 0x3D => self.dec_reg(op),
             0x34 => self.inc_hl_ind(bus),
             0x35 => self.dec_hl_ind(bus),
+            // The accumulator rotates (M2-08, #51). `y(op)` is the rotate in the
+            // `CB` shift table's order (RLC, RRC, RL, RR), so `07 0F 17 1F` are
+            // the table's first four entries and need no opcode list of their own.
+            0x07 | 0x0F | 0x17 | 0x1F => self.rotate_accumulator(op),
             0x08 => self.ex_af_af(),
             0xD9 => self.exx(),
             0xEB => self.ex_de_hl(),
@@ -232,14 +236,19 @@ impl Z80 {
     /// after it: the suite's `cb 00` cases show `R` up by 2 and `PC` up by 2.
     fn exec_cb(&mut self, bus: &mut impl Z80Bus) -> u32 {
         let op = self.fetch_opcode(bus);
-        self.unimplemented(&format!(
-            "CB {op:02X} (x{} y{} z{}, rot {} {})",
-            x(op),
-            y(op),
-            z(op),
-            z(op) >> 3,
-            REG_TABLE[z(op) as usize]
-        ))
+        match op {
+            // Rotates and shifts (M2-08, #51): `y` is the operation, `z` the
+            // operand slot with 6 meaning the memory at `HL`.
+            0x00..=0x3F => self.rot_shift(bus, op),
+            // `BIT`/`RES`/`SET` (M2-09, #52).
+            _ => self.unimplemented(&format!(
+                "CB {op:02X} (x{} y{} z{}, {})",
+                x(op),
+                y(op),
+                z(op),
+                REG_TABLE[z(op) as usize]
+            )),
+        }
     }
 
     /// Dispatch the `ED` space.
@@ -527,9 +536,8 @@ mod tests {
         for prefix in [0xCB, 0xED, 0xDD, 0xFD] {
             let mut cpu = Z80::new();
             let mut bus = Program::new(&[prefix, 0x00]);
-            // CB 00 is a real (unimplemented) opcode; the others rot to NOP. What
-            // matters is that R was counted for both bytes before the dispatch
-            // gave up.
+            // CB 00 is a real opcode; the others rot to NOP. What matters is
+            // that R counted both bytes whichever way the dispatch went.
             let _ = caught(|| cpu.step(&mut bus));
             assert_eq!(cpu.r(), 2, "{prefix:02X} should have counted 2 fetches");
             assert_eq!(cpu.pc(), 2, "{prefix:02X} should have consumed 2 bytes");
