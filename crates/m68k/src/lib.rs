@@ -24,6 +24,7 @@
 mod bus;
 mod cpu;
 mod decode;
+mod disasm;
 mod ea;
 mod exceptions;
 mod interrupts;
@@ -36,6 +37,7 @@ pub mod testbus;
 
 pub use bus::{ADDR_MASK, Bus};
 pub use cpu::{M68k, RESET_CYCLES};
+pub use disasm::disassemble;
 pub use ea::{Ea, Size};
 pub use exceptions::{
     EXC_CHK, EXC_DIV_ZERO, EXC_ILLEGAL, EXC_PRIVILEGE, EXC_TRAPV, TRAP_VECTOR_BASE, trap_vector,
