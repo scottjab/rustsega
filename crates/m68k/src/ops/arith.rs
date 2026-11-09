@@ -627,9 +627,11 @@ impl M68k {
 
         self.advance_opcode(bus);
         // A long compare is one ALU pass the bus cycles do not cover: 2 clocks,
-        // in every addressing mode except `#imm` (`ADD.l` and friends, which
-        // also write a result, pay it only for a source that is not read from
-        // memory — see [`ALU_PASS_CLOCKS]`). `CMP.b`/`CMP.w` are already exact.
+        // in every source mode — a memory source hides nothing here, and all
+        // twelve modes of `CMP.L` (the `#imm` one included) measure exact at 2
+        // (#230). `ADD.l` and friends, which also write a result back, are the
+        // two-pass rule of [`alu_op_clocks`] instead. `CMP.b`/`CMP.w` are
+        // already exact.
         if size == Size::Long {
             ALU_PASS_CLOCKS
         } else {
@@ -734,7 +736,21 @@ impl M68k {
         self.sub_flags_no_x(subtrahend, value, false, size);
 
         self.advance_opcode(bus);
-        0
+        // Which bus cycles cover the long compare's one ALU pass is decided by
+        // the destination, as it is for [`one_operand_clocks`]: `Dn` is no bus
+        // cycle at all and the immediate was popped off the prefetch queue by
+        // `resolve_arith_ea`, so `CMPI.L #,Dn` pays the pass — 14 clocks, 2 over
+        // the 12 its three words fetch, in all 119 such cases of `CMP.l` — while
+        // a memory destination's own read hides it, and every `CMPI.L #,<ea>` to
+        // memory is exact at 0. Measured over all 5034 non-exception cases of
+        // `CMP.l`, whose totals are M68000UM section 8's "Instruction execution
+        // times". `CMPI.b`/`CMPI.w` are a single pass and pay nothing, which is
+        // why `CMP.b`/`CMP.w` were already exact.
+        if size == Size::Long && matches!(dest, Ea::DataReg(_)) {
+            ALU_PASS_CLOCKS
+        } else {
+            0
+        }
     }
 
     /// `TST`: `0100 1010 ss mmm rrr`, `ss` != `11`.
@@ -2141,6 +2157,39 @@ mod tests {
         assert!(cpu.flag_x(), "X unaffected");
         assert_eq!(bus.read_long(MEM), 0x1234_5678, "CMPI stores nothing");
         assert_eq!(cpu.pc, PROGRAM + 8, "opcode + 3 extension words");
+    }
+
+    /// The `CMPI` clock totals, each stated as the suite records it rather than
+    /// as a rule, so the rule cannot drift (M68000UM section 8 "Instruction
+    /// execution times", measured for #230).
+    ///
+    /// Only the long form to a data register pays the ALU pass: `Dn` is no bus
+    /// cycle and the immediate was already popped by the fetch, so it is 14 where
+    /// its three words fetch 12. A memory destination reads for itself — `CMPI.L
+    /// #,(A0)` is the suite's 20 with nothing on top — and byte and word are one
+    /// pass, which is why `CMP.b`/`CMP.w` were exact before this.
+    #[test]
+    fn cmpi_clock_totals() {
+        let (mut cpu, mut bus) = run(0x0C00, &[0x0000, 0x4E71]);
+        assert_eq!(cpu.step(&mut bus), 8, "CMPI.B #,Dn: 2 words, 1 pass");
+
+        let (mut cpu, mut bus) = run(0x0C40, &[0x0000, 0x4E71]);
+        assert_eq!(cpu.step(&mut bus), 8, "CMPI.W #,Dn: 2 words, 1 pass");
+
+        let (mut cpu, mut bus) = run(0x0C80, &[0x0000, 0x0000, 0x4E71]);
+        assert_eq!(
+            cpu.step(&mut bus),
+            14,
+            "CMPI.L #,Dn: 3 words plus the pass neither covers"
+        );
+
+        let (mut cpu, mut bus) = run(0x0C90, &[0x0000, 0x0000, 0x4E71]);
+        cpu.a[0] = MEM;
+        assert_eq!(
+            cpu.step(&mut bus),
+            20,
+            "CMPI.L #,(A0): the long read hides the pass"
+        );
     }
 
     /// `TST.W D0` (`$4A40`) sets N and Z from the operand and clears V and C,
