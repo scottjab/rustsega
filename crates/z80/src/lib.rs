@@ -16,6 +16,7 @@ mod decode;
 mod ld16;
 mod ld8;
 mod regs;
+mod rot;
 #[cfg(test)]
 mod testutil;
 
