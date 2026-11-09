@@ -93,8 +93,8 @@
 //! harness runs with cycles unchecked.
 
 use crate::bus::{ADDR_MASK, Bus};
-use crate::cpu::M68k;
 use crate::cpu::BUS_CYCLE_CLOCKS;
+use crate::cpu::M68k;
 use crate::sr::{SR_S, SR_T};
 
 /// Address error, the group 0 exception.
@@ -215,12 +215,7 @@ impl M68k {
     /// of the faulting instruction reaching the bus: the handlers do not check
     /// a `Result` (threading one through the ~100 access sites in `ops/` and
     /// `ea.rs` is not what this rule needs), so the accessors suppress instead.
-    pub(crate) fn alignment_fault(
-        &mut self,
-        addr: u32,
-        kind: AccessKind,
-        is_long: bool,
-    ) -> bool {
+    pub(crate) fn alignment_fault(&mut self, addr: u32, kind: AccessKind, is_long: bool) -> bool {
         if self.pending_address_error.is_some() {
             return true;
         }
@@ -511,7 +506,11 @@ mod tests {
         // The frame was still completed before the second fault: the status word
         // and the fault address are written before the vector is read.
         let sp = STACK - ADDRESS_ERROR_FRAME_SIZE;
-        assert_eq!(peek_word(&bus, sp), 0x3015, "status word of the first fault");
+        assert_eq!(
+            peek_word(&bus, sp),
+            0x3015,
+            "status word of the first fault"
+        );
         assert_eq!(peek_long(&bus, sp + 2), a0, "fault address");
         assert_eq!(peek_word(&bus, sp + 6), 0x3010, "IRD");
         assert_eq!(peek_word(&bus, sp + 8), SUP | SR_Z, "saved SR");
