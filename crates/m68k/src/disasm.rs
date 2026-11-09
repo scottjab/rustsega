@@ -163,13 +163,13 @@ fn ea_text(r: &mut Reader<'_>, ea: u8, size: Option<Size>) -> String {
         (0b010, n) => format!("({})", an(n)),
         (0b011, n) => format!("({})+", an(n)),
         (0b100, n) => format!("-({})", an(n)),
-        (0b101, n) => format!("{},{}", num(u32::from(r.word())), an(n)),
+        (0b101, n) => format!("{}({})", num(u32::from(r.word())), an(n)),
         (0b110, n) => indexed(r, an(n)),
         // Absolute: a word for `.W` — which is what an unprefixed mode means —
         // and a long for `.L`.
         (0b111, 0b000) => format!("${:04X}", r.word()),
         (0b111, 0b001) => format!("${:06X}", r.long()),
-        (0b111, 0b010) => format!("{},PC", num(u32::from(r.word()))),
+        (0b111, 0b010) => format!("{}(PC)", num(u32::from(r.word()))),
         (0b111, 0b011) => indexed(r, String::from("PC")),
         (0b111, 0b100) => immediate(r, size),
         // Mode `111` with `reg` above `100` is not a mode at all and is never
@@ -184,7 +184,7 @@ fn ea_text(r: &mut Reader<'_>, ea: u8, size: Option<Size>) -> String {
 fn indexed(r: &mut Reader<'_>, base: String) -> String {
     let brief = r.word();
     let d8 = num(u32::from(brief & 0xFF));
-    format!("{d8},{base}({})", index(brief))
+    format!("{d8}({base},{})", index(brief))
 }
 
 /// The index named by a brief extended word: bit 15 selects `An` over `Dn`,
@@ -246,7 +246,7 @@ fn format_op(r: &mut Reader<'_>, opcode: u16) -> String {
         }
         Op::Moveq => {
             let imm = num(u32::from(opcode & 0xFF));
-            format!("MOVEQ {imm},{}", dn(dx))
+            format!("MOVEQ #{imm},{}", dn(dx))
         }
         Op::MoveFromSr => {
             let to = ea_text(r, ea, Some(Size::Word));
@@ -356,7 +356,7 @@ fn format_op(r: &mut Reader<'_>, opcode: u16) -> String {
             // A `000` field is not no shift, it is a full width of it; and the
             // count is in a data register when bit 5 is set.
             let n = if opcode & 0b10_0000 == 0 {
-                num(u32::from(if count == 0 { 8 } else { count }))
+                format!("#{num}", num = num(u32::from(if count == 0 { 8 } else { count })))
             } else {
                 dn(count)
             };
@@ -417,7 +417,7 @@ fn format_op(r: &mut Reader<'_>, opcode: u16) -> String {
 /// field with no mode to name (M68000UM MOVEP).
 fn movep(r: &mut Reader<'_>, opcode: u16) -> String {
     let size = if opcode & 0b100_0000 == 0 { ".W" } else { ".L" };
-    let mem = format!("{},{}", num(u32::from(r.word())), an(field(opcode, 0)));
+    let mem = format!("{}({})", num(u32::from(r.word())), an(field(opcode, 0)));
     let d = dn(field(opcode, 9));
     // Bit 7 set is `MOVEP Dx,d16(An)`; clear is the other direction.
     if opcode & 0b1000_0000 == 0 {
@@ -584,7 +584,9 @@ fn branch(r: &mut Reader<'_>, opcode: u16, name: &str) -> String {
 /// the printed list is not simply the mask read low to high
 /// (`ops::movem::movem_list_ea`).
 fn movem(r: &mut Reader<'_>, opcode: u16) -> String {
-    let to_memory = opcode & 0x0400 != 0;
+    // Bit 10 set is memory to registers; clear is the list going to memory
+    // (`decode::classify_movem`, M68000UM MOVEM).
+    let to_memory = opcode & 0x0400 == 0;
     let long = opcode & 0x0040 != 0;
     let list = r.word();
     let reversed = to_memory && field(opcode, 3) == 0b100;
@@ -633,27 +635,33 @@ fn reg_list(mask: u16, reversed: bool) -> String {
     out
 }
 
-/// One bank's registers, appended as `0-2/5`.
+/// One bank's registers, appended as `D0-D2/5` (each run repeats the bank
+/// letter, the way an assembler writes `MOVEM.L D0-D2/A0`).
 fn runs(out: &mut String, bank: char, regs: &[u8]) {
     let mut sorted = regs.to_vec();
     sorted.sort_unstable();
     let mut start = sorted[0];
     let mut prev = sorted[0];
-    for n in sorted[1..].iter().copied().chain(std::iter::once(0xFF)) {
+    for n in sorted[1..].iter().copied().chain(std::iter::once(u8::MAX)) {
         if n == prev + 1 {
             prev = n;
             continue;
         }
-        if !out.is_empty() && !out.ends_with('/') && !out.ends_with(bank) {
-            out.push('/');
-        }
-        if start == prev {
-            out.push_str(&prev.to_string());
-        } else {
-            out.push_str(&format!("{start}-{prev}"));
-        }
+        push_run(out, bank, start, prev);
         start = n;
         prev = n;
+    }
+}
+
+/// One `D0`/`D0-D3` run of a register list, `/`-separated from what came before.
+fn push_run(out: &mut String, bank: char, start: u8, prev: u8) {
+    if !out.is_empty() {
+        out.push('/');
+    }
+    if start == prev {
+        out.push_str(&format!("{bank}{start}"));
+    } else {
+        out.push_str(&format!("{bank}{start}-{bank}{prev}"));
     }
 }
 
@@ -1030,6 +1038,39 @@ mod tests {
             let (t, got) = disassemble(words, 0x1000);
             assert!(!t.is_empty());
             assert_eq!(got, want, "{:04X}", words[0]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_probe {
+    use crate::decode;
+    #[test]
+    fn probe_prints() {
+        for op in [0x0850u16, 0x0C58, 0x0478, 0x9EC1, 0x41F8, 0x4848, 0x4C50, 0x4E91, 0x4CD1, 0x4C90, 0xB989, 0x4878, 0x41D0, 0x0110, 0x01D8, 0x0C58] {
+            println!(
+                "${op:04X} -> {:?}  hi4={:04b} ddd={:03b} b8={} b76={:02b} mode={:03b} reg={:03b}",
+                decode::decode(op),
+                op >> 12,
+                (op >> 9) & 7,
+                (op >> 8) & 1,
+                (op >> 6) & 3,
+                (op >> 3) & 7,
+                op & 7,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_audit {
+    use super::disassemble;
+    #[test]
+    fn audit_prints() {
+        let cases: &[&[u16]] = &[&[0x4E71],&[0x7001],&[0x7EFF],&[0x1001],&[0x3001],&[0x2001],&[0x6602],&[0x66FE],&[0x6600,0x0100],&[0x6100,0xFFFE],&[0x48E7,0xC080],&[0x4C50,0x00FF],&[0x4C10,0x0F00],&[0x41F0,0x1004],&[0x41F0,0x9003],&[0x4EB9,0x0001,0x2345],&[0xFFFF],&[0xA123],&[0x42C8],&[0x2010],&[0x2018],&[0x2020],&[0x2028,0x0010],&[0x2030,0x1004],&[0x2038,0x1234],&[0x2039,0x0001,0x2345],&[0x203A,0x0010],&[0x203B,0x1004],&[0x203C,0x0000,0x0010],&[0x103C,0x0012],&[0x227C,0x0000,0x0010],&[0xD041],&[0xD1C8],&[0xD0C0],&[0x50C0],&[0x5481],&[0x90F0],&[0x91F2],&[0xB0C8],&[0x51C0],&[0x9EC1],&[0x067C,0x0001,0x0002],&[0x003C,0x00FF],&[0x027C,0x1234],&[0x0A3C,0x0042],&[0x4A10],&[0x4200],&[0x4610],&[0x40D8],&[0x4AC0],&[0x40C0],&[0x44C0],&[0x46D0],&[0x4E61],&[0x4E69],&[0xC342],&[0xC1C8],&[0xD181],&[0x4841],&[0x48C1],&[0x4CC1],&[0xC06E,0x0010],&[0x814E],&[0xC501],&[0x8501],&[0x4810],&[0x4390],&[0x0838,0x0003,0x1234],&[0x0850],&[0x0C58],&[0x0478,0x0001],&[0xE789],&[0xE098],&[0xE0D0],&[0xE6D1],&[0x0108,0x1234],&[0x0148,0x1234],&[0x0188,0x1234],&[0x01C8,0x1234],&[0x51CA,0x0004],&[0x50C8,0x0004],&[0x50C0],&[0x51DF,0x00FF],&[0x4E40],&[0x4E4F],&[0x4E72,0x2700],&[0x4E56,0xFFF8],&[0x4E5D],&[0x4EB8,0x1234],&[0x4EF9,0x0001,0x2345],&[0x4E91],&[0x4848,0x1234],&[0x41F8,0x1234],&[0x4E70],&[0x4E73],&[0x4E75],&[0x4E77],&[0x4E76],&[0x4E71]];
+        for (i, words) in cases.iter().enumerate() {
+            let (t, n) = disassemble(words, 0x1000);
+            println!("AUDITI{}|{}|{}", i, t, n);
         }
     }
 }
