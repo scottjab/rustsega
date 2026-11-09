@@ -14,6 +14,33 @@ fn sst_misc_adjust() {
     harness::run_files(&["27", "2f", "37", "3f"]);
 }
 
+/// `LD I,A`, `LD R,A`, `LD A,I`, `LD A,R`.
+#[test]
+fn sst_misc_ir() {
+    harness::run_files(&["ed 47", "ed 4f", "ed 57", "ed 5f"]);
+}
+
+/// `RRD` and `RLD`.
+#[test]
+fn sst_misc_rxd() {
+    harness::run_files(&["ed 67", "ed 6f"]);
+}
+
+/// `HALT`, `DI`, `EI`, including the `DD`/`FD` forms of `HALT`.
+#[test]
+fn sst_misc_flow() {
+    harness::run_files(&["76", "dd 76", "fd 76", "f3", "fb"]);
+}
+
+/// `IM 0`, `IM 1`, `IM 2` and their mirrors: `46`/`4E`/`66`/`6E`,
+/// `56`/`76`, `5E`/`7E`.
+#[test]
+fn sst_misc_im() {
+    harness::run_files(&[
+        "ed 46", "ed 4e", "ed 66", "ed 6e", "ed 56", "ed 76", "ed 5e", "ed 7e",
+    ]);
+}
+
 /// `NEG` and its seven mirrors: `ED 44` plus `4C`, `54`, `5C`, `64`, `6C`,
 /// `74`, `7C`.
 #[test]

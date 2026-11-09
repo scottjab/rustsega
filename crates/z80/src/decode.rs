@@ -320,6 +320,11 @@ impl Z80 {
             // instruction with bits 4 and 3 of the operand field left open, so
             // the mask below is the whole group.
             0x44 | 0x4C | 0x54 | 0x5C | 0x64 | 0x6C | 0x74 | 0x7C => self.neg(),
+            // The interrupt-side register transfers (M2-13, #56): 9 T-states.
+            0x47 => self.ld_i_a(),
+            0x4F => self.ld_r_a(),
+            0x57 => self.ld_a_i(),
+            0x5F => self.ld_a_r(),
             _ if ed_is_defined(op) => {
                 self.unimplemented(&format!("ED {op:02X} (x{} y{} z{})", x(op), y(op), z(op)))
             }

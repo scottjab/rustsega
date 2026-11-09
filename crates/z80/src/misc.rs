@@ -12,7 +12,7 @@
 
 use crate::alu8::sub_flags;
 use crate::rot::ALL_FLAGS;
-use crate::{FLAG_C, FLAG_H, FLAG_N, FLAG_X, FLAG_Y, SZXY_PARITY, Z80};
+use crate::{FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_X, FLAG_Y, FLAG_Z, SZXY_PARITY, Z80};
 
 impl Z80 {
     /// `DAA` (`27`): 4 T-states.
@@ -132,8 +132,71 @@ impl Z80 {
         self.latch_flags();
         8
     }
-}
 
+    /// `LD I,A` (`ED 47`): 9 T-states.
+    ///
+    /// A plain register-to-interrupt transfer: no flag moves in any of the 1000
+    /// cases of `ed 47.json`, and the latches are cleared like every other `ED`
+    /// register instruction (Z80UM 2.2 for the timing).
+    pub(crate) fn ld_i_a(&mut self) -> u32 {
+        let value = self.a();
+        self.set_i(value);
+        self.clear_latches();
+        9
+    }
+
+    /// `LD R,A` (`ED 4F`): 9 T-states.
+    ///
+    /// Like [`Z80::ld_i_a`], except that it writes the whole of `R` including
+    /// bit 7 - the bit an opcode fetch never touches but a load happily sets
+    /// ("The Undocumented Z80 Documented", Sean Young).
+    pub(crate) fn ld_r_a(&mut self) -> u32 {
+        let value = self.a();
+        self.set_r(value);
+        self.clear_latches();
+        9
+    }
+
+    /// `LD A,I` (`ED 57`) and `LD A,R` (`ED 5F`): 9 T-states.
+    ///
+    /// The flag half of these two is the interesting part (Z80UM 2.2, `LD A,I`):
+    /// `S`/`Z`/`X`/`Y` come from the loaded value, `H` and `N` are cleared, `C`
+    /// survives, and `P/V` is not about the byte at all - it is `IFF2`. The
+    /// undocumented `p` latch follows `P/V` in the general case, and the suite
+    /// is stronger than that: `p` ends set in all 1000 cases of both files,
+    /// including the 483 (`ED 57`) and 518 (`ED 5F`) that start with `IFF2`
+    /// clear, so it is set here unconditionally rather than mirrored off `P/V`.
+    fn ld_a_ir(&mut self, value: u8) -> u32 {
+        self.set_a(value);
+        let mut flags = SZXY_PARITY[usize::from(value)] & (FLAG_S | FLAG_Z | FLAG_X | FLAG_Y);
+        if self.iff2() {
+            flags |= FLAG_PV;
+        }
+        self.update_flags(
+            FLAG_S | FLAG_Z | FLAG_X | FLAG_Y | FLAG_PV | FLAG_H | FLAG_N,
+            flags,
+        );
+        self.latch_flags();
+        self.set_p(true);
+        9
+    }
+
+    /// `LD A,I` (`ED 57`).
+    pub(crate) fn ld_a_i(&mut self) -> u32 {
+        let value = self.i();
+        self.ld_a_ir(value)
+    }
+
+    /// `LD A,R` (`ED 5F`).
+    ///
+    /// `R` is read after both opcode fetches have counted, which is what makes
+    /// this instruction's value depend on how the fetch loop is written: the
+    /// suite's `ed 5f` cases all end with `A` equal to the final `R`.
+    pub(crate) fn ld_a_r(&mut self) -> u32 {
+        let value = self.r();
+        self.ld_a_ir(value)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -236,6 +299,47 @@ mod tests {
         assert_eq!(cpu.neg(), 8);
         assert_eq!(cpu.f(), FLAG_Z | FLAG_N, "NEG 0 clears C and sets Z");
         assert_eq!(cpu.a(), 0);
+    }
+
+    /// `LD A,I` and `LD A,R`: `P/V` is `IFF2`, not parity of the byte, and the
+    /// transfers out of `A` move no flag at all.
+    #[test]
+    fn ld_a_i_pv_from_iff2() {
+        let (mut cpu, mut bus) = cpu_at(0x0100, &[0xED, 0x57]);
+        cpu.set_i(0x80);
+        cpu.set_flags(FLAG_Z | FLAG_C);
+        cpu.set_iff2(false);
+
+        assert_eq!(cpu.step(&mut bus), 9);
+
+        assert_eq!(cpu.a(), 0x80);
+        assert_eq!(
+            cpu.f(),
+            FLAG_S | FLAG_C,
+            "S and X/Y from the value, Z gone, H and N cleared, C untouched, P/V = IFF2 = 0"
+        );
+
+        cpu.set_iff2(true);
+        assert_eq!(cpu.ld_a_i(), 9);
+        assert_ne!(cpu.f() & FLAG_PV, 0, "P/V now mirrors IFF2");
+        assert!(cpu.p(), "and the p latch is set whatever P/V came to");
+
+        // LD A,R reads R as the two opcode fetches left it.
+        cpu.set_r(0x12);
+        assert_eq!(cpu.ld_a_r(), 9);
+        assert_eq!(cpu.a(), cpu.r(), "A is the post-fetch R");
+
+        // LD I,A and LD R,A do not touch the flags.
+        cpu.set_a(0x34);
+        cpu.set_flags(0xFF);
+        let before = cpu.f();
+        assert_eq!(cpu.ld_i_a(), 9);
+        assert_eq!(cpu.i(), 0x34);
+        assert_eq!(cpu.f(), before, "LD I,A moves no flag");
+        cpu.set_a(0xA5);
+        assert_eq!(cpu.ld_r_a(), 9);
+        assert_eq!(cpu.r(), 0xA5, "LD R,A writes bit 7 too");
+        assert_eq!(cpu.f(), before, "LD R,A moves no flag either");
     }
 
     /// `CPL` complements `A`, forces `H` and `N`, takes `X`/`Y` from the new
