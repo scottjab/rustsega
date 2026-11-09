@@ -212,8 +212,9 @@ impl Z80 {
         15
     }
 
-    /// The stack half of `PUSH`: two writes, high byte first.
-    fn push16(&mut self, bus: &mut impl Z80Bus, value: u16) {
+    /// The stack half of `PUSH`: two writes, high byte first. `CALL` and `RST`
+    /// push the return address the same way (`cd`/`c7`: 1000 cases each).
+    pub(crate) fn push16(&mut self, bus: &mut impl Z80Bus, value: u16) {
         let sp = self.sp().wrapping_sub(2);
         self.set_sp(sp);
         bus.write(sp.wrapping_add(1), (value >> 8) as u8);
@@ -244,8 +245,9 @@ impl Z80 {
     }
 
     /// The stack half of `POP`: low byte at `SP`, high byte at `SP + 1`, then
-    /// `SP` moves up by two (`c1` trace: read `SP`, then `SP + 1`).
-    fn pop16(&mut self, bus: &mut impl Z80Bus) -> u16 {
+    /// `SP` moves up by two (`c1` trace: read `SP`, then `SP + 1`). `RET`,
+    /// `RETN` and `RETI` read the return address back out of it.
+    pub(crate) fn pop16(&mut self, bus: &mut impl Z80Bus) -> u16 {
         let sp = self.sp();
         let lo = bus.read(sp);
         let hi = bus.read(sp.wrapping_add(1));
