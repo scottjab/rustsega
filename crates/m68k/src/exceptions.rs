@@ -6,8 +6,8 @@
 //! privilege check for the privileged instructions (this module's
 //! [`M68k::check_supervisor`]), then CHK, TRAPV and divide-by-zero from their
 //! own instruction tickets, and interrupts (M1-28, #36) on top of the mask
-//! change. Group 0 — address error and bus error — pushes a bigger frame and is
-//! M1-29 (#37); nothing here builds one.
+//! change. Group 0 — address error and bus error — pushes a bigger frame and lives
+//! in [`crate::address_error`] (M1-29, #37); nothing here builds one.
 //!
 //! # The vector map, measured
 //!
@@ -23,7 +23,7 @@
 //! | Constant | Vector | Long at | Evidence |
 //! |---|---|---|---|
 //! | — | 0, 1 | `$00`, `$04` | reset SSP / PC ([`crate::M68k::reset`]) |
-//! | — | 2 | `$08` | address error: M1-29 (#37), not raised here |
+//! | — | 2 | `$08` | address error **on hardware**: the slot is claimed by [`crate::address_error::EXC_ADDRESS_ERROR`] at `$0C`, which is what the suite's frames read — see that module for the discrepancy |
 //! | [`EXC_ILLEGAL`] | 3 | `$0C` | every exception case of 62 suite files fetches `$0C` (illegal EA), and `tests/harness/mod.rs` installs its handler there |
 //! | [`EXC_DIV_ZERO`] | 5 | `$14` | `DIVU.json.gz` case `80ef [DIVU (d16, A7), D0] 5745`: divisor word at `$0000F0` is zero, the case reads the long at `$14`/`$16` and the frame goes on the stack. Only case in the suite that divides by zero |
 //! | [`EXC_CHK`] | 6 | `$18` | 4272 of the 7389 exception cases in `CHK.json.gz` fetch `$18` (the rest are illegal-EA cases fetching `$0C`) |
@@ -206,14 +206,14 @@ impl M68k {
         //    (M68000UM "Stack Frame Formats", group 0/1/2 vector frame).
         let sp = self.a[7].wrapping_sub(EXCEPTION_FRAME_SIZE);
         self.set_active_sp(sp);
-        self.write_l(bus, (sp + 2) & ADDR_MASK, pushed_pc);
-        self.write_w(bus, sp, saved_sr);
+        self.write_l_raw(bus, (sp + 2) & ADDR_MASK, pushed_pc);
+        self.write_w_raw(bus, sp, saved_sr);
 
         // 4. New PC from the vector long, then a full queue refill from there:
         //    the words the queue held belong to a stream that is no longer
         //    running, so they are thrown away (M68000UM "Exception Processing":
         //    the processor "begins fetching instructions from the new PC").
-        let handler = self.read_l(bus, vector_address(vector));
+        let handler = self.read_l_raw(bus, vector_address(vector));
         self.jump_to(bus, handler);
 
         // One step, one exception: the record is what the harness and the

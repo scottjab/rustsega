@@ -21,6 +21,7 @@
 //!
 //! Not implemented yet: instructions, real exception frames, interrupts.
 
+mod address_error;
 mod bus;
 mod cpu;
 mod decode;
@@ -35,6 +36,7 @@ mod sr;
 /// `crates/m68k/tests/` and other crates need `m68k::testbus::TestBus` too.
 pub mod testbus;
 
+pub use address_error::{ADDRESS_ERROR_FRAME_SIZE, EXC_ADDRESS_ERROR};
 pub use bus::{ADDR_MASK, Bus};
 pub use cpu::{M68k, RESET_CYCLES};
 pub use disasm::disassemble;

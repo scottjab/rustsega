@@ -4,6 +4,7 @@
 //! instruction tickets (M1-05 onward). Everything else here is the contract
 //! those tickets build on.
 
+use crate::address_error::{AccessKind, PendingFault};
 use crate::bus::{ADDR_MASK, Bus};
 use crate::sr::{CCR_MASK, SR_C, SR_INT_MASK, SR_MASK, SR_N, SR_RESET, SR_S, SR_V, SR_X, SR_Z};
 
@@ -135,6 +136,18 @@ pub struct M68k {
     pub stopped: bool,
     /// True while the HALT pin is asserted (the CPU stops accessing the bus).
     pub halted: bool,
+    /// IRD: the opcode word of the instruction [`M68k::step`] is executing,
+    /// snapshotted from `prefetch[0]` before the operation runs. The group 0
+    /// address error frame pushes it (M68000UM "Address Error", and measured:
+    /// the IRD word in `JMP.json.gz` case `4ed1 [JMP (A1)] 2` is the `JMP`
+    /// opcode, although the queue has moved on by the time its fetch faults).
+    pub(crate) ird: u16,
+    /// The address error raised by an access in the instruction now executing,
+    /// not yet entered ([`crate::address_error`]). [`M68k::step`] takes it once
+    /// the opcode has finished; while it is set every checked bus access is
+    /// suppressed, which is what keeps the rest of the faulting instruction off
+    /// the bus.
+    pub(crate) pending_address_error: Option<PendingFault>,
     /// Vector number of the exception the last [`M68k::step`] took, or `None`
     /// if that step did not take one ([`crate::ops`] holds the numbers).
     ///
@@ -174,6 +187,8 @@ impl M68k {
             ipl_sampled: 0,
             stopped: false,
             halted: false,
+            ird: 0,
+            pending_address_error: None,
             pending_exception: None,
             cycles: 0,
         }
@@ -198,6 +213,8 @@ impl M68k {
         self.ipl_sampled = 0;
         self.stopped = false;
         self.halted = false;
+        self.ird = 0;
+        self.pending_address_error = None;
         self.pending_exception = None;
         self.cycles = 0;
         self.set_sr(SR_RESET);
@@ -271,7 +288,15 @@ impl M68k {
         }
 
         let opcode = self.prefetch[0];
+        // The group 0 frame's IRD is this word, whoever faults later (#37);
+        // see [`M68k::ird`].
+        self.ird = opcode;
         let used = self.run_op(bus, crate::decode::decode(opcode), opcode);
+        // An address error raised by any access the opcode performed is entered
+        // here, after the access layer stopped letting the instruction reach the
+        // bus (M1-29, #37). It is not an early return: the entry has already
+        // thrown the queue away and moved `pc` to the handler by then.
+        self.take_address_error(bus);
         // TODO(M1-31, #39): this is the one place instruction clocks enter
         // `cycles`, but the bus helpers and the EA layer's internal clocks
         // (`INDEX_CALC_CLOCKS`, `PREDEC_CALC_CLOCKS`) already self-charge, so
@@ -392,6 +417,9 @@ impl M68k {
     }
 
     /// Read the byte at `addr`, masked to 24 bits, and charge one bus cycle.
+    ///
+    /// Byte accesses are never alignment-checked: A0 is the byte-select line
+    /// (M68000UM "Address Definition"), so an odd byte address is ordinary.
     #[inline]
     pub fn read_b(&mut self, bus: &mut impl Bus, addr: u32) -> u8 {
         self.cycles += BUS_CYCLE_CLOCKS;
@@ -399,46 +427,116 @@ impl M68k {
     }
 
     /// Read the big endian word at `addr`, masked to 24 bits, and charge one
-    /// bus cycle. `addr` is even: the 68000 never performs an odd word access
-    /// (an unaligned one is an address error exception).
+    /// bus cycle.
+    ///
+    /// An odd `addr` is the address error: the read does not happen, `0` is
+    /// returned, and [`crate::address_error`] enters on the way out of
+    /// [`M68k::step`] (M1-29, #37). While a fault is already pending the access
+    /// is suppressed the same way.
     #[inline]
     pub fn read_w(&mut self, bus: &mut impl Bus, addr: u32) -> u16 {
-        self.cycles += BUS_CYCLE_CLOCKS;
-        bus.read_word(addr & ADDR_MASK)
+        if self.alignment_fault(addr, AccessKind::DataRead, false) {
+            return 0;
+        }
+        self.read_w_raw(bus, addr)
     }
 
     /// Read the big endian long at `addr`: high word at `addr`, low word at
     /// `addr + 2`, two bus cycles charged (8 clocks).
+    ///
+    /// Faults on an odd `addr`, and on a `addr` whose second word would lie past
+    /// `$FFFFFF` — this used to wrap, and the 68000 faults instead
+    /// (M68000UM "Address Error"). See [`M68k::read_w`] for what a fault does to
+    /// the return value.
     #[inline]
     pub fn read_l(&mut self, bus: &mut impl Bus, addr: u32) -> u32 {
+        if self.alignment_fault(addr, AccessKind::DataRead, true) {
+            return 0;
+        }
         let addr = addr & ADDR_MASK;
-        let high = u32::from(self.read_w(bus, addr));
-        let low = u32::from(self.read_w(bus, (addr + 2) & ADDR_MASK));
+        let high = u32::from(self.read_w_raw(bus, addr));
+        let low = u32::from(self.read_w_raw(bus, (addr + 2) & ADDR_MASK));
         (high << 16) | low
     }
 
-    /// Write a byte, masked to 24 bits, and charge one bus cycle.
+    /// Write a byte, masked to 24 bits, and charge one bus cycle. Never
+    /// alignment-checked, like [`M68k::read_b`].
     #[inline]
     pub fn write_b(&mut self, bus: &mut impl Bus, addr: u32, value: u8) {
         self.cycles += BUS_CYCLE_CLOCKS;
         bus.write_byte(addr & ADDR_MASK, value);
     }
 
-    /// Write a big endian word at even `addr`, masked to 24 bits, and charge
-    /// one bus cycle.
+    /// Write a big endian word at `addr`, masked to 24 bits, and charge one bus
+    /// cycle. An odd `addr` is the address error and the write does not happen:
+    /// see [`M68k::read_w`].
     #[inline]
     pub fn write_w(&mut self, bus: &mut impl Bus, addr: u32, value: u16) {
+        if self.alignment_fault(addr, AccessKind::DataWrite, false) {
+            return;
+        }
+        self.write_w_raw(bus, addr, value)
+    }
+
+    /// Write a big endian long: high word at `addr`, low word at `addr + 2`,
+    /// two bus cycles charged (8 clocks). Faults like [`M68k::read_l`] and then
+    /// writes nothing at all.
+    #[inline]
+    pub fn write_l(&mut self, bus: &mut impl Bus, addr: u32, value: u32) {
+        if self.alignment_fault(addr, AccessKind::DataWrite, true) {
+            return;
+        }
+        let addr = addr & ADDR_MASK;
+        self.write_w_raw(bus, addr, (value >> 16) as u16);
+        self.write_w_raw(bus, (addr + 2) & ADDR_MASK, value as u16);
+    }
+
+    // ---- Unchecked accesses -------------------------------------------------
+    //
+    // The exception paths' own bus traffic must never alignment-fault: the
+    // vector table read and the frame writes in `exceptions.rs` and
+    // `address_error.rs` have to succeed whatever the address is (M1-29, #37).
+    // They use these instead of the checked accessors above; nothing else
+    // should, and the difference is deliberately two names rather than a
+    // special-cased address range.
+
+    /// [`M68k::read_w`] without the alignment check. For exception entry only.
+    pub(crate) fn read_w_raw(&mut self, bus: &mut impl Bus, addr: u32) -> u16 {
+        self.cycles += BUS_CYCLE_CLOCKS;
+        bus.read_word(addr & ADDR_MASK)
+    }
+
+    /// [`M68k::read_l`] without the alignment check. For exception entry only.
+    pub(crate) fn read_l_raw(&mut self, bus: &mut impl Bus, addr: u32) -> u32 {
+        let addr = addr & ADDR_MASK;
+        let high = u32::from(self.read_w_raw(bus, addr));
+        let low = u32::from(self.read_w_raw(bus, (addr + 2) & ADDR_MASK));
+        (high << 16) | low
+    }
+
+    /// [`M68k::write_w`] without the alignment check. For exception entry only.
+    pub(crate) fn write_w_raw(&mut self, bus: &mut impl Bus, addr: u32, value: u16) {
         self.cycles += BUS_CYCLE_CLOCKS;
         bus.write_word(addr & ADDR_MASK, value);
     }
 
-    /// Write a big endian long: high word at `addr`, low word at `addr + 2`,
-    /// two bus cycles charged (8 clocks).
-    #[inline]
-    pub fn write_l(&mut self, bus: &mut impl Bus, addr: u32, value: u32) {
+    /// [`M68k::write_l`] without the alignment check. For exception entry only.
+    pub(crate) fn write_l_raw(&mut self, bus: &mut impl Bus, addr: u32, value: u32) {
         let addr = addr & ADDR_MASK;
-        self.write_w(bus, addr, (value >> 16) as u16);
-        self.write_w(bus, (addr + 2) & ADDR_MASK, value as u16);
+        self.write_w_raw(bus, addr, (value >> 16) as u16);
+        self.write_w_raw(bus, (addr + 2) & ADDR_MASK, value as u16);
+    }
+
+    /// Fetch one instruction-stream word: [`M68k::read_w`] with the *code fetch*
+    /// fault kind, so an odd fetch reports `0x1E` in the frame's status word
+    /// rather than the data-read `0x15` (M68000UM "Address Error", and measured
+    /// on `JMP.json.gz` case `4ed1 [JMP (A1)] 2`).
+    #[inline]
+    fn fetch_w(&mut self, bus: &mut impl Bus, addr: u32) -> u16 {
+        if self.alignment_fault(addr, AccessKind::CodeFetch, false) {
+            return 0;
+        }
+        self.read_w_raw(bus, addr)
     }
 
     // ---- Prefetch queue: the only way words enter and leave it (M1-04, #12) ----
@@ -460,10 +558,10 @@ impl M68k {
     /// why a write to the word already sitting in the queue does not reach the
     /// CPU until the queue has moved on (self-modifying code).
     ///
-    /// TODO(M1-29): an instruction fetch from an odd address is an address error
-    /// — vector 2, the long at $000008 (M68000UM, "Exception Vector Memory
-    /// Map"). Every instruction fetch in the core goes through here, so that
-    /// check belongs here rather than in its callers.
+    /// The refill is a *code fetch*, so an odd fetch address is an address error
+    /// with the code-fetch status bits (M1-29, #37, [`crate::address_error`]).
+    /// Every instruction fetch in the core goes through here, so the check
+    /// belongs here rather than in its callers.
     fn pop_word(&mut self, bus: &mut impl Bus) -> u16 {
         let word = self.prefetch[1];
         // The refill address is computed before `pc` moves: the queue's next
@@ -471,7 +569,7 @@ impl M68k {
         let next = (self.pc + FETCH_AHEAD) & ADDR_MASK;
         self.prefetch[0] = word;
         self.pc = (self.pc + 2) & ADDR_MASK;
-        self.prefetch[1] = self.read_w(bus, next);
+        self.prefetch[1] = self.fetch_w(bus, next);
         word
     }
 
@@ -522,9 +620,12 @@ impl M68k {
     /// end with a `pc` above `$FFFFFF` (#193 is the same finding for `LEA`/`PEA`).
     pub(crate) fn jump_to(&mut self, bus: &mut impl Bus, addr: u32) {
         self.pc = addr;
-        let fetch = addr & ADDR_MASK;
-        self.prefetch[0] = self.read_w(bus, fetch);
-        self.prefetch[1] = self.read_w(bus, (fetch + 2) & ADDR_MASK);
+        // The fetches are handed the unmasked `addr` on purpose: `read_w_raw`
+        // masks on the way to the bus, and an address error from one of them
+        // has to report the address that was asked for, not the 24 bit one
+        // (M1-29, #37).
+        self.prefetch[0] = self.fetch_w(bus, addr);
+        self.prefetch[1] = self.fetch_w(bus, addr.wrapping_add(2));
     }
 }
 

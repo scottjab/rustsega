@@ -637,9 +637,14 @@ impl M68k {
     /// negative value lands at `0xFFFF_xxxx`. Byte access to An cannot reach
     /// here: [`M68k::resolve_ea`] rejects it.
     ///
-    /// TODO(M1-29, #37): a word or long access at an odd address is an address
-    /// error (vector 2) before anything is read or written; this layer just
-    /// passes the address on and `Ea::Mem` is where that check will hang.
+    /// An `Ea::Mem` destination is checked for the address error by
+    /// [`M68k::write_w`] / [`M68k::write_l`] (#37), which simply do not perform a
+    /// misaligned write. That is not enough for a *register* destination: an
+    /// instruction whose source read faulted must not write its result anywhere,
+    /// not even somewhere legal, so the whole write-back is skipped once
+    /// [`M68k::address_error_pending`] is set. EA side effects are unaffected —
+    /// the auto-increment of `(An)+` happened in [`M68k::resolve_ea`], on the way
+    /// to this point, and stays done.
     pub(crate) fn write_ea(&mut self, bus: &mut impl Bus, ea: Ea, size: Size, value: u32) {
         debug_assert!(
             ea.accepts_size(size),
@@ -649,6 +654,9 @@ impl M68k {
             !matches!(ea, Ea::Imm(_)),
             "immediates are source-only operands: nothing can be written to {ea:?}"
         );
+        if self.address_error_pending() {
+            return;
+        }
         match ea {
             Ea::DataReg(r) => {
                 let i = usize::from(r);
@@ -1291,20 +1299,24 @@ mod tests {
     /// the core (M68000UM, "Absolute Addressing Mode" and "Data Organization").
     #[test]
     fn abs_l() {
-        // MOVE.L abs.L, D0 (0x2039) with the long $00012345.
-        let (mut cpu, mut bus) = cpu_with_program(&[0x2039, 0x0001, 0x2345, 0x4E71]);
-        bus.write_long(0x0001_2345, 0xDEAD_BEEF);
+        // MOVE.L abs.L, D0 (0x2039) with the long $00012344.
+        //
+        // The operand address is even: a long access at an odd address is an
+        // address error (#37, M1-29) and would never reach the read this test is
+        // about. Nothing else here moves the two words apart by one.
+        let (mut cpu, mut bus) = cpu_with_program(&[0x2039, 0x0001, 0x2344, 0x4E71]);
+        bus.write_long(0x0001_2344, 0xDEAD_BEEF);
 
         let ea = cpu
             .resolve_ea(&mut bus, ABSOLUTE, ABS_L, Size::Long)
             .expect("abs.L resolves");
 
-        assert_eq!(ea, Ea::Mem(0x0001_2345));
+        assert_eq!(ea, Ea::Mem(0x0001_2344));
         assert_eq!(cpu.read_ea(&mut bus, ea, Size::Long), 0xDEAD_BEEF);
         assert_eq!(cpu.pc, PROGRAM_BASE + 4, "both extension words consumed");
         assert_eq!(
             cpu.prefetch,
-            [0x2345, 0x4E71],
+            [0x2344, 0x4E71],
             "the queue slid two words past them, so the next instruction still starts in the right place"
         );
     }
