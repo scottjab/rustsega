@@ -13,3 +13,12 @@ mod harness;
 fn sst_misc_adjust() {
     harness::run_files(&["27", "2f", "37", "3f"]);
 }
+
+/// `NEG` and its seven mirrors: `ED 44` plus `4C`, `54`, `5C`, `64`, `6C`,
+/// `74`, `7C`.
+#[test]
+fn sst_misc_neg() {
+    harness::run_files(&[
+        "ed 44", "ed 4c", "ed 54", "ed 5c", "ed 64", "ed 6c", "ed 74", "ed 7c",
+    ]);
+}

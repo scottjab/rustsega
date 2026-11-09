@@ -316,6 +316,10 @@ impl Z80 {
             // (M2-10, #53). The mirrors are `ED 55`/`5D`/`65`/`6D`/`75`/`7D`.
             0x4D => self.reti(bus),
             0x45 | 0x55 | 0x5D | 0x65 | 0x6D | 0x75 | 0x7D => self.retn(bus),
+            // `NEG` (`ED 44`) and its seven mirrors (M2-13, #56): one
+            // instruction with bits 4 and 3 of the operand field left open, so
+            // the mask below is the whole group.
+            0x44 | 0x4C | 0x54 | 0x5C | 0x64 | 0x6C | 0x74 | 0x7C => self.neg(),
             _ if ed_is_defined(op) => {
                 self.unimplemented(&format!("ED {op:02X} (x{} y{} z{})", x(op), y(op), z(op)))
             }

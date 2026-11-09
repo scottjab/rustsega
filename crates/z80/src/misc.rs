@@ -10,6 +10,7 @@
 //! single-byte flag instructions, which is why they mask only the bits they
 //! actually compute.
 
+use crate::alu8::sub_flags;
 use crate::rot::ALL_FLAGS;
 use crate::{FLAG_C, FLAG_H, FLAG_N, FLAG_X, FLAG_Y, SZXY_PARITY, Z80};
 
@@ -115,7 +116,24 @@ impl Z80 {
     pub(crate) fn ccf(&mut self) -> u32 {
         self.flag_fiddle(true)
     }
+
+    /// `NEG` (`ED 44`) and its seven mirrors: 8 T-states.
+    ///
+    /// `NEG` is `A <- 0 - A` with every flag a subtract would take (Z80UM 2.2,
+    /// `NEG`): `N` set, `C` set for every `A` but `0`, `V` set only for `0x80`.
+    /// The mirrors `ED 4C`, `54`, `5C`, `64`, `6C`, `74` and `7C` are the same
+    /// instruction on the real CPU, which leaves bits 4 and 3 of the operand
+    /// field open in the `ED` group; all 1000 cases of each of the eight files
+    /// agree, and `wz` stays where it was.
+    pub(crate) fn neg(&mut self) -> u32 {
+        let (result, flags) = sub_flags(0, self.a(), 0);
+        self.set_a(result);
+        self.update_flags(ALL_FLAGS, flags);
+        self.latch_flags();
+        8
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -196,6 +214,28 @@ mod tests {
             cpu.get_flag(FLAG_H),
             "0x1 - 0x6 needed no borrow, so H stays"
         );
+    }
+
+    /// `NEG` of `0x80`: the result is `0x80` again, and that one value is what
+    /// sets overflow. `C` is set because `0 - 0x80` borrowed; `0` would not be.
+    #[test]
+    fn neg_0x80_sets_v() {
+        let (mut cpu, mut bus) = cpu_at(0x0100, &[0xED, 0x44]);
+        cpu.set_a(0x80);
+
+        assert_eq!(cpu.step(&mut bus), 8);
+
+        assert_eq!(cpu.a(), 0x80);
+        assert_eq!(
+            cpu.f(),
+            FLAG_S | FLAG_N | FLAG_PV | FLAG_C,
+            "S and P/V from the negation, N set, C set, H and Z clear"
+        );
+
+        cpu.set_a(0x00);
+        assert_eq!(cpu.neg(), 8);
+        assert_eq!(cpu.f(), FLAG_Z | FLAG_N, "NEG 0 clears C and sets Z");
+        assert_eq!(cpu.a(), 0);
     }
 
     /// `CPL` complements `A`, forces `H` and `N`, takes `X`/`Y` from the new
