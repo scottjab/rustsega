@@ -14,6 +14,7 @@ mod alu16;
 mod alu8;
 mod bitops;
 mod decode;
+mod flow;
 mod ld16;
 mod ld8;
 mod regs;

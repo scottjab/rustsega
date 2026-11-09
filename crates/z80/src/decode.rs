@@ -219,6 +219,21 @@ impl Z80 {
             0xD9 => self.exx(),
             0xEB => self.ex_de_hl(),
             0xE3 => self.ex_sp_index(bus, IndexMode::Hl),
+            // Jumps, calls, returns and restarts (M2-10, #53). The conditional
+            // forms are grouped by instruction rather than by `y`, because each
+            // instruction puts its conditions on a different opcode bit and
+            // `JR` only uses the low two bits of `y`.
+            0xC3 => self.jp_nn(bus),
+            0xC2 | 0xCA | 0xD2 | 0xDA | 0xE2 | 0xEA | 0xF2 | 0xFA => self.jp_cc_nn(bus, op),
+            0xE9 => self.jp_index(IndexMode::Hl),
+            0x18 => self.jr_e(bus),
+            0x20 | 0x28 | 0x30 | 0x38 => self.jr_cc(bus, op),
+            0x10 => self.djnz(bus),
+            0xCD => self.call_nn(bus),
+            0xC4 | 0xCC | 0xD4 | 0xDC | 0xE4 | 0xEC | 0xF4 | 0xFC => self.call_cc_nn(bus, op),
+            0xC9 => self.ret(bus),
+            0xC0 | 0xC8 | 0xD0 | 0xD8 | 0xE0 | 0xE8 | 0xF0 | 0xF8 => self.ret_cc(bus, op),
+            0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => self.rst(bus, op),
             _ => self.unimplemented(&format!("main {op:02X} (x{} y{} z{})", x(op), y(op), z(op))),
         }
     }
@@ -271,6 +286,10 @@ impl Z80 {
             // of `ED` included. Bit 3 says which way round they are, `0` being
             // `SBC`; `ed 42` is `SBC HL,BC` and `ed 4a` is `ADC HL,BC`.
             0x42 | 0x4a | 0x52 | 0x5a | 0x62 | 0x6a | 0x72 | 0x7a => self.adc_sbc_hl_rr(op),
+            // `RETI` (ED 4D) and `RETN` (ED 45) with its six documented mirrors
+            // (M2-10, #53). The mirrors are `ED 55`/`5D`/`65`/`6D`/`75`/`7D`.
+            0x4D => self.reti(bus),
+            0x45 | 0x55 | 0x5D | 0x65 | 0x6D | 0x75 | 0x7D => self.retn(bus),
             _ if ed_is_defined(op) => {
                 self.unimplemented(&format!("ED {op:02X} (x{} y{} z{})", x(op), y(op), z(op)))
             }
@@ -301,6 +320,9 @@ impl Z80 {
             // Same reasoning: `NOP` does not mention `HL`, so the prefix is
             // wasted and the `NOP` runs.
             OP_NOP => T_M1 + self.nop(),
+            // `JP (IX)` / `JP (IY)` (M2-10, #53): the first indexed opcode that
+            // takes no displacement, so the whole instruction is two bytes.
+            0xE9 => self.jp_index(mode),
             // The 8-bit indexed loads (M2-04, #47). The rest of this space is
             // either a later ticket or the undocumented IXH/IXL forms
             // (M2-15, #58), which stay a panic.
