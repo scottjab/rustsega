@@ -31,14 +31,24 @@
 //!
 //! # Cycles
 //!
-//! `0`, like every other handler (see [`crate::ops`]). Two numbers are owed by
-//! M1-31 (#39/#40): the widths of M68000PM section 6 for this class, and
-//! `BCLR`'s two extra internal clocks when the bit number is 16 or more on a
-//! `Dn` operand (M68000UM "BCLR", "Timing").
+//! [`bit_op_clocks`] is what the four handlers add to their own bus traffic:
+//! one [`ALU_PASS_CLOCKS`] for `BTST`, `BCHG` and `BSET` and two for `BCLR`
+//! (M68000UM "BCLR", "Timing": the clear costs two clocks more than the change
+//! or the set), plus one more pass when a `Dn` operand's bit lies in the upper
+//! half of the long, which the 16-bit ALU reaches second - and only the three
+//! mnemonics that write the operand pay that.
+//!
+//! Nothing is added for a byte operand: its read, and the write for the three
+//! modifying mnemonics, cover the passes. The bit-number extension word of the
+//! static form is charged by [`M68k::fetch_ext_word`], and that is the whole of
+//! the 4 that separates `BCHG #,$12,D0` from `BCHG D1,D0`.
+//!
+//! Measured over every non-exception case of the four suite files (M1-31b, #40).
 
 use crate::bus::Bus;
 use crate::cpu::M68k;
-use crate::ea::Size;
+use crate::ea::{Ea, Size};
+use crate::ops::arith::ALU_PASS_CLOCKS;
 use crate::ops::field;
 use crate::sr::SR_Z;
 
@@ -124,6 +134,39 @@ const fn bit_modulo(size: Size) -> u32 {
     }
 }
 
+/// The width of the 68000's ALU: a bit at or above this number is only reached
+/// on the second pass of a long operand (see [`bit_op_clocks`]).
+const ALU_WIDTH_BITS: u32 = 16;
+
+/// Clocks a bit instruction pays on top of its own bus traffic and operand
+/// words: nothing for an operand that lives in memory, one to three
+/// [`ALU_PASS_CLOCKS`] for one that does not.
+///
+/// A memory operand — every mode but `Dn` and the immediate, since
+/// [`bit_op_size`] makes those operands bytes — is exact on its accesses: the
+/// read, and the write-back for the three modifying mnemonics, already occupy
+/// the passes below. Only `BTST Dn,#`, where the operand is an operand-position
+/// immediate and `BTST` is the only one of the four that may take it, shows the
+/// rule on the byte side.
+///
+/// A `Dn` operand is a long, and the 16-bit ALU takes passes over it: one for
+/// `BTST`, `BCHG` and `BSET`, two for `BCLR` (M68000UM "BCLR", "Timing": the
+/// clear costs two clocks more than the change or the set), plus one more when
+/// the bit is in the upper half of the long **and** the mnemonic writes it back.
+/// A `BTST` never pays that last one, which is why `BTST D0,D7` is 6 clocks
+/// whatever `D0` holds while `BCHG D0,D7` is 6 or 8 (M68000UM "BTST", "Timing").
+const fn bit_op_clocks(mnemonic: Mnemonic, operand: Ea, bit: u32) -> u32 {
+    if let Ea::Mem(_) = operand {
+        return 0;
+    }
+    let alu_passes = match mnemonic {
+        Mnemonic::Clear => 2,
+        Mnemonic::Test | Mnemonic::Change | Mnemonic::Set => 1,
+    };
+    let upper_half = (mnemonic.writes() && bit >= ALU_WIDTH_BITS) as u32;
+    (alu_passes + upper_half) * ALU_PASS_CLOCKS
+}
+
 impl M68k {
     /// `BTST Dn,<ea>`/`BCHG Dn,<ea>`/`BCLR Dn,<ea>`/`BSET Dn,<ea>`: the dynamic
     /// form, `0000 ddd 1 tt eeeeee`. The bit number is the whole of `Ddd` before
@@ -178,7 +221,7 @@ impl M68k {
         }
 
         self.advance_opcode(bus);
-        0
+        bit_op_clocks(mnemonic, dest, bit)
     }
 }
 
