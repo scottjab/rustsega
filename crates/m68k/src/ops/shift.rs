@@ -75,10 +75,19 @@
 //!
 //! # Cycles
 //!
-//! `0`, like every other handler: the queue rotation in [`M68k::advance_opcode`]
-//! charges what the core models today, and the `6 + 2n` / `8 + 2n` of M68000PM
-//! section 6 are M1-31 (#39/#40)'s — where `n` is exactly what
-//! [`Shift::steps`] already works out.
+//! The register form pays [`Shift::clock_surcharge`]: the `6 + 2n` and `8 + 2n`
+//! of M68000PM section 6 less the opcode fetch [`M68k::advance_opcode`] charges,
+//! which is one [`crate::ops::arith::ALU_PASS_CLOCKS`] pass at a byte or word and
+//! two at a long, plus 2 clocks per place. `n` there is [`Shift::count`] — the
+//! count the opcode gives, saturating and wrapping as it will — and *not* the
+//! [`Shift::steps`] the data movement uses: `ASR.B #39,D0` stops moving data at
+//! 8 places but is still priced at 39. Measured over every non-exception case of
+//! all 24 register-form `ASL`/`ASR`/`LSL`/`LSR`/`ROL`/`ROR`/`ROXL`/`ROXR` suite
+//! files (M1-31b, #40).
+//!
+//! The memory form pays nothing of its own: the `8 + EA` of Format IX is the
+//! fetch, the read and the write, all three of which the core already charges
+//! ([`M68k::op_shift_memory`]).
 
 use crate::bus::Bus;
 use crate::cpu::M68k;
@@ -107,6 +116,10 @@ const IMMEDIATE_EIGHT: u32 = 8;
 /// count of 63 saturates a shift and takes a rotate seven places past a full
 /// turn.
 const REGISTER_COUNT_MASK: u32 = 63;
+
+/// Clocks one place of a shift or rotate: M68000PM section 6 prices the group at
+/// 2 clocks *per place*, and a place costs that whether or not it moved anything.
+const SHIFT_PLACE_CLOCKS: u32 = crate::ops::arith::ALU_PASS_CLOCKS;
 
 /// `tt` of the memory form sits at bits 10..9, where the register form keeps it at
 /// bits 4..3 (M68000UM "Instruction Formats", Format IX).
@@ -218,6 +231,24 @@ impl Shift {
             0 => period,
             rest => rest,
         }
+    }
+
+    /// Clocks the register form pays on top of the opcode fetch: one
+    /// [`crate::ops::arith::ALU_PASS_CLOCKS`] pass at a byte or word and two at a
+    /// long — the ALU is 16 bits wide, so a long operand is a pass of its own —
+    /// plus [`SHIFT_PLACE_CLOCKS`] for every place of [`Shift::count`].
+    ///
+    /// That is M68000PM section 6's `6 + 2n` for `.b`/`.w` and `8 + 2n` for `.l`
+    /// minus the 4 the fetch already charges, and it uses the un-saturated count:
+    /// a shift of 39 places of a byte stops moving data after 8 but not on the
+    /// clock. Measured over every non-exception case of the 24 register-form
+    /// shift and rotate suite files (M1-31b, #40).
+    const fn clock_surcharge(self) -> u32 {
+        let alu_passes = match self.size {
+            Size::Byte | Size::Word => 1,
+            Size::Long => 2,
+        };
+        alu_passes * crate::ops::arith::ALU_PASS_CLOCKS + SHIFT_PLACE_CLOCKS * self.count
     }
 
     /// `C` for a count of zero: `X` for the two rotate-through-extend forms,
@@ -333,7 +364,7 @@ impl M68k {
         self.d[reg] = (self.d[reg] & !shift.size.mask()) | shifted.result;
 
         self.advance_opcode(bus);
-        0
+        shift.clock_surcharge()
     }
 
     /// Memory-form `ASx.w <ea>`: `1110 0tt d 11 mmm rrr` — the same eight mnemonics
@@ -352,9 +383,10 @@ impl M68k {
     /// every EA field that is not alterable memory, so a `None` from `resolve_ea`
     /// means the two disagree; the illegal route is there for the release build.
     ///
-    /// Clocks: the read and the write charge their own bus cycles, as everywhere
-    /// else in this module. Format IX is priced differently from the register form
-    /// in M68000PM section 1; charging that exactly is M1-31 (#39/#40)'s.
+    /// Clocks: `0`. Format IX is priced at `8 + EA` (M68000PM section 6), and at
+    /// a word that is exactly the fetch plus the read and the write, all three of
+    /// which the core charges on its own — measured over every non-exception
+    /// memory-form case of the eight `.w` suite files (M1-31b, #40).
     pub(crate) fn op_shift_memory(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
         let mode = field(opcode, EA_MODE_SHIFT);
         let ea_reg = field(opcode, 0);
