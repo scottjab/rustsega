@@ -94,7 +94,7 @@
 
 use crate::bus::{ADDR_MASK, Bus};
 use crate::cpu::M68k;
-use crate::exceptions::EXCEPTION_ENTRY_CLOCKS;
+use crate::cpu::BUS_CYCLE_CLOCKS;
 use crate::sr::{SR_S, SR_T};
 
 /// Address error, the group 0 exception.
@@ -133,14 +133,22 @@ const STATUS_CODE_FETCH: u16 = 0x1E;
 /// ([`EXCEPTION_ENTRY_CLOCKS`]), so what this frame adds on top is the rest.
 const ADDRESS_ERROR_ENTRY_CLOCKS: u64 = 50;
 
-/// What the entry adds to a group 1/2 entry: 16 clocks.
+/// The bus accesses the group 0 entry performs: the seven word writes of the
+/// frame, the two reads of the vector long, and the two fetches of the queue
+/// refill at the handler. Each charges itself [`BUS_CYCLE_CLOCKS`], exactly as
+/// [`crate::exceptions`] charges its own accesses.
+const ADDRESS_ERROR_ENTRY_ACCESSES: u64 = 10;
+
+/// What the entry adds to the access cost: the part of
+/// [`ADDRESS_ERROR_ENTRY_CLOCKS`] that is not bus traffic.
 ///
-/// Derived, not chosen: the group 0 frame is one more long (the fault address)
-/// and one more word (the IRD) than the group 1/2 frame, and its status word
-/// replaces nothing — 4 extra bus accesses over the six of a group 1/2 entry,
-/// plus the same non-bus time. Expressed as a delta in the style of
-/// [`crate::interrupts::INTERRUPT_ACK_CLOCKS`].
-const ADDRESS_ERROR_EXTRA_CLOCKS: u64 = ADDRESS_ERROR_ENTRY_CLOCKS - EXCEPTION_ENTRY_CLOCKS;
+/// Derived, not chosen, and in the style of
+/// [`crate::interrupts::INTERRUPT_ACK_CLOCKS`] — but as a subtraction from the
+/// documented total rather than a delta on [`EXCEPTION_ENTRY_CLOCKS`], because
+/// the group 0 frame is four words bigger than group 1 and its extra accesses
+/// are what make the two entries differ.
+const ADDRESS_ERROR_EXTRA_CLOCKS: u64 =
+    ADDRESS_ERROR_ENTRY_CLOCKS - ADDRESS_ERROR_ENTRY_ACCESSES * BUS_CYCLE_CLOCKS;
 
 /// The kind of access that faulted, which decides the status word's low five
 /// bits and nothing else.
@@ -227,6 +235,19 @@ impl M68k {
             return true;
         }
         false
+    }
+
+    /// True once an access in the instruction now executing has faulted.
+    ///
+    /// The instruction is not completed after an address error (M68000UM section
+    /// 1 "Address Error", "the access is not performed"), so nothing that happens
+    /// later in the same instruction may reach a register or the bus. Bus
+    /// accesses already stop themselves in [`M68k::read_w`] and friends; this is
+    /// the check for the write-back into a *register*, which no bus accessor is
+    /// on its way past. Operations use it the way they use
+    /// [`M68k::check_supervisor`]: test it, and return.
+    pub(crate) fn address_error_pending(&self) -> bool {
+        self.pending_address_error.is_some()
     }
 
     /// If an access faulted since the last call, enter the address error.
@@ -411,9 +432,12 @@ mod tests {
             "the faulting access must not happen"
         );
         assert_eq!(cpu.d[0], 0x1111_2222, "D0 keeps its old value");
+        // 50 for the entry, plus the one access of the `MOVE` that still ran:
+        // the queue pop. The faulting operand read is suppressed, and a
+        // suppressed access charges nothing.
         assert_eq!(
             cpu.cycles - before,
-            ADDRESS_ERROR_ENTRY_CLOCKS,
+            ADDRESS_ERROR_ENTRY_CLOCKS + BUS_CYCLE_CLOCKS,
             "address error costs 50 clocks (M68000UM)"
         );
     }
@@ -492,7 +516,18 @@ mod tests {
         assert_eq!(peek_word(&bus, sp + 6), 0x3010, "IRD");
         assert_eq!(peek_word(&bus, sp + 8), SUP | SR_Z, "saved SR");
         assert_eq!(peek_long(&bus, sp + 10), PROGRAM, "stacked PC");
-        assert!(!cpu.is_supervisor() || cpu.sr == SUP, "mode went supervisor");
+        // Halting does not undo the mode change. Motorola's exception sequence is
+        // push frame, update SR, *then* fetch the vector long (M68000UM section 6
+        // "Exception Processing"), so the second fault is raised by a CPU that is
+        // already supervisor with the new mask; `halted` stops instruction
+        // execution and rolls nothing back.
+        assert!(cpu.is_supervisor(), "S = 1 at the halt");
+        assert_eq!(cpu.sr & SR_T, 0, "T = 0 at the halt");
+        assert_eq!(
+            cpu.sr & SR_INT_MASK,
+            SR_INT_MASK,
+            "the entry's interrupt mask is still up"
+        );
     }
 
     #[test]
@@ -529,13 +564,14 @@ mod tests {
     }
 
     #[test]
-    fn the_entry_clocks_are_a_delta_on_the_group_1_entry() {
-        // 50 = the 34 every exception entry pays plus this frame's extra
-        // accesses; expressed the way `interrupts.rs` expresses its 44.
-        assert_eq!(ADDRESS_ERROR_EXTRA_CLOCKS, 16);
+    fn the_entry_clocks_are_charged_once_and_not_twice() {
+        // The documented 50 is the entry total; ten bus accesses charge
+        // themselves, so the constant added by `address_error` is the remainder.
+        assert_eq!(ADDRESS_ERROR_EXTRA_CLOCKS, 10);
         assert_eq!(
-            EXCEPTION_ENTRY_CLOCKS + ADDRESS_ERROR_EXTRA_CLOCKS,
-            ADDRESS_ERROR_ENTRY_CLOCKS
+            ADDRESS_ERROR_EXTRA_CLOCKS + ADDRESS_ERROR_ENTRY_ACCESSES * BUS_CYCLE_CLOCKS,
+            ADDRESS_ERROR_ENTRY_CLOCKS,
+            "the entry costs 50 whether it is read as a total or as a sum"
         );
         // And the frame really is seven words of bus traffic.
         assert_eq!(ADDRESS_ERROR_FRAME_SIZE / 2, 7);

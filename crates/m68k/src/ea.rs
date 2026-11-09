@@ -637,9 +637,14 @@ impl M68k {
     /// negative value lands at `0xFFFF_xxxx`. Byte access to An cannot reach
     /// here: [`M68k::resolve_ea`] rejects it.
     ///
-    /// TODO(M1-29, #37): a word or long access at an odd address is an address
-    /// error (vector 2) before anything is read or written; this layer just
-    /// passes the address on and `Ea::Mem` is where that check will hang.
+    /// An `Ea::Mem` destination is checked for the address error by
+    /// [`M68k::write_w`] / [`M68k::write_l`] (#37), which simply do not perform a
+    /// misaligned write. That is not enough for a *register* destination: an
+    /// instruction whose source read faulted must not write its result anywhere,
+    /// not even somewhere legal, so the whole write-back is skipped once
+    /// [`M68k::address_error_pending`] is set. EA side effects are unaffected —
+    /// the auto-increment of `(An)+` happened in [`M68k::resolve_ea`], on the way
+    /// to this point, and stays done.
     pub(crate) fn write_ea(&mut self, bus: &mut impl Bus, ea: Ea, size: Size, value: u32) {
         debug_assert!(
             ea.accepts_size(size),
@@ -649,6 +654,9 @@ impl M68k {
             !matches!(ea, Ea::Imm(_)),
             "immediates are source-only operands: nothing can be written to {ea:?}"
         );
+        if self.address_error_pending() {
+            return;
+        }
         match ea {
             Ea::DataReg(r) => {
                 let i = usize::from(r);
