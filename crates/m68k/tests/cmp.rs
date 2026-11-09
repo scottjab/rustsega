@@ -4,10 +4,9 @@
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
 //! [`harness::Check::StateAndCyclesSkipAddressErrors`] — state *and* `step`'s
-//! clock total (M1-31a, #39) — except `CMP.l`, which is still
-//! [`harness::Check::StateSkipAddressErrors`]; the cases that end in the suite's
-//! exception handler are left to M1-29 (#37) — see
-//! [`harness::is_address_error_case`] and #185.
+//! clock total (M1-31a, #39); the cases that end in the suite's exception
+//! handler are left to M1-29 (#37) — see [`harness::is_address_error_case`] and
+//! #185.
 //!
 //! The suite ships no `CMPI.*` or `CMPM.*` file. Neither instruction is
 //! untested by this binary: their cases live in `CMP.b`, `CMP.w` and `CMP.l`,
@@ -38,13 +37,12 @@ fn cmp_w_file_passes() {
 
 /// `CMP.L`: `$B080`-`$B0BF`, `$0C80`-`$0CBF`, `$B188`-`$B18F`-style.
 ///
-/// State only: with the long-compare pass the `CMP` handler adds, every
-/// addressing mode but `#imm` is exact, and the `CMPI.l` and CMPM cases that
-/// share this file split two ways (some want 2 more, others 2 fewer), so their
-/// rule is not settled yet. Tracked with #39.
+/// Cycle-checked since #230, which found the file's only wrong charge to be
+/// `CMPI.L #,Dn` — the one long compare whose destination register covers
+/// nothing and whose immediate operand was already popped by the fetch.
 #[test]
 fn cmp_l_file_passes() {
-    harness::assert_file_passes("CMP.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("CMP.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `CMPA.W`: operation `011`, so high bytes `$B0`, `$B2`, … `$BE`. Word sources
