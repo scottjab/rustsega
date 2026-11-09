@@ -3,7 +3,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateSkipAddressErrors`], the same one the add, subtract
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`], the same one the add, subtract
 //! and compare classes use: the cases that end in the suite's exception handler
 //! are left to M1-29 (#37) — see [`harness::is_address_error_case`] and #185.
 //!
@@ -32,39 +32,39 @@ mod harness;
 /// `NEG.B`: `$4400`-`$44BF`, `0 - <ea>` → `<ea>`.
 #[test]
 fn neg_b_file_passes() {
-    harness::assert_file_passes("NEG.b", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NEG.b", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `NEG.W`: the same group at `ss` = `01`.
 #[test]
 fn neg_w_file_passes() {
-    harness::assert_file_passes("NEG.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NEG.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `NEG.L`: the same group at `ss` = `10`. `ss` = `11` is nothing at all in
 /// `$44xx`, which is why the group stops dead at `$44BF`.
 #[test]
 fn neg_l_file_passes() {
-    harness::assert_file_passes("NEG.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NEG.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `NEGX.B`: `$4000`-`$40BF`, `0 - <ea> - X` → `<ea>` with `SUBX`'s sticky `Z`.
 #[test]
 fn negx_b_file_passes() {
-    harness::assert_file_passes("NEGX.b", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NEGX.b", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `NEGX.W`.
 #[test]
 fn negx_w_file_passes() {
-    harness::assert_file_passes("NEGX.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NEGX.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `NEGX.L`. The next sixth, `$40C0`-`$40FF`, is MOVE from SR (M1-26, #34) and
 /// stays unimplemented.
 #[test]
 fn negx_l_file_passes() {
-    harness::assert_file_passes("NEGX.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("NEGX.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `CLR.B`: `$4200`-`$42BF`. A memory destination is read before it is written
@@ -72,44 +72,44 @@ fn negx_l_file_passes() {
 /// the read itself is pinned by `ops::arith::tests::clr_to_memory_reads_then_writes`.
 #[test]
 fn clr_b_file_passes() {
-    harness::assert_file_passes("CLR.b", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("CLR.b", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `CLR.W`.
 #[test]
 fn clr_w_file_passes() {
-    harness::assert_file_passes("CLR.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("CLR.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `CLR.L`.
 #[test]
 fn clr_l_file_passes() {
-    harness::assert_file_passes("CLR.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("CLR.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `EXT.W`: `$4880`+`r`, the low byte of `Dn` sign extended to a word.
 #[test]
 fn ext_w_file_passes() {
-    harness::assert_file_passes("EXT.w", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("EXT.w", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `EXT.L`: `$48C0`+`r`, the low word of `Dn` sign extended to a long.
 #[test]
 fn ext_l_file_passes() {
-    harness::assert_file_passes("EXT.l", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("EXT.l", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `SWAP`: `$4840`+`r`, the halves of `Dn` exchanged.
 #[test]
 fn swap_file_passes() {
-    harness::assert_file_passes("SWAP", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("SWAP", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `EXG`: opmode `01000` (`Dx,Dy`), `01001` (`Ax,Ay`) and `10001` (`Dx,Ay`),
 /// none of which sets a flag.
 #[test]
 fn exg_file_passes() {
-    harness::assert_file_passes("EXG", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("EXG", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// The thirteen file names above are what the suite ships for this ticket, so a
