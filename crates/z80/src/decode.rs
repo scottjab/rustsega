@@ -563,7 +563,11 @@ mod tests {
         assert_eq!(cpu.r(), 2);
         assert_eq!(cpu.pc(), 4);
         assert_eq!(bus.reads, vec![0, 1, 2, 3, 4]);
-        assert_eq!(bus.writes, vec![(4, 0x03)], "0x81 left, bit 7 back into bit 0");
+        assert_eq!(
+            bus.writes,
+            vec![(4, 0x03)],
+            "0x81 left, bit 7 back into bit 0"
+        );
         assert!(cpu.get_flag(FLAG_C), "bit 7 of 0x81 shifted out into C");
     }
 

@@ -12,8 +12,8 @@
 //! `z` is also a destination, so the result lands in memory *and* in register
 //! `z`. `BIT` has no destination at all.
 
-use crate::decode::{x, y, z, IndexMode};
-use crate::rot::{shift_byte, shift_flags, ALL_FLAGS};
+use crate::decode::{IndexMode, x, y, z};
+use crate::rot::{ALL_FLAGS, shift_byte, shift_flags};
 use crate::{FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_X, FLAG_Y, FLAG_Z, Z80, Z80Bus};
 
 /// The flag bits `BIT` establishes: everything except `C`, which it leaves
@@ -173,9 +173,7 @@ impl Z80 {
 #[cfg(test)]
 mod tests {
     use crate::testutil::RamBus;
-    use crate::{
-        FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_X, FLAG_Y, FLAG_Z, Z80,
-    };
+    use crate::{FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_X, FLAG_Y, FLAG_Z, Z80};
 
     /// A CPU with `program` sitting at its `PC` and every flag clear, so a
     /// test's `set_flags` call is the whole starting flag state.
