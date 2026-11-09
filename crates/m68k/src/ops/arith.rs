@@ -196,20 +196,17 @@ impl M68k {
             return self.op_illegal(bus);
         };
 
-        let pass_clocks;
-        if op_mode & ALU_MODE_TO_EA == 0 {
-            // ADD <ea>,Dn: the source first, so `(A0)+` steps once.
+        // The EA is the source here and the destination in the `Dn,<ea>` half.
+        // Each is resolved once: resolving twice would step `(A0)+` twice.
+        let pass_clocks = if op_mode & ALU_MODE_TO_EA == 0 {
             let Some(src) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
                 return self.op_illegal(bus);
             };
             let value = self.read_ea(bus, src, size);
             let result = self.add_flags(value, self.d[usize::from(reg)], false, size);
             self.write_ea(bus, Ea::DataReg(reg), size, result);
-            pass_clocks = alu_op_clocks(size, source_accesses(src));
+            alu_op_clocks(size, source_accesses(src))
         } else {
-            // ADD Dn,<ea>: one read-modify-write of the resolved destination.
-            // Resolving the EA twice would step `(A0)+` twice, so it is
-            // resolved once and the same `Ea` is read and written.
             let source = self.d[usize::from(reg)];
             let Some(dest) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
                 return self.op_illegal(bus);
@@ -217,8 +214,8 @@ impl M68k {
             let value = self.read_ea(bus, dest, size);
             let result = self.add_flags(source, value, false, size);
             self.write_ea(bus, dest, size, result);
-            pass_clocks = alu_op_clocks(size, dest_accesses(dest));
-        }
+            alu_op_clocks(size, dest_accesses(dest))
+        };
 
         self.advance_opcode(bus);
         pass_clocks
@@ -411,8 +408,9 @@ impl M68k {
             return self.op_illegal(bus);
         };
 
-        let pass_clocks;
-        if op_mode & ALU_MODE_TO_EA == 0 {
+        // As in `ADD`: the EA is the source in one half and the read-modify-write
+        // destination in the other, and it is resolved once either way.
+        let pass_clocks = if op_mode & ALU_MODE_TO_EA == 0 {
             // SUB <ea>,Dn: the source is read first, so `(A0)+` steps once, and
             // the register is the minuend.
             let Some(src) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
@@ -421,12 +419,10 @@ impl M68k {
             let value = self.read_ea(bus, src, size);
             let result = self.sub_flags(value, self.d[usize::from(reg)], false, size);
             self.write_ea(bus, Ea::DataReg(reg), size, result);
-            pass_clocks = alu_op_clocks(size, source_accesses(src));
+            alu_op_clocks(size, source_accesses(src))
         } else {
-            // SUB Dn,<ea>: one read-modify-write of the resolved destination.
-            // Resolving the EA twice would step `(A0)+` twice, so it is resolved
-            // once and the same `Ea` is read and written. Here the memory operand
-            // is the minuend and the register is taken away from it.
+            // SUB Dn,<ea>: the memory operand is the minuend and the register is
+            // taken away from it.
             let subtrahend = self.d[usize::from(reg)];
             let Some(dest) = self.resolve_arith_ea(bus, mode, ea_reg, size) else {
                 return self.op_illegal(bus);
@@ -434,8 +430,8 @@ impl M68k {
             let value = self.read_ea(bus, dest, size);
             let result = self.sub_flags(subtrahend, value, false, size);
             self.write_ea(bus, dest, size, result);
-            pass_clocks = alu_op_clocks(size, dest_accesses(dest));
-        }
+            alu_op_clocks(size, dest_accesses(dest))
+        };
 
         self.advance_opcode(bus);
         pass_clocks
@@ -1242,6 +1238,69 @@ mod tests {
 
         assert_eq!(cpu.d[0], 0xDEAF_0001, "the whole of A1 is added");
         assert!(!cpu.flag_c(), "and it does not carry out of bit 31");
+    }
+
+    /// The two-pass price of a long ALU operation ([`alu_op_clocks`]) in numbers,
+    /// so a change to the helper says which shape broke: nothing for a byte or a
+    /// word, two passes for a long, one of them hidden by each memory access the
+    /// operand performs. `tests/adds.rs`, `tests/subs.rs` and `tests/logic.rs`
+    /// pin the same rule end to end on every mode of every size (#225).
+    #[test]
+    fn alu_op_clocks_is_two_passes_less_one_per_access() {
+        assert_eq!(alu_op_clocks(Size::Byte, 0), 0);
+        assert_eq!(alu_op_clocks(Size::Word, 0), 0);
+        assert_eq!(
+            alu_op_clocks(Size::Word, 2),
+            0,
+            "a word is one pass however often it touches memory"
+        );
+        assert_eq!(
+            alu_op_clocks(Size::Long, 0),
+            4,
+            "two passes, nothing to hide"
+        );
+        assert_eq!(
+            alu_op_clocks(Size::Long, 1),
+            2,
+            "`ADD.L (A0),D0`: the read covers one pass"
+        );
+        assert_eq!(
+            alu_op_clocks(Size::Long, 2),
+            0,
+            "`ADD.L D0,(A0)`: read and write cover both"
+        );
+    }
+
+    /// The four clock totals that were wrong before #225, each stated as the
+    /// suite records it (`ADD.w`/`ADD.l` for `ADDQ`, `ADDX.b` and `ADDX.l` for
+    /// `ADDX`) rather than as a rule, so the rule cannot drift.
+    ///
+    /// `ADDQ` to `An` is always the long, flagless add, so `.w` pays the extra
+    /// width pass and `.l` does not; the `ADDX` memory form is one predecrement
+    /// charge, not two, because the destination resolves as a write.
+    #[test]
+    fn addq_to_an_and_addx_clock_totals() {
+        // `ADDQ.W #7,D0` (`$5E40`) and `ADDQ.L #7,D0` (`$5E80`), the baseline.
+        let (mut cpu, mut bus) = run(0x5E40, &[0x4E71]);
+        assert_eq!(cpu.step(&mut bus), 4, "ADDQ.W #,Dn");
+        let (mut cpu, mut bus) = run(0x5E80, &[0x4E71]);
+        assert_eq!(cpu.step(&mut bus), 8, "ADDQ.L #,Dn is the long add");
+
+        let (mut cpu, mut bus) = run(0x5E48, &[0x4E71]);
+        assert_eq!(cpu.step(&mut bus), 8, "ADDQ.W #,A0");
+        let (mut cpu, mut bus) = run(0x5E88, &[0x4E71]);
+        assert_eq!(cpu.step(&mut bus), 6, "ADDQ.L #,A0");
+
+        // `ADDX.B -(A0),-(A1)` (`$D109`): two reads, one write, one
+        // predecrement calculation.
+        let (mut cpu, mut bus) = run(0xD109, &[0x4E71]);
+        cpu.a[0] = MEM;
+        cpu.a[1] = MEM + 8;
+        assert_eq!(cpu.step(&mut bus), 18, "ADDX.B -(A0),-(A1)");
+
+        // `ADDX.L D1,D1` (`$D181`): no access to hide either pass.
+        let (mut cpu, mut bus) = run(0xD181, &[0x4E71]);
+        assert_eq!(cpu.step(&mut bus), 8, "ADDX.L D1,D1");
     }
 
     /// `ADD.B #imm,D0` (`$D03C`) takes the low byte of one extension word and
