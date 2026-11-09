@@ -80,7 +80,7 @@ const fn add_flags(a: u8, b: u8, carry_in: u8) -> (u8, u8) {
 /// same XOR tricks as [`add_flags`] with the operand pair that can disagree
 /// about the sign. `C` is the borrow out of bit 7, so it is set whenever the
 /// arithmetic difference goes negative.
-const fn sub_flags(a: u8, b: u8, borrow_in: u8) -> (u8, u8) {
+pub(crate) const fn sub_flags(a: u8, b: u8, borrow_in: u8) -> (u8, u8) {
     let difference = a as i32 - b as i32 - borrow_in as i32;
     let result = difference as u8;
     let mut flags = (SZXY_PARITY[result as usize] & !FLAG_PV) | FLAG_N;

@@ -19,6 +19,7 @@ mod flow;
 mod io;
 mod ld16;
 mod ld8;
+mod misc;
 mod regs;
 mod rot;
 #[cfg(test)]

@@ -438,8 +438,8 @@ mod tests {
     /// `LD (IX+d),(HL)`, and that is how I wrote it first, but the suite's
     /// `dd 76` and `fd 76` cases are both 8 T-states with `PC` up by 2: a rotted
     /// prefix and a HALT. Reading it as a load also eats a displacement byte, so
-    /// pin the shape instead - prefix and `76` consumed, nothing written, and the
-    /// opcode still unimplemented for HALT's ticket (M2-13, #56).
+    /// pin the shape - prefix and `76` consumed, nothing written, and HALT entered
+    /// (M2-13, #56).
     #[test]
     fn dd_76_is_halt_with_a_wasted_prefix() {
         const PC: u16 = 0x0100;
@@ -449,12 +449,9 @@ mod tests {
         cpu.set_hl(0x1234);
         let mut bus = RamBus::at(PC, &[0xDD, 0x76, 0x05]).with_byte(0x1234, 0xAB);
 
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            cpu.step(&mut bus);
-        }))
-        .is_err();
+        assert_eq!(cpu.step(&mut bus), 8, "the rotted prefix costs a NOP");
 
-        assert!(panicked, "HALT is M2-13's (#56), so DD 76 must still panic");
+        assert!(cpu.halted(), "the 76 still ran");
         assert_eq!(
             cpu.pc(),
             PC + 2,
@@ -495,14 +492,25 @@ mod tests {
         }
     }
 
-    /// `76` alone is HALT and belongs to M2-13 (#56): still a named panic.
+    /// `76` is the one opcode in `LD r,r'`'s range that is not a load: it is
+    /// HALT, as of M2-13 (#56). Decoding the block as the uniform `LD r,r'`
+    /// table says it is would move a register and read a memory byte, so pin the
+    /// difference: the only bus access is the opcode fetch, and nothing but the
+    /// halt latch and `PC` moves.
     #[test]
-    fn halt_is_left_for_its_ticket() {
+    fn seven_six_is_halt_not_a_load() {
         const PC: u16 = 0x0100;
         let mut cpu = Z80::new();
         cpu.set_pc(PC);
-        let mut bus = RamBus::at(PC, &[0x76]);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cpu.step(&mut bus)));
-        assert!(result.is_err(), "76 must still be unimplemented");
+        cpu.set_hl(0x8000);
+        let mut bus = RamBus::at(PC, &[0x76]).with_byte(0x8000, 0xAB);
+
+        assert_eq!(cpu.step(&mut bus), 4);
+
+        assert!(cpu.halted());
+        assert_eq!(cpu.pc(), PC + 1);
+        assert_eq!(cpu.hl(), 0x8000, "HALT does not read or write HL");
+        assert_eq!(bus.reads, vec![PC], "no operand fetch: this is not a load");
+        assert!(bus.writes.is_empty(), "HALT must not write memory");
     }
 }
