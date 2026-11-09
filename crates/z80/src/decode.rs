@@ -216,6 +216,10 @@ impl Z80 {
             // the table's first four entries and need no opcode list of their own.
             0x07 | 0x0F | 0x17 | 0x1F => self.rotate_accumulator(op),
             0x08 => self.ex_af_af(),
+            // `OUT (n),A` and `IN A,(n)` (M2-12, #55), addressed with `A` in
+            // the port's high byte.
+            0xD3 => self.out_n_a(bus),
+            0xDB => self.in_a_n(bus),
             0xD9 => self.exx(),
             0xEB => self.ex_de_hl(),
             0xE3 => self.ex_sp_index(bus, IndexMode::Hl),
@@ -282,6 +286,12 @@ impl Z80 {
             // `ED` included, so the timing is checkable against the suite.
             0x4B | 0x5B | 0x6B | 0x7B => self.ld_rr_ind_nn(bus, op),
             0x43 | 0x53 | 0x63 | 0x73 => self.ld_ind_nn_rr(bus, op),
+            // `IN r,(C)` and `OUT (C),r` (M2-12, #55): `y(op)` is the register
+            // slot, where 6 is `IN (C)` (read, set flags, drop the value) and
+            // `OUT (C),0` (the NMOS part writes a zero), and `z(op)` the
+            // direction. 12 T-states, this fetch of `ED` included.
+            0x40 | 0x48 | 0x50 | 0x58 | 0x60 | 0x68 | 0x70 | 0x78 => self.in_r_c(bus, op),
+            0x41 | 0x49 | 0x51 | 0x59 | 0x61 | 0x69 | 0x71 | 0x79 => self.out_c_r(bus, op),
             // `ADC HL,rr` and `SBC HL,rr` (M2-07, #50): 15 T-states, this fetch
             // of `ED` included. Bit 3 says which way round they are, `0` being
             // `SBC`; `ed 42` is `SBC HL,BC` and `ed 4a` is `ADC HL,BC`.
@@ -292,6 +302,11 @@ impl Z80 {
             // rather than another opcode list.
             0xA0 | 0xA8 | 0xB0 | 0xB8 => self.block_transfer(bus, op),
             0xA1 | 0xA9 | 0xB1 | 0xB9 => self.block_search(bus, op),
+            // Block I/O (M2-12, #55): `INI`/`IND`/`INIR`/`INDR` and
+            // `OUTI`/`OUTD`/`OTIR`/`OTDR`. The same three fields as the transfer
+            // group above: bit 0 picks OUT over IN, `0x08` counts down, `0x10`
+            // repeats. 16 T-states for a pass, 21 for one that goes round again.
+            0xA2 | 0xA3 | 0xAA | 0xAB | 0xB2 | 0xB3 | 0xBA | 0xBB => self.block_io(bus, op),
             // `RETI` (ED 4D) and `RETN` (ED 45) with its six documented mirrors
             // (M2-10, #53). The mirrors are `ED 55`/`5D`/`65`/`6D`/`75`/`7D`.
             0x4D => self.reti(bus),
@@ -495,12 +510,14 @@ mod tests {
 
     #[test]
     fn ed_defined_range_panics_rather_than_nopping() {
-        // The fallback above must only cover undefined opcodes. `ED 40` (LDI) is
-        // real, so quietly NOPing it would hide a missing instruction.
+        // The fallback above must only cover undefined opcodes. `ED 47` (`LD I,A`)
+        // is real but not implemented yet, so quietly NOPing it would hide a
+        // missing instruction. `ED 40` used to be this test's example and is now
+        // `IN B,(C)` (M2-12, #55).
         let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0xED, 0x40]);
-        let message = caught(|| cpu.step(&mut bus)).expect_err("ED 40 is not implemented");
-        assert!(message.contains("ED 40"), "{message}");
+        let mut bus = Program::new(&[0xED, 0x47]);
+        let message = caught(|| cpu.step(&mut bus)).expect_err("ED 47 is not implemented");
+        assert!(message.contains("ED 47"), "{message}");
         for op in [0x40u8, 0x7F, 0xA0, 0xA3, 0xA8, 0xAB, 0xB0, 0xB3, 0xB8, 0xBB] {
             assert!(ed_is_defined(op), "ED {op:02X} should be defined");
         }
