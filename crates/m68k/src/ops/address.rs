@@ -39,6 +39,33 @@ use crate::bus::Bus;
 use crate::ea::{Ea, SP_REG, Size, sign_extend_word};
 use crate::ops::field;
 
+/// Clocks `LEA` and `PEA` add on top of [`M68k::ea_address`] when the operand is
+/// `d8(An,Xn)` or `d8(PC,Xn)`, so an indexed operand costs 4 rather than the 2
+/// [`crate::ea`] charges an instruction whose operand is a value.
+///
+/// For those the index addition is part of the operand fetch it is doing
+/// anyway; for `LEA`/`PEA` the calculation *is* the instruction, so it is
+/// exposed. Measured over `LEA.json.gz` and `PEA.json.gz` (M1-31a, #39): every
+/// indexed case (2642 and 2605 of them) is 2 over, every other case is already
+/// exact.
+const INDEX_ADDRESS_CLOCKS: u32 = 2;
+
+/// The two index-displacement forms, mode `110` and mode `111` register `011`.
+const fn is_indexed(mode: u8, reg: u8) -> bool {
+    mode == 0b110 || (mode == 0b111 && reg == 0b011)
+}
+
+/// What `LEA`/`PEA` hand back on top of what they charged themselves: the
+/// indexed case only, because every other part of the instruction is a bus
+/// cycle the accessors have already put on the counter.
+const fn lea_clocks(mode: u8, reg: u8) -> u32 {
+    if is_indexed(mode, reg) {
+        INDEX_ADDRESS_CLOCKS
+    } else {
+        0
+    }
+}
+
 impl M68k {
     /// `LEA <ea>,An` (`0100 ddd 111 mmm rrr`): the address the operand field
     /// computes, into an address register (M68000UM "LEA — Address Register
@@ -61,7 +88,7 @@ impl M68k {
         // byte, which the bus would have dropped.
         self.write_ea(bus, Ea::AddrReg(dest), Size::Long, addr);
         self.advance_opcode(bus);
-        0
+        lea_clocks(mode, reg)
     }
 
     /// `PEA <ea>` (`0100 1000 01 mmm rrr`): `LEA`'s operand pushed instead of
@@ -77,7 +104,7 @@ impl M68k {
 
         self.push_long(bus, addr);
         self.advance_opcode(bus);
-        0
+        lea_clocks(mode, reg)
     }
 
     /// `LINK An,d16` (`0100 1110 0101 0nnn`): build a frame — push `An`, let it
