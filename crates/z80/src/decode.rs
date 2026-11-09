@@ -13,7 +13,7 @@
 //! index `r[]` is `B, C, D, E, H, L, (HL), A` - which is why [`IndexMode`]
 //! rather than a match on `7` is threaded through the index helpers.
 
-use crate::{Z80, Z80Bus};
+use crate::{IntMode, Z80, Z80Bus};
 
 /// Prefix bytes: they switch opcode space instead of executing.
 const OP_CB: u8 = 0xCB;
@@ -87,17 +87,6 @@ pub fn q(op: u8) -> u8 {
     y(op) & 1
 }
 
-/// The register index in the `r[]` table: `B, C, D, E, H, L, (HL), A`.
-///
-/// Index 6 is `(HL)`, so callers must handle that one as a memory access.
-//
-// The two panics that named operands with this table were the `CB` and
-// `DD CB` ones, and both are real instructions as of M2-09 (#52). The
-// main-space panic (M2-13, #56) is the next caller; until then only
-// `decomposition_matches_the_reference` below reads it.
-#[allow(dead_code)]
-pub const REG_TABLE: [&str; 8] = ["B", "C", "D", "E", "H", "L", "(HL)", "A"];
-
 /// Is this an `ED` opcode that is actually defined?
 ///
 /// The `ED` space is mostly empty, and the empty part is not an error: an
@@ -111,12 +100,6 @@ fn ed_is_defined(op: u8) -> bool {
 }
 
 impl Z80 {
-    /// Fetch the opcode at `PC` and execute one instruction.
-    pub(crate) fn exec(&mut self, bus: &mut impl Z80Bus) -> u32 {
-        let op = self.fetch_opcode(bus);
-        self.exec_main(bus, op)
-    }
-
     /// Fetch the next opcode byte.
     ///
     /// This is an M1 fetch, so it is the one place the `R` increment belongs:
@@ -176,8 +159,8 @@ impl Z80 {
             0x3A => self.ld_a_ind_nn(bus),
             0x36 => self.ld_hl_ind_n(bus),
             // `LD r,r'` is the whole `40`-`7F` block except `76`, which is HALT
-            // and belongs to M2-13 (#56).
-            OP_HALT => self.unimplemented(&format!("main {op:02X} (HALT)")),
+            // (M2-13, #56).
+            OP_HALT => self.halt(),
             0x40..=0x7F => self.ld_rr(bus, op),
             // `LD r,n`: the immediate loads, named out rather than derived from
             // `x`/`z` so the arm does not depend on what is matched above it.
@@ -227,6 +210,11 @@ impl Z80 {
             0xDB => self.in_a_n(bus),
             0xD9 => self.exx(),
             0xEB => self.ex_de_hl(),
+            // `DI` and `EI` (M2-13, #56): no operand, no memory, no flag to
+            // lose. `EI` leaves the one-instruction latch for whoever accepts
+            // interrupts (M2-14, #57).
+            0xF3 => self.di(),
+            0xFB => self.ei(),
             0xE3 => self.ex_sp_index(bus, IndexMode::Hl),
             // Jumps, calls, returns and restarts (M2-10, #53). The conditional
             // forms are grouped by instruction rather than by `y`, because each
@@ -243,7 +231,11 @@ impl Z80 {
             0xC9 => self.ret(bus),
             0xC0 | 0xC8 | 0xD0 | 0xD8 | 0xE0 | 0xE8 | 0xF0 | 0xF8 => self.ret_cc(bus, op),
             0xC7 | 0xCF | 0xD7 | 0xDF | 0xE7 | 0xEF | 0xF7 | 0xFF => self.rst(bus, op),
-            _ => self.unimplemented(&format!("main {op:02X} (x{} y{} z{})", x(op), y(op), z(op))),
+            // No fallback arm: `M2-13` (#56) was the last of the main-space
+            // tickets, so all 256 opcodes are dispatched and the compiler
+            // checks that for us. The main space is the only one of the four
+            // that is fully populated - `CB`, `ED` and the index prefixes all
+            // keep a fallback of their own.
         }
     }
 
@@ -260,6 +252,23 @@ impl Z80 {
         self.p = false;
         self.ei_pending = false;
         T_M1
+    }
+
+    /// Fetch the opcode at `PC` and execute one instruction.
+    ///
+    /// A halted CPU takes no opcode fetch at all: the Z80 stops fetching and
+    /// stretches the bus until an interrupt or a reset takes it out of the halt
+    /// (Z80UM 2.1, "HALT"). This core models that as the 4 T-state cycle in
+    /// [`Z80::halt_cycle`], which bumps `R` like any M1 slot and reads nothing,
+    /// so a caller driving `step` round a halted CPU sees the 4 T-states per
+    /// halt slot the hardware counts and never runs the instruction sitting at
+    /// `PC`.
+    pub(crate) fn exec(&mut self, bus: &mut impl Z80Bus) -> u32 {
+        if self.halted() {
+            return self.halt_cycle();
+        }
+        let op = self.fetch_opcode(bus);
+        self.exec_main(bus, op)
     }
 
     /// Dispatch the `CB` space. The prefix was an M1 fetch, and so is the byte
@@ -329,6 +338,13 @@ impl Z80 {
             // misc group that touch memory.
             0x67 => self.rrd(bus),
             0x6F => self.rld(bus),
+            // `IM 0`/`IM 1`/`IM 2` (M2-13, #56) and their mirrors: bits 4 and 3
+            // of the operand field are open, so `46`/`4E`/`66`/`6E` are one
+            // instruction, `56`/`76` another, `5E`/`7E` the third. `ED 76` is
+            // `IM 1`, *not` HALT`: HALT only exists in the unprefixed space.
+            0x46 | 0x4E | 0x66 | 0x6E => self.interrupt_mode(IntMode::Mode0),
+            0x56 | 0x76 => self.interrupt_mode(IntMode::Mode1),
+            0x5E | 0x7E => self.interrupt_mode(IntMode::Mode2),
             _ if ed_is_defined(op) => {
                 self.unimplemented(&format!("ED {op:02X} (x{} y{} z{})", x(op), y(op), z(op)))
             }
@@ -407,6 +423,9 @@ impl Z80 {
             // rots into a NOP and the instruction runs (`dd d9` / `dd eb`: 8
             // T-states, `PC + 2`, in all 1000 cases of each).
             0xD9 | 0xEB => T_M1 + self.exec_main(bus, op),
+            // `DD HALT`/`FD HALT`: the prefix rots, so this is the 8 T-state
+            // pair the suite's `dd 76`/`fd 76` show - PC up by 2, R up by 2.
+            OP_HALT => T_M1 + self.exec_main(bus, op),
             _ => self.unimplemented(&format!(
                 "{} {op:02X} (x{} y{} z{})",
                 mode.prefix(),
@@ -528,14 +547,16 @@ mod tests {
 
     #[test]
     fn ed_defined_range_panics_rather_than_nopping() {
-        // The fallback above must only cover undefined opcodes. `ED 47` (`LD I,A`)
-        // is real but not implemented yet, so quietly NOPing it would hide a
-        // missing instruction. `ED 40` used to be this test's example and is now
-        // `IN B,(C)` (M2-12, #55).
+        // The fallback above must only cover undefined opcodes. `ED 77` is inside
+        // the range the suite ships and is not implemented, so quietly NOPing it
+        // would hide a missing instruction. `ED 40` used to be this test's
+        // example and is now `IN B,(C)` (M2-12, #55); `ED 47` (`LD I,A`) was next
+        // and is now M2-13 (#56). `ED 77` and `ED 7F` are all of the defined range
+        // that no ticket has claimed yet.
         let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0xED, 0x47]);
-        let message = caught(|| cpu.step(&mut bus)).expect_err("ED 47 is not implemented");
-        assert!(message.contains("ED 47"), "{message}");
+        let mut bus = Program::new(&[0xED, 0x77]);
+        let message = caught(|| cpu.step(&mut bus)).expect_err("ED 77 is not implemented");
+        assert!(message.contains("ED 77"), "{message}");
         for op in [0x40u8, 0x7F, 0xA0, 0xA3, 0xA8, 0xAB, 0xB0, 0xB3, 0xB8, 0xBB] {
             assert!(ed_is_defined(op), "ED {op:02X} should be defined");
         }
@@ -634,13 +655,18 @@ mod tests {
         assert!(cpu.get_flag(FLAG_C), "bit 7 of 0x81 shifted out into C");
     }
 
+    /// The main space has no fallback arm any more: M2-13 (#56) was the last
+    /// ticket for it, so all 256 opcodes are dispatched and `0x2F` used to be
+    /// this test's example. The panic being checked is the one that is still
+    /// reachable, in the index space - `DD 68` would be `LD B,B` with `IX` in the
+    /// middle, and nothing implements it.
     #[test]
-    fn main_space_gives_a_useful_panic() {
+    fn index_space_gives_a_useful_panic() {
         let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0x2F]); // CPL, which is M2-13 (#56)
-        let message = caught(|| cpu.step(&mut bus)).expect_err("CPL is not implemented");
+        let mut bus = Program::new(&[0xDD, 0x68]);
+        let message = caught(|| cpu.step(&mut bus)).expect_err("DD 68 is not implemented");
         assert!(
-            message.contains("main 2F (x0 y5 z7)"),
+            message.contains("DD 68 (x1 y5 z0)"),
             "unhelpful message: {message}"
         );
     }
@@ -662,7 +688,9 @@ mod tests {
         assert_eq!((x(0x41), y(0x41), z(0x41)), (1, 0, 1));
         assert_eq!((x(0xB5), y(0xB5), z(0xB5)), (2, 6, 5));
         assert_eq!((p(0xB5), q(0xB5)), (3, 0));
-        assert_eq!(REG_TABLE[6], "(HL)");
-        assert_eq!(REG_TABLE[7], "A");
+        // The `r[]` register-name table this test used to check is gone: M2-13
+        // (#56) was the last ticket that could have been its caller and it
+        // dispatches ED by opcode group instead, so naming operands from a table
+        // is no longer part of the decode path.
     }
 }

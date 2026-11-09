@@ -19,7 +19,8 @@
 use crate::alu8::sub_flags;
 use crate::rot::ALL_FLAGS;
 use crate::{
-    FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_X, FLAG_Y, FLAG_Z, SZXY_PARITY, Z80, Z80Bus,
+    FLAG_C, FLAG_H, FLAG_N, FLAG_PV, FLAG_S, FLAG_X, FLAG_Y, FLAG_Z, IntMode, SZXY_PARITY, Z80,
+    Z80Bus,
 };
 
 impl Z80 {
@@ -235,6 +236,76 @@ impl Z80 {
         18
     }
 
+    /// `HALT` (`76`): 4 T-states.
+    ///
+    /// `PC` has already moved past the opcode with the M1 fetch, and that is
+    /// where it stops: the halted CPU does not fetch the next instruction, it
+    /// waits (Z80UM 2.1, "HALT"). The suite's `76` cases show exactly that -
+    /// `PC` up by one, `R` up by one, no other change but the latches. Nothing
+    /// here takes the CPU out of the halt; that is interrupt acceptance
+    /// (M2-14, #57) and `RESET`.
+    pub(crate) fn halt(&mut self) -> u32 {
+        self.set_halted(true);
+        self.clear_latches();
+        4
+    }
+
+    /// One M1 slot of a halted CPU: 4 T-states, `R` moves, nothing else does.
+    ///
+    /// The hardware stretches the bus rather than running anything, but the
+    /// T-state and `R` counting of those slots is what an emulator driving the
+    /// core from a frame loop needs to see, so they are modelled as a fetch-less
+    /// `NOP`: `R` counts the slot, no byte is read, `PC` stays put and the
+    /// latches clear like any other NOP.
+    pub(crate) fn halt_cycle(&mut self) -> u32 {
+        self.inc_r();
+        self.clear_latches();
+        4
+    }
+
+    /// `IM 0` (`ED 46`, `4E`, `66`, `6E`), `IM 1` (`ED 56`, `76`) and `IM 2`
+    /// (`ED 5E`, `7E`): 8 T-states.
+    ///
+    /// Selecting the interrupt mode moves nothing else: no flag, and the latches
+    /// clear like any other `ED` register instruction (Z80UM 2.2, `IM`). The
+    /// mirrors come from bits 4 and 3 of the operand field being open, and the
+    /// suite ships all ten files. Nothing reads the mode yet - the
+    /// interrupt-acceptance ticket (M2-14, #57) is the first user - but the mode
+    /// is observable state, so `IM 2` after `IM 1` has to land on 2.
+    pub(crate) fn interrupt_mode(&mut self, mode: IntMode) -> u32 {
+        self.set_im(mode);
+        self.clear_latches();
+        8
+    }
+
+    /// `DI` (`F3`): 4 T-states.
+    ///
+    /// Clears both interrupt flip-flops, and the EI latch with them: the one
+    /// instruction `EI` protects itself with does not survive a `DI` that comes
+    /// first (Z80UM 2.2, `DI`; all 1000 cases of `f3.json` end with `IFF1`,
+    /// `IFF2` and the latch all clear).
+    pub(crate) fn di(&mut self) -> u32 {
+        self.set_iff1(false);
+        self.set_iff2(false);
+        self.clear_latches();
+        4
+    }
+
+    /// `EI` (`FB`): 4 T-states.
+    ///
+    /// Sets both interrupt flip-flops and raises the latch that delays interrupt
+    /// acceptance until after the *next* instruction (Z80UM 2.2, `EI`). Nothing
+    /// consumes the latch yet - the suite's `fb.json` only shows it set - so this
+    /// is the half that belongs to this instruction; the acceptance step is
+    /// M2-14 (#57).
+    pub(crate) fn ei(&mut self) -> u32 {
+        self.set_iff1(true);
+        self.set_iff2(true);
+        self.clear_latches();
+        self.set_ei_pending(true);
+        4
+    }
+
     /// `RRD` (`ED 67`): right rotate - the byte at `HL` moves up into `A`.
     pub(crate) fn rrd(&mut self, bus: &mut impl Z80Bus) -> u32 {
         self.rotate_digit(bus, false)
@@ -388,6 +459,47 @@ mod tests {
         assert_eq!(cpu.ld_r_a(), 9);
         assert_eq!(cpu.r(), 0xA5, "LD R,A writes bit 7 too");
         assert_eq!(cpu.f(), before, "LD R,A moves no flag either");
+    }
+
+    /// `HALT` stops the fetch loop: the byte after the `HALT` is never executed,
+    /// and every later step is a 4 T-state slot that moves nothing but `R`.
+    #[test]
+    fn halt_spins_4t_and_bumps_r() {
+        // `HALT` then `INC BC`: if the fetch loop did not stop, `BC` would change.
+        let (mut cpu, mut bus) = cpu_at(0x0100, &[0x76, 0x04]);
+
+        assert_eq!(cpu.step(&mut bus), 4);
+        assert!(cpu.halted());
+        let r = cpu.r();
+        let reads = bus.reads.len();
+
+        assert_eq!(cpu.step(&mut bus), 4, "a halt slot is 4 T-states");
+        assert_eq!(cpu.step(&mut bus), 4);
+        assert_eq!(cpu.r() - r, 2, "R counts the halt slots");
+        assert_eq!(cpu.pc(), 0x0101, "PC stays past the HALT");
+        assert_eq!(cpu.bc(), 0, "the INC at PC was never executed");
+        assert_eq!(bus.reads.len(), reads, "a halt slot fetches nothing");
+    }
+
+    /// `EI` sets both interrupt flip-flops and the one-instruction latch; `DI`
+    /// clears all three, the latch included.
+    #[test]
+    fn ei_sets_pending() {
+        let (mut cpu, mut bus) = cpu_at(0x0100, &[0xFB, 0xF3]);
+        assert!(!cpu.iff1() && !cpu.iff2() && !cpu.ei_pending());
+
+        assert_eq!(cpu.step(&mut bus), 4);
+        assert!(cpu.iff1(), "EI enables through IFF1");
+        assert!(cpu.iff2(), "and copies into IFF2");
+        assert!(cpu.ei_pending(), "and holds the next instruction");
+
+        assert_eq!(cpu.step(&mut bus), 4, "DI is 4 T-states");
+        assert!(!cpu.iff1());
+        assert!(!cpu.iff2());
+        assert!(
+            !cpu.ei_pending(),
+            "DI cancels an EI that has not been honoured yet"
+        );
     }
 
     /// `RLD` turns the 12-bit register left: `A`'s low nibble goes down into the
