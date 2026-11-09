@@ -16,6 +16,7 @@ mod bitops;
 mod block;
 mod decode;
 mod flow;
+mod io;
 mod ld16;
 mod ld8;
 mod regs;
