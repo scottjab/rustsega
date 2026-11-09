@@ -12,6 +12,7 @@
 
 mod alu16;
 mod alu8;
+mod bitops;
 mod decode;
 mod ld16;
 mod ld8;

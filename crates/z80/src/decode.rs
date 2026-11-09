@@ -90,6 +90,12 @@ pub fn q(op: u8) -> u8 {
 /// The register index in the `r[]` table: `B, C, D, E, H, L, (HL), A`.
 ///
 /// Index 6 is `(HL)`, so callers must handle that one as a memory access.
+//
+// The two panics that named operands with this table were the `CB` and
+// `DD CB` ones, and both are real instructions as of M2-09 (#52). The
+// main-space panic (M2-13, #56) is the next caller; until then only
+// `decomposition_matches_the_reference` below reads it.
+#[allow(dead_code)]
 pub const REG_TABLE: [&str; 8] = ["B", "C", "D", "E", "H", "L", "(HL)", "A"];
 
 /// Is this an `ED` opcode that is actually defined?
@@ -240,14 +246,10 @@ impl Z80 {
             // Rotates and shifts (M2-08, #51): `y` is the operation, `z` the
             // operand slot with 6 meaning the memory at `HL`.
             0x00..=0x3F => self.rot_shift(bus, op),
-            // `BIT`/`RES`/`SET` (M2-09, #52).
-            _ => self.unimplemented(&format!(
-                "CB {op:02X} (x{} y{} z{}, {})",
-                x(op),
-                y(op),
-                z(op),
-                REG_TABLE[z(op) as usize]
-            )),
+            // `BIT`/`RES`/`SET` (M2-09, #52): `y` is the bit number, `z` the
+            // operand slot, and `x` says which of the three it is.
+            0x40..=0x7F => self.bit_test(bus, op),
+            0x80..=0xFF => self.res_set(bus, op),
         }
     }
 
@@ -362,14 +364,7 @@ impl Z80 {
     fn exec_index_cb(&mut self, bus: &mut impl Z80Bus, mode: IndexMode) -> u32 {
         let disp = self.fetch_byte(bus);
         let op = self.fetch_byte(bus);
-        self.unimplemented(&format!(
-            "{} CB {disp:02X} {op:02X} (x{} y{} z{}, rot, {})",
-            mode.prefix(),
-            x(op),
-            y(op),
-            z(op),
-            REG_TABLE[z(op) as usize]
-        ))
+        self.index_cb(bus, mode, disp, op)
     }
 
     /// The single exit for a space we have not implemented yet.
@@ -389,12 +384,17 @@ impl Z80 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FLAG_C;
 
     /// A bus that reads back a fixed program, so a test can name the exact bytes
     /// an instruction is made of and see what `step()` did with them.
     struct Program {
         ram: Vec<u8>,
         reads: Vec<u16>,
+        /// Memory writes, in order. `DD CB d op` on `(IX + d)` is the first
+        /// instruction in this file that writes; before it the bus could afford
+        /// to be read-only.
+        writes: Vec<(u16, u8)>,
     }
 
     impl Program {
@@ -404,6 +404,7 @@ mod tests {
             Self {
                 ram,
                 reads: Vec::new(),
+                writes: Vec::new(),
             }
         }
     }
@@ -414,8 +415,9 @@ mod tests {
             self.ram[usize::from(addr)]
         }
 
-        fn write(&mut self, _addr: u16, _value: u8) {
-            panic!("no instruction implemented so far should write");
+        fn write(&mut self, addr: u16, value: u8) {
+            self.writes.push((addr, value));
+            self.ram[usize::from(addr)] = value;
         }
 
         fn io_read(&mut self, _port: u16) -> u8 {
@@ -547,15 +549,26 @@ mod tests {
     #[test]
     fn dd_cb_counts_the_prefix_and_cb_but_not_the_operands() {
         // `DD CB d op` is 4 bytes but only 2 M1 fetches, which is the R total of
-        // 2 the suite's `dd cb __ 00` files expect. The displacement is read
-        // before the opcode.
+        // 2 the suite's `dd cb __ 00` cases expect. The displacement is read
+        // before the opcode, and both come before the operand the opcode names:
+        // `0x06` is `RLC (IX + d)` with `z = 6`, and with `IX` at 0 that operand
+        // is the byte at `0x0004`, the fifth byte of the program below. So the
+        // read log is the whole instruction in fetch order, and the write is the
+        // read-modify-write of that byte.
         let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0xDD, 0xCB, 0x7F, 0x06]);
-        let message = caught(|| cpu.step(&mut bus)).expect_err("DD CB is not implemented");
+        let mut bus = Program::new(&[0xDD, 0xCB, 0x04, 0x06, 0x81]);
+
+        assert_eq!(cpu.step(&mut bus), 23, "RLC (IX + d) is 23 T-states");
+
         assert_eq!(cpu.r(), 2);
         assert_eq!(cpu.pc(), 4);
-        assert_eq!(bus.reads, vec![0, 1, 2, 3]);
-        assert!(message.contains("DD CB 7F 06"), "{message}");
+        assert_eq!(bus.reads, vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            bus.writes,
+            vec![(4, 0x03)],
+            "0x81 left, bit 7 back into bit 0"
+        );
+        assert!(cpu.get_flag(FLAG_C), "bit 7 of 0x81 shifted out into C");
     }
 
     #[test]
