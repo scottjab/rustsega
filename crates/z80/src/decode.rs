@@ -215,6 +215,11 @@ impl Z80 {
             // `CB` shift table's order (RLC, RRC, RL, RR), so `07 0F 17 1F` are
             // the table's first four entries and need no opcode list of their own.
             0x07 | 0x0F | 0x17 | 0x1F => self.rotate_accumulator(op),
+            // Decimal adjust, complement and the flag fiddles (M2-13, #56).
+            0x27 => self.daa(),
+            0x2F => self.cpl(),
+            0x37 => self.scf(),
+            0x3F => self.ccf(),
             0x08 => self.ex_af_af(),
             // `OUT (n),A` and `IN A,(n)` (M2-12, #55), addressed with `A` in
             // the port's high byte.
