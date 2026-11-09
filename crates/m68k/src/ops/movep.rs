@@ -30,6 +30,15 @@
 //! of that are measured: every one of the 4047 word loads in `MOVEP.w.json.gz`
 //! keeps the upper half of its register, and the stores write nothing outside
 //! the two or four bytes the width calls for.
+//!
+//! # Cycles
+//!
+//! Nothing extra: the two or four byte accesses a MOVEP performs are already
+//! charged by [`M68k::read_byte`] / [`M68k::write_byte`], and together with the
+//! opcode word and the displacement word that is exactly M68000UM section 8's
+//! 16 (word) and 24 (long) — `MOVEP.w.json.gz` and `MOVEP.l.json.gz` report one
+//! `length` each, 16 and 24 over all 8065 cases of both files, and the core
+//! reached both before M1-31b (#40) flipped them to cycle checking.
 
 use crate::M68k;
 use crate::bus::Bus;
