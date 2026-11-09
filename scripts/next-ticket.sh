@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 # Prints the next ticket an agent should work on.
 #
-# Reads the tracking issue (label: tracking), walks its task list in order,
-# and prints the first issue that is:
+# Candidates are the union of two lists, tried in this order:
+#   1. the `- [ ] #N` task-list lines of the tracking issue (label: tracking),
+#      in list order;
+#   2. every other open issue, lowest issue number first. Workers file
+#      follow-up issues straight with `gh issue create` (AGENTS.md §3) and
+#      tick-tracking.sh only ticks lines that already exist, so without this
+#      second pass a worker-filed issue never reaches the loop.
+# The tracking issue itself is never a candidate.
+#
+# A candidate is ready when it is
 #   - open
 #   - not labeled in-progress, blocked, or needs-split
 #   - every issue in its "Depends on:" line is closed
@@ -18,17 +26,31 @@ if [[ -z "$tracking" ]]; then
 fi
 
 # Task list lines look like: "- [ ] #123 M1-04: title"
-mapfile -t candidates < <(gh issue view "$tracking" --json body --jq '.body' \
+mapfile -t listed < <(gh issue view "$tracking" --json body --jq '.body' \
   | grep -oE '^- \[[ x]\] #[0-9]+' | grep -oE '[0-9]+$')
 
-# Fetch all issue states once (one API call, not one per issue).
+# Fetch all issue states once (one API call, not one per issue). The unlisted
+# pass below reads the same snapshot, so it sees at most the 1000 issues gh
+# returns here.
 states=$(gh issue list --state all --limit 1000 --json number,state,labels \
   --jq '.[] | "\(.number) \(.state) \([.labels[].name] | join(","))"')
 
 state_of() { awk -v n="$1" '$1==n {print $2}' <<<"$states"; }
 labels_of() { awk -v n="$1" '$1==n {print $3}' <<<"$states"; }
 
-for n in "${candidates[@]}"; do
+# Open issues from that snapshot that are neither the tracking issue nor
+# already on the task list, lowest number first. Label and dependency filters
+# live in the loop below so they are spelled only once, and only candidates
+# that survive those cheap filters pay for a body fetch.
+mapfile -t unlisted < <(awk -v tracking="$tracking" -v listed="${listed[*]-}" '
+    BEGIN {
+      count = split(listed, line, " ")
+      for (i = 1; i <= count; i++) on_list[line[i]] = 1
+    }
+    $2 == "OPEN" && $1 != tracking && !($1 in on_list) { print $1 }' <<<"$states" \
+  | sort -n)
+
+for n in "${listed[@]}" "${unlisted[@]}"; do
   [[ "$(state_of "$n")" == "OPEN" ]] || continue
   labels=",$(labels_of "$n"),"
   [[ "$labels" == *",in-progress,"* || "$labels" == *",blocked,"* || "$labels" == *",needs-split,"* ]] && continue
