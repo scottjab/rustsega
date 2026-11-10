@@ -1,9 +1,9 @@
-//! Cartridge: ROM header, ROM loading, and later the mappers and the save RAM
-//! that hang off them.
+//! Cartridge: the ROM image and the header that describes it. The mappers and
+//! the save RAM it declares are decoded in their own tickets.
 
 pub mod header;
 
-pub use header::{Regions, RomHeader, parse_header};
+pub use header::{Regions, RomHeader, compute_checksum, parse_header};
 
 /// Why a ROM image could not be loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
