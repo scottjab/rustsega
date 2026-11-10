@@ -2,8 +2,10 @@
 //! the save RAM it declares are decoded in their own tickets.
 
 pub mod header;
+pub mod smd;
 
 pub use header::{Regions, RomHeader, compute_checksum, parse_header};
+pub use smd::{deinterleave, is_smd, normalize_rom};
 
 /// Why a ROM image could not be loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
