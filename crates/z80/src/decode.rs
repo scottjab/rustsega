@@ -87,6 +87,21 @@ pub fn q(op: u8) -> u8 {
     y(op) & 1
 }
 
+/// Is this one of the two register slots a `DD`/`FD` prefix can rename: `H` or
+/// `L`, which become `IXH`/`IYH` and `IXL`/`IYL` (M2-15, #58)?
+const fn is_half(slot: u8) -> bool {
+    matches!(slot, 4 | 5)
+}
+
+/// Does this `LD r,r'`-shaped opcode name `H` or `L` on either side?
+///
+/// The question decides whether the prefix has anything to do: `DD 44` is
+/// `LD B,IXH`, and the 8-bit load and `INC`/`DEC` groups are otherwise left to
+/// rot in front of an instruction the prefix cannot touch.
+fn names_half(op: u8) -> bool {
+    is_half(y(op)) || is_half(z(op))
+}
+
 /// Is this an `ED` opcode that is actually defined?
 ///
 /// The `ED` space is mostly empty, and the empty part is not an error: an
@@ -389,6 +404,19 @@ impl Z80 {
             // a real HALT, not `LD (IX+d),(HL)`. So it falls through to the
             // prefix fallback and HALT (M2-13, #56) picks it up there.
             0x70..=0x75 | 0x77 => self.ld_index_ind_r(bus, mode, op),
+            // The undocumented `IXH`/`IXL` registers (M2-15, #58). The two arms
+            // above own every `(IX+d)` form, and those keep the real `H`/`L`, so
+            // what reaches this one is register to register with at least one
+            // side renamed. `76` names neither half, so `HALT` is unaffected.
+            0x40..=0x7F if names_half(op) => self.ld_index_half(op, mode),
+            // `INC`/`DEC` and `LD r,n` for the two halves. `y` picks the half in
+            // all three, exactly as it picks `H`/`L` without a prefix.
+            0x24 | 0x2c => self.inc_index_half(op, mode),
+            0x25 | 0x2d => self.dec_index_half(op, mode),
+            0x26 | 0x2e => self.ld_index_half_n(bus, op, mode),
+            // `ALU A,IXH` and `ALU A,IXL`. Only `z` is an operand here (`y` is
+            // the operation), and `z = 6` was taken by the `(IX+d)` arm above.
+            0x80..=0xBF if is_half(z(op)) => self.alu_a_index_half(op, mode),
             // The 16-bit loads, stack and exchanges in this space (M2-05, #48).
             // `22`/`2A` move the index pair through memory rather than `HL`; see
             // `Z80::ld_index_ind_nn` for the traces that settled that.
@@ -604,17 +632,45 @@ mod tests {
         assert_eq!(cpu.step(&mut bus), 12);
         assert_eq!((cpu.pc(), cpu.r()), (3, 3));
 
-        // Last prefix wins, in both orders: `DD FD 24` is `INC IYH` and `FD DD 24`
-        // is `INC IXH`, whichever way the prefixes are stacked. `24` is used
-        // because the `IXH`/`IXL` half of this space is a later ticket (M2-15,
-        // #58), so the panic still names the winning prefix.
+        // Last prefix wins, in both orders: `DD FD 80` reaches the `IXH`/`IXL`
+        // ALU block as `FD 80` and `FD DD 80` as `DD 80`, whichever way the
+        // prefixes are stacked. `80` is used because the `LD r,r'` half of this
+        // space became real instructions in M2-15 (#58), which moved this test
+        // off its old `24` example: the chain still has to be proved, it just
+        // has to be proved on an opcode that is still missing.
         for (first, second, winner) in [(0xDD, 0xFD, "FD"), (0xFD, 0xDD, "DD")] {
             let mut cpu = Z80::new();
-            let mut bus = Program::new(&[first, second, 0x24]);
+            let mut bus = Program::new(&[first, second, 0x80]);
             let message =
-                caught(|| cpu.step(&mut bus)).expect_err("{second:02X} 24 is not implemented");
-            assert!(message.contains(&format!("{winner} 24")), "{message}");
+                caught(|| cpu.step(&mut bus)).expect_err("{second:02X} 80 is not implemented");
+            assert!(message.contains(&format!("{winner} 80")), "{message}");
         }
+    }
+
+    /// A prefix chain that lands on a real instruction: the surviving prefix is
+    /// the one whose index halves the instruction reads.
+    #[test]
+    fn dd_fd_chain_uses_iy() {
+        let mut cpu = Z80::new();
+        let mut bus = Program::new(&[0xDD, 0xFD, 0x44]);
+        cpu.set_ix(0x1111);
+        cpu.set_iy(0x2222);
+
+        assert_eq!(
+            cpu.step(&mut bus),
+            12,
+            "a rotted prefix, a live prefix and a load"
+        );
+        assert_eq!(cpu.b(), 0x22, "the FD won, so this is LD B,IYH");
+        assert_eq!(cpu.ix(), 0x1111, "and IX was not read at all");
+        assert_eq!((cpu.pc(), cpu.r()), (3, 3));
+
+        let mut cpu = Z80::new();
+        let mut bus = Program::new(&[0xFD, 0xDD, 0x44]);
+        cpu.set_ix(0x1111);
+        cpu.set_iy(0x2222);
+        assert_eq!(cpu.step(&mut bus), 12);
+        assert_eq!(cpu.b(), 0x11, "and the DD won this way round");
     }
 
     #[test]
@@ -659,16 +715,15 @@ mod tests {
 
     /// The main space has no fallback arm any more: M2-13 (#56) was the last
     /// ticket for it, so all 256 opcodes are dispatched and `0x2F` used to be
-    /// this test's example. The panic being checked is the one that is still
-    /// reachable, in the index space - `DD 68` would be `LD B,B` with `IX` in the
-    /// middle, and nothing implements it.
+    /// this test's example. The index space keeps one, and the example moved to
+    /// `DD 80` when M2-15 (#58) turned `DD 68` into `LD IYL,B`.
     #[test]
     fn index_space_gives_a_useful_panic() {
         let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0xDD, 0x68]);
-        let message = caught(|| cpu.step(&mut bus)).expect_err("DD 68 is not implemented");
+        let mut bus = Program::new(&[0xDD, 0x80]);
+        let message = caught(|| cpu.step(&mut bus)).expect_err("DD 80 is not implemented");
         assert!(
-            message.contains("DD 68 (x1 y5 z0)"),
+            message.contains("DD 80 (x2 y0 z0)"),
             "unhelpful message: {message}"
         );
     }

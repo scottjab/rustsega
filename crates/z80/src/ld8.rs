@@ -29,6 +29,27 @@ impl Z80 {
         }
     }
 
+    /// Read register slot `idx` as an instruction with an index prefix in front
+    /// of it sees it.
+    ///
+    /// `DD` and `FD` rename the `H` and `L` slots to `IXH`/`IXL` and `IYH`/`IYL`
+    /// (M2-15, #58). The renaming is of the *pair*, never of `HL`, so `H` and `L`
+    /// keep their own values throughout - which is what the suite shows for every
+    /// file in this group, e.g. `dd 44` leaves `H` alone in all 1000 cases.
+    ///
+    /// The one instruction that must not use this is the `(IX+d)` direction of a
+    /// load, where the plain register operand stays the real `H`/`L` (see
+    /// [`Z80::ld_r_ind_index`] and [`Z80::ld_index_ind_r`]).
+    pub(crate) fn index_reg_slot(&self, mode: IndexMode, idx: u8) -> u8 {
+        match (mode, idx) {
+            (IndexMode::Ix, 4) => self.ix_hi(),
+            (IndexMode::Ix, 5) => self.ix_lo(),
+            (IndexMode::Iy, 4) => self.iy_hi(),
+            (IndexMode::Iy, 5) => self.iy_lo(),
+            _ => self.reg_slot(idx),
+        }
+    }
+
     /// Write register slot `idx`, as [`Z80::reg_slot`].
     pub(crate) fn set_reg_slot(&mut self, idx: u8, value: u8) {
         match idx {
@@ -105,6 +126,47 @@ impl Z80 {
         bus.write(addr, value);
         self.clear_latches();
         10
+    }
+
+    /// `LD r,IXH`, `LD IXH,r` and the `IY` forms: `DD`/`FD` plus `40`-`7F` where
+    /// the opcode names `H` or `L`. 8 T-states, the prefix's 4 on top of `LD
+    /// r,r'`.
+    ///
+    /// Neither side can be `(IX+d)` here: the dispatch hands over only the
+    /// opcodes where both sides are registers, because the `LD r,(IX + d)` and
+    /// `LD (IX + d),r` forms read and write the real `H`/`L` instead.
+    pub(crate) fn ld_index_half(&mut self, op: u8, mode: IndexMode) -> u32 {
+        let value = self.index_reg_slot(mode, z(op));
+        self.set_index_reg_slot(mode, y(op), value);
+        self.clear_latches();
+        8
+    }
+
+    /// `LD IXH,n` (`DD 26 n`) and `LD IYL,n` (`FD 2E n`): 11 T-states, `LD r,n`
+    /// plus the prefix. Only the `y` 4 and 5 forms reach this; the rest of the
+    /// `LD r,n` block has nothing for the prefix to rename.
+    pub(crate) fn ld_index_half_n(
+        &mut self,
+        bus: &mut impl Z80Bus,
+        op: u8,
+        mode: IndexMode,
+    ) -> u32 {
+        let value = self.fetch_byte(bus);
+        self.set_index_reg_slot(mode, y(op), value);
+        self.clear_latches();
+        11
+    }
+
+    /// Write register slot `idx` as an index-prefixed instruction sees it, per
+    /// [`Z80::index_reg_slot`].
+    pub(crate) fn set_index_reg_slot(&mut self, mode: IndexMode, idx: u8, value: u8) {
+        match (mode, idx) {
+            (IndexMode::Ix, 4) => self.set_ix_hi(value),
+            (IndexMode::Ix, 5) => self.set_ix_lo(value),
+            (IndexMode::Iy, 4) => self.set_iy_hi(value),
+            (IndexMode::Iy, 5) => self.set_iy_lo(value),
+            _ => self.set_reg_slot(idx, value),
+        }
     }
 
     /// `LD A,(BC)` / `LD A,(DE)`: 7 T-states, `wz = addr + 1` (both files, 1000
@@ -512,5 +574,128 @@ mod tests {
         assert_eq!(cpu.hl(), 0x8000, "HALT does not read or write HL");
         assert_eq!(bus.reads, vec![PC], "no operand fetch: this is not a load");
         assert!(bus.writes.is_empty(), "HALT must not write memory");
+    }
+
+    /// `LD B,IXH` (`DD 44`): 8 T-states, and `H` is not involved anywhere.
+    ///
+    /// The undocumented index halves (M2-15, #58): with `DD` in front, the `H`
+    /// and `L` slots of `LD r,r'` are the two halves of `IX`. `H` and `L` keep
+    /// their own values (`dd 44`: `H` unchanged in all 1000 cases) so the index
+    /// pair is not a window onto `HL`.
+    #[test]
+    fn ld_b_ixh() {
+        const PC: u16 = 0x1000;
+        let mut cpu = Z80::new();
+        cpu.set_pc(PC);
+        cpu.set_hl(0x1122);
+        cpu.set_ix(0x3344);
+        cpu.set_b(0xEE);
+        let mut bus = RamBus::at(PC, &[0xDD, 0x44]);
+
+        assert_eq!(
+            cpu.step(&mut bus),
+            8,
+            "the prefix costs 4 on top of the load"
+        );
+
+        assert_eq!(cpu.b(), 0x33, "IXH went to B");
+        assert_eq!(
+            (cpu.h(), cpu.l()),
+            (0x11, 0x22),
+            "H and L are not the source"
+        );
+        assert_eq!(cpu.ix(), 0x3344, "and IX is not disturbed");
+        assert_eq!(cpu.pc(), PC + 2);
+        assert_eq!(cpu.r(), 2, "prefix and opcode are both M1 fetches");
+        assert_eq!(bus.reads, vec![PC, PC + 1], "no operand and no memory read");
+        assert!(bus.writes.is_empty());
+    }
+
+    /// `LD IXH,n` (`DD 26 n`) and `LD IYL,n` (`FD 2E n`): 11 T-states, one half
+    /// of the index pair written and the other one kept.
+    #[test]
+    fn ld_ixh_n() {
+        for (prefix, mode_name) in [(0xDDu8, "DD"), (0xFD, "FD")] {
+            const PC: u16 = 0x2000;
+            let mut cpu = Z80::new();
+            cpu.set_pc(PC);
+            cpu.set_hl(0xAAAA);
+            cpu.set_ix(0x1111);
+            cpu.set_iy(0x2222);
+            let mut bus = RamBus::at(PC, &[prefix, 0x26, 0xCD]);
+
+            assert_eq!(cpu.step(&mut bus), 11, "{mode_name} 26 is LD <ixh>,n");
+
+            let (hi, lo) = if prefix == 0xDD {
+                (cpu.ix_hi(), cpu.ix_lo())
+            } else {
+                (cpu.iy_hi(), cpu.iy_lo())
+            };
+            assert_eq!(hi, 0xCD, "{mode_name} 26 wrote the high half");
+            assert_eq!(
+                lo,
+                if prefix == 0xDD { 0x11 } else { 0x22 },
+                "low half kept"
+            );
+            assert_eq!(cpu.hl(), 0xAAAA, "and HL is nowhere near it");
+            assert_eq!(cpu.pc(), PC + 3);
+        }
+    }
+
+    /// The four ways `H`/`L` can be named by a prefixed `LD r,r'`, all landing on
+    /// the index halves, plus the `LD IXH,IXL` case where both sides move.
+    #[test]
+    fn ld_index_half_r_r() {
+        // DD 45 LD B,IXL / DD 65 LD IXH,IXL / FD 6C LD IYL,IYH / FD 7D LD A,IYL.
+        let mut cpu = Z80::new();
+        cpu.set_pc(0x3000);
+        cpu.set_ix(0x1234);
+        cpu.set_b(0xFF);
+        let mut bus = RamBus::at(0x3000, &[0xDD, 0x45]);
+        assert_eq!(cpu.step(&mut bus), 8);
+        assert_eq!(cpu.b(), 0x34, "DD 45 is LD B,IXL");
+
+        let mut cpu = Z80::new();
+        cpu.set_pc(0x3000);
+        cpu.set_ix(0x1234);
+        let mut bus = RamBus::at(0x3000, &[0xDD, 0x65]);
+        assert_eq!(cpu.step(&mut bus), 8);
+        assert_eq!(cpu.ix(), 0x3434, "DD 65 is LD IXH,IXL");
+
+        // FD 6C is `LD IYL,IYH`: with a prefix in front there is no way to name
+        // the real `L` at all, so `HL` is not reachable from this opcode.
+        let mut cpu = Z80::new();
+        cpu.set_pc(0x3000);
+        cpu.set_iy(0x5678);
+        cpu.set_hl(0x9999);
+        let mut bus = RamBus::at(0x3000, &[0xFD, 0x6C]);
+        assert_eq!(cpu.step(&mut bus), 8);
+        assert_eq!(cpu.iy(), 0x5656, "FD 6C is LD IYL,IYH");
+        assert_eq!(cpu.hl(), 0x9999, "and H and L stay where they were");
+
+        let mut cpu = Z80::new();
+        cpu.set_pc(0x3000);
+        cpu.set_iy(0x5678);
+        let mut bus = RamBus::at(0x3000, &[0xFD, 0x7D]);
+        assert_eq!(cpu.step(&mut bus), 8);
+        assert_eq!(cpu.a(), 0x78, "FD 7D is LD A,IYL");
+    }
+
+    /// The exception the whole scheme hangs on: when one operand is `(IX+d)`, the
+    /// other is the **real** `H`/`L`, not an index half.
+    #[test]
+    fn ld_h_ix_d_uses_real_h() {
+        const PC: u16 = 0x4000;
+        let mut cpu = Z80::new();
+        cpu.set_pc(PC);
+        cpu.set_ix(0x1234);
+        cpu.set_hl(0xEE00);
+        let mut bus = RamBus::at(PC, &[0xDD, 0x66, 0x02]).with_byte(0x1236, 0x77);
+
+        assert_eq!(cpu.step(&mut bus), 19, "LD H,(IX + d) is 19 T-states");
+
+        assert_eq!(cpu.h(), 0x77, "the byte went into H");
+        assert_eq!(cpu.ix_hi(), 0x12, "and not into IXH");
+        assert_eq!(bus.reads, vec![PC, PC + 1, PC + 2, 0x1236]);
     }
 }
