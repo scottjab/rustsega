@@ -71,6 +71,17 @@ const FETCH_AHEAD: u32 = 4;
 /// queue: see [`M68k::jump_ext_word`].
 const JUMP_WORD_CLOCKS: u64 = 2;
 
+/// Clocks for a result the CPU made itself — a condition-code test, the status
+/// register — landing in a **data register**.
+///
+/// A memory destination pays nothing on top of its own write cycle; a data
+/// register is not on the bus, so the write is a short internal cycle instead.
+/// Measured on `Scc.json.gz`, where `Scc` to `Dn` is 6 clocks when the condition
+/// holds and 4 when it does not (so it really is the write, not the test), and
+/// on `MOVEfromSR.json.gz`, where `MOVE SR,D0` is 6 and every memory destination
+/// is the unchanged read-then-write (M1-31c, #41).
+pub(crate) const INTERNAL_RESULT_WRITE_CLOCKS: u32 = 2;
+
 /// The 68000 register file and CPU state.
 ///
 /// Fields are plain data (no `Box<dyn _>`, no references) so the save-state
