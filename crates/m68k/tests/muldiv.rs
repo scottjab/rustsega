@@ -84,7 +84,7 @@ fn muls_file_passes() {
 /// (#238).
 #[test]
 fn divu_file_passes() {
-    harness::assert_file_passes("DIVU", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("DIVU", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `DIVS`: `$81C0`–`$81FF` (`1000 ddd 111 eeeeee`), 8065 cases of which 3073
@@ -99,7 +99,7 @@ fn divu_file_passes() {
 /// for `n` (#238).
 #[test]
 fn divs_file_passes() {
-    harness::assert_file_passes("DIVS", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("DIVS", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `MULU`'s cycle count: `step` returns the case's `length` for every case that

@@ -168,6 +168,24 @@ const EXCEPTION_FRAME_SIZE: u32 = 6;
 /// `TRAP.json.gz` case reports as its `length`.
 pub(crate) const EXCEPTION_ENTRY_CLOCKS: u64 = 34;
 
+/// What [`M68k::exception`] does **not** bill for an instruction that had
+/// already fetched its opcode before it faulted: those
+/// [`OPCODE_CLOCKS`](crate::cpu::OPCODE_CLOCKS) themselves.
+///
+/// A handler returns them so the step totals the fetch it really spent, and the
+/// two numbers add up on the suite's only cycle-checked case of the kind,
+/// `80ef [DIVU (d16, A7), D0] 5745`: `length` 46 = 4 fetch + 8 for the
+/// `(d16,An)` read + 34 entry (#238). `CHK`, whose file is not cycle-checked,
+/// agrees with the same split — its trapping cases cost `4 + ea + 34` at their
+/// cheapest per mode (`Dn` 38, `(An)` 42, `-(An)` 44), with a spread of another
+/// 2 or 8 clocks on some cases that no model here accounts for (the core has no
+/// wait states; see the follow-up issue for `CHK`'s side).
+///
+/// Not for the traps that *are* the instruction: `TRAP` and an illegal opcode
+/// fault before any operand is read, and both cost the entry's 34 with nothing
+/// of their own on top — 34 in every one of the 8065 `TRAP.json.gz` cases.
+pub(crate) const FAULTED_FETCH_CLOCKS: u32 = crate::cpu::OPCODE_CLOCKS;
+
 /// Bus accesses [`M68k`] performs during an exception entry: three writes for
 /// the frame (PC high, PC low, SR), two reads for the vector long, and two
 /// reads to refill the prefetch queue from the handler address. The suite's own
