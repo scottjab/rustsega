@@ -2,4 +2,7 @@
 
 pub mod cart;
 
-pub use cart::{LoadError, Regions, RomHeader, compute_checksum, parse_header};
+pub use cart::{
+    LoadError, Regions, RomHeader, compute_checksum, deinterleave, is_smd, normalize_rom,
+    parse_header,
+};
