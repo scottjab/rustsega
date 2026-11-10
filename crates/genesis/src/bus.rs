@@ -60,6 +60,15 @@ const RAM_START: u32 = 0xE0_0000;
 const RAM_END: u32 = 0xFF_FFFF;
 /// Work RAM is 64 KiB behind a 2 MiB window, so only these bits select a byte.
 const RAM_MASK: u32 = 0x0000_FFFF;
+/// The hardware version register, the first word of the I/O area: 0xA10001 read
+/// as a byte, 0xA10000 read as a word (plutiedev "Using the Sub-CPU in mode 1",
+/// `HwVersion: equ $A10001`).
+const IO_VERSION: u32 = IO_START;
+/// Address mask that drops A0: the I/O registers sit two bytes apart and decode
+/// without A0 (plutiedev "I/O ports" lists them at $A10001, $A10003, ..., and
+/// BlastEm's `io_read` decodes with `location >> 1`), so `addr & EVEN_LANE`
+/// names the register a masked I/O address belongs to.
+const EVEN_LANE: u32 = !1;
 
 /// A decoded region of the 24 bit address space.
 ///
@@ -82,12 +91,13 @@ enum Region {
     /// TODO(M3-08 #68): Z80 RAM, YM2612 and PSG through the sound CPU's side.
     Z80,
     /// 0xA10000-0xA10FFF, I/O: version register and the three controller ports -
-    /// the whole decoded area, of which the 0xA10000-0xA1001F block #63 lists is
-    /// the part that answers today.
+    /// the whole decoded area, not just the 0xA10000-0xA1001F block of registers
+    /// (plutiedev "I/O ports", and "68000 address space overview" for the width
+    /// of the area).
     ///
-    /// TODO(M3-04 #64): the hardware version register at 0xA10001.
+    /// Only [`Bus::version`] at [`IO_VERSION`] answers so far.
     /// TODO(M3-05 #65): controller port data and direction pins, the byte
-    /// registers at 0xA10001-0xA1000D (plutiedev "I/O ports").
+    /// registers at 0xA10003-0xA1001F (plutiedev "I/O ports").
     Io,
     /// 0xA11000-0xA11FFF, Z80 bus control.
     ///
@@ -149,15 +159,34 @@ pub struct Bus {
     pub rom: Vec<u8>,
     /// 64 KiB of work RAM, mapped at 0xE00000 and mirrored every 0x10000.
     pub ram: Box<[u8; 0x10000]>,
+    /// The byte 0xA10001 reports: [`crate::Region::version_register`] for the
+    /// region [`crate::Config::resolve_region`] picked, with that config's TMSS
+    /// flag. See [`Bus::new`].
+    pub version: u8,
 }
 
 impl Bus {
-    /// A bus with `rom` loaded. Work RAM starts zeroed; a real console powers
-    /// up with undefined contents, which nothing depends on yet.
-    pub fn new(rom: Vec<u8>) -> Self {
+    /// A bus with `rom` loaded and `version` behind 0xA10001. Work RAM starts
+    /// zeroed; a real console powers up with undefined contents, which nothing
+    /// depends on yet.
+    ///
+    /// `version` is what the console decided to be, not something the bus
+    /// works out: the caller has [`crate::Config`] and the header, and says
+    ///
+    /// ```ignore
+    /// let region = config.resolve_region(&header);
+    /// Bus::new(rom, region.version_register(config.tmss))
+    /// ```
+    ///
+    /// Taking the byte rather than a whole [`crate::Config`] keeps the bus out of
+    /// the parts of the config that are not addresses - and taking it at all,
+    /// instead of defaulting a region here, is what stops a bus existing that
+    /// quietly lies to a game about the machine it is running on.
+    pub fn new(rom: Vec<u8>, version: u8) -> Self {
         Self {
             rom,
             ram: Box::new([0; 0x10000]),
+            version,
         }
     }
 
@@ -261,20 +290,54 @@ impl Bus {
     /// Z80 bus word write. Placeholder for [`Region::Z80`].
     fn write_z80_word(&mut self, _addr: u32, _value: u16) {}
 
-    /// I/O byte read. Placeholder for [`Region::Io`].
-    fn read_io_byte(&mut self, _addr: u32) -> u8 {
-        OPEN_BUS
+    /// I/O byte read: the version register, then nothing.
+    ///
+    /// A0 does not select between the two bytes of the register - the I/O
+    /// registers are one per two bytes and decode without it (plutiedev "I/O
+    /// ports" lists them two bytes apart; BlastEm's `io_read` decodes the pair
+    /// with `location >> 1`) - so 0xA10000 answers as 0xA10001 does. Everything
+    /// else in the range is still [`OPEN_BUS`] until M3-05 (#65).
+    fn read_io_byte(&mut self, addr: u32) -> u8 {
+        if is_version_register(addr) {
+            self.version
+        } else {
+            OPEN_BUS
+        }
     }
 
-    /// I/O word read. Placeholder for [`Region::Io`].
-    fn read_io_word(&mut self, _addr: u32) -> u16 {
-        OPEN_BUS_WORD
+    /// I/O word read: the version register, in both bytes.
+    ///
+    /// Its own function rather than two [`Bus::read_io_byte`] calls, because a
+    /// word is a different access here: the register pair decodes without A0, so
+    /// one register answers the whole 16 bit access, and the answer is the byte
+    /// twice. BlastEm models it the same way - `io_read_w` in `genesis.c` reads
+    /// the register once for a word access in the I/O area and mirrors it,
+    /// `value = value | (value << 8)`.
+    ///
+    /// The alternative is MAME: `src/mame/sega/megadriv.cpp` maps 0xA10000-0xA10001
+    /// to a 16 bit handler returning the byte zero extended, so a word read there
+    /// reports 0 in the half of the word nothing is wired to. On real hardware
+    /// that half floats, and only the byte read at 0xA10001 is documented
+    /// (plutiedev "I/O ports": the I/O registers are "byte-sized"), so no game
+    /// can be relying on either. The mirror is what keeps a word read consistent
+    /// with the two byte reads it covers.
+    ///
+    /// An odd `addr` is an address error the 68k never completes, so the pair
+    /// check is all the word case needs.
+    fn read_io_word(&mut self, addr: u32) -> u16 {
+        if is_version_register(addr) {
+            u16::from_be_bytes([self.version, self.version])
+        } else {
+            OPEN_BUS_WORD
+        }
     }
 
-    /// I/O byte write. Placeholder for [`Region::Io`].
+    /// I/O byte write. The version register is read-only, and the port registers
+    /// that take writes are still M3-05 (#65): dropped.
     fn write_io_byte(&mut self, _addr: u32, _value: u8) {}
 
-    /// I/O word write. Placeholder for [`Region::Io`].
+    /// I/O word write. Placeholder for the rest of [`Region::Io`], see
+    /// [`Bus::write_io_byte`].
     fn write_io_word(&mut self, _addr: u32, _value: u16) {}
 
     /// Z80 bus control byte read. Placeholder for [`Region::Z80Ctrl`].
@@ -340,6 +403,12 @@ impl Bus {
 
     /// Undecoded word write. Placeholder for [`Region::Unmapped`].
     fn write_unmapped_word(&mut self, _addr: u32, _value: u16) {}
+}
+
+/// Is `addr`, masked and already decoded as [`Region::Io`], one of the two bytes
+/// of the hardware version register at [`IO_VERSION`]?
+fn is_version_register(addr: u32) -> bool {
+    (addr & EVEN_LANE) == IO_VERSION
 }
 
 // `int_ack` and `reset_devices` are deliberately left at the `m68k::Bus`
@@ -417,9 +486,14 @@ mod tests {
         (0..len).map(|i| (i % 251) as u8).collect()
     }
 
+    /// What the version register at 0xA10001 reports for these tests: an export
+    /// NTSC machine without TMSS ([`crate::Region::Usa`]). Deliberately not
+    /// [`OPEN_BUS`], so a stub read cannot pass on the version register's value.
+    const TEST_VERSION: u8 = 0xA0;
+
     #[test]
     fn reads_rom_bytes_and_words() {
-        let mut bus = Bus::new(vec![0xAB, 0xCD, 0x00, 0xFF]);
+        let mut bus = Bus::new(vec![0xAB, 0xCD, 0x00, 0xFF], TEST_VERSION);
         assert_eq!(bus.read_byte(ROM_START), 0xAB);
         assert_eq!(bus.read_byte(ROM_START + 1), 0xCD);
         assert_eq!(bus.read_word(ROM_START), 0xABCD);
@@ -431,7 +505,7 @@ mod tests {
         rom[0x1235] = 0x34;
         rom[ROM_END as usize - 1] = 0xFE;
         rom[ROM_END as usize] = 0xFF;
-        let mut bus = Bus::new(rom);
+        let mut bus = Bus::new(rom, TEST_VERSION);
         assert_eq!(bus.read_word(0x001234), 0x1234);
         assert_eq!(bus.read_byte(ROM_END), 0xFF);
         assert_eq!(bus.read_word(ROM_END - 1), 0xFEFF);
@@ -439,7 +513,7 @@ mod tests {
 
     #[test]
     fn rom_is_read_only() {
-        let mut bus = Bus::new(vec![0xAB, 0xCD, 0xEF, 0x01]);
+        let mut bus = Bus::new(vec![0xAB, 0xCD, 0xEF, 0x01], TEST_VERSION);
         bus.write_byte(ROM_START, 0x00);
         bus.write_word(ROM_START + 2, 0x0000);
         assert_eq!(bus.read_byte(ROM_START), 0xAB);
@@ -449,7 +523,7 @@ mod tests {
 
     #[test]
     fn ram_read_write_byte_and_word() {
-        let mut bus = Bus::new(Vec::new());
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
 
         bus.write_byte(RAM_START, 0x5A);
         assert_eq!(bus.read_byte(RAM_START), 0x5A);
@@ -468,7 +542,7 @@ mod tests {
 
     #[test]
     fn ram_is_mirrored() {
-        let mut bus = Bus::new(Vec::new());
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
 
         bus.write_byte(0xFF0010, 0x77);
         assert_eq!(bus.read_byte(0xE00010), 0x77);
@@ -483,7 +557,7 @@ mod tests {
     #[test]
     fn addresses_masked_to_24_bits() {
         // The CPU masks too; this is the bus masking for its direct callers.
-        let mut bus = Bus::new(Vec::new());
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         bus.write_byte(0x01FF_0010, 0x5C);
         assert_eq!(bus.read_byte(0x01FF_0010), 0x5C);
         assert_eq!(bus.read_byte(0x00FF_0010), 0x5C);
@@ -492,7 +566,7 @@ mod tests {
         let mut rom = rom_image(0x200000);
         rom[0x100010] = 0x7E;
         rom[0x100011] = 0x7D;
-        let mut bus = Bus::new(rom);
+        let mut bus = Bus::new(rom, TEST_VERSION);
         assert_eq!(bus.read_word(0x0110_0010), 0x7E7D);
         bus.write_byte(0x0110_0010, 0x00);
         assert_eq!(bus.read_byte(0x0110_0010), 0x7E);
@@ -502,7 +576,7 @@ mod tests {
     fn reads_past_rom_end_return_ff() {
         // An odd number of bytes on purpose: it is the only way a word access
         // straddles the end of the image.
-        let mut bus = Bus::new(vec![0x12, 0x34, 0x56]);
+        let mut bus = Bus::new(vec![0x12, 0x34, 0x56], TEST_VERSION);
         assert_eq!(bus.read_byte(0x000001), 0x34);
         assert_eq!(bus.read_byte(0x000002), 0x56);
         assert_eq!(bus.read_byte(0x000003), OPEN_BUS);
@@ -514,7 +588,7 @@ mod tests {
 
     #[test]
     fn unmapped_reads_return_open_bus_placeholder() {
-        let mut bus = Bus::new(Vec::new());
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         for addr in [
             0x400000, 0x7FFFFE, 0x800000, 0x9FFFFE, 0xA12000, 0xA15000, 0xBFFFFE,
         ] {
@@ -525,7 +599,7 @@ mod tests {
 
     #[test]
     fn unmapped_writes_are_dropped() {
-        let mut bus = Bus::new(Vec::new());
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         for addr in [0x400000, 0x800000, 0xA12000, 0xBFFFFE] {
             bus.write_byte(addr, 0x11);
             bus.write_word(addr, 0x2222);
@@ -536,10 +610,12 @@ mod tests {
 
     #[test]
     fn stub_regions_read_open_bus_until_their_ticket() {
-        let mut bus = Bus::new(Vec::new());
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         // One address per stub region, including every register the map names.
+        // The I/O entry is past the version register, which #64 implements and
+        // the tests below cover.
         for addr in [
-            0xA00000, 0xA10000, 0xA11100, 0xA11200, 0xA130F1, 0xA14000, 0xA14101, 0xC00000,
+            0xA00000, 0xA10020, 0xA11100, 0xA11200, 0xA130F1, 0xA14000, 0xA14101, 0xC00000,
         ] {
             assert_eq!(bus.read_byte(addr), OPEN_BUS, "byte at {addr:#08x}");
             assert_eq!(
@@ -558,10 +634,65 @@ mod tests {
         assert!(bus.ram.iter().all(|&b| b == 0), "stub writes reached RAM");
     }
 
+    /// The version register answers a byte at 0xA10001, which is how a game
+    /// finds out what console it is on (plutiedev "Using the Sub-CPU in mode 1",
+    /// `HwVersion: equ $A10001`), and the value is exactly what
+    /// [`crate::Region::version_register`] produced for the resolved region.
+    #[test]
+    fn version_register_reads_at_a10001() {
+        // Japan NTSC, export NTSC and export PAL, each with and without TMSS.
+        for version in [0x20u8, 0xA0, 0xE0, 0x21, 0xA1, 0xE1] {
+            let mut bus = Bus::new(Vec::new(), version);
+            assert_eq!(bus.read_byte(0xA10001), version, "byte at 0xA10001");
+        }
+    }
+
+    /// A word read at 0xA10000 reports the version register in *both* bytes.
+    ///
+    /// The verification the ticket asked for. A0 does not pick between the two
+    /// halves of the register pair, and BlastEm models a word access to the I/O
+    /// area as the register read once and mirrored into both halves
+    /// (`io_read_w`: `value = value | (value << 8)`), which is what this bus
+    /// does. See [`Bus::read_io_word`] for the sources and for how MAME differs
+    /// on the half of the word nothing is wired to.
+    #[test]
+    fn version_register_word_read_reports_both_bytes() {
+        let mut bus = Bus::new(Vec::new(), 0xA0);
+        assert_eq!(bus.read_word(0xA10000), 0xA0A0);
+        // A0 is ignored, so the even byte of the pair answers too.
+        assert_eq!(bus.read_byte(0xA10000), 0xA0);
+    }
+
+    /// The version register is read-only: the writes a game makes to the I/O
+    /// area are to the port registers of M3-05 (#65), never to this one.
+    #[test]
+    fn version_register_is_read_only() {
+        let mut bus = Bus::new(Vec::new(), 0xA0);
+        bus.write_byte(0xA10000, 0x00);
+        bus.write_byte(0xA10001, 0x00);
+        bus.write_word(0xA10000, 0x0000);
+        assert_eq!(bus.read_byte(0xA10001), 0xA0);
+        assert_eq!(bus.read_word(0xA10000), 0xA0A0);
+    }
+
+    /// Everything else [`Region::Io`] covers is still #65's to fill in: the
+    /// version register must not answer for the rest of the range.
+    #[test]
+    fn io_past_the_version_register_is_still_a_stub() {
+        let mut bus = Bus::new(Vec::new(), 0x20);
+        for addr in [0xA10002, 0xA10003, 0xA10009, 0xA1001F, IO_END] {
+            let word_addr = addr & EVEN_LANE;
+            assert_eq!(bus.read_byte(addr), OPEN_BUS, "{addr:#08x} byte");
+            assert_eq!(bus.read_word(word_addr), OPEN_BUS_WORD, "{word_addr:#08x}");
+            bus.write_byte(addr, 0x11);
+            assert_eq!(bus.read_byte(addr), OPEN_BUS, "{addr:#08x} after write");
+        }
+    }
+
     #[test]
     fn int_ack_and_device_reset_keep_the_m68k_defaults() {
         // A Genesis always autovectors, and there are no devices to reset yet.
-        let mut bus = Bus::new(Vec::new());
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         assert_eq!(bus.int_ack(2), None);
         bus.reset_devices();
     }
