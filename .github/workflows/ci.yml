@@ -105,6 +105,18 @@ jobs:
       - name: just check
         run: nix develop -c just check
 
+      - name: m68k conformance gate
+        # The whole 68000 SingleStepTests suite at state-and-clocks checking, as
+        # `singlestep.rs`'s `all_instructions` gate: 3.7 s of test time, about
+        # 5 s wall once `just check` has built the test binaries, so it fits on a
+        # pull request too and a conformance regression fails before merge
+        # instead of only showing up on main afterwards. `--no-capture` is what
+        # puts the per-file table in the log: nextest hides the output of a test
+        # that passes, and #186 is about doing that for `just test-all` as a
+        # whole. The pin, the measured numbers and every known failure are in
+        # docs/m68k-conformance.md.
+        run: nix develop -c cargo nextest run -p m68k --run-ignored all --no-capture all_instructions
+
       - name: just test-all (main only)
         # The slow #[ignore] suites (full SingleStepTests, long ROM runs) run on
         # main, where a late failure is information, and not on PRs, where they
