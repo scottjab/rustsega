@@ -1,7 +1,18 @@
 //! `CHK` in the pinned 680x0 suite (M1-27, #35).
 //!
 //! One test for `CHK.json.gz`, in the style of `status.rs`, checked with
-//! [`harness::Check::StateSkipAddressErrors`]. The file runs `CHK.W Dn,<ea>` for
+//! [`harness::Check::StateSkipAddressErrors`]. It is the one instruction file
+//! M1-31c (#41) left off cycle checking, and it is not because it was skipped:
+//! measured over the 4948 cases this test compares, `CHK`'s own work is
+//! 6 clocks when the comparison completes — `CHK.W D0,D0` is 10, `CHK.W (A0)` is
+//! 14, and every mode is exactly 6 over its operand's bus traffic — but a CHK
+//! that traps pays `4 + <ea> + 34` for some cases and `6 + <ea> + 34` for
+//! others, and what picks between the two is not the operand, the mode or the
+//! direction of the overflow. That split is issue #241; until it has an answer
+//! there is no rule to implement here, so enabling clocks would mean writing a
+//! rule that is wrong on part of the file. See the measurement in the #41 PR.
+//!
+//! The file runs `CHK.W Dn,<ea>` for
 //! every `Dn` and every addressing mode, so a large share of its cases end in the
 //! suite's exception handler on an odd address and the skip is doing real work
 //! here rather than hiding anything.

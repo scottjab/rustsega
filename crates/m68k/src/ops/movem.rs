@@ -196,7 +196,7 @@ impl M68k {
         if matches!(mode, MODE_POST_INCREMENT | MODE_PRE_DECREMENT) {
             return Some(self.a[usize::from(reg)]);
         }
-        self.ea_address(bus, mode, reg)
+        self.ea_address(bus, mode, reg, false)
     }
 }
 

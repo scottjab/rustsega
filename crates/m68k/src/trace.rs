@@ -200,6 +200,28 @@ mod tests {
         assert_eq!(cpu.pc, TRACE_HANDLER + 2, "the handler ran");
     }
 
+    /// The ticket's test (#41): the trace exception costs
+    /// [`crate::exceptions::EXCEPTION_ENTRY_CLOCKS`] — **34** — on top of the
+    /// traced instruction's own clocks, with nothing added for being trace. It is
+    /// an ordinary group 1/2 entry ([`M68k::take_trace`] calls
+    /// [`M68k::exception`] like any other), so a traced `NOP` is its 4-clock
+    /// fetch plus the entry.
+    #[test]
+    fn trace_exception_clocks() {
+        let (mut cpu, mut bus) = cpu_tracing(&[NOP, NOP]);
+
+        let clocks = cpu.step(&mut bus);
+
+        assert_eq!(cpu.pending_exception, Some(EXC_TRACE), "the NOP ran");
+        assert_eq!(
+            clocks,
+            crate::cpu::OPCODE_CLOCKS + crate::exceptions::EXCEPTION_ENTRY_CLOCKS as u32,
+            "the fetch of the traced instruction plus the 34-clock entry, and no \
+             acknowledge on top: an interrupt, which is not trace, is what pays \
+             those 10 more"
+        );
+    }
+
     /// The ticket's test: an instruction that *sets* T is not traced itself, and
     /// the instruction after it is — the T bit is read before the instruction,
     /// not after (M68000UM section 6.3.8).

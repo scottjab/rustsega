@@ -556,7 +556,25 @@ impl M68k {
     /// `mode` and `reg` are the two halves of the EA field as in
     /// [`M68k::resolve_ea`], and the extension words are consumed the same way —
     /// including `d16(PC)`/`d8(PC,Xn)` measuring from [`M68k::ext_addr`].
-    pub(crate) fn ea_address(&mut self, bus: &mut impl Bus, mode: u8, reg: u8) -> Option<u32> {
+    ///
+    /// `ends_in_jump` is true when the instruction's next act is
+    /// [`M68k::jump_to`] — `JMP` and `JSR` — which prices the plain displacement
+    /// words at [`M68k::jump_ext_word`]'s 2 clocks instead of a bus cycle each:
+    /// the reload at the target throws the queue away, so the read that popping
+    /// them would schedule never happens. `LEA`/`PEA`/`MOVEM` pass `false` and
+    /// keep the read. Measured per mode on `JMP.json.gz` (M1-31c, #41):
+    /// `(An)` 8 = `jump_to` alone, `d16(An)` / `(xxx).W` / `d16(PC)` 10, `(xxx).l`
+    /// 12 (its first word still reads, to bring the second in).
+    /// [`M68k::indexed_addr`]'s modes are priced as they are: `JMP (d8,A0,Xn)` is
+    /// 14, and the suite's trace books that mode's 6 clocks as calculation
+    /// (`n 6`) rather than as a bus cycle, so there is nothing to cancel.
+    pub(crate) fn ea_address(
+        &mut self,
+        bus: &mut impl Bus,
+        mode: u8,
+        reg: u8,
+        ends_in_jump: bool,
+    ) -> Option<u32> {
         if !is_control(mode, reg) {
             return None;
         }
@@ -565,16 +583,26 @@ impl M68k {
             // (An): the register contents are the address, whole.
             0b010 => self.a[r],
             // d16(An).
-            0b101 => self.a[r].wrapping_add(sign_extend_word(self.fetch_ext_word(bus))),
+            0b101 => {
+                let disp = self.jumpable_ext_word(bus, ends_in_jump);
+                self.a[r].wrapping_add(sign_extend_word(disp))
+            }
             // d8(An,Xn).
             0b110 => self.indexed_addr(bus, self.a[r]),
             // 111: the sub-mode is the register field, as in `resolve_ea`.
             0b111 => match reg {
-                0b000 => sign_extend_word(self.fetch_ext_word(bus)),
-                0b001 => self.fetch_ext_long(bus),
+                0b000 => sign_extend_word(self.jumpable_ext_word(bus, ends_in_jump)),
+                0b001 => {
+                    if ends_in_jump {
+                        self.pop_queued_ext_long(bus)
+                    } else {
+                        self.fetch_ext_long(bus)
+                    }
+                }
                 0b010 => {
                     let base = self.ext_addr();
-                    base.wrapping_add(sign_extend_word(self.fetch_ext_word(bus)))
+                    let disp = self.jumpable_ext_word(bus, ends_in_jump);
+                    base.wrapping_add(sign_extend_word(disp))
                 }
                 0b011 => {
                     let base = self.ext_addr();
@@ -587,6 +615,16 @@ impl M68k {
             _ => return None,
         };
         Some(addr)
+    }
+
+    /// [`M68k::fetch_ext_word`] for `JMP`/`JSR`, [`M68k::fetch_ext_word`] for
+    /// everybody else: see [`M68k::ea_address`].
+    fn jumpable_ext_word(&mut self, bus: &mut impl Bus, ends_in_jump: bool) -> u16 {
+        if ends_in_jump {
+            self.jump_ext_word()
+        } else {
+            self.fetch_ext_word(bus)
+        }
     }
 
     /// The `d8(An,Xn)` / `d8(PC,Xn)` brief extension word: `An` (or the PC

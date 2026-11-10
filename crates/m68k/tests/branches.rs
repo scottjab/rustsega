@@ -3,9 +3,12 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateSkipAddressErrors`], as in `NEG`/`CLR`/`EXG` and
-//! `LEA`/`PEA`: the cases that end in the suite's exception handler are left to
-//! M1-29 (#37) — see [`harness::is_address_error_case`] and #185.
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`]: state *and* the clock
+//! count, as in the add, logic and move files. M1-31c (#41) turned the cycle
+//! half on for these four files; the cases that end in the suite's exception
+//! handler are still left to M1-29 (#37) — see [`harness::is_address_error_case`]
+//! and #185. Of the 8065 cases in each file the cycle check now covers 5865
+//! (`Bcc`), 4085 (`BSR`), 6101 (`DBcc`) and all 8065 (`Scc`).
 //!
 //! The suite has no `BRA.json.gz`: `BRA` is `Bcc` with condition code `0000`,
 //! so `$6000`..`$60FF` of `Bcc.json.gz` is `BRA.B` and `$6000` with a zero low
@@ -26,26 +29,26 @@ mod harness;
 /// `pc + 2 + d8` (or `+ d16` when `d8` is zero), taking no flags.
 #[test]
 fn bcc_file_passes() {
-    harness::assert_file_passes("Bcc", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("Bcc", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `BSR`: `$6100`..`$61FF`, the same displacement plus a long push of the
 /// address of the following instruction.
 #[test]
 fn bsr_file_passes() {
-    harness::assert_file_passes("BSR", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("BSR", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `DBcc`: `$50C8`..`$5FCF`, decrement-and-branch on a word counter.
 #[test]
 fn dbcc_file_passes() {
-    harness::assert_file_passes("DBcc", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("DBcc", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `Scc`: `$50C0`..`$5FC7` at every mode but `001`, writing `$FF` or `$00`.
 #[test]
 fn scc_file_passes() {
-    harness::assert_file_passes("Scc", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("Scc", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// The four file names above are what the suite ships for this ticket, so a

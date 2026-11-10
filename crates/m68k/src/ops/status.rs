@@ -52,6 +52,28 @@ const EA_REG_IMMEDIATE: u8 = 0b100;
 /// `MOVE An,USP` (`$4E60`+`r`) (M68000UM "MOVE to/from USP").
 const USP_TO_AN: u16 = 0x0008;
 
+/// Clocks a write to the status register itself costs on top of the operand
+/// traffic that produced the value.
+///
+/// Measured over every non-faulting case of `MOVEtoSR.json.gz` and
+/// `MOVEtoCCR.json.gz` for M1-31c (#41): each of the nine modes is exactly eight
+/// clocks above the same-shaped `MOVE` to a data register — `MOVE.W D3,SR` is 12,
+/// `(A3)` and `(A3)+` 16, `-(A3)` 18, `d16(A3)` 20, `d8(A3,Xn)` 22, `(xxx).W` 16,
+/// `(xxx).l` 20, `d16(PC)` 22, `d8(PC,Xn)` 24 — which is the two bus cycles the
+/// register file's own write takes. `MOVE SR,<ea>` is *not* charged it: only the
+/// `Dn` destination costs anything, and there only [`INTERNAL_RESULT_WRITE_CLOCKS`].
+const SR_WRITE_CLOCKS: u32 = 8;
+
+/// [`SR_WRITE_CLOCKS`] plus the read of the register that `ANDI`/`ORI`/`EORI`
+/// modify first.
+///
+/// All 8065 cases of each of `ANDItoCCR`, `ANDItoSR`, `ORItoCCR`, `ORItoSR`,
+/// `EORItoCCR` and `EORItoSR` are a flat 20 clocks (#41). Not to be merged with
+/// [`crate::ops::logic`]: the ordinary `ANDI #imm,<ea>` to memory or `Dn` has no
+/// such charge, and on the 68000 these are the only instructions that reach the
+/// status register that way.
+const SR_MODIFY_CLOCKS: u32 = SR_WRITE_CLOCKS + 4;
+
 impl M68k {
     /// `MOVE SR,<ea>`: `$40C0` + `<ea>` — the only read of SR that is not
     /// privileged on the 68000, which is why user-mode code can inspect its own
@@ -71,10 +93,13 @@ impl M68k {
             return self.op_illegal(bus);
         };
 
+        let to_data_register = matches!(dest, Ea::DataReg(_));
         self.read_ea(bus, dest, Size::Word);
         self.write_ea(bus, dest, Size::Word, u32::from(self.sr));
         self.advance_opcode(bus);
-        0
+        // `MOVE SR,D0` is 6 clocks, `MOVE SR,(A0)` is the plain 8: the value came
+        // out of the CPU, so only the `Dn` destination costs anything.
+        u32::from(to_data_register) * crate::cpu::INTERNAL_RESULT_WRITE_CLOCKS
     }
 
     /// `MOVE <ea>,CCR`: `$44C0` + `<ea>`. A word operand whose low five bits
@@ -95,7 +120,7 @@ impl M68k {
 
         self.set_ccr(value as u16);
         self.advance_opcode(bus);
-        0
+        SR_WRITE_CLOCKS
     }
 
     /// `MOVE <ea>,SR`: `$46C0` + `<ea>` — word operand to SR, privileged
@@ -124,7 +149,7 @@ impl M68k {
 
         self.set_sr(value as u16);
         self.advance_opcode(bus);
-        0
+        SR_WRITE_CLOCKS
     }
 
     /// `MOVE An,USP` (`$4E60`+`n`) and `MOVE USP,An` (`$4E68`+`n`), privileged in
@@ -170,7 +195,7 @@ impl M68k {
 
         self.set_ccr(op.apply(u32::from(self.ccr()), imm) as u16);
         self.advance_opcode(bus);
-        0
+        SR_MODIFY_CLOCKS
     }
 
     /// `ANDI`/`ORI`/`EORI #imm,SR`: `$027C`, `$007C`, `$0A7C` (M68000UM
@@ -192,7 +217,7 @@ impl M68k {
 
         self.set_sr(op.apply(u32::from(self.sr), imm) as u16);
         self.advance_opcode(bus);
-        0
+        SR_MODIFY_CLOCKS
     }
 
     /// Fetch the instruction's own immediate operand: the mode `111` register

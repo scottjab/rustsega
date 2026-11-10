@@ -84,7 +84,7 @@ fn pushed_frame(case: &harness::TestCase) -> Option<(u16, u32)> {
 /// M1-29, #37). This is the file #16 exists to turn green.
 #[test]
 fn trap_file_passes_with_a_state_check() {
-    harness::assert_file_passes("TRAP", harness::Check::State);
+    harness::assert_file_passes("TRAP", harness::Check::StateAndCycles);
 }
 
 /// TRAP #n fetches the long at `$80 + 4 * n`, which is what makes the vector

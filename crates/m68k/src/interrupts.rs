@@ -270,6 +270,51 @@ mod tests {
         );
     }
 
+    /// The ticket's test (#41): one autovector interrupt is **44 clocks**,
+    /// counted out of [`M68k::step`] itself because that return value is what the
+    /// scheduler charges for the step.
+    ///
+    /// M68000UM "Interrupt Acknowledge Timing" gives 31 + 2n bus cycles for the
+    /// acknowledge, 4 clocks a cycle, one device here; [`EXCEPTION_ENTRY_CLOCKS`]
+    /// covers the frame and the two vector fetches and
+    /// [`INTERRUPT_ACK_CLOCKS`] the rest.
+    #[test]
+    fn interrupt_takes_44_clocks() {
+        let (mut cpu, mut bus) = cpu_masking(3);
+        cpu.ipl = 6;
+
+        let clocks = cpu.step(&mut bus);
+
+        assert_eq!(
+            clocks,
+            u32::try_from(EXCEPTION_ENTRY_CLOCKS + INTERRUPT_ACK_CLOCKS)
+                .expect("44 clocks fit in a u32"),
+            "the step is the entry and the acknowledge, and nothing of the \
+             instruction it pre-empted"
+        );
+        assert_eq!(clocks, 44, "the number the tests assert");
+    }
+
+    /// The ticket's test (#41): a CPU that is stopped and has nothing to wake it
+    /// still answers [`M68k::step`] with [`STOPPED_CLOCKS`] — 4 clocks, so the
+    /// scheduler keeps ticking and the stopped CPU costs the emulated machine
+    /// something. One step per call, and the step runs no instruction at all:
+    /// `pc` and the interrupt mask are unchanged however often it is repeated.
+    #[test]
+    fn stopped_step_returns_4() {
+        let (mut cpu, mut bus) = cpu_pointed_at_handler(&[0x4E72, 0x2300, NOP]);
+        cpu.step(&mut bus);
+        assert!(cpu.stopped, "STOP stopped it");
+
+        let pc = cpu.pc;
+        let mask = cpu.int_mask();
+        for _ in 0..3 {
+            assert_eq!(cpu.step(&mut bus), STOPPED_CLOCKS);
+        }
+        assert_eq!(cpu.pc, pc, "a stopped CPU does not advance");
+        assert_eq!(cpu.int_mask(), mask);
+    }
+
     /// The frame carries the address of the instruction that *would* have run:
     /// the interrupt pre-empts an instruction that has not executed at all, so
     /// the frame PC is `pc` itself and the instruction's effect has not happened.
