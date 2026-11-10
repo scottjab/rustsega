@@ -52,8 +52,9 @@ fn file_passes(name: &str) {
 /// So `asl_b_file_passes` runs `ASL.b` with these two cases dropped. That is a
 /// hole in the coverage of one file, not a weakening of a rule: every other case
 /// of `ASL.b`, including every other `$E502` case, is checked, and the
-/// whole-suite run (`singlestep.rs`'s `all_instructions`) still reports the
-/// shortfall.
+/// whole-suite gate (`singlestep.rs`'s `all_instructions`) still counts the two
+/// as failures — it lets the file fail only because `KNOWN_FAILURES` carries
+/// #209, and it stops letting it the moment they pass.
 const ASL_B_BROKEN_CASES: [&str; 2] = ["e502 [ASL.b Q, D2] 1583", "e502 [ASL.b Q, D2] 1761"];
 
 /// Every case of `ASL.b` except [`ASL_B_BROKEN_CASES`].

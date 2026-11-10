@@ -632,9 +632,9 @@ fn print_table(reports: &[(String, harness::Report)]) {
     }
 }
 
-/// The failure lines a [`harness::Report`] kept, under a heading naming the file
-/// and its issue, so a reader sees the mismatch rather than inferring it from a
-/// table cell.
+/// The failure lines each [`harness::Report`] kept, under a heading naming the
+/// file and its issue, so a reader sees the mismatch rather than inferring it
+/// from a table cell.
 fn print_failures(reports: &[(String, harness::Report)]) {
     for (name, report) in reports {
         if report.failed() == 0 {
@@ -690,6 +690,9 @@ fn print_totals(reports: &[(String, harness::Report)]) {
 fn all_instructions() {
     let started = std::time::Instant::now();
     let reports = harness::run_all_files(GATE_CHECK);
+    // Timed because CI keeps or drops this run on the number: see the runtime
+    // recorded in docs/m68k-conformance.md.
+    let sweep_seconds = started.elapsed().as_secs_f64();
     if reports.is_empty() {
         // No data root: `run_all_files` already printed `SKIPPED:` for the
         // suite directory, and `just check` has to stay green without it.
@@ -698,7 +701,7 @@ fn all_instructions() {
     print_table(&reports);
     print_failures(&reports);
     print_totals(&reports);
-    println!("gate run took {:.1}s", started.elapsed().as_secs_f64());
+    println!("sweep took {sweep_seconds:.1}s");
 
     let (unlisted, stale) = gate_diff(&reports);
     assert!(
