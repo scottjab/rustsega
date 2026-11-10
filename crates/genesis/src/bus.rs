@@ -29,10 +29,12 @@
 //! plutiedev "Memory map" documents 0xC00020-0xC0003F, inside the VDP area, as
 //! "hangs up". Modelling open bus is M3-16 (#77).
 //!
-//! [`m68k::Bus::int_ack`] and [`m68k::Bus::reset_devices`] are deliberately left
-//! at the trait defaults: returning `None` *is* what a Genesis does, and the
-//! devices that need a reset arrive with M3-08 (#68) and M3-09 (#69).
+//! [`m68k::Bus::int_ack`] is deliberately left at the trait default: returning
+//! `None` *is* what a Genesis does, always autovectoring.
+//! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`], the first device
+//! behind the bus; the rest arrive with M3-08 (#68) and M3-09 (#69).
 
+use crate::io::Io;
 use m68k::ADDR_MASK;
 
 /// What an undriven data bus reads as: the placeholder for every area that
@@ -95,9 +97,8 @@ enum Region {
     /// (plutiedev "I/O ports", and "68000 address space overview" for the width
     /// of the area).
     ///
-    /// Only [`Bus::version`] at [`IO_VERSION`] answers so far.
-    /// TODO(M3-05 #65): controller port data and direction pins, the byte
-    /// registers at 0xA10003-0xA1001F (plutiedev "I/O ports").
+    /// [`Bus::version`] answers [`IO_VERSION`] and [`Bus::io`] the register block
+    /// at 0xA10000-0xA1001F; the rest of the area is [`OPEN_BUS`].
     Io,
     /// 0xA11000-0xA11FFF, Z80 bus control.
     ///
@@ -163,6 +164,12 @@ pub struct Bus {
     /// region [`crate::Config::resolve_region`] picked, with that config's TMSS
     /// flag. See [`Bus::new`].
     pub version: u8,
+    /// The I/O chip: the controller ports behind 0xA10003-0xA1000D and the serial
+    /// registers behind 0xA1000F-0xA1001F.
+    ///
+    /// Public because a front end has to be able to say which buttons are held:
+    /// `bus.io.set_buttons(port, buttons)` once per frame. See [`crate::Buttons`].
+    pub io: Io,
 }
 
 impl Bus {
@@ -187,6 +194,7 @@ impl Bus {
             rom,
             ram: Box::new([0; 0x10000]),
             version,
+            io: Io::new(),
         }
     }
 
@@ -290,55 +298,70 @@ impl Bus {
     /// Z80 bus word write. Placeholder for [`Region::Z80`].
     fn write_z80_word(&mut self, _addr: u32, _value: u16) {}
 
-    /// I/O byte read: the version register, then nothing.
+    /// I/O byte read: the version register, then the I/O chip.
     ///
-    /// A0 does not select between the two bytes of the register - the I/O
+    /// A0 does not select between the two bytes of a register - the I/O
     /// registers are one per two bytes and decode without it (plutiedev "I/O
     /// ports" lists them two bytes apart; BlastEm's `io_read` decodes the pair
-    /// with `location >> 1`) - so 0xA10000 answers as 0xA10001 does. Everything
-    /// else in the range is still [`OPEN_BUS`] until M3-05 (#65).
+    /// with `location >> 1`) - so 0xA10000 answers as 0xA10001 does, and 0xA10002
+    /// answers as 0xA10003 does. [`Io::read`] does that for its own registers and
+    /// answers `None` past the end of the register block, where nothing drives the
+    /// bus and [`OPEN_BUS`] is what a read gets.
     fn read_io_byte(&mut self, addr: u32) -> u8 {
         if is_version_register(addr) {
             self.version
         } else {
-            OPEN_BUS
+            self.io.read(addr).unwrap_or(OPEN_BUS)
         }
     }
 
-    /// I/O word read: the version register, in both bytes.
+    /// I/O word read: one register answers the whole 16 bit access, with its byte
+    /// in both halves.
     ///
     /// Its own function rather than two [`Bus::read_io_byte`] calls, because a
     /// word is a different access here: the register pair decodes without A0, so
-    /// one register answers the whole 16 bit access, and the answer is the byte
-    /// twice. BlastEm models it the same way - `io_read_w` in `genesis.c` reads
-    /// the register once for a word access in the I/O area and mirrors it,
+    /// one register answers the whole 16 bit access, and the answer is that byte
+    /// twice - through [`io_word`], so the version register and the port registers
+    /// of [`Region::Io`] cannot grow different word rules.
+    ///
+    /// BlastEm models it that way for the whole area: `io_read_w` in `genesis.c`
+    /// reads the register once for a word access and mirrors it,
     /// `value = value | (value << 8)`.
     ///
     /// The alternative is MAME: `src/mame/sega/megadriv.cpp` maps 0xA10000-0xA10001
     /// to a 16 bit handler returning the byte zero extended, so a word read there
     /// reports 0 in the half of the word nothing is wired to. On real hardware
-    /// that half floats, and only the byte read at 0xA10001 is documented
-    /// (plutiedev "I/O ports": the I/O registers are "byte-sized"), so no game
-    /// can be relying on either. The mirror is what keeps a word read consistent
-    /// with the two byte reads it covers.
+    /// that half floats, and only the byte read is documented (plutiedev "I/O
+    /// ports": the I/O registers are "byte-sized"), so no game can be relying on
+    /// either. The mirror is what keeps a word read consistent with the two byte
+    /// reads it covers, which is why #65 kept it rather than the ticket's "the byte
+    /// in the low half": the ticket's rule is MAME's, and taking it would have
+    /// meant rewriting what #64 settled and documented for the version register in
+    /// order to standardise the region on the half of the word nothing drives.
     ///
-    /// An odd `addr` is an address error the 68k never completes, so the pair
-    /// check is all the word case needs.
+    /// An odd `addr` is an address error the 68k never completes, so nothing here
+    /// needs to care which half of the pair was asked for.
     fn read_io_word(&mut self, addr: u32) -> u16 {
-        if is_version_register(addr) {
-            u16::from_be_bytes([self.version, self.version])
-        } else {
-            OPEN_BUS_WORD
-        }
+        io_word(self.read_io_byte(addr))
     }
 
-    /// I/O byte write. The version register is read-only, and the port registers
-    /// that take writes are still M3-05 (#65): dropped.
-    fn write_io_byte(&mut self, _addr: u32, _value: u8) {}
+    /// I/O byte write: the port and serial registers of [`Bus::io`]. The version
+    /// register is read-only, and `Io::write` drops that write along with the ones
+    /// past the end of the register block.
+    fn write_io_byte(&mut self, addr: u32, value: u8) {
+        self.io.write(addr, value);
+    }
 
-    /// I/O word write. Placeholder for the rest of [`Region::Io`], see
-    /// [`Bus::write_io_byte`].
-    fn write_io_word(&mut self, _addr: u32, _value: u16) {}
+    /// I/O word write: the low byte of `value`, which is the byte at the odd
+    /// address every register of the area is documented at.
+    ///
+    /// A 16 bit write to a byte register is not something a game does - the setup
+    /// code of plutiedev "Controllers", "Setting up", is all `move.b` - so all this
+    /// has to settle is which half of the word reaches the register, and it is the
+    /// half that a split into two byte accesses delivers.
+    fn write_io_word(&mut self, addr: u32, value: u16) {
+        self.write_io_byte(addr, value as u8);
+    }
 
     /// Z80 bus control byte read. Placeholder for [`Region::Z80Ctrl`].
     fn read_z80_ctrl_byte(&mut self, _addr: u32) -> u8 {
@@ -411,8 +434,15 @@ fn is_version_register(addr: u32) -> bool {
     (addr & EVEN_LANE) == IO_VERSION
 }
 
-// `int_ack` and `reset_devices` are deliberately left at the `m68k::Bus`
-// defaults; the module docs say why.
+/// The one word rule of [`Region::Io`]: a register answers a 16 bit access to its
+/// pair by repeating its byte into both halves. See [`Bus::read_io_word`] for the
+/// sources and for the alternative that was not taken.
+fn io_word(byte: u8) -> u16 {
+    u16::from_be_bytes([byte, byte])
+}
+
+/// `int_ack` is deliberately left at the `m68k::Bus` default; the module docs say
+/// why.
 impl m68k::Bus for Bus {
     fn read_byte(&mut self, addr: u32) -> u8 {
         let addr = addr & ADDR_MASK;
@@ -472,6 +502,13 @@ impl m68k::Bus for Bus {
             Region::Tmss => self.write_tmss_word(addr, value),
             Region::Unmapped => self.write_unmapped_word(addr, value),
         }
+    }
+
+    /// The `RESET` instruction restarts the console, so the I/O chip's registers
+    /// go back to their power-on values. Work RAM does not, and cannot: this is the
+    /// console's `RESET`, not a reinitialisation of everything the emulator holds.
+    fn reset_devices(&mut self) {
+        self.io.reset();
     }
 }
 
@@ -675,12 +712,20 @@ mod tests {
         assert_eq!(bus.read_word(0xA10000), 0xA0A0);
     }
 
-    /// Everything else [`Region::Io`] covers is still #65's to fill in: the
-    /// version register must not answer for the rest of the range.
+    /// Everything [`Region::Io`] covers past the register block at
+    /// 0xA10000-0xA1001F is still nothing's: it must read open bus, and neither
+    /// the version register nor the port registers of #65 may answer for it.
+    ///
+    /// The addresses of #64's version of this test - 0xA10003, 0xA10009, 0xA1001F
+    /// and the rest of the register block - are answered now, and
+    /// [`Bus::controller_ports_are_readable_through_the_bus`] and `io::tests` are
+    /// what cover them. The point being kept is the one the loop makes: an address
+    /// of the I/O area that no register lives at reads open bus rather than
+    /// whatever its neighbour holds.
     #[test]
-    fn io_past_the_version_register_is_still_a_stub() {
+    fn io_past_the_register_block_is_still_a_stub() {
         let mut bus = Bus::new(Vec::new(), 0x20);
-        for addr in [0xA10002, 0xA10003, 0xA10009, 0xA1001F, IO_END] {
+        for addr in [0xA10020, 0xA10021, 0xA10023, IO_END] {
             let word_addr = addr & EVEN_LANE;
             assert_eq!(bus.read_byte(addr), OPEN_BUS, "{addr:#08x} byte");
             assert_eq!(bus.read_word(word_addr), OPEN_BUS_WORD, "{word_addr:#08x}");
@@ -689,11 +734,85 @@ mod tests {
         }
     }
 
+    /// A byte read at `0xA10003` is player 1's data port: the point of wiring
+    /// [`Io`] into the `Region::Io` dispatch is that a game's
+    /// `move.b (IoData1),d0` reaches the pad, and that the two pad ports, the
+    /// expansion port and the version register beside them do not answer for each
+    /// other (plutiedev "I/O ports", "Basic usage", for the addresses).
     #[test]
-    fn int_ack_and_device_reset_keep_the_m68k_defaults() {
-        // A Genesis always autovectors, and there are no devices to reset yet.
+    fn controller_ports_are_readable_through_the_bus() {
+        use crate::io::Buttons;
+
+        let mut bus = Bus::new(Vec::new(), 0xA0);
+        bus.io.set_buttons(0, Buttons::UP);
+        bus.write_byte(0xA10009, 0x40); // ctrl port 1: TH an output, every other pin an input
+        bus.write_byte(0xA10003, 0x40); // TH high, so the pad reports the dpad and B/C
+        assert_eq!(bus.read_byte(0xA10003), 0x7E, "Up held on port 1");
+        assert_eq!(bus.read_byte(0xA10009), 0x40, "ctrl port 1 reads back");
+
+        // The other half of the TH protocol: drop TH and read A and Start.
+        bus.write_byte(0xA10003, 0x00);
+        assert_eq!(bus.read_byte(0xA10003), 0x32, "TH low, only Up held");
+
+        // Word access answers data port 1 with the byte in both halves, which is
+        // the same rule the version register uses. See `Bus::read_io_word`.
+        bus.write_byte(0xA10003, 0x40);
+        assert_eq!(
+            bus.read_word(0xA10002),
+            0x7E7E,
+            "word at the port 1 data pair"
+        );
+
+        // Port 2 is its own port with nothing on it, and the expansion port is
+        // idle too; neither saw port 1's setup or its pad.
+        bus.write_byte(0xA1000B, 0x40);
+        bus.write_byte(0xA10005, 0x40);
+        assert_eq!(bus.read_byte(0xA10005), 0x7F, "port 2, no buttons");
+        assert_eq!(
+            bus.read_byte(0xA10007),
+            0x7F,
+            "expansion port, nothing attached"
+        );
+
+        // The serial registers store through the bus, and the version register
+        // took none of this.
+        bus.write_byte(0xA1000F, 0x5A);
+        assert_eq!(bus.read_byte(0xA1000F), 0x5A);
+        assert_eq!(
+            bus.read_byte(0xA10001),
+            0xA0,
+            "version register still answers"
+        );
+    }
+
+    /// `RESET` puts the I/O chip back to its power-on values and leaves work RAM
+    /// alone: `m68k::Bus::reset_devices` is "the 68000 `RESET` instruction, which
+    /// restarts the whole console, not just the CPU", and the console's RAM
+    /// survives that.
+    #[test]
+    fn reset_devices_resets_the_io_chip_and_not_ram() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        bus.write_byte(0xA10009, 0x40);
+        bus.write_byte(0xA10003, 0x00);
+        bus.write_byte(0xA1000F, 0x5A);
+        bus.write_byte(RAM_START, 0x12);
+
+        bus.reset_devices();
+
+        assert_eq!(
+            bus.read_byte(0xA10009),
+            0x00,
+            "ctrl port 1 back to all-input"
+        );
+        assert_eq!(bus.read_byte(0xA10003), 0x7F, "data port 1 back to TH high");
+        assert_eq!(bus.read_byte(0xA1000F), 0x00, "serial register back to 0");
+        assert_eq!(bus.read_byte(RAM_START), 0x12, "work RAM survives RESET");
+    }
+
+    #[test]
+    fn int_ack_keeps_the_m68k_default() {
+        // A Genesis always autovectors, so the bus never gives the CPU a vector.
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         assert_eq!(bus.int_ack(2), None);
-        bus.reset_devices();
     }
 }
