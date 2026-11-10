@@ -3,9 +3,11 @@
 
 pub mod header;
 pub mod smd;
+pub mod sram;
 
 pub use header::{Regions, RomHeader, compute_checksum, parse_header};
 pub use smd::{deinterleave, is_smd, normalize_rom};
+pub use sram::{Sram, SramInfo, SramKind};
 
 /// Why a ROM image could not be loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
