@@ -6,10 +6,12 @@
 //! the suite's machine state into a real [`m68k::M68k`] and reads it back, and
 //! its comparison notices a single wrong byte.
 //!
-//! Nothing here runs a real instruction file to green, and that is deliberate.
-//! No instruction is implemented yet, so no instruction file can pass; the
-//! whole-suite [`all_instructions`] run reports how far the core actually is,
-//! per file and in total.
+//! Most of what follows is the harness's own fixtures: they poke one field of a
+//! hand-written case and check that the comparison notices exactly that field.
+//! Running real instruction files to green is what the per-group tests in
+//! `crates/m68k/tests/*.rs` do; the whole-suite [`all_instructions`] run here is
+//! the gate over all of them at once, and `docs/m68k-conformance.md` records
+//! what it measured.
 //!
 //! # Why the fixtures changed in #15
 //!
@@ -553,32 +555,160 @@ fn every_instruction_file_in_the_suite_is_enumerated() {
     );
 }
 
-/// Every file in the suite, one line each, then the grand total.
+/// The `Check` level the whole-suite gate runs at: state *and* clocks, with the
+/// cases that end in the suite's exception handler left out.
 ///
-/// `#[ignore]`d because no instruction is implemented yet — `step()` decodes
-/// and dispatches (M1-07, #15), so nearly every case walks into the loud
-/// `unimplemented!` path and the harness catches it per case — so this reports
-/// instead of asserting; M1-32
-/// (#42) is where it becomes a gate. Run it with
-/// `cargo nextest run -p m68k --run-ignored all --no-capture all_instructions`;
-/// `just test-all` on `main` runs it too, but nextest hides the output of a test
-/// that passes, so its counts only reach the CI log once #186 lands.
-#[test]
-#[ignore = "reports the whole suite; no instruction is implemented yet"]
-fn all_instructions() {
-    let reports = harness::run_all_files(harness::Check::StateSkipAddressErrors);
-    let files = reports.len();
-    let files_passed = reports
+/// State-only would leave the clock tables unmeasured, and the exception cases
+/// cannot be checked at any level until #223 lands, so this is the strictest
+/// level the suite can be held to today.
+const GATE_CHECK: harness::Check = harness::Check::StateAndCyclesSkipAddressErrors;
+
+/// Files the gate lets fail, each with the issue that carries it, as
+/// `(file, issue)` with a comment saying what fails and on which axis.
+///
+/// This list is the whole of the suite's outstanding failure budget, so it is
+/// checked both ways: a file that fails and is not here fails the gate, and a
+/// file here that passes fails it too (see [`gate_diff`]). The list cannot
+/// quietly grow stale, and `docs/m68k-conformance.md` documents the same set with
+/// the measured numbers.
+const KNOWN_FAILURES: &[(&str, &str)] = &[
+    // Two cases, state, not clocks: their recorded `final.d2` cannot come from
+    // their own `initial.d2` on any machine. Upstream data bug, #209; the
+    // same two cases `shifts.rs` drops from `asl_b_file_passes`.
+    ("ASL.b", "#209"),
+    // Clocks only — every CHK case's state matches, which is what the
+    // `Check::StateSkipAddressErrors` per-file test already proves. 4948 of the
+    // 8065 cases run (the rest are the exception cases) and all 4948 are 4 or 6
+    // clocks below the suite's `length`: a trapped CHK wants 38 + ea and a
+    // passing one wants 10 + ea, against this core's 34 + ea and 4 + ea.
+    // #241 carries the CHK clock law.
+    ("CHK", "#241"),
+];
+
+/// The files that failed without an issue, and the issues whose files now pass.
+///
+/// A known file that has gone missing from the suite counts as "now passes":
+/// the pin moved under us and the gate should say so rather than stop covering it.
+fn gate_diff(reports: &[(String, harness::Report)]) -> (Vec<String>, Vec<String>) {
+    let unlisted = reports
         .iter()
-        .filter(|(_, report)| report.failures.is_empty())
-        .count();
-    let cases: usize = reports.iter().map(|(_, report)| report.total).sum();
-    let passed: usize = reports.iter().map(|(_, report)| report.passed).sum();
-    let skipped: usize = reports.iter().map(|(_, report)| report.skipped).sum();
+        .filter(|(_, report)| report.failed() > 0)
+        .map(|(name, _)| name)
+        .filter(|name| {
+            KNOWN_FAILURES
+                .iter()
+                .all(|(file, _)| *file != name.as_str())
+        })
+        .map(String::from)
+        .collect();
+    let stale = KNOWN_FAILURES
+        .iter()
+        .filter(|(file, _)| {
+            reports
+                .iter()
+                .all(|(name, report)| name != *file || report.failed() == 0)
+        })
+        .map(|(file, _)| (*file).to_string())
+        .collect();
+    (unlisted, stale)
+}
+
+/// One row per file, sorted: file, total, passed, failed, skipped.
+///
+/// `run_all_files` sorts by name, so two sweeps produce two tables that diff.
+fn print_table(reports: &[(String, harness::Report)]) {
     println!(
-        "68000 SingleStepTests: {files_passed}/{files} files pass; \
-         {passed}/{cases} cases passed, {skipped} cases skipped as exceptions \
-         (Check::StateSkipAddressErrors, #185 / M1-29 #37), {} files failed",
-        files - files_passed,
+        "{:<16}{:>8}{:>8}{:>8}{:>8}",
+        "file", "total", "passed", "failed", "skipped"
+    );
+    for (name, report) in reports {
+        println!(
+            "{name:<16}{:>8}{:>8}{:>8}{:>8}",
+            report.total,
+            report.passed,
+            report.failed(),
+            report.skipped
+        );
+    }
+}
+
+/// The failure lines each [`harness::Report`] kept, under a heading naming the
+/// file and its issue, so a reader sees the mismatch rather than inferring it
+/// from a table cell.
+fn print_failures(reports: &[(String, harness::Report)]) {
+    for (name, report) in reports {
+        if report.failed() == 0 {
+            continue;
+        }
+        let issue = KNOWN_FAILURES
+            .iter()
+            .find(|(file, _)| *file == name)
+            .map_or(String::new(), |(_, issue)| format!(" ({issue})"));
+        println!("\n{name}{issue}: {} failing cases", report.failed());
+        for failure in &report.failures {
+            println!("  {failure}");
+        }
+    }
+}
+
+/// The grand total under the table: files, cases, skipped cases, failures.
+fn print_totals(reports: &[(String, harness::Report)]) {
+    let sum = |pick: fn(&harness::Report) -> usize| -> usize {
+        reports.iter().map(|(_, report)| pick(report)).sum()
+    };
+    let failing = reports
+        .iter()
+        .filter(|(_, report)| report.failed() > 0)
+        .count();
+    println!(
+        "\n{} files: {}/{} cases passed, {} cases skipped as exceptions, \
+         {} cases failing in {failing} files",
+        reports.len(),
+        sum(|report| report.passed),
+        sum(|report| report.total),
+        sum(|report| report.skipped),
+        sum(|report| report.failed()),
+    );
+}
+
+/// The whole 68000 SingleStepTests suite in one run: every file, [`GATE_CHECK`],
+/// printed as a per-file table and then gated.
+///
+/// It gates exactly as far as [`KNOWN_FAILURES`] says: one more failing file, or
+/// one fewer, and the test fails with the difference. The gate is not the only
+/// place a failure is recorded — `docs/m68k-conformance.md` holds the same list
+/// with the numbers and the reason, and one issue per entry.
+///
+/// `#[ignore]`d so `just check` does not read the 195 MB suite; `just test-all`
+/// and the dedicated CI step (`just test-all` is main-only) run it. Nextest
+/// hides the output of a passing test, so the table only reaches the CI log from
+/// the step that passes `--no-capture`; #186 is about the rest of `just
+/// test-all`. Run it by hand with
+/// `cargo nextest run -p m68k --run-ignored all --no-capture all_instructions`.
+#[test]
+#[ignore = "whole-suite 68000 conformance gate; run with --run-ignored all"]
+fn all_instructions() {
+    let started = std::time::Instant::now();
+    let reports = harness::run_all_files(GATE_CHECK);
+    // Timed because CI keeps or drops this run on the number: see the runtime
+    // recorded in docs/m68k-conformance.md.
+    let sweep_seconds = started.elapsed().as_secs_f64();
+    if reports.is_empty() {
+        // No data root: `run_all_files` already printed `SKIPPED:` for the
+        // suite directory, and `just check` has to stay green without it.
+        return;
+    }
+    print_table(&reports);
+    print_failures(&reports);
+    print_totals(&reports);
+    println!("sweep took {sweep_seconds:.1}s");
+
+    let (unlisted, stale) = gate_diff(&reports);
+    assert!(
+        unlisted.is_empty() && stale.is_empty(),
+        "conformance gate at {GATE_CHECK:?} disagrees with KNOWN_FAILURES and docs/m68k-conformance.md:\n \
+         {unlisted:?} fail without an issue\n \
+         {stale:?} are listed but no longer fail\n\
+         update KNOWN_FAILURES and docs/m68k-conformance.md together."
     );
 }

@@ -37,9 +37,12 @@ CPU conformance runs against the fetched SingleStepTests suites and skips (does
 not fail) when the data is absent, so `just check` is green with or without
 `just fetch`. Coverage is per opcode file: implementing a group means adding a
 test that names its files, e.g. `harness::run_files(&["40", "41"])` in
-`crates/z80/tests/`. The whole-suite runs (`all_opcodes` for the Z80) are
-`#[ignore]`d and report per file instead of asserting, so they are useful before
-the instructions exist; `just test-all`, which runs on `main`, includes them.
+`crates/z80/tests/`. The whole-suite runs are `#[ignore]`d so `just check` stays
+quick: `all_instructions` for the m68k, which gates all 124 files at state and
+clock level and is recorded in [`m68k-conformance.md`](m68k-conformance.md), and
+`all_opcodes` for the Z80, which still reports per file instead of asserting so
+it is useful before the instructions exist. `just test-all`, which runs on
+`main`, includes both.
 
 ## External test data
 
@@ -98,7 +101,11 @@ wall of `SKIPPED`.
 Heavy suites (full SingleStepTests, long ROM runs) are `#[ignore]` by default
 and run with `cargo nextest run --run-ignored all` or `just test-all`. CI runs
 `just test-all` as an extra step on pushes to `main`, so the slow suites report
-on main without making every PR wait for them.
+on main without making every PR wait for them. The 68000 conformance gate is the
+exception: at 3.7 s it runs as its own CI step on every push and pull request,
+with `--no-capture` so its per-file table reaches the log ([#186](https://github.com/scottjab/rustsega/issues/186)
+tracks making `just test-all` do the same for every passing test). See
+[`m68k-conformance.md`](m68k-conformance.md).
 
 ## Known public test data
 
