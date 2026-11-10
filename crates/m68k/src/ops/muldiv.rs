@@ -875,30 +875,6 @@ mod tests {
         );
     }
 
-    /// The `DIVU` clock count at three points taken straight out of
-    /// `DIVU.json.gz` — the cheapest divide its 613 completed `Dn` cases
-    /// contain, its worst case, and two between them — so the walk of
-    /// [`div_loops`] is pinned against the chip rather than against itself. The
-    /// worst case is 130 clocks for a `Dn` source, and the 63 loops behind it
-    /// are the 63 the manual's 140-clock worst case divides out to
-    /// (`14 + 2 • 63`): the two agree on `n` and differ by the ten clocks of
-    /// fixed time this core does not charge ([#238], [`div_clocks`]).
-    #[test]
-    fn divu_timing_examples() {
-        for (dividend, divisor, want) in [
-            (0xAFCC_BF14i32, 0xEB2Bi32, 88), //  n = 42, the cheapest in the file
-            (0x4B85_A7DA, 0xE436, 104),      //  n = 50
-            (0x6679_284B, 0xC0CD, 130),      //  n = 63, the worst case
-        ] {
-            let (cpu, cycles) = divide(DIVU, dividend, divisor);
-            assert_eq!(
-                cycles, want,
-                "DIVU ${dividend:08X}/${divisor:04X}, quotient ${:08X}",
-                cpu.d[0] & 0xFFFF
-            );
-        }
-    }
-
     /// The clock count is the walk's, not the answer's: `DIVU.json.gz` contains
     /// two divides with the same quotient `$9F67` that cost 106 and 116 clocks,
     /// and the whole reason #238 exists is that no count of the quotient — set
@@ -919,31 +895,21 @@ mod tests {
         assert_eq!(same, also, "but not in the walk");
     }
 
-    /// The `DIVS` clock count: the same walk over the absolute values, at the
-    /// three measured points of `DIVS.json.gz` — 126, 136 and its worst case
-    /// 152 — plus the two sign terms of [`div_loops`] in isolation, on four
-    /// divides whose walk is identical because only their signs differ.
+    /// The two sign terms of [`div_loops`] in isolation: four divides whose walk
+    /// is identical because only their signs differ, so the differences between
+    /// them are exactly the two loops a negative dividend costs and the one loop
+    /// that puts a negative quotient back. The absolute-value points of the same
+    /// law are checked against the chip by `divs_file_passes` (#238).
     #[test]
-    fn divs_timing_examples() {
-        for (dividend, divisor, want) in [
-            (0x23CD_47A1i32, 0x47A1i32, 126), //  n = 61, the cheapest in the file
-            (0x191D_87A8, 0xB4A8, 136),       //  n = 66
-            (0xFF92_A491u32 as i32, 0x6B10, 152), //  n = 74: negative dividend, negative quotient
-        ] {
-            let (cpu, cycles) = divide(DIVS, dividend, divisor);
-            assert_eq!(
-                cycles, want,
-                "DIVS ${dividend:08X}/${divisor:04X}, quotient ${:08X}",
-                cpu.d[0] & 0xFFFF
-            );
-        }
-
-        // 7 / 2 four ways: one walk, four sign treatments, and the differences
-        // are exactly the two loops a negative dividend costs and the one loop
-        // of putting a negative quotient back.
+    fn divs_sign_corrections_cost_loops() {
+        // 7 / 2 four ways: one walk, four sign treatments.
         let plus = divide(DIVS, 7, 2).1;
         assert_eq!(divide(DIVS, 7, -2).1, plus + 2, "signs differ: one loop");
-        assert_eq!(divide(DIVS, -7, -2).1, plus + 4, "negative dividend, signs agree");
+        assert_eq!(
+            divide(DIVS, -7, -2).1,
+            plus + 4,
+            "negative dividend, signs agree"
+        );
         assert_eq!(divide(DIVS, -7, 2).1, plus + 6, "both terms at once");
     }
 }
