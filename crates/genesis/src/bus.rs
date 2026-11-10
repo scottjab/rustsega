@@ -168,7 +168,13 @@ pub struct Bus {
     /// registers behind 0xA1000F-0xA1001F.
     ///
     /// Public because a front end has to be able to say which buttons are held:
-    /// `bus.io.set_buttons(port, buttons)` once per frame. See [`crate::Buttons`].
+    /// `bus.io.set_buttons(port, buttons)` once per frame, or
+    /// `bus.io.set_buttons_6(port, buttons)` for a 6-button pad. See
+    /// [`crate::Buttons`].
+    ///
+    /// The bus holds no cycle counter for the pads' `TH` timeouts: M3-14 #75,
+    /// the scheduler, is the thing that will know what time it is, and it says so
+    /// with `bus.io.set_time(cycles)` ([`Io::set_time`]).
     pub io: Io,
 }
 

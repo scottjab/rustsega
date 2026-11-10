@@ -17,4 +17,4 @@ pub use config::{Config, Region, RegionSetting};
 // `Buttons` is what a front end feeds the emulated pads: docs/ARCHITECTURE.md,
 // "Input: one `InputState` that merges keyboard, Gamepad API, and touch overlay
 // into `Buttons` per port".
-pub use io::{Buttons, Device, Io, Port};
+pub use io::{Buttons, Device, Io, Pad6State, Port};
