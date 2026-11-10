@@ -19,6 +19,14 @@
 //! costs one `and` on a value that is already in a register and guarantees the
 //! region functions never see an address outside the region that decoded them.
 //!
+//! ## The TMSS gate
+//!
+//! On a console that reports a TMSS in the version register, nothing behind
+//! [`Region::Vdp`] can be reached until the 68k has written `SEGA` to
+//! [`TMSS_SECURITY`]; a try before that freezes the CPU. The check is one line in
+//! each [`m68k::Bus`] dispatch arm, in front of the region's own functions, so that
+//! the ticket filling the VDP in cannot miss it - see [`Bus::vdp_access_denied`].
+//!
 //! ## Reading what is not there
 //!
 //! Reads from an area nothing drives return `OPEN_BUS` (0xFF) and writes there
@@ -86,6 +94,31 @@ const Z80_RESET_REG: u32 = 0xA11200;
 /// as `(address >> 8) & 0xFF` in `ctrl_io_write_byte`; MAME maps only the two
 /// addresses themselves (`map(0xa11100, 0xa11101)`), which the mask still hits.
 const Z80_CTRL_MASK: u32 = !0xFF;
+/// The TMSS security register: the four bytes a TMSS console listens to for the
+/// long `move.l #"SEGA", $A14000` that releases the VDP (segaretro "TradeMark
+/// Security System", "Design", and [`TMSS_SECURITY_STRING`] for the value).
+///
+/// Just the longword, not the whole 0xA14000-0xA14FFF area: that is what segaretro
+/// names and what BlastEm decodes (`location == 0xA14000 || location == 0xA14002`
+/// for a word, `0xA14000..=0xA14003` for a byte in `write_tmss`). Genesis Plus GX
+/// takes the whole 0xA140 page (`case 0x40` of `ctrl_io_write_byte`), which no game
+/// has ever needed.
+const TMSS_SECURITY: u32 = TMSS_START;
+/// Address mask that names [`TMSS_SECURITY`] from an address in [`Region::Tmss`]:
+/// the register is a longword, so dropping A0-A1 is what is left of its decode.
+const TMSS_SECURITY_MASK: u32 = !3;
+/// What [`TMSS_SECURITY`] must be written with, in address order: `S`,`E`,`G`,`A`.
+const TMSS_SECURITY_STRING: [u8; 4] = *b"SEGA";
+/// The TMSS ROM select register, `0xA14101` of the cartridge slot extra area: bit 0
+/// selects the cartridge (1) or the TMSS boot ROM (0) at 0x000000. segaretro
+/// "TradeMark Security System"; Genesis Plus GX's `gen_bankswitch_w` takes
+/// `data & 1` for the pair.
+const TMSS_ROM_SELECT: u32 = 0xA14100;
+/// The bits of the version register that say whether this console has a TMSS: the
+/// hardware version number, bits 3-0, of which 1 is TMSS and 0 is "no TMSS"
+/// (see [`crate::Region::version_register`]). BlastEm asks the same question with
+/// `version_reg & 0xF` in `io_write`.
+const TMSS_VERSION_MASK: u8 = 0x0F;
 /// Only these bits of a 68k address in [`Region::Z80`] reach the Z80's bus: the 68k
 /// drops its top byte at the sound side, so 0xA08000 is 0xA00000 again. BlastEm
 /// masks a 68k access to the area with `0x7FFF`, and Genesis Plus GX decodes it with
@@ -121,6 +154,10 @@ enum Region {
     Ram,
     /// 0xC00000-0xDFFFFF, VDP and PSG ports.
     ///
+    /// Every access to this area passes the TMSS gate in the dispatch below first:
+    /// on a TMSS console nothing here is reachable at all until the security string
+    /// arrives (see [`Bus::vdp_access_denied`]).
+    ///
     /// TODO(M3-09 #69): the data/control/HV-counter/PSG ports at
     /// 0xC00000-0xC0001C, mirrored every 0x40 (plutiedev "Memory map").
     Vdp,
@@ -145,10 +182,11 @@ enum Region {
     /// TODO(M3-11 #71): SRAM control at 0xA130F1-0xA130FF.
     /// TODO(M3-12 #72): the Sega SSF2 mapper in the same block.
     CartExtra,
-    /// 0xA14000-0xA14FFF, TMSS ports.
+    /// 0xA14000-0xA14FFF, TMSS ports: the security register at
+    /// [`TMSS_SECURITY`] and the ROM select register at [`TMSS_ROM_SELECT`].
     ///
-    /// TODO(M3-10 #70): the revision register at 0xA14000 and the MMU registers
-    /// at 0xA14101.
+    /// Only a TMSS console answers either; the rest of the area reads
+    /// [`OPEN_BUS`] and drops writes.
     Tmss,
     /// Everything the console does not decode: the expansion slot at
     /// 0x400000-0x7FFFFF, the 32X area at 0x800000-0x9FFFFF, the Sega CD extra
@@ -238,6 +276,34 @@ pub struct Bus {
     /// `PC` at 0, and the bus cannot reach into the CPU to do it, so the scheduler
     /// (M3-14 #75) asks with this.
     z80_reset_pulse: bool,
+    /// How far through [`TMSS_SECURITY_STRING`] the writes to [`TMSS_SECURITY`] have
+    /// got: the index of the byte the next one has to be.
+    ///
+    /// The detector, rather than an image of the register: segaretro "TradeMark
+    /// Security System" only says the console watches for the string, and a wrong
+    /// byte abandons the attempt (`tmss_seek` back to 0) rather than doing anything
+    /// else to the machine. See [`Bus::feed_tmss`].
+    tmss_seek: usize,
+    /// Has the 68k written the security string, so that [`Region::Vdp`] is released?
+    ///
+    /// Always false on a console without TMSS ([`Bus::tmss_enabled`] is false),
+    /// because there is nothing to write and nothing locks either.
+    tmss_unlocked: bool,
+    /// Has a VDP access been refused by TMSS, freezing the 68k?
+    ///
+    /// On real hardware there is no recovery from this short of a reset, so nothing
+    /// here clears it but [`m68k::Bus::reset_devices`] - which is why it is a flag on
+    /// the bus and not just a dropped access. See [`Bus::locked_up`] for who acts on
+    /// it.
+    locked_up: bool,
+    /// Bit 0 of [`TMSS_ROM_SELECT`]: 1 for the cartridge at 0x000000, 0 for the
+    /// TMSS boot ROM. Stored and nothing more - this emulator ships no boot ROM, so
+    /// the cart stays mapped whatever this says (see [`Bus::write_tmss_byte`]).
+    ///
+    /// Public because the ticket that ships a TMSS boot ROM is the thing that will
+    /// switch the cartridge slot on it, and reading it back is all that ticket needs
+    /// of #70; nothing here reads it.
+    pub tmss_cart_selected: bool,
 }
 
 impl Bus {
@@ -268,6 +334,11 @@ impl Bus {
     /// the parts of the config that are not addresses - and taking it at all,
     /// instead of defaulting a region here, is what stops a bus existing that
     /// quietly lies to a game about the machine it is running on.
+    ///
+    /// It is also the one thing that decides whether the VDP is locked: the hardware
+    /// version number in that byte *is* TMSS, so a bus built from
+    /// `region.version_register(config.tmss)` locks its VDP exactly when the config
+    /// asked for TMSS and never otherwise. See [`Bus::tmss_enabled`].
     pub fn new(rom: Vec<u8>, version: u8) -> Self {
         Self {
             rom,
@@ -278,7 +349,105 @@ impl Bus {
             z80_busreq: false,
             z80_reset: true,
             z80_reset_pulse: false,
+            tmss_seek: 0,
+            tmss_unlocked: false,
+            locked_up: false,
+            // A TMSS console comes out of reset with its own boot ROM in front of the
+            // cart (Genesis Plus GX's `gen_reset` maps `boot_rom` at 0x000000 again),
+            // so the select bit starts at 0. The cart is what answers 0x000000 here
+            // either way: no boot ROM ships.
+            tmss_cart_selected: false,
         }
+    }
+
+    /// Does this console have a TMSS at all?
+    ///
+    /// The version register's hardware version number answers it: [`Bus::new`] is
+    /// handed the byte the caller built with
+    /// [`crate::Region::version_register`], and that bit is [`crate::Config::tmss`].
+    /// Deriving the lock from the register rather than carrying a second copy of the
+    /// config means "the register says TMSS, the behaviour says off" cannot happen.
+    /// BlastEm asks the same question the same way (`has_tmss = version_reg & 0xF` in
+    /// `io_write`).
+    fn tmss_enabled(&self) -> bool {
+        self.version & TMSS_VERSION_MASK != 0
+    }
+
+    /// Is [`Region::Vdp`] being held by TMSS: this console has one, and the security
+    /// string has not been written?
+    fn vdp_locked(&self) -> bool {
+        self.tmss_enabled() && !self.tmss_unlocked
+    }
+
+    /// Has this access to [`Region::Vdp`] been refused: is the VDP held by TMSS?
+    ///
+    /// Asking is also what records the lock-up, because a refused VDP access is the
+    /// lock-up: on real hardware the next access to the VDP before `SEGA` freezes the
+    /// 68000 (segaretro "TradeMark Security System": "the next VDP data port access
+    /// will cause the 68000 to lock up - this is performed by the I/O controller"),
+    /// so this sets [`Bus::locked_up`] and the caller drops the access - reads return
+    /// [`OPEN_BUS`] as every other refused access here does, writes go nowhere.
+    ///
+    /// It is called from the `Region::Vdp` arms of the [`m68k::Bus`] dispatch, not
+    /// from `read_vdp_*`/`write_vdp_*`, and that is deliberate: those four functions
+    /// belong to M3-09 (#69) and a lock check written inside them is a lock check
+    /// that gets rewritten away. M3-09: fill the stubs in and this still holds - just
+    /// do not move the check into them.
+    ///
+    /// The scope is the whole area, which is what Genesis Plus GX does by pointing
+    /// all of 0xC0-0xDF at its lockup handlers in `gen_tmss_w`: data, control, HV
+    /// counter, debug and **PSG** ports, the every-0x40 mirrors and the
+    /// 0xC00020-0xC0003F hang-up corner. The PSG port at 0xC00011 locks because it
+    /// lives in the VDP's port pair (plutiedev "Memory map") and is reached from here.
+    /// The Z80's own route to that port ([`SoundSide::Psg`], `0xA07F11`) is *not*
+    /// gated here, and that is a boundary rather than an oversight: it is the sound
+    /// side's path, #67 and #68 settled it without TMSS in it, and this bus only
+    /// freezes what the 68k asked for. Genesis Plus GX locks that route as well
+    /// (`zbank_memory_map` in `gen_tmss_w`), so
+    /// [#262](https://github.com/scottjab/rustsega/issues/262) is open on whether we
+    /// should.
+    fn vdp_access_denied(&mut self) -> bool {
+        if !self.vdp_locked() {
+            return false;
+        }
+        self.locked_up = true;
+        true
+    }
+
+    /// Feed one byte of the security string to the detector at [`TMSS_SECURITY`].
+    ///
+    /// Bytes arrive in the order the 68k writes them, which is the order that matters
+    /// here: `move.l #"SEGA", (A14000).l` is two word writes with the high word first
+    /// (`m68k::cpu`, "a long is two word accesses, high word first"), so `S` `E`
+    /// `G` `A`, and four `move.b`s in address order are the same four bytes.
+    ///
+    /// A byte that is not the next one of `SEGA` restarts the detector: the console
+    /// has stopped paying attention to this attempt, and the machine is untouched.
+    /// A console without a TMSS ignores its security register entirely (BlastEm's
+    /// `write_tmss` only accepts the string when the version register claims TMSS).
+    fn feed_tmss(&mut self, byte: u8) {
+        if !self.tmss_enabled() || self.tmss_unlocked {
+            return;
+        }
+        if byte != TMSS_SECURITY_STRING[self.tmss_seek] {
+            self.tmss_seek = 0;
+            return;
+        }
+        self.tmss_seek += 1;
+        if self.tmss_seek == TMSS_SECURITY_STRING.len() {
+            self.tmss_unlocked = true;
+        }
+    }
+
+    /// Has a VDP access frozen the 68k, so that it must not be stepped any more?
+    ///
+    /// This is the question the scheduler asks; it has no other effect today, which
+    /// is why the flag lives on the bus rather than stopping anything itself.
+    ///
+    /// TODO(M3-14 #75): freeze the 68k while this is set. Nothing clears it but
+    /// `RESET` - see [`m68k::Bus::reset_devices`].
+    pub fn locked_up(&self) -> bool {
+        self.locked_up
     }
 
     /// May the Z80 run: it is neither held in reset nor has the 68k taken its bus.
@@ -423,6 +592,10 @@ impl Bus {
     /// where a real console reads the VDP data port, the status register, the HV
     /// counter or nothing, and 0xC00020-0xC0003F hangs the bus (plutiedev
     /// "Memory map").
+    ///
+    /// The TMSS gate is not here: it is in the dispatch, in front of every
+    /// `Region::Vdp` arm, so that filling these four functions in cannot lose it. See
+    /// [`Bus::vdp_access_denied`].
     fn read_vdp_byte(&mut self, _addr: u32) -> u8 {
         OPEN_BUS
     }
@@ -632,21 +805,62 @@ impl Bus {
     /// Cartridge slot extra word write. Placeholder for [`Region::CartExtra`].
     fn write_cart_extra_word(&mut self, _addr: u32, _value: u16) {}
 
-    /// TMSS port byte read. Placeholder for [`Region::Tmss`].
+    /// TMSS port byte read: nothing here is readable.
+    ///
+    /// TODO(M3-16 #77): reading [`TMSS_SECURITY`] back returns the bytes written to
+    /// it (BlastEm answers from its `tmss_lock` pair, Genesis Plus GX from its
+    /// `tmss[4]` image) and reading [`TMSS_ROM_SELECT`] back returns its bit 0
+    /// (Genesis Plus GX's `gen_bankswitch_r`). Neither is asked for by a game - the
+    /// security register exists for the 68k to write, and the TMSS boot ROM that
+    /// would read the select bit does not ship - so they are open bus, like the rest
+    /// of what nothing drives.
     fn read_tmss_byte(&mut self, _addr: u32) -> u8 {
         OPEN_BUS
     }
 
-    /// TMSS port word read. Placeholder for [`Region::Tmss`].
+    /// TMSS port word read. Nothing is readable; see [`Bus::read_tmss_byte`].
     fn read_tmss_word(&mut self, _addr: u32) -> u16 {
         OPEN_BUS_WORD
     }
 
-    /// TMSS port byte write. Placeholder for [`Region::Tmss`].
-    fn write_tmss_byte(&mut self, _addr: u32, _value: u8) {}
+    /// TMSS port byte write: one more byte of the security string, or the ROM select
+    /// bit.
+    ///
+    /// `0xA14101` bit 0 says whether the cartridge or the TMSS boot ROM is mapped at
+    /// 0x000000 (segaretro "TradeMark Security System"; Genesis Plus GX's
+    /// `gen_bankswitch_w`). This emulator ships no boot ROM, so **the cart stays
+    /// mapped whatever this bit says** and writing it only stores it, which is what
+    /// lets a program that has already written `SEGA` carry straight on. Without TMSS
+    /// neither register is there, and the write is dropped.
+    fn write_tmss_byte(&mut self, addr: u32, value: u8) {
+        if (addr & TMSS_SECURITY_MASK) == TMSS_SECURITY {
+            self.feed_tmss(value);
+        } else if (addr & EVEN_LANE) == TMSS_ROM_SELECT {
+            // The pair, not just 0xA14101: like the I/O registers these decode
+            // without A0, which is how BlastEm takes them too (`location == 0xA14100
+            // || location == 0xA14101`).
+            if self.tmss_enabled() {
+                self.tmss_cart_selected = value & 1 != 0;
+            }
+        }
+    }
 
-    /// TMSS port word write. Placeholder for [`Region::Tmss`].
-    fn write_tmss_word(&mut self, _addr: u32, _value: u16) {}
+    /// TMSS port word write: both halves of the word are data, high byte first.
+    ///
+    /// Unlike every other word write on this bus, which takes one of its two bytes,
+    /// this one is a 32 bit register arriving as two 16 bit writes: the security
+    /// register is a longword and `move.l #"SEGA", (A14000).l` is the documented way
+    /// to write it (segaretro "TradeMark Security System"). The core issues the high
+    /// word first, so the bytes reach [`Bus::feed_tmss`] in `SEGA` order.
+    ///
+    /// A 16 bit write to the [`TMSS_ROM_SELECT`] pair goes through both lanes too, and
+    /// the one that lands on 0xA14101 - the low byte, the lane the register is
+    /// documented at - is the one that ends up stored, the same rule as
+    /// [`Bus::write_io_word`].
+    fn write_tmss_word(&mut self, addr: u32, value: u16) {
+        self.write_tmss_byte(addr, (value >> 8) as u8);
+        self.write_tmss_byte(addr + 1, value as u8);
+    }
 
     /// Undecoded byte read. Placeholder for [`Region::Unmapped`].
     fn read_unmapped_byte(&mut self, _addr: u32) -> u8 {
@@ -793,6 +1007,10 @@ impl m68k::Bus for Bus {
         match Region::decode(addr) {
             Region::Rom => self.read_rom_byte(addr),
             Region::Ram => self.read_ram_byte(addr),
+            // The TMSS gate: asking costs the access on a locked console. It lives in
+            // the dispatch rather than in `read_vdp_byte` so that M3-09 (#69) cannot
+            // fill the stub in and lose it - see [`Bus::vdp_access_denied`].
+            Region::Vdp if self.vdp_access_denied() => OPEN_BUS,
             Region::Vdp => self.read_vdp_byte(addr),
             Region::Z80 => self.read_z80_byte(addr),
             Region::Io => self.read_io_byte(addr),
@@ -808,6 +1026,8 @@ impl m68k::Bus for Bus {
         match Region::decode(addr) {
             Region::Rom => self.read_rom_word(addr),
             Region::Ram => self.read_ram_word(addr),
+            // TMSS, and see the note on [`Bus::read_byte`].
+            Region::Vdp if self.vdp_access_denied() => OPEN_BUS_WORD,
             Region::Vdp => self.read_vdp_word(addr),
             Region::Z80 => self.read_z80_word(addr),
             Region::Io => self.read_io_word(addr),
@@ -823,6 +1043,8 @@ impl m68k::Bus for Bus {
         match Region::decode(addr) {
             Region::Rom => self.write_rom_byte(addr, value),
             Region::Ram => self.write_ram_byte(addr, value),
+            // TMSS, and see the note on [`Bus::read_byte`].
+            Region::Vdp if self.vdp_access_denied() => {}
             Region::Vdp => self.write_vdp_byte(addr, value),
             Region::Z80 => self.write_z80_byte(addr, value),
             Region::Io => self.write_io_byte(addr, value),
@@ -838,6 +1060,8 @@ impl m68k::Bus for Bus {
         match Region::decode(addr) {
             Region::Rom => self.write_rom_word(addr, value),
             Region::Ram => self.write_ram_word(addr, value),
+            // TMSS, and see the note on [`Bus::read_byte`].
+            Region::Vdp if self.vdp_access_denied() => {}
             Region::Vdp => self.write_vdp_word(addr, value),
             Region::Z80 => self.write_z80_word(addr, value),
             Region::Io => self.write_io_word(addr, value),
@@ -851,6 +1075,8 @@ impl m68k::Bus for Bus {
     /// The `RESET` instruction restarts the console, so the I/O chip's registers
     /// go back to their power-on values. Work RAM does not, and cannot: this is the
     /// console's `RESET`, not a reinitialisation of everything the emulator holds.
+    /// TMSS is restarted too - the security string is forgotten and the VDP locked
+    /// again, while any freeze goes with the CPU that `RESET` has just restarted.
     ///
     /// Neither do the Z80's two control lines: they go back the way [`Bus::new`] leaves
     /// them, under reset and with the bus the Z80's own, taking the grant the 68k was
@@ -872,6 +1098,21 @@ impl m68k::Bus for Bus {
         self.z80_reset_pulse = false;
         self.z80.ym_reset();
         self.z80.bank = 0;
+        // TMSS: `RESET` restarts the console, and a console that restarts asks the
+        // security question again. Genesis Plus GX's `gen_reset` clears its TMSS
+        // register and reinstalls the lockup handlers for exactly this ("clear TMSS
+        // register", "VDP access is locked by default"), so a game has to write
+        // `SEGA` once more before it may touch the VDP. The cart select bit goes back
+        // to the boot ROM with it, and the detector goes back to the start of `SEGA`.
+        //
+        // The freeze goes the other way. It belongs to the 68k, and `RESET` has just
+        // restarted the 68k: a machine that stayed frozen through a reset could not be
+        // restarted by one, so clearing the flag is the only thing that makes the
+        // instruction mean what it says.
+        self.tmss_seek = 0;
+        self.tmss_unlocked = false;
+        self.locked_up = false;
+        self.tmss_cart_selected = false;
     }
 }
 
@@ -1563,5 +1804,281 @@ mod tests {
         );
         assert_eq!(bus.z80.bank, 0, "the bank register belongs to this reset");
         assert_eq!(bus.z80.ram[0x0010], 0x5A, "sound RAM survives RESET");
+    }
+
+    // ---- TMSS: the trademark security lock on VDP access (M3-10 #70) ----
+    //
+    // A TMSS console holds the VDP off until the 68k has written the long "SEGA" to
+    // 0xA14000. segaretro "TradeMark Security System", "Design": "Write a long word
+    // containing "SEGA" (all caps) to address 00 A14000 before accessing the VDP data
+    // port (00 C00000). If the game fails to do this, the next VDP data port access
+    // will cause the 68000 to lock up - this is performed by the I/O controller."
+    // The port addresses and their mirroring are plutiedev "Memory map".
+
+    /// A machine that reports no TMSS: [`crate::Region::Usa`] without the bit, which
+    /// is [`TEST_VERSION`] and what [`crate::Config::default`] asks for.
+    const NO_TMSS: u8 = 0xA0;
+    /// The same machine with the TMSS bit of the version register set, which is how
+    /// [`crate::Region::version_register`] says "I have a TMSS".
+    const WITH_TMSS: u8 = 0xA1;
+
+    /// Write the security string the way a game's `move.l #"SEGA", (A14000).l` does:
+    /// two word writes, high word first, because the 68k splits a long into two word
+    /// accesses in that order (`m68k::cpu`, "a long is two word accesses, high word
+    /// first"). So `0x5345` then `0x4741` - the bytes of `SEGA` in order.
+    fn write_sega(bus: &mut Bus) {
+        bus.write_word(TMSS_SECURITY, 0x5345);
+        bus.write_word(TMSS_SECURITY + 2, 0x4741);
+    }
+
+    /// One of every kind of access this bus offers, across the VDP window: data,
+    /// control and PSG ports, the hang-up corner, a mirror and the top of the area.
+    /// Reads and writes, both widths. What the VDP answers is M3-09 (#69)'s; what
+    /// TMSS does about it is what these tests are about, and that shows as
+    /// [`Bus::locked_up`].
+    fn touch_vdp(bus: &mut Bus) {
+        for addr in [
+            0xC00000,
+            0xC00004,
+            0xC00008,
+            0xC00011,
+            0xC00020,
+            0xC00040,
+            VDP_END - 1,
+        ] {
+            let _ = bus.read_byte(addr);
+            let _ = bus.read_word(addr & EVEN_LANE);
+            bus.write_byte(addr, 0x5A);
+            bus.write_word(addr & EVEN_LANE, 0x5A5A);
+        }
+    }
+
+    /// With TMSS off - what [`crate::Config::default`] asks for and so what most
+    /// games on most emulated consoles get - the VDP is open from the first cycle:
+    /// no access freezes anything, and the security register is not there to write
+    /// to (BlastEm's `write_tmss` only accepts the string when the version register
+    /// claims TMSS).
+    #[test]
+    fn tmss_off_vdp_access_works() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        touch_vdp(&mut bus);
+        assert!(!bus.locked_up(), "no TMSS, so no lock-up");
+
+        write_sega(&mut bus);
+        touch_vdp(&mut bus);
+        assert!(
+            !bus.tmss_unlocked,
+            "a console with nothing to unlock has nothing unlocked either"
+        );
+        assert!(!bus.locked_up(), "and still nothing froze");
+    }
+
+    /// A TMSS console refuses the VDP until the string arrives: the access is
+    /// dropped, which for reads is the same [`OPEN_BUS`] every other refused access
+    /// here returns and for writes is nothing at all, and the lock-up flag goes set
+    /// for the scheduler to freeze the 68k with. There is no recovery short of a
+    /// reset, which is why the flag is set rather than the access answered.
+    #[test]
+    fn tmss_on_vdp_access_before_unlock_sets_locked_flag() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        assert!(!bus.locked_up(), "nothing has happened yet");
+
+        // A game's usual first write: `move.w #$3FA0, (VDPControl)`, before it has
+        // thought about TMSS at all.
+        bus.write_word(0xC00004, 0x3FA0);
+        assert!(
+            bus.locked_up(),
+            "VDP write before the unlock freezes the 68k"
+        );
+    }
+
+    /// Reads lock up too: segaretro says "the next VDP data port access", and
+    /// Genesis Plus GX maps the read handlers to its lockup handlers along with the
+    /// write ones, so a probe of the HV counter is as fatal as a write to control.
+    #[test]
+    fn tmss_on_vdp_read_before_unlock_sets_locked_flag() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        assert_eq!(bus.read_word(0xC00000), OPEN_BUS_WORD, "access dropped");
+        assert!(
+            bus.locked_up(),
+            "VDP read before the unlock freezes the 68k"
+        );
+    }
+
+    /// `SEGA` written as the 68k writes a long - two words, high word first - gets
+    /// past the check, and after that the VDP is the 68k's.
+    #[test]
+    fn tmss_unlock_with_sega_write() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+
+        bus.write_word(TMSS_SECURITY, 0x5345);
+        assert!(!bus.tmss_unlocked, "half the string is not the string");
+        bus.read_byte(0xC00000);
+        assert!(bus.locked_up(), "still locked on half");
+
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        write_sega(&mut bus);
+        assert!(bus.tmss_unlocked, "0x5345 then 0x4741 is SEGA");
+        touch_vdp(&mut bus);
+        assert!(!bus.locked_up(), "the VDP is released");
+    }
+
+    /// The same check fed one byte at a time, which is what a game doing
+    /// `move.b #$53, (A14000).l` and friends produces: the byte lane says which byte
+    /// of the string each write is, so four bytes in address order are the string.
+    #[test]
+    fn tmss_unlock_with_sega_bytes() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        for (offset, byte) in TMSS_SECURITY_STRING.iter().enumerate() {
+            bus.write_byte(TMSS_SECURITY + offset as u32, *byte);
+            let written = offset + 1;
+            assert_eq!(
+                bus.tmss_unlocked,
+                written == TMSS_SECURITY_STRING.len(),
+                "{written} byte(s) of SEGA"
+            );
+        }
+        touch_vdp(&mut bus);
+        assert!(!bus.locked_up(), "byte writes release the VDP too");
+    }
+
+    /// A wrong byte fails the check without doing anything else to the machine:
+    /// the attempt is abandoned and the detector starts again, so the real string
+    /// written afterwards unlocks. Genesis Plus GX gets the same out of keeping the
+    /// 4-byte register image and comparing it against `"SEGA"` on every write.
+    #[test]
+    fn wrong_string_does_not_unlock() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        // "SEGB", wrong in the last byte only.
+        bus.write_word(TMSS_SECURITY, 0x5345);
+        bus.write_word(TMSS_SECURITY + 2, 0x4742);
+        assert!(!bus.tmss_unlocked, "SEGB is not SEGA");
+
+        bus.write_word(0xC00000, 0x0000);
+        assert!(bus.locked_up(), "and the VDP is still held");
+    }
+
+    /// ... and a wrong string followed by the right one ends unlocked: the detector
+    /// restarting must not latch on the mistake.
+    #[test]
+    fn wrong_string_then_sega_unlocks() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        bus.write_word(TMSS_SECURITY, 0x4E41); // "NA"
+        bus.write_byte(TMSS_SECURITY + 2, b'X');
+        assert!(!bus.tmss_unlocked);
+
+        write_sega(&mut bus);
+        assert!(bus.tmss_unlocked, "the detector recovers");
+        touch_vdp(&mut bus);
+        assert!(!bus.locked_up());
+    }
+
+    /// `RESET` restarts the console, and a console that restarts asks the security
+    /// question again: the string is forgotten. Genesis Plus GX's `gen_reset` clears
+    /// the TMSS register and reinstalls its lockup handlers for exactly this
+    /// ("clear TMSS register", "VDP access is locked by default"). The freeze goes
+    /// the other way: it belongs to the CPU that `RESET` has just restarted, so a
+    /// machine still frozen after a reset could not be restarted by one.
+    #[test]
+    fn tmss_reset_rearms_the_lock() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        write_sega(&mut bus);
+        touch_vdp(&mut bus);
+        assert!(!bus.locked_up(), "unlocked and working");
+
+        bus.reset_devices();
+
+        assert!(!bus.tmss_unlocked, "RESET asks the question again");
+        assert!(!bus.locked_up, "and clears the freeze it caused");
+        bus.write_word(0xC00004, 0x3FA0);
+        assert!(bus.locked_up, "the VDP is locked up for its answer");
+    }
+
+    /// The lock covers the whole [`Region::Vdp`] window, not just the two ports a
+    /// game usually touches: Genesis Plus GX's `gen_tmss_w` answers the security
+    /// register by mapping all of 0xC0-0xDF to its lockup handlers, which is the
+    /// data, control, HV counter, **PSG** and debug ports, their mirrors every 0x40
+    /// and the 0xC00020-0xC0003F hang-up corner of plutiedev "Memory map". The PSG
+    /// is in there because it lives in the VDP's own port pair (plutiedev "Memory
+    /// map", "PSG is normally accessed by byte, so you'll generally see $C00011
+    /// instead") and reaches the bus through this region, not through the Z80 side.
+    #[test]
+    fn tmss_lock_covers_the_whole_vdp_window() {
+        let vdp_addresses = [
+            0xC00000, // data port
+            0xC00004, // control port
+            0xC00008, // HV counter
+            0xC00011, // PSG port
+            0xC00018, // debug address port
+            0xC00020, // the hang-up corner
+            0xC00040, // the every-0x40 mirror
+            VDP_END - 1,
+        ];
+
+        for addr in vdp_addresses {
+            let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+            bus.write_byte(addr, 0x5A);
+            assert!(bus.locked_up, "{addr:#08x} is inside the lock");
+            assert!(
+                bus.z80.psg_log.is_empty(),
+                "{addr:#08x} must not reach the PSG while locked"
+            );
+        }
+
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        write_sega(&mut bus);
+        for addr in vdp_addresses {
+            bus.write_byte(addr, 0x5A);
+            let _ = bus.read_word(addr & EVEN_LANE);
+            assert!(!bus.locked_up, "{addr:#08x} is open once unlocked");
+        }
+    }
+
+    /// 0xA14101 bit 0 is "what sits behind the cartridge slot": 1 the cartridge, 0
+    /// the TMSS boot ROM (segaretro "TradeMark Security System"; Genesis Plus GX's
+    /// `gen_bankswitch_w` takes `data & 1` the same way and reads it back in
+    /// `gen_bankswitch_r`). This emulator ships no boot ROM, so the cart stays
+    /// mapped whatever the bit says and the bit is only stored - and only a TMSS
+    /// console has the register to store it in (BlastEm ignores the write without
+    /// TMSS, as it does the security register).
+    #[test]
+    fn tmss_rom_select_bit_is_stored() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        assert!(!bus.tmss_cart_selected, "power on asks for the boot ROM");
+
+        bus.write_byte(TMSS_ROM_SELECT + 1, 0xFF);
+        assert!(bus.tmss_cart_selected, "bit 0 of the byte written");
+        bus.write_byte(TMSS_ROM_SELECT, 0x02);
+        assert!(!bus.tmss_cart_selected, "only bit 0 means anything");
+
+        bus.write_byte(TMSS_ROM_SELECT + 1, 0x01);
+        bus.reset_devices();
+        assert!(
+            !bus.tmss_cart_selected,
+            "RESET puts the boot ROM back, as Genesis Plus GX maps it at 0x000000 on reset"
+        );
+
+        let mut plain = Bus::new(Vec::new(), NO_TMSS);
+        plain.write_byte(TMSS_ROM_SELECT + 1, 0x01);
+        assert!(!plain.tmss_cart_selected, "no TMSS, no ROM select");
+    }
+
+    /// The acceptance criterion "default config keeps TMSS off", end to end: the
+    /// version byte [`crate::Config::default`] produces claims no TMSS, so a bus
+    /// built the way [`Bus::new`] tells its caller to leaves the VDP open from the
+    /// first access.
+    #[test]
+    fn default_config_leaves_tmss_off() {
+        let config = crate::Config::default();
+        let version = crate::Region::Usa.version_register(config.tmss);
+        assert_eq!(
+            version & TMSS_VERSION_MASK,
+            0,
+            "bit 0 of the version is TMSS"
+        );
+
+        let mut bus = Bus::new(Vec::new(), version);
+        touch_vdp(&mut bus);
+        assert!(!bus.locked_up(), "a default console does not lock its VDP");
     }
 }
