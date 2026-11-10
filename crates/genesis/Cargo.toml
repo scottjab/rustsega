@@ -7,5 +7,10 @@ publish.workspace = true
 
 [dependencies]
 
+[dev-dependencies]
+# Only tests: the core itself keeps no dependencies, per docs/ARCHITECTURE.md.
+# Used by the commercial-ROM test; the header decode itself needs nothing.
+testkit = { path = "../testkit" }
+
 [lints]
 workspace = true

@@ -58,6 +58,9 @@ dependencies = [
 [[package]]
 name = "genesis"
 version = "0.1.0"
+dependencies = [
+ "testkit",
+]
 
 [[package]]
 name = "hashbrown"
