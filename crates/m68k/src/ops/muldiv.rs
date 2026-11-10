@@ -38,15 +38,14 @@
 //! remainder, `N`/`Z` come from the quotient and `V`/`C` are cleared. `DIVS`
 //! truncates toward zero and its remainder takes the sign of the **dividend**.
 //!
-//! Divide timing is `base + 2n` in `n` of the quotient (see [`div_clocks`]) and
-//! is an approximation on purpose: #30 ships the semantics, and the exact
-//! divider law — like the bus wait states this core does not model — belongs to
-//! M1-31 (#39/#40).
+//! Divide timing is `4 + 2n` over the source's own addressing time, in `n` the
+//! loops the divider walks for *this* pair of operands (see [`div_clocks`]): 10
+//! clocks flat for a divide that overflows, and 88 to 130 for one that finishes.
 
 use crate::bus::Bus;
 use crate::cpu::{M68k, OPCODE_CLOCKS};
 use crate::ea::{Ea, Size, sign_extend_word};
-use crate::exceptions::EXC_DIV_ZERO;
+use crate::exceptions::{EXC_DIV_ZERO, FAULTED_FETCH_CLOCKS};
 use crate::ops::field;
 use crate::sr::{SR_C, SR_N, SR_V, SR_Z};
 
@@ -61,19 +60,20 @@ const MUL_BASE_CLOCKS: u32 = 38;
 /// Clocks each iteration of the multiply array costs: `2n` in the formula above.
 const MUL_ITERATION_CLOCKS: u32 = 2;
 
-/// The worst case of each divide, from M68000UM "68000 Programmers Interface"
-/// ("Divide Instructions": DIVU 68/70/140, DIVS 74/76/158 — typical, 64-bit
-/// extension, worst case). Only the worst case is a 16/32-bit divide, and `n`
-/// below runs 0..=16, so the bases are `140 - 2*16` and `158 - 2*16`.
-const DIVU_WORST_CLOCKS: u32 = 140;
-/// See [`DIVU_WORST_CLOCKS`].
-const DIVS_WORST_CLOCKS: u32 = 158;
-/// `DIVU`'s base: [`DIVU_WORST_CLOCKS`] less its 16 iterations.
-const DIVU_BASE_CLOCKS: u32 = DIVU_WORST_CLOCKS - 2 * DIV_MAX_ITERATIONS;
-/// `DIVS`' base, same again for [`DIVS_WORST_CLOCKS`].
-const DIVS_BASE_CLOCKS: u32 = DIVS_WORST_CLOCKS - 2 * DIV_MAX_ITERATIONS;
-/// The most a divide iterates: one pass per quotient bit.
-const DIV_MAX_ITERATIONS: u32 = 16;
+/// Clocks each loop of the divide costs: the `2n` of `4 + 2n` (M68000UM
+/// instruction-set timing, "DIVU — Divide Unsigned": `14 + n • (2) + (ea)`,
+/// whose `n` this is and whose `14` the measured constant is 10 below).
+const DIV_LOOP_CLOCKS: u32 = 2;
+/// Loops a divide spends before its walk starts — the `4` of `n = 4 + Σ`steps`.
+const DIV_BASE_LOOPS: u32 = 4;
+/// Steps of the walk: the 31 dividend bits above bit 0 (see [`div_loops`]).
+const DIV_WALK_STEPS: u32 = 31;
+/// The loops `DIVS` spends over `DIVU` before the sign corrections of
+/// [`div_loops`]: the manual puts `DIVS` 18 clocks above `DIVU` at the worst case
+/// and 6 at the typical one, and the walk that finishes lands between them, at 14
+/// clocks with no operand needing its sign fixed and up to 20 with both of them
+/// negative and the quotient coming out negative (measured, [#238]).
+const DIVS_BASE_LOOPS: u32 = 7;
 /// A `DIVU` that overflows: 10 clocks over the source's own addressing time,
 /// measured over all 2469 overflowing cases of `DIVU.json.gz`. See
 /// [`div_overflow_clocks`].
@@ -144,42 +144,94 @@ fn divide_32_by_16(dividend: u32, divisor: u16, signed: bool) -> Option<(u16, u1
     }
 }
 
-/// The approximate cost of a divide: `base + 2n` in `n` **of the quotient** —
-/// set bits for `DIVU`, bit transitions for `DIVS`, the same two counts the
-/// multiplies use ([`mulu_iterations`], [`muls_iterations`]) taken of the answer
-/// being built rather than of the source, because an array divider walks the
-/// quotient it is producing.
+/// A divide that finishes costs `4 + 2n` over its operands, in the `n` of
+/// [`div_loops`] — **the loops this pair of operands walks**, not a count of the
+/// answer the way [`mulu_iterations`] counts the multiplier's set bits.
 ///
-/// **This is an approximation, which is as far as #30 takes it**: M1-31 (#39 and
-/// #40) owns the divider's real clock law. Measured over the 4964 `DIVU` and
-/// 4992 `DIVS` cases of the pinned suite that do not end in its exception
-/// handler, with the source's own access taken back out:
+/// The shape is M68000UM instruction-set timing's `14 + n • (2) + (ea)` for
+/// DIVU/DIVS with two differences the pinned suite forces (M1-31b #40 measured
+/// it, #238 fitted it): the fixed part is the 4-clock opcode fetch alone, ten
+/// below the manual's 14, and the `n` runs to 63 for `DIVU`, which is exactly
+/// the 63 the manual's 140-clock worst case divides out to.
 ///
-/// * every cost is a multiple of 2;
-/// * a completed divide is 38..=136 for `DIVU` and 120..=154 for `DIVS` — both
-///   under the manual's 140 / 158 worst case that [`DIVU_BASE_CLOCKS`] and
-///   [`DIVS_BASE_CLOCKS`] are anchored to, but spread far wider than this model,
-///   which cannot go below its own 108 / 126 base;
-/// * no function of the quotient alone can fit it: 171 of the 4774 distinct
-///   `DIVU` quotients appear at two different costs, so the divider also depends
-///   on the dividend or on the order the walk runs in.
+/// So a `DIVU D1,D0` is 88 to 130 clocks and a `DIVS` up to 152, against the
+/// 108-to-140 and 126-to-158 the approximation #30 shipped used to claim; an
+/// overflowing divide is 10, 16 or 18 however the operands look
+/// ([`div_overflow_clocks']).
+const fn div_clocks(signed: bool, dividend: u32, divisor: u16) -> u32 {
+    OPCODE_CLOCKS + DIV_LOOP_CLOCKS * div_loops(signed, dividend, divisor)
+}
+
+/// The walk behind [`div_clocks`]: `DIV_BASE_LOOPS` loops of preamble, then one
+/// loop for each of the 31 dividend bits above bit 0 that the divider shifts
+/// into the remainder, one more for each trial subtract that borrows and has to
+/// be undone, and one **fewer** for each shift that carries out of the remainder
+/// — that carry already is the quotient bit `1`, so its subtract rides along on
+/// the shift rather than costing a compare of its own.
 ///
-/// The measured shape of the law, from M1-31b (#40): a divide that finishes is
-/// `4 + 2n +` the source's own addressing time, with `n` from **42 to 63** for
-/// `DIVU` and **61 to 74** for `DIVS` (measured over the 613 and 333 `Dn`-source
-/// cases that neither take the suite's exception handler nor overflow). This
-/// model does not reach those bounds: it is off by -46..=+16 and -26..=+16
-/// clocks. `bit_length` and `count_ones` of the quotient, of the remainder, of
-/// the divisor and of the dividend's high word were each measured as a sole
-/// predictor, and each leaves 31 or more distinct residuals per bucket: the
-/// divider's `n` needs the walk itself, not a count of the answer (#238).
-////// `divu_timing_examples` and `divs_timing_examples` pin the shape that ships.
-const fn div_clocks(signed: bool, quotient: u16) -> u32 {
-    if signed {
-        DIVS_BASE_CLOCKS + MUL_ITERATION_CLOCKS * muls_iterations(quotient)
+/// The 32nd dividend bit is not a step: the last quotient bit is the last
+/// compare's own answer. And the 16 steps of the overflow test are not separate
+/// from the walk — the remainder is still empty for all of them and they always
+/// fail, which is what puts the floor of `n` at 35 rather than at 4 and matches
+/// the 63-loop worst case of the manual's DIVU footnote.
+///
+/// `DIVS` walks the same path over the **absolute** values of its operands — the
+/// quotient is positive when the signs agree and the remainder follows the
+/// dividend (M68000UM DIVS) — and pays [`DIVS_BASE_LOOPS`] over `DIVU`, two more
+/// loops for a negative dividend and one more when the signs disagree and the
+/// quotient has to be put back negative.
+///
+/// Measured, not fitted to a guess: exact on all 613 `DIVU` and all 333 `DIVS`
+/// `Dn`-source cases of the pinned files that finish, and — with the source's
+/// own access taken back out — on all 4964 / 4992 runnable cases of
+/// `DIVU.json.gz` and `DIVS.json.gz` over every addressing mode, which
+/// `divu_file_passes` and `divs_file_passes` check (#238).
+const fn div_loops(signed: bool, dividend: u32, divisor: u16) -> u32 {
+    let negative_dividend = (dividend as i32) < 0;
+    let negative_divisor = (divisor as i16) < 0;
+    let sign_loops = if signed {
+        // A negative dividend is a long to negate and costs two loops; a
+        // disagreeing sign puts the quotient back negative on one loop of its
+        // own, which is all a negative divisor costs — taken as an absolute
+        // value alongside the dividend's, it buys nothing else. The sign restore
+        // runs on the sign alone, so it is paid for even when the quotient is
+        // zero; the suite has no divide that finishes that way and cannot say
+        // either way (#238).
+        DIVS_BASE_LOOPS
+            + 2 * negative_dividend as u32
+            + (negative_dividend != negative_divisor) as u32
     } else {
-        DIVU_BASE_CLOCKS + MUL_ITERATION_CLOCKS * mulu_iterations(quotient)
+        0
+    };
+    let dividend = if signed && negative_dividend {
+        dividend.wrapping_neg()
+    } else {
+        dividend
+    };
+    let divisor = if signed && negative_divisor {
+        divisor.wrapping_neg()
+    } else {
+        divisor
+    };
+
+    let divisor = divisor as u32;
+    let mut remainder = 0u32;
+    let mut failed = 0;
+    let mut carried = 0;
+    let mut bit = DIV_WALK_STEPS;
+    while bit > 0 {
+        remainder = (remainder << 1) | ((dividend >> bit) & 1);
+        if remainder >> 16 != 0 {
+            carried += 1;
+        }
+        if remainder < divisor {
+            failed += 1;
+        } else {
+            remainder -= divisor;
+        }
+        bit -= 1;
     }
+    DIV_BASE_LOOPS + DIV_WALK_STEPS + failed - carried + sign_loops
 }
 
 /// A divide that overflows never walks the quotient at all, and the suite says
@@ -322,10 +374,14 @@ impl M68k {
             self.set_flag(SR_Z, false);
             self.set_flag(SR_V, false);
             self.set_flag(SR_C, false);
-            // `0` for the reason [`Self::op_illegal`] gives: the exception has
-            // already been charged, and this instruction has not advanced.
+            // The exception's 34 clocks are charged by [`M68k::exception`];
+            // what it does not cover is the opcode fetch this divide had already
+            // taken before it found the zero, and that is what
+            // [`FAULTED_FETCH_CLOCKS`] hands back — see it for the arithmetic
+            // this case pins. Unlike [`Self::op_illegal`], which faults with
+            // nothing of its own spent and so returns 0.
             self.exception(bus, EXC_DIV_ZERO, divide_pc);
-            return 0;
+            return FAULTED_FETCH_CLOCKS;
         }
 
         // The two outcomes cost different amounts, so which one this is decides
@@ -347,7 +403,7 @@ impl M68k {
                 self.advance_opcode(bus);
                 // Less the opcode fetch, as in [`M68k::op_mul`]; the source EA
                 // charged itself.
-                div_clocks(signed, quotient) - OPCODE_CLOCKS
+                div_clocks(signed, dividend, divisor) - OPCODE_CLOCKS
             }
             None => {
                 // Overflow. `V` set and `C` cleared; `N`, `Z` and `X` are left
@@ -696,7 +752,7 @@ mod tests {
         assert!(!cpu.flag_c(), "overflow sets V and clears C");
         assert_eq!(
             clocks, 10,
-            "and it is cheap: the walk never ran, so 10 clocks, not the 108 a divide that finished starts from"
+            "and it is cheap: the walk never ran, so 10 clocks, not the 88 that the cheapest divide which did run one costs"
         );
         assert!(cpu.flag_n(), "N is left alone");
         assert!(cpu.flag_z(), "Z is left alone");
@@ -760,8 +816,13 @@ mod tests {
             cpu.d[0] = 0xDEAD_BEEF;
             cpu.d[1] = 0;
             let sp = cpu.a[7];
-            cpu.step(&mut bus);
+            let cycles = cpu.step(&mut bus);
 
+            // 4 clocks of opcode fetch, which the fault had already spent, and
+            // the entry's 34: see [`FAULTED_FETCH_CLOCKS`] and the suite's one
+            // cycle-checked case of it, `DIVU (d16, A7), D0` at 46 clocks with
+            // 8 of those 46 in the `(d16,An)` read.
+            assert_eq!(cycles, 38, "a faulted divide still paid for its fetch");
             assert_eq!(cpu.pending_exception, Some(crate::EXC_DIV_ZERO));
             assert_eq!(cpu.pc, HANDLER, "the vector-5 handler ran");
             assert_eq!(cpu.a[7], sp - 6, "a group 1 frame was pushed");
@@ -814,37 +875,44 @@ mod tests {
         );
     }
 
-    /// The `DIVU` cost model: `108 + 2n` with `n` the set bits of the quotient,
-    /// so the manual's 140-clock worst case is `108 + 2*16` and the cheapest
-    /// divide is 108. Approximation — see [`div_clocks`].
+    /// The clock count is the walk's, not the answer's: `DIVU.json.gz` contains
+    /// two divides with the same quotient `$9F67` that cost 106 and 116 clocks,
+    /// and the whole reason #238 exists is that no count of the quotient — set
+    /// bits, transitions, bit length — separates them.
     #[test]
-    fn divu_timing_examples() {
-        for (dividend, want) in [
-            (0x0000_0000i32, 108), // quotient 0: no set bits
-            (0x0000_0001, 110),    // one set bit
-            (0x0000_00FF, 124),    // eight
-            (0x0000_5555, 124),    // 0x5555 has eight set bits too
-            (0x0000_FFFF, 140),    // the manual's worst case
-        ] {
-            let (_, cycles) = divide(DIVU, dividend, 1);
-            assert_eq!(cycles, want, "DIVU ${dividend:08X}/1");
-        }
+    fn divu_clocks_are_not_a_function_of_the_quotient() {
+        let (cpu, a) = divide(DIVU, 0x5AFA_921Cu32 as i32, 0x921C);
+        let (cpu2, b) = divide(DIVU, 0x36C8_9B4Eu32 as i32, 0x57FB);
+        assert_eq!(cpu.d[0] & 0xFFFF, 0x9F67);
+        assert_eq!(cpu2.d[0] & 0xFFFF, 0x9F67, "the same quotient");
+        assert_eq!((a, b), (106, 116), "two different costs");
+
+        // And the last dividend bit is not a step of the walk at all: flipping
+        // it changes the quotient and not the clocks.
+        let (cpu, same) = divide(DIVU, 0x5AFA_921Cu32 as i32, 0x921C);
+        let (cpu2, also) = divide(DIVU, 0x5AFA_921Du32 as i32, 0x921C);
+        assert_ne!(
+            cpu.d[0], cpu2.d[0],
+            "bit 0 of the dividend is in the quotient"
+        );
+        assert_eq!(same, also, "but not in the walk");
     }
 
-    /// The `DIVS` cost model: `126 + 2n` with `n` the bit-transition count of
-    /// the quotient (the signed divider skips runs of equal bits, the same shape
-    /// [`muls_iterations`] charges a multiply), anchored on the manual's
-    /// 158-clock worst case: `126 + 2*16`.
+    /// The two sign terms of [`div_loops`] in isolation: four divides whose walk
+    /// is identical because only their signs differ, so the differences between
+    /// them are exactly the two loops a negative dividend costs and the one loop
+    /// that puts a negative quotient back. The absolute-value points of the same
+    /// law are checked against the chip by `divs_file_passes` (#238).
     #[test]
-    fn divs_timing_examples() {
-        for (dividend, want) in [
-            (0x0000_0000i32, 126), // quotient 0: no transitions at all
-            (0x0000_0001, 130),    // one set bit, two transitions
-            (0x0000_5555, 158),    // alternating bits: the worst case
-            (-1, 128),             // quotient -1 = 0xFFFF: a single transition
-        ] {
-            let (_, cycles) = divide(DIVS, dividend, 1);
-            assert_eq!(cycles, want, "DIVS ${dividend:#X}/1");
-        }
+    fn divs_sign_corrections_cost_loops() {
+        // 7 / 2 four ways: one walk, four sign treatments.
+        let plus = divide(DIVS, 7, 2).1;
+        assert_eq!(divide(DIVS, 7, -2).1, plus + 2, "signs differ: one loop");
+        assert_eq!(
+            divide(DIVS, -7, -2).1,
+            plus + 4,
+            "negative dividend, signs agree"
+        );
+        assert_eq!(divide(DIVS, -7, 2).1, plus + 6, "both terms at once");
     }
 }

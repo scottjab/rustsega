@@ -76,30 +76,28 @@ fn muls_file_passes() {
 /// (`80ef [DIVU (d16, A7), D0] 5745`), which ends at the vector-5 handler
 /// instead and so is not skipped (M1-22, #30).
 ///
-/// State only, deliberately: `DIVU`'s overflow path is exact (10 clocks over the
-/// source's own access, every one of the file's 2469 overflowing cases), but a
-/// divide that *finishes* is not — see the measurement in `div_clocks`. Over the
-/// cases that finish, `length` is `4 + 2n` plus the source's own time with `n`
-/// from 42 to 63, and nothing measured so far predicts `n` from the operands
-/// (#238).
+/// Cycles as well as state since #238: `div_clocks` is exact on every one of
+/// them — the 2469 overflowing cases at 10 clocks over the source's own access,
+/// and the 4964 that finish at `4 + 2n` over it with `n` from 42 to 63.
 #[test]
 fn divu_file_passes() {
-    harness::assert_file_passes("DIVU", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("DIVU", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `DIVS`: `$81C0`–`$81FF` (`1000 ddd 111 eeeeee`), 8065 cases of which 3073
 /// take the suite's exception handler; 4992 to pass. No divide-by-zero case
 /// exists in this file (every one of its 8065 divisors is non-zero), so the
 /// signed trap path is pinned by the unit test in `ops/muldiv.rs` and by
-/// `DIVU` above.
+/// `DIVU` above. Measured rather than assumed: no case of this file moves `ssp`
+/// by an exception frame, where `DIVU.json.gz` has exactly one (#238).
 ///
-/// State only, for `DIVU`'s reason: the sign of the dividend now makes the
-/// overflowing cases exact (16 and 18 clocks, `DIVS_OVERFLOW_NEGATIVE_CLOCKS`),
-/// and a divide that finishes is `4 + 2n` with `n` from 61 to 74 and no rule yet
-/// for `n` (#238).
+/// Cycles as well as state, for `DIVU`'s reason: the sign of the dividend makes
+/// the overflowing cases exact (16 and 18 clocks,
+/// `DIVS_OVERFLOW_NEGATIVE_CLOCKS`), and `div_clocks` covers the 4992 that
+/// finish at `4 + 2n` with `n` from 61 to 74.
 #[test]
 fn divs_file_passes() {
-    harness::assert_file_passes("DIVS", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("DIVS", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `MULU`'s cycle count: `step` returns the case's `length` for every case that
