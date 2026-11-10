@@ -175,15 +175,22 @@ pub(crate) const EXCEPTION_ENTRY_CLOCKS: u64 = 34;
 /// A handler returns them so the step totals the fetch it really spent, and the
 /// two numbers add up on the suite's only cycle-checked case of the kind,
 /// `80ef [DIVU (d16, A7), D0] 5745`: `length` 46 = 4 fetch + 8 for the
-/// `(d16,An)` read + 34 entry (#238). `CHK`, whose file is not cycle-checked,
-/// agrees with the same split — its trapping cases cost `4 + ea + 34` at their
-/// cheapest per mode (`Dn` 38, `(An)` 42, `-(An)` 44), with a spread of another
-/// 2 or 8 clocks on some cases that no model here accounts for (the core has no
-/// wait states; see the follow-up issue for `CHK`'s side).
+/// `(d16,An)` read + 34 entry (#238). It is the only case of its kind under a
+/// cycle check: every other trapping case either sits in a file that is not
+/// cycle-checked (`CHK`, `TRAP`, `TRAPV`) or is left out by
+/// `harness::is_address_error_case`. `CHK` is the second family that agrees with
+/// the split, at `4 + ea + 34` on all 3989 of its trapping cases (`Dn` 38,
+/// `(An)` 42, `-(An)` 44, `(xxx).l` 50), and #241 carries the 2-clock half of
+/// `CHK`'s population that no model here accounts for.
 ///
-/// Not for the traps that *are* the instruction: `TRAP` and an illegal opcode
-/// fault before any operand is read, and both cost the entry's 34 with nothing
-/// of their own on top — 34 in every one of the 8065 `TRAP.json.gz` cases.
+/// Not for the traps that *are* the instruction: `TRAP`, `TRAPV` and an illegal
+/// opcode fault before any operand is read, and cost the entry's 34 with nothing
+/// of their own on top — 34 in every one of the 8065 `TRAP.json.gz` cases and
+/// the 4095 trapping cases of `TRAPV.json.gz`. No illegal-instruction case is
+/// dated by the suite at all (they all end at the vector `is_address_error_case`
+/// skips), which is what keeps this 4 away from [`M68k::op_illegal`].
+///
+/// [`M68k::op_illegal`]: crate::M68k::op_illegal
 pub(crate) const FAULTED_FETCH_CLOCKS: u32 = crate::cpu::OPCODE_CLOCKS;
 
 /// Bus accesses [`M68k`] performs during an exception entry: three writes for

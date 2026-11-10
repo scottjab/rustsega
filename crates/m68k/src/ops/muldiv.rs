@@ -891,7 +891,10 @@ mod tests {
         // it changes the quotient and not the clocks.
         let (cpu, same) = divide(DIVU, 0x5AFA_921Cu32 as i32, 0x921C);
         let (cpu2, also) = divide(DIVU, 0x5AFA_921Du32 as i32, 0x921C);
-        assert_ne!(cpu.d[0], cpu2.d[0], "bit 0 of the dividend is in the quotient");
+        assert_ne!(
+            cpu.d[0], cpu2.d[0],
+            "bit 0 of the dividend is in the quotient"
+        );
         assert_eq!(same, also, "but not in the walk");
     }
 
