@@ -491,13 +491,13 @@ struct FileReport {
 /// instruction) and the sweep has to keep going past it to the other 1500 files.
 /// The panic message becomes the mismatch line, so it reads the same in either
 /// case. The default panic hook still writes the message to stderr.
-fn run_one_file(cases: &[TestCase]) -> FileReport {
+fn run_one_file(cases: &[TestCase], limit: Option<usize>) -> FileReport {
     let mut report = FileReport {
         passed: 0,
         failed: 0,
         first_failure: None,
     };
-    for case in cases {
+    for case in cases.iter().take(limit.unwrap_or(cases.len())) {
         let mismatches =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(case))) {
                 Ok(mismatches) => mismatches,
@@ -562,7 +562,7 @@ pub fn run_files(names: &[&str]) {
     let mut passed_cases = 0;
     for name in names {
         let cases = load_file(name).unwrap_or_else(|| unreachable!("suite_dir checked above"));
-        let report = run_one_file(&cases);
+        let report = run_one_file(&cases, None);
         report.print(name, cases.len());
         passed_cases += report.passed;
         if report.failed > 0 {
@@ -580,9 +580,13 @@ pub fn run_files(names: &[&str]) {
     );
 }
 
-/// Silence the default panic hook while the sweep walks into ~1600 unimplemented
-/// opcodes on purpose. The message is already in the report line, and 1600
-/// copies of it on stderr bury the rest of the log.
+/// Silence the default panic hook for the duration of a sweep.
+///
+/// [`run_one_file`] catches a core panic and turns it into the file's mismatch
+/// line, so the message is already in the report; the hook is what stops one
+/// panic per case from burying the rest of the log. It also keeps a sweep that
+/// steps a genuinely unimplemented opcode reporting per file instead of
+/// shouting.
 ///
 /// The hook is process-global, which is why only the sweep uses this and not
 /// [`run_files`]: a test panicking in another thread while it is installed would
@@ -609,40 +613,46 @@ impl Drop for QuietPanicHook {
     }
 }
 
-/// Run every file in the suite and print one pass/fail line per file, plus a
-/// grand total. Never asserts.
+/// Every file in the suite, run case by case, and nothing else: returns the
+/// names of the files that had a failing case and prints one pass/fail line per
+/// file plus a grand total.
 ///
-/// This is the shape M2-17 (#60) turns into a gate. Until the instructions are
-/// implemented most files fail, so asserting here would only measure how much
-/// work is left. A file whose opcode is not implemented yet counts as failed
-/// with the panic's text as the reason, not as an error.
-pub fn run_all_files() {
+/// The caller is the gate - `all_opcodes` in `singlestep.rs` asserts the result
+/// is empty, `sst_sample` runs the same sweep over fewer cases per file. A file
+/// whose opcode is not implemented counts as failed with the `unimplemented`
+/// panic's text as the reason, not as an error, so the sweep still reports per
+/// file when the core walks into a hole.
+///
+/// `case_limit` caps how many cases each file contributes, which is what makes
+/// the sample cheap: parsing the suite is the slow part, not running it.
+pub fn sweep(case_limit: Option<usize>) -> Vec<String> {
     let _quiet = QuietPanicHook::install();
     let Some(names) = all_files() else {
         eprintln!("SKIPPED: missing test data: Z80 SingleStepTests ({SUITE_DIR})");
-        return;
+        return Vec::new();
     };
-    let mut files_passed = 0;
+    let mut failed: Vec<String> = Vec::new();
     let mut cases_passed = 0;
-    let mut cases_failed = 0;
     for name in &names {
         // One file at a time: the whole suite does not fit in memory at once
         // and there is no reason to keep a file around after reporting it.
         let cases = load_file(name).expect("suite_dir was present");
-        let report = run_one_file(&cases);
-        report.print(name, cases.len());
+        let shown = case_limit.unwrap_or(cases.len()).min(cases.len());
+        let report = run_one_file(&cases, case_limit);
+        report.print(name, shown);
         cases_passed += report.passed;
-        cases_failed += report.failed;
-        if report.failed == 0 {
-            files_passed += 1;
+        if report.failed > 0 {
+            failed.push(name.clone());
         }
     }
     println!(
-        "Z80 SingleStepTests: {files_passed}/{} files pass; {} cases passed, {} \
-         files failed (a failing file stops at its first bad case, so the case \
-         count is checked cases, not all cases)",
+        "Z80 SingleStepTests: {}/{} files pass; {} cases passed, {} files failed \
+         (a failing file stops at its first bad case, so the case count is \
+         checked cases, not all cases)",
+        names.len() - failed.len(),
         names.len(),
         cases_passed,
-        cases_failed,
+        failed.len(),
     );
+    failed
 }

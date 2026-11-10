@@ -146,14 +146,85 @@ fn harness_detects_wrong_tstate_count() {
     assert_eq!(run(&case), vec!["tstates: expected 3, got 4"]);
 }
 
-/// The whole suite, one line per file.
+/// The whole suite, one line per file, asserting zero failing files.
 ///
-/// `#[ignore]`d because most files fail until their opcodes exist, so it reports
-/// instead of asserting; M2-17 (#60) is where it becomes a gate. Run it with
-/// `cargo nextest run -p z80 --run-ignored all all_opcodes`, or via `just
-/// test-all` on `main`.
+/// This is the Z80 conformance gate (M2-17, #60): every file in the pinned
+/// [SingleStepTests/z80] suite has to pass all 1000 of its cases - every
+/// visible and hidden register, the RAM it listed, its I/O traffic and its
+/// T-state count. What is known to be out of reach is recorded in
+/// [`docs/z80-conformance.md`]; there is no allowance list here, because there
+/// is nothing left unallowed.
+///
+/// `#[ignore]`d because it reads the whole fetched suite; `just test-all` runs
+/// it, and `sst_sample` is what protects an ordinary `just check`. Run it by
+/// hand with
+/// `cargo nextest run -p z80 --run-ignored all --no-capture all_opcodes`.
+///
+/// [SingleStepTests/z80]: https://github.com/SingleStepTests/z80
 #[test]
-#[ignore = "reports the whole suite; most opcodes are not implemented yet"]
+#[ignore = "whole-suite Z80 conformance gate; run with --run-ignored all"]
 fn all_opcodes() {
-    harness::run_all_files();
+    let failed = harness::sweep(None);
+    assert!(
+        failed.is_empty(),
+        "{} of {} Z80 SingleStepTests files failed: {}",
+        failed.len(),
+        harness::all_files().map_or(0, |names| names.len()),
+        failed.join(", "),
+    );
+}
+
+/// The count both gates above walk, pinned.
+///
+/// They iterate over whatever `all_files` finds, so without this a pin bump that
+/// renamed or dropped a family would quietly shrink the gate. Same guard as the
+/// m68k suite's `every_instruction_file_in_the_suite_is_enumerated`, and the
+/// number is the one `docs/TESTING.md` and `docs/z80-conformance.md` quote.
+#[test]
+fn every_opcode_file_in_the_suite_is_enumerated() {
+    let Some(names) = harness::all_files() else {
+        eprintln!(
+            "SKIPPED: missing test data: Z80 SingleStepTests ({})",
+            harness::SUITE_DIR
+        );
+        return;
+    };
+    assert_eq!(
+        names.len(),
+        1604,
+        "the pinned z80 suite holds 1604 opcode files (docs/TESTING.md)"
+    );
+    // One name per family in the suite, including the two this ticket's
+    // instructions live in and the indexed bit-shift spelling, which is
+    // `dd cb __ 36` rather than anything you could guess.
+    for name in ["00", "cb 3e", "dd 80", "ed 77", "ed 7f", "fd cb __ 36"] {
+        assert!(names.iter().any(|n| n == name), "{name} is missing");
+    }
+}
+
+/// How many leading cases of each file [`sst_sample`] runs.
+///
+/// Twenty is enough to catch a wrong opcode that fails its whole file the same
+/// way - which is how every one of the suite's mismatches has shown up so far -
+/// while keeping the sweep to the parsing time that dominates it.
+const SAMPLE_CASES: usize = 20;
+
+/// The first [`SAMPLE_CASES`] cases of every file in the suite, asserted.
+///
+/// `all_opcodes` is the gate but it is `#[ignore]`d, so without this an
+/// `just check` on a branch would never look at the hardware suite at all. The
+/// sample covers every file rather than a chosen subset, so the regression it
+/// catches is one nobody thought to name a test for; what it cannot see is a
+/// case past the twentieth, which is what the ignored gate is for.
+#[test]
+fn sst_sample() {
+    let failed = harness::sweep(Some(SAMPLE_CASES));
+    assert!(
+        failed.is_empty(),
+        "{} of {} Z80 SingleStepTests files failed in their first {SAMPLE_CASES} \
+         cases: {}",
+        failed.len(),
+        harness::all_files().map_or(0, |names| names.len()),
+        failed.join(", "),
+    );
 }

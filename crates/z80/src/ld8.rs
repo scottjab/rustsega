@@ -239,6 +239,33 @@ impl Z80 {
         self.clear_latches();
         19
     }
+
+    /// `LD (MEMPTR),A` (`ED 77`, and `ED 7F` behind it): 8 T-states, `wz` unmoved.
+    ///
+    /// The store that gives the hidden pointer its name, and the only one here
+    /// that leaves `wz` exactly where it found it: all 1000 cases of `ed 77` and
+    /// all 1000 of `ed 7f` start and finish on the same `wz`, because the value
+    /// goes to the address `wz` holds rather than into it.
+    ///
+    /// The address is then the one thing the suite cannot see. `final.ram` lists
+    /// only the two opcode bytes in every one of those 2000 cases, and
+    /// `compare_ram` checks a case only at the addresses it lists, so the write
+    /// below is unverified either way - the suite pins the timing, the register
+    /// state and the fact that `wz` survives, and nothing else. `ED 7F` is
+    /// documented as the 7-bit form of the same store, which is a distinction
+    /// this core has nothing to draw: its `wz` is a plain 16-bit pointer, and no
+    /// case separates `ED 7F` from `ED 77`.
+    ///
+    /// Hardware reference: "Z80 Undocumented Operations" (Z80-Docs, `ED 77` and
+    /// `ED 7F`, `LD (MEMPTR),A`). `docs/z80-conformance.md` records what the
+    /// suite does and does not prove about it.
+    pub(crate) fn ld_memptr_a(&mut self, bus: &mut impl Z80Bus) -> u32 {
+        let value = self.a();
+        let addr = self.wz();
+        bus.write(addr, value);
+        self.clear_latches();
+        8
+    }
 }
 
 #[cfg(test)]
@@ -679,6 +706,36 @@ mod tests {
         let mut bus = RamBus::at(0x3000, &[0xFD, 0x7D]);
         assert_eq!(cpu.step(&mut bus), 8);
         assert_eq!(cpu.a(), 0x78, "FD 7D is LD A,IYL");
+    }
+
+    /// `ED 77` and `ED 7F` (`LD (MEMPTR),A`): 8 T-states, `A` written to the
+    /// address `wz` holds, and `wz` itself unmoved.
+    ///
+    /// The address is the part the suite cannot check - `ed 77` and `ed 7f` list
+    /// nothing but their own two opcode bytes in `final.ram` - so this is where
+    /// the store is pinned.
+    #[test]
+    fn ld_memptr_a() {
+        const PC: u16 = 0x3000;
+        for op in [0x77u8, 0x7F] {
+            let mut cpu = Z80::new();
+            cpu.set_pc(PC);
+            cpu.set_a(0xC5);
+            cpu.set_wz(0x4000);
+            cpu.set_q(0xFF);
+            let mut bus = RamBus::at(PC, &[0xED, op]);
+
+            assert_eq!(cpu.step(&mut bus), 8, "ED {op:02X}");
+
+            assert_eq!(bus.writes, vec![(0x4000, 0xC5)], "ED {op:02X}");
+            assert_eq!(cpu.wz(), 0x4000, "ED {op:02X} stores through the pointer");
+            assert_eq!(
+                cpu.q(),
+                0,
+                "ED {op:02X} clears q like every other instruction"
+            );
+            assert_eq!((cpu.pc(), cpu.r()), (PC + 2, 2), "ED {op:02X}");
+        }
     }
 
     /// The exception the whole scheme hangs on: when one operand is `(IX+d)`, the

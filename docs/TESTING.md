@@ -40,9 +40,11 @@ test that names its files, e.g. `harness::run_files(&["40", "41"])` in
 `crates/z80/tests/`. The whole-suite runs are `#[ignore]`d so `just check` stays
 quick: `all_instructions` for the m68k, which gates all 124 files at state and
 clock level and is recorded in [`m68k-conformance.md`](m68k-conformance.md), and
-`all_opcodes` for the Z80, which still reports per file instead of asserting so
-it is useful before the instructions exist. `just test-all`, which runs on
-`main`, includes both.
+`all_opcodes` for the Z80, which has every one of its 1604 files passing and is
+recorded in [`z80-conformance.md`](z80-conformance.md). `just check` cannot
+afford either sweep, so the Z80's `sst_sample` runs in its place: the first 20
+cases of all 1604 files. `just test-all`, which runs on `main`, includes both
+full sweeps.
 
 ## External test data
 
@@ -101,11 +103,13 @@ wall of `SKIPPED`.
 Heavy suites (full SingleStepTests, long ROM runs) are `#[ignore]` by default
 and run with `cargo nextest run --run-ignored all` or `just test-all`. CI runs
 `just test-all` as an extra step on pushes to `main`, so the slow suites report
-on main without making every PR wait for them. The 68000 conformance gate is the
-exception: at 3.7 s it runs as its own CI step on every push and pull request,
-with `--no-capture` so its per-file table reaches the log ([#186](https://github.com/scottjab/rustsega/issues/186)
-tracks making `just test-all` do the same for every passing test). See
-[`m68k-conformance.md`](m68k-conformance.md).
+on main without making every PR wait for them. The two conformance gates are the
+exception: at 3.7 s (68000) and 6.8 s (Z80) each runs as its own CI step on
+every push and pull request, with `--no-capture` so its per-file table reaches
+the log ([#186](https://github.com/scottjab/rustsega/issues/186) tracks making
+`just test-all` do the same for every passing test). See
+[`m68k-conformance.md`](m68k-conformance.md) and
+[`z80-conformance.md`](z80-conformance.md).
 
 ## Known public test data
 

@@ -45,17 +45,6 @@ pub enum IndexMode {
     Iy,
 }
 
-impl IndexMode {
-    /// Which prefix byte selects this mode, for panic messages.
-    fn prefix(self) -> &'static str {
-        match self {
-            Self::Hl => "",
-            Self::Ix => "DD",
-            Self::Iy => "FD",
-        }
-    }
-}
-
 /// `x` from the x/y/z decomposition: the top two bits, the major group.
 pub fn x(op: u8) -> u8 {
     op >> 6
@@ -303,10 +292,11 @@ impl Z80 {
 
     /// Dispatch the `ED` space.
     ///
-    /// The 16-bit pair loads (M2-05, #48) are dispatched here. Anything else
-    /// that is defined but not implemented yet panics. Undefined opcodes are
-    /// not an error at all: they behave as an 8 T-state NOP, and the byte after
-    /// `ED` is still fetched, which is why `R` counts 2.
+    /// Every opcode [`ed_is_defined`] claims is dispatched here, so the
+    /// `unimplemented` arm below is a guard against a dropped arm rather than a
+    /// list of holes. Undefined opcodes are not an error at all: they behave as
+    /// an 8 T-state NOP, and the byte after `ED` is still fetched, which is why
+    /// `R` counts 2.
     fn exec_ed(&mut self, bus: &mut impl Z80Bus) -> u32 {
         let op = self.fetch_opcode(bus);
         match op {
@@ -353,6 +343,11 @@ impl Z80 {
             // misc group that touch memory.
             0x67 => self.rrd(bus),
             0x6F => self.rld(bus),
+            // The undocumented `LD (MEMPTR),A` (M2-17, #60): `ED 7F` is `ED 77`
+            // with a 7-bit destination, which this core cannot tell apart
+            // because its `wz` is the whole 16-bit pointer the suite leaves
+            // untouched. See `Z80::ld_memptr_a`.
+            0x77 | 0x7F => self.ld_memptr_a(bus),
             // `IM 0`/`IM 1`/`IM 2` (M2-13, #56) and their mirrors: bits 4 and 3
             // of the operand field are open, so `46`/`4E`/`66`/`6E` are one
             // instruction, `56`/`76` another, `5E`/`7E` the third. `ED 76` is
@@ -381,21 +376,10 @@ impl Z80 {
             // The indexed bit-shift space: the displacement comes first, then
             // the opcode that says what to do.
             OP_CB => self.exec_index_cb(bus, mode),
-            // Chained prefixes: this one rots, the next one takes over.
-            OP_DD => T_M1 + self.exec_index(bus, IndexMode::Ix),
-            OP_FD => T_M1 + self.exec_index(bus, IndexMode::Iy),
-            // `DD ED ...`: the prefix rots and `ED` executes normally, since `ED`
-            // instructions never mention `HL`.
-            OP_ED => T_M1 + self.exec_ed(bus),
-            // Same reasoning: `NOP` does not mention `HL`, so the prefix is
-            // wasted and the `NOP` runs.
-            OP_NOP => T_M1 + self.nop(),
             // `JP (IX)` / `JP (IY)` (M2-10, #53): the first indexed opcode that
             // takes no displacement, so the whole instruction is two bytes.
             0xE9 => self.jp_index(mode),
-            // The 8-bit indexed loads (M2-04, #47). The rest of this space is
-            // either a later ticket or the undocumented IXH/IXL forms
-            // (M2-15, #58), which stay a panic.
+            // The 8-bit indexed loads (M2-04, #47).
             0x36 => self.ld_index_ind_n(bus, mode),
             0x46 | 0x4E | 0x56 | 0x5E | 0x66 | 0x6E | 0x7E => self.ld_r_ind_index(bus, mode, op),
             // `70`-`77` in this space is `LD (IX+d),r` - except `76`, which the
@@ -407,7 +391,9 @@ impl Z80 {
             // The undocumented `IXH`/`IXL` registers (M2-15, #58). The two arms
             // above own every `(IX+d)` form, and those keep the real `H`/`L`, so
             // what reaches this one is register to register with at least one
-            // side renamed. `76` names neither half, so `HALT` is unaffected.
+            // side renamed. `76` names neither half, so `HALT` is unaffected -
+            // and neither does any other `40`-`7F`, which is why the rest of the
+            // block reaches the rot below instead.
             0x40..=0x7F if names_half(op) => self.ld_index_half(op, mode),
             // `INC`/`DEC` and `LD r,n` for the two halves. `y` picks the half in
             // all three, exactly as it picks `H`/`L` without a prefix.
@@ -422,8 +408,9 @@ impl Z80 {
             // `Z80::ld_index_ind_nn` for the traces that settled that.
             // The 8-bit ALU and `INC`/`DEC` against `(IX+d)` (M2-06, #49). The
             // ALU needs `z = 6`, which is the only indexed ALU encoding; the
-            // rest of `DD 80`-`DD BF` is the undocumented `IXH`/`IXL` set
-            // (M2-15, #58) and stays a panic.
+            // undocumented `IXH`/`IXL` half of `DD 80`-`DD BF` went to
+            // [`is_half`] just above and its `z = 0`-`3`/`7` remainder to the rot
+            // below (`dd 80` is `ADD A,B` behind a wasted prefix).
             0x86 | 0x8E | 0x96 | 0x9E | 0xA6 | 0xAE | 0xB6 | 0xBE => {
                 self.alu_a_index(bus, mode, op)
             }
@@ -442,26 +429,37 @@ impl Z80 {
             0x09 | 0x19 | 0x29 | 0x39 => self.add_hl_rr(op, mode),
             0x23 => self.inc_rr(op, mode),
             0x2b => self.dec_rr(op, mode),
-            // `INC BC` and friends never mention `HL`, so the prefix has
-            // nothing to index and rots into a `NOP` in front of the unprefixed
-            // instruction (`dd 03`: 10 T-states, `PC + 2`, `R + 2`, `BC`
-            // incremented, in all 1000 cases).
-            0x03 | 0x13 | 0x33 | 0x0b | 0x1b | 0x3b => T_M1 + self.exec_main(bus, op),
-            // `EXX` and `EX DE,HL` have nothing for the prefix to index, so it
-            // rots into a NOP and the instruction runs (`dd d9` / `dd eb`: 8
-            // T-states, `PC + 2`, in all 1000 cases of each).
-            0xD9 | 0xEB => T_M1 + self.exec_main(bus, op),
-            // `DD HALT`/`FD HALT`: the prefix rots, so this is the 8 T-state
-            // pair the suite's `dd 76`/`fd 76` show - PC up by 2, R up by 2.
-            OP_HALT => T_M1 + self.exec_main(bus, op),
-            _ => self.unimplemented(&format!(
-                "{} {op:02X} (x{} y{} z{})",
-                mode.prefix(),
-                x(op),
-                y(op),
-                z(op)
-            )),
+            // Everything else: the prefix has nothing to rename, so it decays
+            // into a `NOP` and the byte after it starts a fresh unprefixed
+            // instruction.
+            _ => self.prefix_rot(bus, op),
         }
+    }
+
+    /// A `DD`/`FD` the instruction after it does not use: 4 T-states of nothing,
+    /// then `op` executed as an unprefixed opcode.
+    ///
+    /// This is not a fallback for missing work - the index space has no holes
+    /// left, and this one arm is the whole remainder of it: the `LD r,r'` moves
+    /// that name no half (`40 41 42 43 47 48 49 4A 4B 4F 50 51 52 53 57 58 59
+    /// 5A 5B 5F 78 79 7A 7B 7F`, the remainder of `LD r,r'` after M2-15), the
+    /// ALU against `B`/`C`/`D`/`E`/`A`, the jumps, calls, returns and restarts,
+    /// the stack pairs, the block instructions reached through `ED`, `HALT`,
+    /// `NOP`, chained prefixes, and everything else that never mentions `H`,
+    /// `L` or `(HL)`.
+    ///
+    /// The prefix is an instruction of its own, so - like `NOP` - it clears `q`,
+    /// `p` and the EI latch before `op` runs. `SCF` and `CCF` are what prove it:
+    /// they take the undocumented `X`/`Y` flags from `((q ^ F) | A) & 0x28`, and
+    /// all 1000 cases each of `dd 37`, `fd 37`, `dd 3f` and `fd 3f` want
+    /// `(F | A) & 0x28` - the same formula with `q` cleared out from under it,
+    /// which `flag_fiddle` alone never does. `ei` agrees: of every prefixed
+    /// `dd`/`fd` file in the suite, only `dd fb` and `fd fb` - `EI`, which sets
+    /// the latch again after the prefix cleared it - have a case whose latch is
+    /// still set at the end.
+    fn prefix_rot(&mut self, bus: &mut impl Z80Bus, op: u8) -> u32 {
+        self.clear_latches();
+        T_M1 + self.exec_main(bus, op)
     }
 
     /// Dispatch `DD CB d op` / `FD CB d op`.
@@ -494,7 +492,8 @@ impl Z80 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FLAG_C;
+    use crate::testutil::RamBus;
+    use crate::{FLAG_C, FLAG_X, FLAG_Y};
 
     /// A bus that reads back a fixed program, so a test can name the exact bytes
     /// an instruction is made of and see what `step()` did with them.
@@ -575,18 +574,36 @@ mod tests {
         assert_eq!(cpu.r(), 2);
     }
 
+    /// Every `ED` opcode the hardware defines is dispatched, so the guard under
+    /// `exec_ed`'s match is a net rather than a list of holes: `ED 77` and
+    /// `ED 7F` (`LD (MEMPTR),A`) were the last to land, in M2-17 (#60).
+    ///
+    /// This is what the `ED 77` example in
+    /// `ed_defined_range_panics_rather_than_nopping` was checking from the other
+    /// side - it stepped the one defined opcode that was still missing, and once
+    /// there was none left the honest version is to walk all 80 and require that
+    /// none of them panics. `ed_is_defined` keeps the guard honest in both
+    /// directions: an undefined `ED` opcode is an 8 T-state NOP, so a defined one
+    /// that reaches the guard would otherwise go quietly.
     #[test]
-    fn ed_defined_range_panics_rather_than_nopping() {
-        // The fallback above must only cover undefined opcodes. `ED 77` is inside
-        // the range the suite ships and is not implemented, so quietly NOPing it
-        // would hide a missing instruction. `ED 40` used to be this test's
-        // example and is now `IN B,(C)` (M2-12, #55); `ED 47` (`LD I,A`) was next
-        // and is now M2-13 (#56). `ED 77` and `ED 7F` are all of the defined range
-        // that no ticket has claimed yet.
-        let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0xED, 0x77]);
-        let message = caught(|| cpu.step(&mut bus)).expect_err("ED 77 is not implemented");
-        assert!(message.contains("ED 77"), "{message}");
+    fn every_defined_ed_opcode_is_dispatched() {
+        for op in 0x00u8..=0xFF {
+            if !ed_is_defined(op) {
+                continue;
+            }
+            let mut cpu = Z80::new();
+            cpu.set_sp(0x2000);
+            // Four bytes: `ED 43` (`LD (nn),BC`) wants the whole word, and
+            // `RamBus` rather than `Program` because the defined range includes
+            // `IN r,(C)`/`OUT (C),r`.
+            let mut bus = RamBus::at(0, &[0xED, op, 0x34, 0x12]);
+            let step = caught(|| cpu.step(&mut bus));
+            assert!(step.is_ok(), "ED {op:02X} panicked: {step:?}");
+        }
+    }
+
+    #[test]
+    fn ed_defined_range_is_the_suites_ed_files() {
         for op in [0x40u8, 0x7F, 0xA0, 0xA3, 0xA8, 0xAB, 0xB0, 0xB3, 0xB8, 0xBB] {
             assert!(ed_is_defined(op), "ED {op:02X} should be defined");
         }
@@ -612,6 +629,33 @@ mod tests {
         }
     }
 
+    /// A rotted prefix is an instruction of its own, so it clears the
+    /// undocumented latches before the instruction behind it runs.
+    ///
+    /// `SCF` is the only way to see this from the outside: it builds `X`/`Y`
+    /// from `(q ^ F) | A`, so plain `37` keeps the previous instruction's `q`
+    /// (see `misc::tests::scf_xy_uses_q`) and `DD 37` must not. Every one of the
+    /// 1000 cases of the suite's `dd 37`, `fd 37`, `dd 3f` and `fd 3f` agrees
+    /// with the cleared version, and none of them would with `q` still live.
+    #[test]
+    fn rotted_prefix_clears_q_before_the_instruction() {
+        for prefix in [0xDDu8, 0xFD] {
+            let mut cpu = Z80::new();
+            let mut bus = RamBus::at(0, &[prefix, 0x37]);
+            cpu.set_a(0x00);
+            cpu.set_flags(FLAG_X);
+            cpu.set_q(FLAG_X);
+
+            // Four T-states for the prefix, four for the `SCF` behind it.
+            assert_eq!(cpu.step(&mut bus), 8, "{prefix:02X} 37");
+            assert_eq!(
+                cpu.f() & (FLAG_X | FLAG_Y),
+                FLAG_X,
+                "{prefix:02X} 37: q is cleared, so F alone supplies X and A adds nothing"
+            );
+        }
+    }
+
     #[test]
     fn chained_prefixes_each_cost_a_nop_and_the_last_wins() {
         // No SingleStepTests file covers chained prefixes, so this pins the rule
@@ -632,18 +676,22 @@ mod tests {
         assert_eq!(cpu.step(&mut bus), 12);
         assert_eq!((cpu.pc(), cpu.r()), (3, 3));
 
-        // Last prefix wins, in both orders: `DD FD 80` reaches the `IXH`/`IXL`
-        // ALU block as `FD 80` and `FD DD 80` as `DD 80`, whichever way the
-        // prefixes are stacked. `80` is used because the `LD r,r'` half of this
-        // space became real instructions in M2-15 (#58), which moved this test
-        // off its old `24` example: the chain still has to be proved, it just
-        // has to be proved on an opcode that is still missing.
-        for (first, second, winner) in [(0xDD, 0xFD, "FD"), (0xFD, 0xDD, "DD")] {
+        // Last prefix wins, proved on an opcode whose result says which index
+        // pair it used: `DD FD 21 nn` is `LD IY,nn` behind a rotted `DD`, and
+        // `FD DD 21 nn` is `LD IX,nn`. The chain used to be proved by reading a
+        // panic message back from an opcode that was still missing, and M2-17
+        // (#60) left the index space with none - `DD FD 80` is `ADD A,B` by now.
+        // [`Z80::dd_fd_chain_uses_iy`] is the same claim on `LD B,IYH`.
+        for (first, second, want) in [
+            (0xDDu8, 0xFDu8, (0u16, 0x1234u16)),
+            (0xFD, 0xDD, (0x1234, 0)),
+        ] {
             let mut cpu = Z80::new();
-            let mut bus = Program::new(&[first, second, 0x80]);
-            let message =
-                caught(|| cpu.step(&mut bus)).expect_err("{second:02X} 80 is not implemented");
-            assert!(message.contains(&format!("{winner} 80")), "{message}");
+            let mut bus = Program::new(&[first, second, 0x21, 0x34, 0x12]);
+            // The rotted prefix costs a NOP in front of the 14 T-state indexed
+            // load (`LD IX,nn` is 14, not the 10 of `LD HL,nn`).
+            assert_eq!(cpu.step(&mut bus), 18, "{first:02X} {second:02X} 21");
+            assert_eq!((cpu.ix(), cpu.iy()), want, "{first:02X} {second:02X} 21");
         }
     }
 
@@ -713,19 +761,29 @@ mod tests {
         assert!(cpu.get_flag(FLAG_C), "bit 7 of 0x81 shifted out into C");
     }
 
-    /// The main space has no fallback arm any more: M2-13 (#56) was the last
-    /// ticket for it, so all 256 opcodes are dispatched and `0x2F` used to be
-    /// this test's example. The index space keeps one, and the example moved to
-    /// `DD 80` when M2-15 (#58) turned `DD 68` into `LD IYL,B`.
+    /// The index space has no fallback arm any more, so nothing in it may
+    /// panic: every one of the 512 `DD`/`FD` opcodes is either an indexed
+    /// instruction or a rotted prefix in front of an unprefixed one.
+    ///
+    /// This is what `index_space_gives_a_useful_panic` checked before M2-17
+    /// (#60) closed the space - it named one still-missing opcode (`DD 80`,
+    /// `DD 68` before that) and read the panic back. With the rot in place the
+    /// honest version of the same check is that there is nothing left to name.
     #[test]
-    fn index_space_gives_a_useful_panic() {
-        let mut cpu = Z80::new();
-        let mut bus = Program::new(&[0xDD, 0x80]);
-        let message = caught(|| cpu.step(&mut bus)).expect_err("DD 80 is not implemented");
-        assert!(
-            message.contains("DD 80 (x2 y0 z0)"),
-            "unhelpful message: {message}"
-        );
+    fn index_space_is_fully_dispatched() {
+        for prefix in [0xDDu8, 0xFD] {
+            for op in 0x00u8..=0xFF {
+                let mut cpu = Z80::new();
+                cpu.set_sp(0x2000);
+                // Six bytes: the prefix and the opcode, plus room for a
+                // displacement, a word operand and a stack push. `RamBus`, not the
+                // `Program` of the tests above, because the rot sends `DD D3` and
+                // `DD DB` to a real `OUT`/`IN` and `Program` has no ports.
+                let mut bus = RamBus::at(0, &[prefix, op, 0x00, 0x00, 0x00, 0x00]);
+                let step = caught(|| cpu.step(&mut bus));
+                assert!(step.is_ok(), "{prefix:02X} {op:02X} panicked: {step:?}");
+            }
+        }
     }
 
     #[test]
