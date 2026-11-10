@@ -582,6 +582,15 @@ pub struct Report {
 }
 
 impl Report {
+    /// Cases that ran and did not match: `total - passed - skipped`.
+    ///
+    /// Kept as a subtraction rather than a fourth counter so the three
+    /// invariants a reader checks by hand (`passed + failed + skipped == total`)
+    /// cannot drift apart from each other.
+    pub fn failed(&self) -> usize {
+        self.total - self.passed - self.skipped
+    }
+
     /// Print this file's line, plus the lines of the failures it kept.
     fn print(&self, name: &str) {
         let skipped = if self.skipped == 0 {
@@ -660,30 +669,28 @@ pub fn run_cases(cases: &[TestCase], check: Check) -> Report {
     run_cases_on(&mut Machine::new(), cases, check)
 }
 
-/// Run every instruction file in the suite under `base`, printing one line per
-/// file, and return `(name, report)` for each. Empty when the suite is not
+/// Run every instruction file in the suite under `base` and return
+/// `(name, report)` for each, sorted by name. Empty when the suite is not
 /// fetched.
 ///
-/// This is the shape M1-32 (#42) turns into a gate, and it never asserts: until
-/// the instructions exist most files fail, so asserting here would only measure
-/// how much work is left.
+/// Neither printing nor asserting is this function's job: the sweep in
+/// `singlestep.rs` (M1-32, #42) owns both, and a report here would duplicate the
+/// table that gate prints.
 pub fn run_all_files_in(base: &Path, check: Check) -> Vec<(String, Report)> {
     let Some(names) = all_files_in(base) else {
         eprintln!("{}", skip_line(SUITE_DIR));
         return Vec::new();
     };
-    // Most of the suite walks into an unimplemented instruction on purpose, and
-    // the panic text is already in the report line; 124 files' worth of default
-    // panic output would bury the rest of the log.
+    // A case whose instruction has no handler panics on purpose, and the panic
+    // text is already in the report line; a whole sweep's worth of default panic
+    // output would bury the rest of the log.
     let _quiet = QuietPanicHook::install();
     // One machine for the whole sweep: the bus is 16 MiB and the files are 124.
     let mut machine = Machine::new();
     let mut reports = Vec::with_capacity(names.len());
     for name in names {
         let cases = load_file_in(base, &name).expect("the suite was listed");
-        let report = run_cases_on(&mut machine, &cases, check);
-        report.print(&name);
-        reports.push((name, report));
+        reports.push((name, run_cases_on(&mut machine, &cases, check)));
     }
     reports
 }
