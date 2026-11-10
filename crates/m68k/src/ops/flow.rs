@@ -29,14 +29,23 @@
 //!
 //! # Timing
 //!
-//! The handlers return 0, like every other handler in this module: the clocks a
-//! branch costs come from the self-charging bus helpers, which is enough to keep
-//! the property the manual cares about — a taken branch refills the queue and so
-//! costs [`crate::M68k::jump_to`]'s 8 clocks, a not-taken one slides the window
-//! for 4. The reference totals (Bcc taken 10, `Bcc.B` not taken 8, `Bcc.W` not
-//! taken 12, BSR 18, DBcc 12/10/14, Scc 4/6 — M68000UM appendix "Instruction
-//! Timing") are M1-31's (#39/#40) to settle, and adding them here on top of the
-//! cycles the queue already charged would only double-count them.
+//! A branch's clocks are the queue's plus one of two flat numbers, and the flat
+//! numbers are what the handlers hand back ([`BRANCH_TAKEN_CLOCKS`] 2 for the
+//! branch that goes, [`BRANCH_NOT_TAKEN_CLOCKS`] 4 for the one that stays).
+//! Together with [`crate::M68k::jump_to`]'s 8 clocks for the two fetches at the
+//! target and [`crate::M68k::advance_opcode`]'s 4 for sliding the window, that
+//! reproduces the reference totals exactly: `Bcc`/`BRA` taken 10, `Bcc.B` not
+//! taken 8, `Bcc.W` not taken 12, `BSR` 18 for both displacement widths
+//! (M68000UM appendix "Instruction Timing", and every branch-taking and
+//! non-branching non-exception case of the pinned `Bcc`/`BSR`/`DBcc` files).
+//!
+//! The one thing the queue does *not* pay for on a taken branch is the refill
+//! read of the displacement word — see [`M68k::branch_displacement`] — which is
+//! why `Bcc.W` taken is 10 rather than the 12 its extra fetch would cost.
+//!
+//! `Scc` carries a rule of its own ([`SCC_WRITE_CLOCKS`]); `JMP`, `JSR`, `RTS`,
+//! `RTR`, `RTE`, `NOP`, `TRAPV` and `RESET` need nothing beyond the bus cycles
+//! they already charge.
 
 use crate::M68k;
 use crate::bus::Bus;
@@ -63,6 +72,31 @@ const TRAPV_WIDTH: u32 = 2;
 /// [`M68k::op_reset`] hands back because RESET makes no bus access of its own.
 pub(crate) const RESET_CLOCKS: u32 = 132;
 
+/// Clocks a taken branch pays over and above refilling the queue at its target:
+/// the branch processor loads the new PC and restarting the fetch there costs
+/// two clocks that no bus cycle covers (M68000UM, "Instruction Processing").
+///
+/// The reference totals are `Bcc`/`BRA` taken 10 and `BSR` 18; `jump_to` already
+/// charges the two target fetches (8) and `BSR`'s push another 8, so this is
+/// what is left. Measured over every branch-taking, non-exception case of the
+/// pinned `Bcc.json.gz` (2 951 cases, all 10) and `BSR.json.gz` (4 085, all 18)
+/// for M1-31c (#41) — which is also what shows the two clocks being flat: the
+/// `d16` forms pay no more than the `d8` ones, because the displacement word is
+/// read out of the queue and the queue is reloaded at the target instead of
+/// being refilled (see [`M68k::queued_ext_word`]).
+const BRANCH_TAKEN_CLOCKS: u32 = 2;
+
+/// Clocks a branch that does *not* branch pays over and above finishing the
+/// opcode: 4, where a taken branch pays [`BRANCH_TAKEN_CLOCKS`].
+///
+/// The reference totals are `Bcc` not taken 8 for a byte displacement and 12 for
+/// a word one; [`M68k::advance_opcode`] charges the 4 (or 8, with the
+/// displacement word's own refill) that leaves, so this is the remainder.
+/// Measured over every non-exception, non-branching case of `Bcc.json.gz`
+/// (2 914 at 8 and 12 with a word displacement) and `DBcc.json.gz` (4 096 at 12)
+/// for #41.
+const BRANCH_NOT_TAKEN_CLOCKS: u32 = 4;
+
 /// A `Bcc`/`BSR` byte displacement of zero is not a branch to the next
 /// instruction: it is the escape hatch that means a 16-bit displacement word
 /// follows (M68000UM "Bcc — Branch Conditional").
@@ -81,6 +115,17 @@ const INSTRUCTION_WIDTH: u32 = 2;
 /// (M68000UM "Scc — Set Conditional": "if condition FALSE, 0; else, all ones").
 const SCC_TRUE: u8 = 0xFF;
 
+/// Clocks `Scc` pays for writing `$FF` to a data register on top of its bus
+/// traffic: the memory forms' write is already a bus cycle, the register form's
+/// is a 2-clock pass.
+///
+/// `Scc` to `Dn` is 4 where the condition does not hold and 6 where it does
+/// (M68000UM "Scc — Set Conditional", appendix "Instruction Timing", 4/6 for the
+/// register form). Measured over `Scc.json.gz` for #41: the file's mode-000
+/// cases split 641 at 6 to 639 at 4, on the value written and nothing else, and
+/// every memory case is exact with no charge at all.
+const SCC_WRITE_CLOCKS: u32 = 2;
+
 /// The value `DBcc`'s counter holds after the decrement that ends the loop, and
 /// the reason the loop does not branch a final time: the counter is a *word*, so
 /// `0 - 1` is `$FFFF` rather than "ran out" (M68000UM "DBcc — Decrement and
@@ -97,14 +142,16 @@ impl M68k {
     /// (M68000UM "68000 CCR Affected by Instruction Set").
     pub(crate) fn op_bcc(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
         let base = self.branch_base();
-        let (disp, _wide) = self.branch_displacement(bus, opcode);
+        let taken = test_cc(condition(opcode), self.sr);
+        let (disp, _wide) = self.branch_displacement(bus, opcode, taken);
 
-        if test_cc(condition(opcode), self.sr) {
+        if taken {
             self.jump_to(bus, base.wrapping_add(disp));
+            BRANCH_TAKEN_CLOCKS
         } else {
             self.advance_opcode(bus);
+            BRANCH_NOT_TAKEN_CLOCKS
         }
-        0
     }
 
     /// `BSR d8`/`BSR d16`, `0110 0001 dddddddd`: `Bcc` with a call attached
@@ -116,11 +163,13 @@ impl M68k {
     /// pops it again.
     pub(crate) fn op_bsr(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
         let base = self.branch_base();
-        let (disp, wide) = self.branch_displacement(bus, opcode);
+        // `BSR` branches unconditionally, so the displacement word never gets
+        // its queue refill (see [`M68k::branch_displacement`]).
+        let (disp, wide) = self.branch_displacement(bus, opcode, true);
 
         self.push_long(bus, base.wrapping_add(wide));
         self.jump_to(bus, base.wrapping_add(disp));
-        0
+        BRANCH_TAKEN_CLOCKS
     }
 
     /// `Scc <ea>`, `0101 cccc 11 eeeeee` at every mode but `001`
@@ -149,6 +198,15 @@ impl M68k {
         );
 
         self.advance_opcode(bus);
+        // Writing `$FF` to a data register is a 2-clock pass the memory forms do
+        // not need, because their write is already a bus cycle: `Scc` to `Dn` is
+        // 6 where the condition holds and 4 where it does not, which the file's
+        // mode-000 cases split 641/639 on exactly the value written, and every
+        // memory case of the file is exact without it (M68000UM "Scc — Set
+        // Conditional", "4/6" for the register form; measured for #41).
+        if holds && matches!(dest, Ea::DataReg(_)) {
+            return SCC_WRITE_CLOCKS;
+        }
         0
     }
 
@@ -162,25 +220,37 @@ impl M68k {
     /// `self.d[]` — and the base is the address of the displacement word.
     pub(crate) fn op_dbcc(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
         let base = self.branch_base();
-        // The displacement word is popped before the condition is looked at: it is
-        // part of the instruction either way, and the base has to be read while
-        // `pc` is still the opcode's address.
-        let disp = sign_extend_word(self.fetch_ext_word(bus));
-
-        if test_cc(condition(opcode), self.sr) {
-            self.advance_opcode(bus);
-            return 0;
-        }
+        let holds = test_cc(condition(opcode), self.sr);
         let counter = field(opcode, EA_REG_SHIFT);
         let next = (self.d[usize::from(counter)] as u16).wrapping_sub(1);
+        // Whether this step ends in the queue being reloaded has to be known
+        // before the displacement is read, because that is what decides whether
+        // the word costs the refill read or nothing (see
+        // [`M68k::branch_displacement`]).
+        let taken = !holds && next != DBCC_EXPIRED;
+        let disp = sign_extend_word(if taken {
+            self.queued_ext_word()
+        } else {
+            self.fetch_ext_word(bus)
+        });
+
+        if holds {
+            self.advance_opcode(bus);
+            return BRANCH_NOT_TAKEN_CLOCKS;
+        }
         self.write_ea(bus, Ea::DataReg(counter), Size::Word, u32::from(next));
 
-        if next == DBCC_EXPIRED {
-            self.advance_opcode(bus);
-        } else {
+        if taken {
             self.jump_to(bus, base.wrapping_add(disp));
+            BRANCH_TAKEN_CLOCKS
+        } else {
+            // The loop ran out: the counter is written and the instruction
+            // finishes where it was. `DBcc.json.gz` has no case whose counter is
+            // `$0000`, so nothing in the suite dates this path; it is timed like
+            // the other not-taken one, whose 12 clocks the file does measure.
+            self.advance_opcode(bus);
+            BRANCH_NOT_TAKEN_CLOCKS
         }
-        0
     }
 
     /// `JMP <ea>`, `0100 1110 11 mmm rrr` (M68000UM "JMP — Jump"): go to the
@@ -414,13 +484,23 @@ impl M68k {
     /// The other side of that rule is what the 68020 added and the 68000 does not
     /// have: `$FF` is a displacement of -1 here, never a long-branch marker, so
     /// `$60FF` is `BRA.B #-1`.
-    fn branch_displacement(&mut self, bus: &mut impl Bus, opcode: u16) -> (u32, u32) {
+    /// `taken` says whether the branch is going to be taken, which is what
+    /// decides whether the displacement word costs a bus cycle: a taken branch
+    /// reloads the queue at its target a moment later, so the read that popping
+    /// the word would schedule never happens and the word is read straight out
+    /// of the queue ([`M68k::queued_ext_word`]). Measured on the suite's own bus
+    /// traces: `6300 [Bcc #] 2193` (taken, word displacement, `length` 10) has
+    /// no read at `pc + 4`, `6200 [Bcc #] 193` (not taken, `length` 12) has one
+    /// (M1-31c, #41).
+    fn branch_displacement(&mut self, bus: &mut impl Bus, opcode: u16, taken: bool) -> (u32, u32) {
         let low = opcode as u8;
         if low == WORD_DISPLACEMENT {
-            (
-                sign_extend_word(self.fetch_ext_word(bus)),
-                WORD_DISPLACEMENT_WIDTH,
-            )
+            let word = if taken {
+                self.queued_ext_word()
+            } else {
+                self.fetch_ext_word(bus)
+            };
+            (sign_extend_word(word), WORD_DISPLACEMENT_WIDTH)
         } else {
             (sign_extend_byte(low), 0)
         }

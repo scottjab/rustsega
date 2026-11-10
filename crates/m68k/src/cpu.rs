@@ -629,6 +629,22 @@ impl M68k {
         self.pop_word(bus)
     }
 
+    /// The word already sitting at the back of the queue — the instruction's
+    /// extension word — taken **without** the refill read [`M68k::pop_word`]
+    /// charges.
+    ///
+    /// Only for an instruction that is about to throw the queue away. A branch
+    /// that takes reloads both slots at its target, so the read that would have
+    /// refilled the extension word's slot never reaches the bus: the word was
+    /// fetched while the opcode was still being decoded. Measured on the
+    /// bus traces of `Bcc.json.gz` — case `6300 [Bcc #] 2193` (`Bcc.W`, taken,
+    /// `length` 10) lists `n 2` and the two target fetches and nothing else,
+    /// while `6200 [Bcc #] 193` (the same opcode, not taken, `length` 12) lists
+    /// the fetch at `pc + 4` that the pop does owe (M1-31c, #41).
+    pub(crate) const fn queued_ext_word(&self) -> u16 {
+        self.prefetch[1]
+    }
+
     /// A long extension word: two queue words, high word first, so 8 clocks and
     /// `pc` advances by 4.
     pub(crate) fn fetch_ext_long(&mut self, bus: &mut impl Bus) -> u32 {
