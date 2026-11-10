@@ -117,6 +117,18 @@ jobs:
         # docs/m68k-conformance.md.
         run: nix develop -c cargo nextest run -p m68k --run-ignored all --no-capture all_instructions
 
+      - name: z80 conformance gate
+        # The whole Z80 SingleStepTests suite - every register including the
+        # hidden `wz`/`p`/`q` ones, the RAM and port traffic each case lists, and
+        # the T-state count - as `singlestep.rs`'s `all_opcodes` gate: 6.8 s of
+        # test time, the same argument for putting it on a pull request as the
+        # step above. `just check` already runs `sst_sample`, 20 cases of every
+        # file, so what this adds is the other 980 of each file: the cases where
+        # an undocumented flag or an edge-case cycle count first appears.
+        # `--no-capture` for the per-file table, as above. The pin, the numbers
+        # and the blind spots are in docs/z80-conformance.md.
+        run: nix develop -c cargo nextest run -p z80 --run-ignored all --no-capture all_opcodes
+
       - name: just test-all (main only)
         # The slow #[ignore] suites (full SingleStepTests, long ROM runs) run on
         # main, where a late failure is information, and not on PRs, where they
