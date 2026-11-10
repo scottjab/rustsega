@@ -79,7 +79,7 @@ impl M68k {
         let dest = field(opcode, 9);
         let mode = field(opcode, 3);
         let reg = field(opcode, 0);
-        let Some(addr) = self.ea_address(bus, mode, reg) else {
+        let Some(addr) = self.ea_address(bus, mode, reg, false) else {
             return self.op_illegal(bus);
         };
 
@@ -98,7 +98,7 @@ impl M68k {
     pub(crate) fn op_pea(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
         let mode = field(opcode, 3);
         let reg = field(opcode, 0);
-        let Some(addr) = self.ea_address(bus, mode, reg) else {
+        let Some(addr) = self.ea_address(bus, mode, reg, false) else {
             return self.op_illegal(bus);
         };
 

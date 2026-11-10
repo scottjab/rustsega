@@ -267,7 +267,7 @@ impl M68k {
     pub(crate) fn op_jmp(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
         let mode = field(opcode, EA_MODE_SHIFT);
         let reg = field(opcode, EA_REG_SHIFT);
-        let Some(target) = self.ea_address(bus, mode, reg) else {
+        let Some(target) = self.ea_address(bus, mode, reg, true) else {
             return self.op_illegal(bus);
         };
 
@@ -292,7 +292,7 @@ impl M68k {
     pub(crate) fn op_jsr(&mut self, bus: &mut impl Bus, opcode: u16) -> u32 {
         let mode = field(opcode, EA_MODE_SHIFT);
         let reg = field(opcode, EA_REG_SHIFT);
-        let Some(target) = self.ea_address(bus, mode, reg) else {
+        let Some(target) = self.ea_address(bus, mode, reg, true) else {
             return self.op_illegal(bus);
         };
 

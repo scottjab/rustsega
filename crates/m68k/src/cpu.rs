@@ -67,6 +67,10 @@ pub(crate) const STOPPED_CLOCKS: u32 = 4;
 /// `pc + FETCH_AHEAD` and every queue refill reads from there.
 const FETCH_AHEAD: u32 = 4;
 
+/// Clocks a jump pays for one displacement word it reads out of the prefetch
+/// queue: see [`M68k::jump_ext_word`].
+const JUMP_WORD_CLOCKS: u64 = 2;
+
 /// The 68000 register file and CPU state.
 ///
 /// Fields are plain data (no `Box<dyn _>`, no references) so the save-state
@@ -643,6 +647,49 @@ impl M68k {
     /// the fetch at `pc + 4` that the pop does owe (M1-31c, #41).
     pub(crate) const fn queued_ext_word(&self) -> u16 {
         self.prefetch[1]
+    }
+
+    /// [`M68k::fetch_ext_word`] for the **last** extension word of an
+    /// instruction that is about to [`M68k::jump_to`]: takes the word out of the
+    /// queue — `pc` and `prefetch[0]` move exactly as they would — but skips the
+    /// refill read, which is the whole cost of a pop and which the discarded
+    /// queue makes pointless.
+    ///
+    /// `prefetch[1]` is left holding the word that moved to the front, so the
+    /// `prefetch == [word(pc), word(pc + 2)]` invariant is broken between here
+    /// and the `jump_to` that restores it. Nothing may read the queue in
+    /// between, which is why this is only for a jump: `push_long`, `write_ea`
+    /// and friends never touch it.
+    pub(crate) fn pop_queued_ext_word(&mut self) -> u16 {
+        let word = self.prefetch[1];
+        self.prefetch[0] = word;
+        self.pc = (self.pc + 2) & ADDR_MASK;
+        word
+    }
+
+    /// [`M68k::pop_queued_ext_word`] at the 2-clock price a *jump* pays for the
+    /// displacement word it reads: the refill read is cancelled with the queue,
+    /// and what is left is turning the word into an address.
+    ///
+    /// Measured per control mode on `JMP.json.gz` (M1-31c, #41): `JMP (An)` is 8
+    /// clocks — `jump_to` alone — and `JMP (d16,A0)`, `JMP (xxx).W` and
+    /// `JMP (d16,PC)` are 10, one word's 2 on top. `JMP (d8,A0,Xn)` is 14 and is
+    /// **not** priced this way: see [`M68k::indexed_addr`].
+    pub(crate) fn jump_ext_word(&mut self) -> u16 {
+        let word = self.pop_queued_ext_word();
+        self.cycles += JUMP_WORD_CLOCKS;
+        word
+    }
+
+    /// [`M68k::fetch_ext_long`] for an instruction that is about to discard the
+    /// queue: the first word still costs its refill read, because that read is
+    /// what brings the second word in, and the second word costs nothing.
+    /// `JMP (xxx).l`'s trace is exactly that — one read at `pc + 4` and the two
+    /// fetches at the target, 12 clocks (`4ef9 [JMP (xxx).l] 43`).
+    pub(crate) fn pop_queued_ext_long(&mut self, bus: &mut impl Bus) -> u32 {
+        let high = u32::from(self.fetch_ext_word(bus));
+        let low = u32::from(self.pop_queued_ext_word());
+        (high << 16) | low
     }
 
     /// A long extension word: two queue words, high word first, so 8 clocks and
