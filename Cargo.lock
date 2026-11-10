@@ -61,6 +61,7 @@ version = "0.1.0"
 dependencies = [
  "m68k",
  "testkit",
+ "z80",
 ]
 
 [[package]]
