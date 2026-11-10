@@ -31,11 +31,11 @@
 //!
 //! [`m68k::Bus::int_ack`] is deliberately left at the trait default: returning
 //! `None` *is* what a Genesis does, always autovectoring.
-//! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`], the first device
-//! behind the bus; the rest arrive with M3-08 (#68) and M3-09 (#69).
+//! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`] and the Z80's control
+//! lines; the VDP joins them with M3-09 (#69).
 
 use crate::io::Io;
-use crate::z80_bus::Z80Side;
+use crate::z80_bus::{self, YM_STATUS_IDLE, Z80Side};
 use m68k::ADDR_MASK;
 
 /// What an undriven data bus reads as: the placeholder for every area that
@@ -70,6 +70,38 @@ const RAM_MASK: u32 = 0x0000_FFFF;
 /// as a byte, 0xA10000 read as a word (plutiedev "Using the Sub-CPU in mode 1",
 /// `HwVersion: equ $A10001`).
 const IO_VERSION: u32 = IO_START;
+/// The Z80 bus request register, `Z80BusReq: equ $A11100` of plutiedev "Using the
+/// Z80". Writing 1 asks the sound CPU for its bus; reading bit 0 says whether the
+/// Z80 is still running.
+const Z80_BUSREQ: u32 = 0xA11100;
+/// The Z80 reset register, `Z80Reset: equ $A11200` of the same page. Writing 0
+/// asserts reset - the Z80 stops and the YM2612 is reset with it - and 1 releases it,
+/// which resets the Z80's `PC` to 0.
+const Z80_RESET_REG: u32 = 0xA11200;
+/// Address mask that names one of the two Z80 control registers: each sits at the
+/// bottom of a 0x100 block and neither decodes A0-A7, so 0xA11100-0xA111FF are all
+/// the bus request register and 0xA11200-0xA112FF are all the reset register.
+///
+/// BlastEm decodes the pair as `location & 0xFFF00` in `io_write` and Genesis Plus GX
+/// as `(address >> 8) & 0xFF` in `ctrl_io_write_byte`; MAME maps only the two
+/// addresses themselves (`map(0xa11100, 0xa11101)`), which the mask still hits.
+const Z80_CTRL_MASK: u32 = !0xFF;
+/// Only these bits of a 68k address in [`Region::Z80`] reach the Z80's bus: the 68k
+/// drops its top byte at the sound side, so 0xA08000 is 0xA00000 again. BlastEm
+/// masks a 68k access to the area with `0x7FFF`, and Genesis Plus GX decodes it with
+/// `(address >> 13) & 3` and `(address >> 8) & 0x7F` on a 16 bit offset, which wraps
+/// the upper 32 KiB of the area onto the lower 32 KiB exactly the same way.
+const Z80_AREA_MASK: u32 = 0x7FFF;
+
+// Sub-decode of [`Region::Z80`]: the boundaries of the Z80's own map
+// ([`crate::z80_bus`]) as offsets into its 32 KiB window. See [`SoundSide`].
+const SND_RAM_END: u32 = 0x3FFF;
+const SND_YM_START: u32 = 0x4000;
+const SND_YM_END: u32 = 0x5FFF;
+const SND_BANK_START: u32 = 0x6000;
+const SND_BANK_END: u32 = 0x60FF;
+const SND_VDP_START: u32 = 0x7F00;
+const SND_VDP_END: u32 = 0x7FFF;
 /// Address mask that drops A0: the I/O registers sit two bytes apart and decode
 /// without A0 (plutiedev "I/O ports" lists them at $A10001, $A10003, ..., and
 /// BlastEm's `io_read` decodes with `location >> 1`), so `addr & EVEN_LANE`
@@ -92,9 +124,10 @@ enum Region {
     /// TODO(M3-09 #69): the data/control/HV-counter/PSG ports at
     /// 0xC00000-0xC0001C, mirrored every 0x40 (plutiedev "Memory map").
     Vdp,
-    /// 0xA00000-0xA0FFFF, the Z80 bus seen from the 68k.
+    /// 0xA00000-0xA0FFFF, the Z80 bus seen from the 68k: the sound RAM, the YM2612,
+    /// the bank register and the PSG, reached only while the 68k holds the Z80's bus.
     ///
-    /// TODO(M3-08 #68): Z80 RAM, YM2612 and PSG through the sound CPU's side.
+    /// [`SoundSide`] is the decode and [`Bus::z80_bus_granted`] the gate.
     Z80,
     /// 0xA10000-0xA10FFF, I/O: version register and the three controller ports -
     /// the whole decoded area, not just the 0xA10000-0xA1001F block of registers
@@ -104,10 +137,8 @@ enum Region {
     /// [`Bus::version`] answers [`IO_VERSION`] and [`Bus::io`] the register block
     /// at 0xA10000-0xA1001F; the rest of the area is [`OPEN_BUS`].
     Io,
-    /// 0xA11000-0xA11FFF, Z80 bus control.
-    ///
-    /// TODO(M3-08 #68): BUSREQ at 0xA11100 and Z80 RESET at 0xA11200, which
-    /// decide whether a 68k access to [`Region::Z80`] is allowed at all.
+    /// 0xA11000-0xA11FFF, Z80 bus control: [`Z80_BUSREQ`] and [`Z80_RESET_REG`],
+    /// which decide whether a 68k access to [`Region::Z80`] is allowed at all.
     Z80Ctrl,
     /// 0xA13000-0xA130FF, the cartridge slot extra.
     ///
@@ -188,12 +219,42 @@ pub struct Bus {
     /// the module docs of [`crate::z80_bus`]. The Z80 runs on the same board as
     /// this bus, and stepping it is `Z80View::new(&mut bus)`.
     pub z80: Z80Side,
+    /// The Z80's bus request line, as the 68k last set it at [`Z80_BUSREQ`].
+    ///
+    /// `true` means the 68k has asked for the bus and therefore owns the sound side
+    /// ([`Bus::z80_bus_granted`]); `false` means the Z80 has it. There is one line, not
+    /// a register per address: the decode drops A0-A7, so 0xA11100 and 0xA11101 are
+    /// the same flag.
+    z80_busreq: bool,
+    /// The Z80's reset line, as the 68k last set it at [`Z80_RESET_REG`]. Inverted the
+    /// way the hardware is: `true` is *asserted*, which is what the 68k asks for by
+    /// writing 0, and while it holds the Z80 does not run and the YM2612 is reset with
+    /// it.
+    z80_reset: bool,
+    /// Set when the 68k releases [`Z80_RESET_REG`], and cleared by
+    /// [`Bus::take_z80_reset`].
+    ///
+    /// Coming out of reset is an event rather than a level: it is what puts the Z80's
+    /// `PC` at 0, and the bus cannot reach into the CPU to do it, so the scheduler
+    /// (M3-14 #75) asks with this.
+    z80_reset_pulse: bool,
 }
 
 impl Bus {
-    /// A bus with `rom` loaded and `version` behind 0xA10001. Work RAM starts
-    /// zeroed; a real console powers up with undefined contents, which nothing
-    /// depends on yet.
+    /// A bus with `rom` loaded and `version` behind 0xA10001, and the Z80 parked the
+    /// way a real console leaves it at power on: **reset asserted, bus released to the
+    /// Z80**, so [`Bus::z80_can_run`] is false and [`Region::Z80`] is unreachable until a
+    /// program asks for it. Work RAM starts zeroed; a real console powers up with
+    /// undefined contents, which nothing depends on yet.
+    ///
+    /// Those two power-on levels are what both references that set the lines up use:
+    /// MAME's `machine_reset` (`src/mame/sega/megadriv.cpp`) sets `z80_is_reset = 1` and
+    /// `z80_has_bus = 1`, and Genesis Plus GX's `gen_reset` (`core/genesis.c`) sets
+    /// `zstate = 0` on the line commented "Z80 bus is released & Z80 is reseted", plus
+    /// `zbank = 0`. It is also what the init code of plutiedev "Using the Z80" expects:
+    /// it asserts reset, requests the bus, releases reset, and only then copies its
+    /// program into Z80 RAM, because the sound CPU has not initialised itself until it is
+    /// let go.
     ///
     /// `version` is what the console decided to be, not something the bus
     /// works out: the caller has [`crate::Config`] and the header, and says
@@ -214,7 +275,84 @@ impl Bus {
             version,
             io: Io::new(),
             z80: Z80Side::new(),
+            z80_busreq: false,
+            z80_reset: true,
+            z80_reset_pulse: false,
         }
+    }
+
+    /// May the Z80 run: it is neither held in reset nor has the 68k taken its bus.
+    ///
+    /// This is the question the scheduler (M3-14 #75) asks before stepping the sound
+    /// CPU; both lines are driven by the 68k at [`Z80_RESET_REG`] and [`Z80_BUSREQ`],
+    /// and either one stops it. Neither line has a delay here - see
+    /// [`Bus::z80_bus_granted`] for what is not modelled.
+    pub fn z80_can_run(&self) -> bool {
+        !(self.z80_busreq || self.z80_reset)
+    }
+
+    /// Take the "the Z80 has just come out of reset" pulse, and clear it.
+    ///
+    /// The scheduler answers a `true` with `z80::Z80::reset`, which is what puts `PC`
+    /// back to 0; Genesis Plus GX's `gen_zreset_w` calls `z80_reset()` on exactly this
+    /// edge. The pulse is one-shot so a scheduler that steps the CPU between two writes
+    /// cannot reset it twice, or miss a reset, by looking at the level.
+    pub fn take_z80_reset(&mut self) -> bool {
+        let pulse = self.z80_reset_pulse;
+        self.z80_reset_pulse = false;
+        pulse
+    }
+
+    /// Drive the Z80's reset line: `true` asserts it, `false` releases it.
+    ///
+    /// Both edges matter and neither is silent:
+    ///
+    /// - asserting also resets the YM2612, whose `/RESET` pin is tied to this one
+    ///   (BlastEm's `io_write` calls `ym_reset` in the branch that asserts Z80 reset);
+    ///   see [`Z80Side::ym_reset`].
+    /// - releasing is what resets the Z80 itself, so it raises [`Bus::z80_reset_pulse`]
+    ///   for [`Bus::take_z80_reset`] to deliver.
+    ///
+    /// Writing the level the line is already at does neither, which is why this is
+    /// edge-detecting rather than a field write: plutiedev "Using the Z80" asserts and
+    /// releases the line repeatedly while loading a program, and the YM is only reset
+    /// on the assert edges.
+    fn set_z80_reset(&mut self, asserted: bool) {
+        if asserted == self.z80_reset {
+            return;
+        }
+        if asserted {
+            self.z80.ym_reset();
+        } else {
+            self.z80_reset_pulse = true;
+        }
+        self.z80_reset = asserted;
+    }
+
+    /// Does the 68k hold the Z80's bus, so that [`Region::Z80`] reaches the sound
+    /// hardware at all?
+    ///
+    /// The answer is the bus request line alone: `0xA11100` written 1 stops the Z80 and
+    /// hands the area over, which is what a game does before it touches the sound side
+    /// (plutiedev "Using the Z80", and BlastEm gates `io_read`/`io_write` for the whole
+    /// area on `z80_get_busack`). Without the grant a read of the area is [`OPEN_BUS`]
+    /// and a write to it is dropped - a real console is harsher than that, and a program
+    /// that skips the request may not merely read nonsense but stop: Genesis Plus GX
+    /// swaps the whole page over to a bus *lockup* handler while the Z80 owns it
+    /// (`gen_zbusreq_w`), which is also what "reads return open bus, writes are dropped"
+    /// in #68 is standing in for.
+    ///
+    /// Two things are deliberately not modelled, both M3-16 (#77)'s and the scheduler's:
+    /// the grant is instant, so no cycle is spent waiting for the Z80 to finish the bus
+    /// cycle it is in and no poll of the read-back can spin; and an access to the area
+    /// costs no penalty. The dropped write logs nothing, because a Genesis bus has no
+    /// logging facility and this is a hot path.
+    ///
+    /// plutiedev "Using the Z80", MAME and Genesis Plus GX all *also* refuse these
+    /// accesses while the Z80 is held in reset; BlastEm does not, and this follows
+    /// BlastEm. See [#260](https://github.com/scottjab/rustsega/issues/260).
+    fn z80_bus_granted(&self) -> bool {
+        self.z80_busreq
     }
 
     /// Cartridge slot byte read.
@@ -301,21 +439,66 @@ impl Bus {
     /// VDP port word write. Placeholder for [`Region::Vdp`].
     fn write_vdp_word(&mut self, _addr: u32, _value: u16) {}
 
-    /// Z80 bus byte read. Placeholder for [`Region::Z80`].
-    fn read_z80_byte(&mut self, _addr: u32) -> u8 {
-        OPEN_BUS
+    /// Z80 bus byte read: one of the sound side's devices, or open bus if the 68k does
+    /// not hold the Z80's bus. See [`Bus::z80_bus_granted`] for the gate and
+    /// [`SoundSide`] for what each address is.
+    fn read_z80_byte(&mut self, addr: u32) -> u8 {
+        if !self.z80_bus_granted() {
+            return OPEN_BUS;
+        }
+        match SoundSide::decode(addr) {
+            SoundSide::Ram => self.z80.ram[z80_bus::ram_index(addr as u16)],
+            // A read of the YM2612 is its status byte whichever port was used: the
+            // chip has exactly one readable register, so the Z80's own view answers
+            // the same way for all four.
+            SoundSide::Ym => YM_STATUS_IDLE,
+            // The bank register has no read handler in any reference, and the PSG is
+            // write-only.
+            SoundSide::Bank | SoundSide::Psg | SoundSide::Nothing => OPEN_BUS,
+        }
     }
 
-    /// Z80 bus word read. Placeholder for [`Region::Z80`].
-    fn read_z80_word(&mut self, _addr: u32) -> u16 {
-        OPEN_BUS_WORD
+    /// Z80 bus word read: the byte at `addr`, in both halves of the word.
+    ///
+    /// A 16 bit access to the sound side is one byte access, which is what both
+    /// references that model it say: Genesis Plus GX's `z80_read_word` reads the byte
+    /// once and mirrors it (`data | (data << 8)`), and MAME's `megadriv_68k_read_z80_ram`
+    /// answers a word from the one Z80 byte the address names. plutiedev "Using the
+    /// Z80" is blunt about it: "you must use byte accesses when touching Z80 RAM, word
+    /// accesses won't work". So the low half of every word read here is a copy, not
+    /// another byte of RAM, and [`Bus::write_z80_word`] drops the other half of a write
+    /// for the same reason.
+    fn read_z80_word(&mut self, addr: u32) -> u16 {
+        z80_word(self.read_z80_byte(addr))
     }
 
-    /// Z80 bus byte write. Placeholder for [`Region::Z80`].
-    fn write_z80_byte(&mut self, _addr: u32, _value: u8) {}
+    /// Z80 bus byte write: the sound side's device, dropped entirely unless the 68k
+    /// holds the Z80's bus. See [`Bus::z80_bus_granted`] and [`SoundSide`].
+    fn write_z80_byte(&mut self, addr: u32, value: u8) {
+        if !self.z80_bus_granted() {
+            return;
+        }
+        match SoundSide::decode(addr) {
+            SoundSide::Ram => self.z80.ram[z80_bus::ram_index(addr as u16)] = value,
+            SoundSide::Ym => self.z80.ym_log.push((z80_bus::ym_port(addr as u16), value)),
+            SoundSide::Bank => self.z80.shift_in(value),
+            SoundSide::Psg => self.z80.psg_log.push(value),
+            SoundSide::Nothing => {}
+        }
+    }
 
-    /// Z80 bus word write. Placeholder for [`Region::Z80`].
-    fn write_z80_word(&mut self, _addr: u32, _value: u16) {}
+    /// Z80 bus word write: the high byte, to the address the access names; the low half
+    /// of the word is ignored. See [`Bus::read_z80_word`] for where that comes from -
+    /// Genesis Plus GX's `z80_write_word` is `z80_write_byte(address, data >> 8)` and
+    /// MAME's write handler says "for WORD access only the MSB is used, LSB is
+    /// ignored".
+    ///
+    /// It is one rule for the whole area, RAM, YM2612, bank register and PSG alike,
+    /// which is what Genesis Plus GX does by routing every word access through the byte
+    /// handler; BlastEm's `io_write_w` for the area is the same `value >> 8`.
+    fn write_z80_word(&mut self, addr: u32, value: u16) {
+        self.write_z80_byte(addr, (value >> 8) as u8);
+    }
 
     /// I/O byte read: the version register, then the I/O chip.
     ///
@@ -382,21 +565,56 @@ impl Bus {
         self.write_io_byte(addr, value as u8);
     }
 
-    /// Z80 bus control byte read. Placeholder for [`Region::Z80Ctrl`].
-    fn read_z80_ctrl_byte(&mut self, _addr: u32) -> u8 {
-        OPEN_BUS
+    /// Z80 bus control byte read: the bus request register, and nothing else.
+    ///
+    /// Bit 0 answers 0 once the 68k holds the bus and 1 while the Z80 runs, which is
+    /// what plutiedev "Using the Z80" polls (`btst #0, (Z80BusReq)`) between requesting
+    /// the bus and touching the sound side. The reset register has no read handler in
+    /// any of the three references, so it reads [`OPEN_BUS`].
+    fn read_z80_ctrl_byte(&mut self, addr: u32) -> u8 {
+        match Z80Ctrl::decode(addr) {
+            Some(Z80Ctrl::Busreq) => busreq_byte(!self.z80_bus_granted()),
+            Some(Z80Ctrl::Reset) | None => OPEN_BUS,
+        }
     }
 
-    /// Z80 bus control word read. Placeholder for [`Region::Z80Ctrl`].
-    fn read_z80_ctrl_word(&mut self, _addr: u32) -> u16 {
-        OPEN_BUS_WORD
+    /// Z80 bus control word read: the same flag, in bit 8 of the word.
+    ///
+    /// Not [`io_word`]: the flag is driven on D8 and the low byte of the word is
+    /// nothing's, rather than being a second copy of a byte register. Genesis Plus GX's
+    /// `ctrl_io_read_word` clears or sets `0x0100` in an otherwise floating word and
+    /// MAME's `megadriv_68k_check_z80_bus` does `nextvalue | 0x0100`.
+    fn read_z80_ctrl_word(&mut self, addr: u32) -> u16 {
+        match Z80Ctrl::decode(addr) {
+            Some(Z80Ctrl::Busreq) => busreq_word(!self.z80_bus_granted()),
+            Some(Z80Ctrl::Reset) | None => OPEN_BUS_WORD,
+        }
     }
 
-    /// Z80 bus control byte write. Placeholder for [`Region::Z80Ctrl`].
-    fn write_z80_ctrl_byte(&mut self, _addr: u32, _value: u8) {}
+    /// Z80 bus control byte write: bit 0 of the byte written, at either address of the
+    /// register pair - the decode drops A0, so `0xA11101` moves the same bus request
+    /// flag and is not a second one.
+    ///
+    /// BlastEm takes `value & 1` from anywhere in the 0x100 block and MAME reads bit 0
+    /// of whichever lane arrives; Genesis Plus GX only accepts the even lane. Every
+    /// documented use is the word write at `0xA11100` (plutiedev "Using the Z80"), where
+    /// all three agree.
+    fn write_z80_ctrl_byte(&mut self, addr: u32, value: u8) {
+        match Z80Ctrl::decode(addr) {
+            Some(Z80Ctrl::Busreq) => self.z80_busreq = value & 1 != 0,
+            // The reset line is inverted: 0 asserts, 1 releases.
+            Some(Z80Ctrl::Reset) => self.set_z80_reset(value & 1 == 0),
+            None => {}
+        }
+    }
 
-    /// Z80 bus control word write. Placeholder for [`Region::Z80Ctrl`].
-    fn write_z80_ctrl_word(&mut self, _addr: u32, _value: u16) {}
+    /// Z80 bus control word write: bit 8 of `value`, which is bit 0 of the byte at the
+    /// even address of the pair (Genesis Plus GX's `ctrl_io_write_word` is
+    /// `(data >> 8) & 1`, MAME's is `data & 0x0100`, and BlastEm's `io_write_w` hands
+    /// the byte handler `value >> 8`).
+    fn write_z80_ctrl_word(&mut self, addr: u32, value: u16) {
+        self.write_z80_ctrl_byte(addr, (value >> 8) as u8);
+    }
 
     /// Cartridge slot extra byte read. Placeholder for [`Region::CartExtra`].
     fn read_cart_extra_byte(&mut self, _addr: u32) -> u8 {
@@ -451,6 +669,113 @@ impl Bus {
 /// of the hardware version register at [`IO_VERSION`]?
 fn is_version_register(addr: u32) -> bool {
     (addr & EVEN_LANE) == IO_VERSION
+}
+
+/// A decoded part of [`Region::Z80`]: which sound-side device a 68k access lands on.
+///
+/// The 68k has no separate map for the sound side; it drives the Z80's address lines,
+/// so this is [`crate::z80_bus`]'s own map applied to the low 15 bits of the address
+/// ([`Z80_AREA_MASK`]) and the devices are the same objects, not copies of them: one
+/// 8 KiB RAM, one bank register, one YM2612 log and one PSG log for both CPUs. The
+/// boundaries are worth reading next to the Z80 side's:
+///
+/// - BlastEm's `io_write` masks the address with `0x7FFF` and then takes `0x0000`-
+///   `0x3FFF` for the RAM (`& 0x1FFF`, so the mirror at `0x2000` is the Z80's mirror),
+///   `0x4000`-`0x5FFF` for the YM2612 and `0x6000` for the bank register;
+/// - Genesis Plus GX's `z80_read_byte`/`z80_write_byte` decode the same area with
+///   `(address >> 13) & 3` and `(address >> 8) & 0x7F`;
+/// - MAME maps `0xa00000-0xa01fff` (plus the `0xa02000` write mirror), `0xa04000`-
+///   `0xa04003` and `0xa06000-0xa06001`.
+enum SoundSide {
+    /// The 8 KiB of sound RAM, mirrored at `0x2000` inside the window.
+    Ram,
+    /// The YM2612: four ports at `addr & 3`, in [`Z80Side::ym_log`].
+    Ym,
+    /// The bank shift register: `0x6000-0x60FF`, in [`Z80Side::bank`].
+    ///
+    /// The whole block, because that is what the Z80 side accepts (MAME maps
+    /// `0xa06000-0xa06001` for the 68k, Genesis Plus GX the whole `0x60` page) and
+    /// there is one register to accept it in.
+    Bank,
+    /// The PSG port: `0xA07F11` and its `0x13`/`0x15`/`0x17` mirrors, which are the
+    /// port the Z80 sees at `0x7F11` and the 68k sees at `0xC00011`. One port, one log,
+    /// three spellings - see [`z80_bus::is_psg_port`].
+    Psg,
+    /// Anything else in the area: the gaps of the Z80 map, and the rest of the VDP
+    /// window at `0xA07F00-0xA07FFF`.
+    ///
+    /// No reference drives those from the 68k - Genesis Plus GX's `z80_write_byte` treats
+    /// the VDP lanes as a bus lockup and MAME and BlastEm leave them unmapped - because
+    /// the 68k has the VDP on its own bus at `0xC00000` and would not go through the
+    /// sound side to reach it. Reads are [`OPEN_BUS`] and writes are dropped; M3-09
+    /// (#69) does not change this, it puts a VDP behind `Region::Vdp`.
+    Nothing,
+}
+
+impl SoundSide {
+    /// Decode `addr`, masked and already decoded as [`Region::Z80`].
+    fn decode(addr: u32) -> Self {
+        match addr & Z80_AREA_MASK {
+            0x0000..=SND_RAM_END => Self::Ram,
+            SND_YM_START..=SND_YM_END => Self::Ym,
+            SND_BANK_START..=SND_BANK_END => Self::Bank,
+            offset @ SND_VDP_START..=SND_VDP_END if z80_bus::is_psg_port(offset as u16) => {
+                Self::Psg
+            }
+            _ => Self::Nothing,
+        }
+    }
+}
+
+/// One of the two Z80 control registers of [`Region::Z80Ctrl`].
+enum Z80Ctrl {
+    /// `0xA11100`: ask the Z80 for its bus, and read back who has it.
+    Busreq,
+    /// `0xA11200`: hold the Z80 in reset, or let it go. The YM2612 hangs off the same
+    /// line, so this resets it too.
+    Reset,
+}
+
+impl Z80Ctrl {
+    /// Decode `addr`, masked and already decoded as [`Region::Z80Ctrl`]. Each register
+    /// owns a 0x100 block and neither looks at A0-A7, which is why there is one flag per
+    /// block and not one per address; see [`Z80_CTRL_MASK`] for the sources.
+    fn decode(addr: u32) -> Option<Self> {
+        match addr & Z80_CTRL_MASK {
+            Z80_BUSREQ => Some(Self::Busreq),
+            Z80_RESET_REG => Some(Self::Reset),
+            _ => None,
+        }
+    }
+}
+
+/// The one word rule of [`Region::Z80`]: a 16 bit access is a single byte access
+/// answered in both halves. See [`Bus::read_z80_word`] for the sources.
+fn z80_word(byte: u8) -> u16 {
+    u16::from_be_bytes([byte, byte])
+}
+
+/// What a byte read of the bus request register reports: `running` in bit 0 and every
+/// other bit [`OPEN_BUS`].
+///
+/// The unused bits are documented as returning whatever the previous bus transfer left
+/// there, and the emulators keep them nonzero on purpose: MAME's comment on this
+/// register is that ddragon, beast, superoff and Time Killers poll it expecting a zero
+/// that never comes, and Genesis Plus GX says the same ("Unused bits return prefetched
+/// bus data (Time Killers)"). A fixed 1 is the cheap version of never-zero, and open
+/// bus is 1 anyway.
+fn busreq_byte(running: bool) -> u8 {
+    if running { OPEN_BUS } else { OPEN_BUS & !1 }
+}
+
+/// What a word read of the bus request register reports: `running` in bit 8, with the
+/// same placeholder bits around it. See [`Bus::read_z80_ctrl_word`].
+fn busreq_word(running: bool) -> u16 {
+    if running {
+        OPEN_BUS_WORD
+    } else {
+        OPEN_BUS_WORD & !0x0100
+    }
 }
 
 /// The one word rule of [`Region::Io`]: a register answers a 16 bit access to its
@@ -526,15 +851,36 @@ impl m68k::Bus for Bus {
     /// The `RESET` instruction restarts the console, so the I/O chip's registers
     /// go back to their power-on values. Work RAM does not, and cannot: this is the
     /// console's `RESET`, not a reinitialisation of everything the emulator holds.
+    ///
+    /// Neither do the Z80's two control lines: they go back the way [`Bus::new`] leaves
+    /// them, under reset and with the bus the Z80's own, taking the grant the 68k was
+    /// holding with them. Genesis Plus GX's `gen_reset` does this (`zstate = 0`, on the
+    /// line commented "Z80 bus is released & Z80 is reseted", plus `zbank = 0`) and
+    /// MAME's `machine_reset` sets `z80_is_reset = 1; z80_has_bus = 1`. The bank register
+    /// is cleared here rather than by [`crate::z80_bus`] because this is the reset that
+    /// owns the sound side's control state; the sound RAM survives like work RAM does.
+    ///
+    /// Asserting the reset line is not the edge that restarts the Z80, so no pulse is
+    /// raised, but the YM2612 goes into reset with the line - and `gen_reset` calls
+    /// `fm_reset` for the console's own reset whether or not the line had to move, which
+    /// is why the YM is reset unconditionally here instead of through
+    /// [`Bus::set_z80_reset`].
     fn reset_devices(&mut self) {
         self.io.reset();
+        self.z80_busreq = false;
+        self.z80_reset = true;
+        self.z80_reset_pulse = false;
+        self.z80.ym_reset();
+        self.z80.bank = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::z80_bus::{Z80View, ZRAM_SIZE};
     use m68k::Bus as _;
+    use z80::Z80Bus as _;
 
     /// An image of `len` bytes with no word of it reading as a plausible
     /// default, so a test cannot pass by accident.
@@ -669,10 +1015,9 @@ mod tests {
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         // One address per stub region, including every register the map names.
         // The I/O entry is past the version register, which #64 implements and
-        // the tests below cover.
-        for addr in [
-            0xA00000, 0xA10020, 0xA11100, 0xA11200, 0xA130F1, 0xA14000, 0xA14101, 0xC00000,
-        ] {
+        // the tests below cover. The Z80 area and its two control registers left
+        // this list with #68 and are covered by the arbitration tests below.
+        for addr in [0xA10020, 0xA130F1, 0xA14000, 0xA14101, 0xC00000] {
             assert_eq!(bus.read_byte(addr), OPEN_BUS, "byte at {addr:#08x}");
             assert_eq!(
                 bus.read_word(addr + 2),
@@ -833,5 +1178,390 @@ mod tests {
         // A Genesis always autovectors, so the bus never gives the CPU a vector.
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         assert_eq!(bus.int_ack(2), None);
+    }
+
+    // ---- Z80 bus arbitration, Z80 reset, and the 68k's way into the sound side ----
+    //
+    // The addresses and the register writes are plutiedev "Using the Z80", which is
+    // what a game's own init code does:
+    //
+    //     Z80Ram:     equ $A00000
+    //     Z80BusReq:  equ $A11100
+    //     Z80Reset:   equ $A11200
+
+    /// Take the Z80's bus the way a game does - `move.w #$100, (Z80BusReq)` - so a
+    /// test can reach the hardware behind `0xA00000`. The bus is released at power
+    /// on (see [`Bus::new`]), so this is the setup every access to that area needs.
+    fn request_the_z80_bus(bus: &mut Bus) {
+        bus.write_word(Z80_BUSREQ, 0x0100);
+    }
+
+    /// Release it again, so the Z80 can run.
+    fn release_the_z80_bus(bus: &mut Bus) {
+        bus.write_word(Z80_BUSREQ, 0x0000);
+    }
+
+    /// Release the Z80's reset line - `move.w #$100, (Z80Reset)`.
+    fn release_the_z80_reset(bus: &mut Bus) {
+        bus.write_word(Z80_RESET_REG, 0x0100);
+    }
+
+    /// The Z80 owns the bus until a 68k request says otherwise, so the bus register
+    /// reads back "the Z80 is running" from the moment the bus exists: bit 0 of the
+    /// byte and bit 8 of the word are both 1 (plutiedev "Using the Z80", whose
+    /// `PauseZ80` macro polls `btst #0, (Z80BusReq)` until it reads 0).
+    #[test]
+    fn busreq_read_reports_running_by_default() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        assert_eq!(bus.read_byte(Z80_BUSREQ) & 1, 1, "byte: Z80 running");
+        assert_eq!(
+            bus.read_word(Z80_BUSREQ) & 0x0100,
+            0x0100,
+            "word: Z80 running"
+        );
+
+        // Every other bit is open bus, and open bus here means 1. That is also what
+        // the polling games need: MAME's note on this register is that Time Killers
+        // and friends loop until the read is nonzero, and Genesis Plus GX returns
+        // prefetched bus data for the unused bits for the same reason.
+        assert_eq!(bus.read_byte(Z80_BUSREQ), OPEN_BUS);
+        assert_eq!(bus.read_word(Z80_BUSREQ), OPEN_BUS_WORD);
+    }
+
+    /// A granted bus reads back as granted: writing bit 8 of the word at
+    /// `0xA11100` takes the bus from the Z80, and the same bit reads back 0.
+    #[test]
+    fn busreq_grant_after_request() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        bus.write_word(Z80_BUSREQ, 0x0100);
+        assert_eq!(
+            bus.read_word(Z80_BUSREQ) & 0x0100,
+            0,
+            "word read of the grant"
+        );
+        assert_eq!(bus.read_byte(Z80_BUSREQ) & 1, 0, "byte read of the grant");
+        assert_ne!(
+            bus.read_byte(Z80_BUSREQ),
+            0,
+            "the unused bits are never all-zero"
+        );
+
+        // Writing 0 releases it and the Z80 is running again; nothing latches.
+        bus.write_word(Z80_BUSREQ, 0x0000);
+        assert_eq!(bus.read_word(Z80_BUSREQ) & 0x0100, 0x0100);
+    }
+
+    /// The byte write does the same thing, from bit 0 of the byte rather than bit 8
+    /// of the word, and `0xA11101` is the same register and not a second flag: the
+    /// decode drops A0 (BlastEm decodes the `0xA11100` block with `location &
+    /// 0xFFF00` and takes `value & 1`; MAME maps `0xA11100-0xA11101` as one
+    /// register, reading bit 0 of whichever byte lane arrives).
+    #[test]
+    fn byte_write_busreq() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        bus.write_byte(Z80_BUSREQ, 0x01);
+        assert_eq!(bus.read_byte(Z80_BUSREQ) & 1, 0, "$01 requests the bus");
+
+        // It is the one flag: the grant the byte write took is the grant the sound
+        // side checks, and it is still the same flag at the odd address.
+        bus.write_byte(0xA00010, 0x5A);
+        assert_eq!(bus.z80.ram[0x0010], 0x5A, "byte write requested for real");
+        bus.write_byte(0xA11101, 0x00);
+        assert_eq!(
+            bus.read_word(Z80_BUSREQ) & 0x0100,
+            0x0100,
+            "$00 at 0xA11101 releases"
+        );
+
+        // Bits 1-7 of a byte write are ignored, like the bank register before it.
+        bus.write_byte(Z80_BUSREQ, 0xFE);
+        assert_eq!(bus.read_byte(Z80_BUSREQ) & 1, 1, "0xFE asked for nothing");
+    }
+
+    /// With the bus granted, `0xA00000-0xA01FFF` is the sound RAM: the 68k reads and
+    /// writes it, the `0xA02000` mirror answers the same bytes, and the whole area
+    /// repeats every `0x8000` because only the low 15 address bits reach the Z80 bus
+    /// (BlastEm masks a 68k access to the area with `0x7FFF`).
+    #[test]
+    fn z80_ram_access_from_68k_when_bus_granted() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        request_the_z80_bus(&mut bus);
+
+        bus.write_byte(0xA00010, 0x5A);
+        assert_eq!(bus.read_byte(0xA00010), 0x5A);
+        assert_eq!(bus.z80.ram[0x0010], 0x5A);
+
+        // The mirror the 8 KiB sits behind, in both directions.
+        assert_eq!(bus.read_byte(0xA02010), 0x5A, "mirror at 0xA02000");
+        bus.write_byte(0xA03FFF, 0x77);
+        assert_eq!(bus.read_byte(0xA01FFF), 0x77);
+        assert_eq!(
+            bus.read_byte(0xA08010),
+            0x5A,
+            "the area repeats every 0x8000"
+        );
+    }
+
+    /// Without the grant there is nothing behind `0xA00000`: reads return open bus
+    /// and writes vanish. Real hardware is nastier than that - Genesis Plus GX
+    /// installs a bus lockup for the whole area while the Z80 owns it, and BlastEm
+    /// pays a wait state and then reads garbage - so a game that pokes the sound side
+    /// without requesting the bus first hangs or reads junk rather than getting a
+    /// clean 0xFF. This is the default state, because the bus is released at power on.
+    #[test]
+    fn z80_ram_access_blocked_without_bus() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        assert_eq!(bus.read_byte(0xA00010), OPEN_BUS);
+        assert_eq!(bus.read_word(0xA00010), OPEN_BUS_WORD);
+
+        bus.write_byte(0xA00010, 0x5A);
+        bus.write_word(0xA00010, 0x5A5A);
+        assert!(
+            bus.z80.ram.iter().all(|&b| b == 0),
+            "dropped writes reached the RAM"
+        );
+        assert_eq!(
+            Z80View::new(&mut bus).read(0x0010),
+            0,
+            "the Z80 sees nothing either"
+        );
+    }
+
+    /// The Z80-RAM word quirk, kept because both references that model it have it:
+    /// a word read answers the byte at the even address twice, and a word write only
+    /// writes that byte and ignores the other half. Genesis Plus GX's `z80_read_word`
+    /// is literally the byte read once and mirrored, `z80_write_word` is
+    /// `z80_write_byte(address, data >> 8)`, and MAME's write handler says "for WORD
+    /// access only the MSB is used, LSB is ignored". plutiedev "Using the Z80" puts
+    /// it as "you must use byte accesses when touching Z80 RAM, word accesses won't
+    /// work". See [`Bus::read_z80_word`] before changing any of this in M5.
+    #[test]
+    fn word_read_z80_ram_duplicates_byte() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        request_the_z80_bus(&mut bus);
+
+        bus.write_byte(0xA00010, 0x3C);
+        assert_eq!(bus.read_word(0xA00010), 0x3C3C);
+
+        // The other half of the quirk.
+        bus.write_byte(0xA00011, 0xC3);
+        bus.write_word(0xA00010, 0xABCD);
+        assert_eq!(
+            bus.z80.ram[0x0010], 0xAB,
+            "the high byte of the word was written"
+        );
+        assert_eq!(
+            bus.z80.ram[0x0011], 0xC3,
+            "the low byte of the word was ignored"
+        );
+    }
+
+    /// The Z80 runs only when the 68k has neither held it in reset nor taken its bus,
+    /// which is the ticket's `!busreq && !reset`. Reset is what makes it false at
+    /// power on: both references that set the lines up start with reset asserted and
+    /// the bus released (MAME's `machine_reset` sets `z80_is_reset = 1` and
+    /// `z80_has_bus = 1`, Genesis Plus GX's `gen_reset` sets `zstate = 0`, commented
+    /// "Z80 bus is released & Z80 is reseted").
+    #[test]
+    fn reset_held_means_z80_does_not_run() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        assert!(!bus.z80_can_run(), "held in reset at power on");
+
+        release_the_z80_reset(&mut bus);
+        assert!(bus.z80_can_run(), "released and on its bus");
+
+        bus.write_word(Z80_RESET_REG, 0x0000);
+        assert!(!bus.z80_can_run(), "reset asserted again");
+
+        // The two lines are independent: a bus request stops a Z80 that is out of
+        // reset, and releasing the request starts it back up.
+        release_the_z80_reset(&mut bus);
+        request_the_z80_bus(&mut bus);
+        assert!(!bus.z80_can_run(), "the 68k has the bus");
+        release_the_z80_bus(&mut bus);
+        assert!(bus.z80_can_run());
+    }
+
+    /// Coming out of reset is the event that resets the Z80's PC to 0 (plutiedev
+    /// "Using the Z80": release reset, and the program in RAM starts at `$0000`;
+    /// Genesis Plus GX's `gen_zreset_w` calls `z80_reset()` on exactly that edge).
+    /// The bus cannot touch the CPU itself, so it raises a pulse the scheduler takes
+    /// with [`Bus::take_z80_reset`] and answers with `z80::Z80::reset`.
+    #[test]
+    fn reset_release_resets_z80_pc() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        let mut cpu = z80::Z80::new();
+        assert!(
+            !bus.take_z80_reset(),
+            "power on asserts the line, it does not release it"
+        );
+
+        // Asserting an already asserted line is neither a release nor an edge, so the
+        // YM2612 hanging off the same pin is held in reset rather than reset again.
+        let ym_resets = bus.z80.ym_resets;
+        bus.write_word(Z80_RESET_REG, 0x0000);
+        assert!(!bus.take_z80_reset());
+        assert_eq!(bus.z80.ym_resets, ym_resets, "no edge, no YM2612 reset");
+
+        // The release edge, and the scheduler's side of the handshake: the bus raises
+        // the pulse, the scheduler answers it with the CPU's own reset.
+        release_the_z80_reset(&mut bus);
+        cpu.set_pc(0x1234);
+        if bus.take_z80_reset() {
+            cpu.reset();
+        }
+        assert_eq!(
+            cpu.pc(),
+            0,
+            "the release the bus reported is the one that clears PC"
+        );
+        assert!(!bus.take_z80_reset(), "the pulse is consumed once");
+
+        // Asserting it for real now takes the YM2612 with it: BlastEm's reset handler
+        // calls `ym_reset` in the same branch that asserts the Z80's reset.
+        bus.write_word(Z80_RESET_REG, 0x0000);
+        assert_eq!(
+            bus.z80.ym_resets,
+            ym_resets + 1,
+            "asserting reset reaches the YM2612"
+        );
+        assert!(
+            !bus.take_z80_reset(),
+            "and asserting is still not a release"
+        );
+    }
+
+    /// The `0xA00000` window and the Z80's `0x0000` RAM are one and the same 8 KiB:
+    /// the 68k writes, the Z80 reads it through its own map, and the other way round.
+    #[test]
+    fn z80_ram_is_one_array_seen_by_both_cpus() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        request_the_z80_bus(&mut bus);
+
+        bus.write_byte(0xA00020, 0x67);
+        assert_eq!(Z80View::new(&mut bus).read(0x0020), 0x67);
+        assert_eq!(
+            Z80View::new(&mut bus).read(0x2020),
+            0x67,
+            "the Z80's own mirror is the same byte"
+        );
+
+        Z80View::new(&mut bus).write(0x1234, 0x1E);
+        assert_eq!(bus.read_byte(0xA01234), 0x1E);
+        assert_eq!(bus.z80.ram.len(), ZRAM_SIZE, "one 8 KiB array, not two");
+    }
+
+    /// The 68k can move the Z80's bank register - `0xA06000` is the same shift
+    /// register the Z80 sees at `0x6000`, which is why it sits behind the bus grant
+    /// too. Every reference that decodes the area gives the 68k the write: BlastEm's
+    /// `io_write` shifts `z80_bank_reg` from `0xA00000`-side addresses, Genesis Plus
+    /// GX's `z80_write_byte` takes the `0x60` block into `gen_zbank_w`, and MAME maps
+    /// `0xA06000-0xA06001` to `megadriv_68k_z80_bank_write`.
+    #[test]
+    fn bus_write_from_68k_moves_the_z80_bank() {
+        let mut rom = vec![0u8; 0x1_0000];
+        rom[0x8010] = 0x6C;
+        let mut bus = Bus::new(rom, TEST_VERSION);
+
+        // No grant, no shift.
+        for _ in 0..9 {
+            bus.write_byte(0xA06000, 0x01);
+        }
+        assert_eq!(bus.z80.bank, 0);
+
+        request_the_z80_bus(&mut bus);
+        // Nine writes, least significant bit first: each write enters at the top of the
+        // 9 bit register, so a 1 written first shifts down to bit 0.
+        bus.write_byte(0xA06000, 0x01);
+        for _ in 0..8 {
+            bus.write_byte(0xA06000, 0x00);
+        }
+        assert_eq!(bus.z80.bank, 0x001);
+
+        // The Z80's window follows the register the 68k moved: 0x001 << 15 is
+        // 0x008000, so its `0x8010` is the 68k's 0x8010.
+        assert_eq!(Z80View::new(&mut bus).read(0x8010), 0x6C);
+    }
+
+    /// `0xA04000-0xA05FFF` is the YM2612, the same four ports at `addr & 3` that #67
+    /// gave the Z80, logging into the same list: bank 0 at `0xA04000/1` and bank 1 at
+    /// `0xA04002/3` (plutiedev "YM2612 register reference", and BlastEm's
+    /// `io_write`, which picks the port from bits 0 and 1 of the area offset).
+    #[test]
+    fn ym2612_ports_are_reachable_from_the_68k() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        request_the_z80_bus(&mut bus);
+
+        bus.write_byte(0xA04000, 0x28);
+        bus.write_byte(0xA04001, 0xB3);
+        bus.write_byte(0xA04002, 0x27);
+        bus.write_byte(0xA04003, 0x00);
+        bus.write_byte(0xA04006, 0x11);
+        assert_eq!(
+            bus.z80.ym_log,
+            vec![(0, 0x28), (1, 0xB3), (2, 0x27), (3, 0x00), (2, 0x11)],
+            "four ports, repeating every 4 bytes, in the Z80's log"
+        );
+
+        // One chip: the Z80's write to its own 0x4001 joins the same list.
+        Z80View::new(&mut bus).write(0x4001, 0x2A);
+        assert_eq!(bus.z80.ym_log.last(), Some(&(1, 0x2A)));
+
+        // A read is the status port, and the stub is never busy.
+        assert_eq!(bus.read_byte(0xA04000), 0x00);
+    }
+
+    /// `0xA07F11` is the PSG port the Z80 sees at `0x7F11`, which #67 settled as one
+    /// port with several spellings, so this is a third address into the same log and
+    /// not a third view: the `0x11/0x13/0x15/0x17` lanes of the VDP window, never the
+    /// even lane of the pair.
+    #[test]
+    fn psg_write_from_68k_at_a07f11() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        request_the_z80_bus(&mut bus);
+
+        bus.write_byte(0xA07F11, 0x9F);
+        bus.write_byte(0xA07F13, 0x10);
+        assert_eq!(bus.z80.psg_log, vec![0x9F, 0x10]);
+
+        // The even byte of the pair is not the port, and neither is any other lane
+        // of the VDP window; the 68k has its own VDP ports for those.
+        bus.write_byte(0xA07F10, 0x00);
+        bus.write_byte(0xA07F00, 0xFF);
+        assert_eq!(bus.z80.psg_log, vec![0x9F, 0x10]);
+
+        Z80View::new(&mut bus).write(0x7F11, 0x20);
+        assert_eq!(bus.z80.psg_log, vec![0x9F, 0x10, 0x20], "one PSG, one log");
+
+        // The PSG is write-only, so a read of its port is nothing's.
+        assert_eq!(bus.read_byte(0xA07F11), OPEN_BUS);
+        assert_eq!(bus.read_word(0xA07F10), OPEN_BUS_WORD);
+    }
+
+    /// The console's `RESET` puts the two control lines back to their power-on
+    /// values, which is what Genesis Plus GX's `gen_reset` does ("Z80 bus is released
+    /// & Z80 is reseted", and `zbank = 0`) and MAME's `machine_reset`
+    /// (`z80_is_reset = 1; z80_has_bus = 1`). The sound RAM survives, like work RAM.
+    #[test]
+    fn reset_devices_parks_the_z80_and_clears_the_bank() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        request_the_z80_bus(&mut bus);
+        bus.write_byte(0xA06000, 0x01);
+        bus.write_byte(0xA00010, 0x5A);
+        release_the_z80_reset(&mut bus);
+        release_the_z80_bus(&mut bus);
+        assert!(bus.z80_can_run(), "the setup let the Z80 have its bus back");
+
+        bus.reset_devices();
+
+        assert!(!bus.z80_can_run(), "back under reset");
+        assert!(!bus.take_z80_reset(), "asserting is not a release");
+        assert_eq!(
+            bus.read_byte(Z80_BUSREQ) & 1,
+            1,
+            "the 68k lost its grant too"
+        );
+        assert_eq!(bus.z80.bank, 0, "the bank register belongs to this reset");
+        assert_eq!(bus.z80.ram[0x0010], 0x5A, "sound RAM survives RESET");
     }
 }
