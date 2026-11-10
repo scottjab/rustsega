@@ -39,7 +39,9 @@ use z80::Z80Bus;
 
 /// Sound RAM: 8 KiB, at 0x0000-0x1FFF and mirrored at 0x2000-0x3FFF.
 pub const ZRAM_SIZE: usize = 0x2000;
-/// These bits of a Z80 address name a byte of sound RAM.
+/// These bits of a Z80 address name a byte of sound RAM. Used through
+/// [`ram_index`], which is what the 68k's `0xA00000` window uses too - see
+/// [`crate::bus`].
 const ZRAM_MASK: usize = ZRAM_SIZE - 1;
 
 // Region boundaries of the Z80 map. See `Region`.
@@ -59,7 +61,10 @@ const YM_PORT_MASK: u16 = 0x03;
 /// A YM2612 status byte with bit 7 clear. Bit 7 is the busy/IRQ flag the driver
 /// waits on; the chip is never busy while it is a log, and `ym2612::Ym2612`
 /// (M5-03 #107) will answer this itself.
-const YM_STATUS_IDLE: u8 = 0x00;
+///
+/// Crate-visible because the 68k reads the same chip through its `0xA04000` window
+/// (plutiedev "YM2612 register reference": the flag-clearing read is at $A04000).
+pub(crate) const YM_STATUS_IDLE: u8 = 0x00;
 
 /// The bank register selects 68k addresses this far up: it holds bits 15-23, and
 /// a 9-bit register times 32 KiB is the whole 24 bit address bus.
@@ -153,6 +158,20 @@ pub struct Z80Side {
     /// (register interface M5-03 #107), which takes exactly this
     /// `write(port, value)` (docs/ARCHITECTURE.md, "Audio chips").
     pub ym_log: Vec<(u8, u8)>,
+    /// How many times this bus has driven the YM2612's reset line.
+    ///
+    /// The chip's `/RESET` pin is tied to the Z80's own reset line, so the 68k resets
+    /// it with `0xA11200`: BlastEm's reset handler calls `ym_reset` in the branch that
+    /// asserts Z80 reset, and Genesis Plus GX's `gen_zreset_w` calls `fm_reset` on
+    /// both edges of the line and its `gen_reset` once more for the console's
+    /// `RESET`. `crates/ym2612` is still a one-line stub, so the event is counted
+    /// rather than delivered; [`Z80Side::ym_reset`] is the hook M5 replaces.
+    ///
+    /// Counted per edge, not per level: `crate::bus::Bus::new` starts with the line held
+    /// asserted, and that is the Z80 not having been let go yet rather than a reset
+    /// anyone performed. The console's `RESET` counts even when the line was already
+    /// held, because Genesis Plus GX's `gen_reset` calls `fm_reset` there too.
+    pub ym_resets: usize,
     /// Every PSG write: the byte that reached the PSG port, oldest first.
     ///
     /// TODO(M5-13 #118): replaced by the `sn76489::Sn76489` the bus will own
@@ -168,8 +187,20 @@ impl Z80Side {
             ram: Box::new([0; ZRAM_SIZE]),
             bank: 0,
             ym_log: Vec::new(),
+            ym_resets: 0,
             psg_log: Vec::new(),
         }
+    }
+
+    /// Assert the YM2612's reset line, which the hardware ties to the Z80's.
+    ///
+    /// The chip is a stub, so all this does is record that it happened. See
+    /// [`Z80Side::ym_resets`] for the hardware, and `crate::bus` for the two callers:
+    /// the 68k's write to `0xA11200` and [`m68k::Bus::reset_devices`].
+    ///
+    /// TODO(M5-13 #118): calls `ym2612::Ym2612::reset` on the chip the bus will own.
+    pub fn ym_reset(&mut self) {
+        self.ym_resets += 1;
     }
 
     /// Shift one write of the bank register in: bit 0 of `value` becomes the new
@@ -178,7 +209,12 @@ impl Z80Side {
     ///
     /// Needs no mask: `bank` only ever holds 9 bits, so the shift cannot drop
     /// anything but the bit the hardware drops, and cannot widen the register.
-    fn shift_in(&mut self, value: u8) {
+    ///
+    /// Crate-visible because the 68k drives the same register from `0xA06000`: that
+    /// window and the Z80's `0x6000` are one register, so they share one shift
+    /// (BlastEm's `io_write` and Genesis Plus GX's `z80_write_byte` both take 68k
+    /// writes to it, and MAME maps `0xA06000-0xA06001` to a bank write handler).
+    pub(crate) fn shift_in(&mut self, value: u8) {
         self.bank = (self.bank >> 1) | (u16::from(value & 1) << 8);
     }
 
@@ -265,7 +301,12 @@ impl Z80Bus for Z80View<'_> {
 
 /// The index of a Z80 address in [`Z80Side::ram`]: the 8 KiB is mirrored, so only
 /// these bits name a byte, and 0x2000-0x3FFF is the same RAM as 0x0000-0x1FFF.
-fn ram_index(addr: u16) -> usize {
+///
+/// Crate-visible because the 68k reaches the same array at `0xA00000` and must wrap
+/// its address exactly this way, not a second time (M3-08 #68): the Z80's low bus
+/// address is what survives the window, and the Z80 map already says which bits of it
+/// name a byte.
+pub(crate) fn ram_index(addr: u16) -> usize {
     usize::from(addr) & ZRAM_MASK
 }
 
@@ -283,7 +324,10 @@ fn ram_index(addr: u16) -> usize {
 /// - MAME's `megadriv_z80_map`: `map(0x4000, 0x4003).mirror(0x1ffc)`,
 /// - BlastEm's Z80 map: `0x4000..0x6000` with mask `0x0003`,
 /// - Genesis Plus GX's `z80_memory_w`: `fm_write(Z80.cycles, address & 3, data)`.
-fn ym_port(addr: u16) -> u8 {
+///
+/// Crate-visible because the 68k's `0xA04000` window reaches the same four ports and
+/// must not grow a second decode of them (M3-08 #68).
+pub(crate) fn ym_port(addr: u16) -> u8 {
     (addr & YM_PORT_MASK) as u8
 }
 
@@ -312,7 +356,11 @@ fn vdp_port_addr(addr: u16) -> u32 {
 /// decodes to from here is M3-09's (#69) to settle; it goes to [`vdp_port_addr`]
 /// and answers whatever the 68k's VDP region answers, which today is
 /// [`OPEN_BUS`] on reads and nothing on writes.
-fn is_psg_port(addr: u16) -> bool {
+///
+/// Crate-visible for the same reason as [`ym_port`]: the 68k's `0xA07F11` is this
+/// port, not another one, so this is the one rule about which lanes of the window are
+/// the PSG (M3-08 #68).
+pub(crate) fn is_psg_port(addr: u16) -> bool {
     matches!(u32::from(addr) & VDP_PORT_MASK, 0x11 | 0x13 | 0x15 | 0x17)
 }
 
