@@ -6,6 +6,10 @@ version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The bus in `bus.rs` implements `m68k::Bus`. Chip crates never depend on each
+# other, but `genesis` composing them is the point of the crate
+# (docs/ARCHITECTURE.md).
+m68k = { path = "../m68k" }
 
 [dev-dependencies]
 # Only tests: the core itself keeps no dependencies, per docs/ARCHITECTURE.md.
