@@ -37,11 +37,19 @@
 //! plutiedev "Memory map" documents 0xC00020-0xC0003F, inside the VDP area, as
 //! "hangs up". Modelling open bus is M3-16 (#77).
 //!
+//! ## The cartridge slot, in order
+//!
+//! 0x000000-0x3FFFFF is one region with two owners: the ROM image, and - for the
+//! window its header declares - the battery-backed save RAM of [`crate::cart`].
+//! The order the slot answers them in, and where the M3-12 (#72) mapper goes,
+//! is on [`Bus::read_rom_byte`].
+//!
 //! [`m68k::Bus::int_ack`] is deliberately left at the trait default: returning
 //! `None` *is* what a Genesis does, always autovectoring.
 //! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`] and the Z80's control
 //! lines; the VDP joins them with M3-09 (#69).
 
+use crate::cart::{Sram, sram};
 use crate::io::Io;
 use crate::z80_bus::{self, YM_STATUS_IDLE, Z80Side};
 use m68k::ADDR_MASK;
@@ -94,6 +102,16 @@ const Z80_RESET_REG: u32 = 0xA11200;
 /// as `(address >> 8) & 0xFF` in `ctrl_io_write_byte`; MAME maps only the two
 /// addresses themselves (`map(0xa11100, 0xa11101)`), which the mask still hits.
 const Z80_CTRL_MASK: u32 = !0xFF;
+/// The save RAM control register, `SramLock: equ $A130F1` of plutiedev "Saving
+/// progress with SRAM": bit 0 maps the save RAM over the cartridge area, bit 1
+/// write protects it - the same two bits Genesis Plus GX's `mapper_sega_w` takes
+/// from one write.
+///
+/// The pair, so that `0xA130F0` answers as `0xA130F1` does, because the register
+/// decodes without A0 like [`IO_VERSION`] and the two Z80 control registers:
+/// MAME maps both lanes of it, and Genesis Plus GX accepts the whole
+/// 0xA13060-0xA130F1 range for it (`default_time_w`).
+const SRAM_CONTROL: u32 = 0xA130F0;
 /// The TMSS security register: the four bytes a TMSS console listens to for the
 /// long `move.l #"SEGA", $A14000` that releases the VDP (segaretro "TradeMark
 /// Security System", "Design", and [`TMSS_SECURITY_STRING`] for the value).
@@ -179,7 +197,10 @@ enum Region {
     Z80Ctrl,
     /// 0xA13000-0xA130FF, the cartridge slot extra.
     ///
-    /// TODO(M3-11 #71): SRAM control at 0xA130F1-0xA130FF.
+    /// [`SRAM_CONTROL`] answers here for a cart that declares save RAM; for one
+    /// that does not the whole block is nothing's, reading [`OPEN_BUS`] and
+    /// dropping writes.
+    ///
     /// TODO(M3-12 #72): the Sega SSF2 mapper in the same block.
     CartExtra,
     /// 0xA14000-0xA14FFF, TMSS ports: the security register at
@@ -231,6 +252,17 @@ pub struct Bus {
     /// [`crate::cart`], and the code that turns a file into a `Bus` is a later
     /// ticket.
     pub rom: Vec<u8>,
+    /// The cart's save RAM, from [`crate::cart::sram::detect`] on [`Bus::rom`],
+    /// or `None` for a cart that declares none.
+    ///
+    /// Not a region of its own: the save lives *inside* the cartridge area, so a
+    /// mapped save is an overlay on [`Region::Rom`] and this is the field the slot
+    /// consults first. [`Bus::read_rom_byte`] is the order, and the seam the
+    /// M3-12 (#72) mapper extends.
+    ///
+    /// Private behind [`Bus::sram`], [`Bus::load_sram`] and [`Bus::take_dirty`]:
+    /// the only writes that may reach a save are ones that can say so.
+    sram: Option<Sram>,
     /// 64 KiB of work RAM, mapped at 0xE00000 and mirrored every 0x10000.
     pub ram: Box<[u8; 0x10000]>,
     /// The byte 0xA10001 reports: [`crate::Region::version_register`] for the
@@ -339,9 +371,23 @@ impl Bus {
     /// version number in that byte *is* TMSS, so a bus built from
     /// `region.version_register(config.tmss)` locks its VDP exactly when the config
     /// asked for TMSS and never otherwise. See [`Bus::tmss_enabled`].
+    ///
+    /// The save RAM is the one thing here that is read out of the ROM rather than
+    /// handed in: [`crate::cart::sram::detect`] decodes the header at 0x100, so a
+    /// bus cannot exist with a save that does not match its image and a cart with
+    /// no `RA` in its header gets no save. The other two shapes - an
+    /// `Option<SramInfo>` parameter, or an `attach_sram` the caller may or may not
+    /// remember - both allow a bus whose save and ROM disagree, and the second one
+    /// fails quietly: no save, no error, a player who loses progress. A parameter
+    /// is what the M3-15 (#76) loader will use if it wants to pass what it has
+    /// already parsed along; until then there is no loader to take it.
     pub fn new(rom: Vec<u8>, version: u8) -> Self {
+        // The save RAM of a cart is declared in its header, which is 0x200 bytes
+        // into the image and may not be there at all.
+        let sram = sram::detect(&rom).map(|info| Sram::new(info, rom.len()));
         Self {
             rom,
+            sram,
             ram: Box::new([0; 0x10000]),
             version,
             io: Io::new(),
@@ -358,6 +404,44 @@ impl Bus {
             // either way: no boot ROM ships.
             tmss_cart_selected: false,
         }
+    }
+
+    /// The cart's save RAM, or `None` when it declares none: the bytes a front end
+    /// persists, packed as [`crate::cart::sram`] describes them (the usual
+    /// 0x200001-0x20FFFF odd-only window is 32 KiB here, not 64 KiB with a gap).
+    ///
+    /// Read-only, because the only writes that may reach a save are the 68k's -
+    /// they are what [`Bus::take_dirty`] reports - and [`Bus::load_sram`] for the
+    /// one thing a front end does with the bytes back.
+    pub fn sram(&self) -> Option<&[u8]> {
+        self.sram.as_ref().map(|save| save.contents())
+    }
+
+    /// Put `data` back as the cart's save RAM, where `data` is what [`Bus::sram`]
+    /// gave for this cart.
+    ///
+    /// A blob of any other length is another cart's save, so it is refused whole:
+    /// nothing is loaded, nothing is panicked on, and the contents stay exactly as
+    /// they were. A cart with no save RAM has nowhere for one to land and ignores
+    /// it too. Both are why this reports nothing: see
+    /// [`crate::cart::sram::Sram::load`] for the choice.
+    ///
+    /// Restoring is not a change to persist, so [`Bus::take_dirty`] is `false`
+    /// after it.
+    pub fn load_sram(&mut self, data: &[u8]) {
+        if let Some(save) = self.sram.as_mut() {
+            save.load(data);
+        }
+    }
+
+    /// Has the save RAM changed since this was last asked, clearing it?
+    ///
+    /// The front end's reason to write anything, and true for exactly one call
+    /// after any write the 68k has stored: never for a read, a
+    /// [`Bus::load_sram`], or a write the cart refused with the `0xA130F1` write
+    /// protect or by hitting the dead half of a half-width window.
+    pub fn take_dirty(&mut self) -> bool {
+        self.sram.as_mut().is_some_and(|save| save.take_dirty())
     }
 
     /// Does this console have a TMSS at all?
@@ -524,35 +608,73 @@ impl Bus {
         self.z80_busreq
     }
 
-    /// Cartridge slot byte read.
+    /// Cartridge slot byte read, in the order the slot decides:
     ///
-    /// A read above the end of the loaded image returns [`OPEN_BUS`]. Real
-    /// hardware leaves the bus floating there, and some dumps are sold as
-    /// mirrored copies of the ROM; either way an image shorter than the slot is
-    /// the common case and 0xFF is what nothing driving the lines reads as.
+    /// 1. **the save RAM**, for a cart that has one and a window that is mapped:
+    ///    [`crate::cart::sram::Sram::read`] answers `None` for every address the
+    ///    save has no claim on, so the one call is the whole overlay and never a
+    ///    scattered `if sram`.
+    /// 2. **the mapper** - M3-12 (#72) belongs here, between the overlay and the
+    ///    image, as a translation of `addr` to an offset in [`Bus::rom`]. Below
+    ///    the overlay and not above it because `0xA130F1` bit 0 *is* the switch
+    ///    that picks ROM or save RAM for this window, and a mapper only decides
+    ///    which ROM is on the other side of it: that is how Genesis Plus GX's
+    ///    `mapper_sega_w` treats the same register, which maps the save over the
+    ///    bank and remembers which bank was underneath to put back.
+    /// 3. **the image**, in address order. A read above its end is [`OPEN_BUS`]:
+    ///    real hardware leaves the bus floating there, some dumps are sold as
+    ///    mirrored copies of the ROM, and either way an image shorter than the
+    ///    slot is the common case and 0xFF is what nothing driving the lines reads
+    ///    as.
     fn read_rom_byte(&mut self, addr: u32) -> u8 {
+        if let Some(value) = self.sram.as_ref().and_then(|save| save.read(addr)) {
+            return value;
+        }
+        // M3-12 (#72): the mapper turns `addr` into an offset here; the overlay
+        // above has already had its say and must keep its priority.
         let offset = (addr - ROM_START) as usize;
         self.rom.get(offset).copied().unwrap_or(OPEN_BUS)
     }
 
-    /// Cartridge slot word read, big endian: the byte at the lower address is
-    /// the high byte (M68000UM, "Data Organization").
+    /// Cartridge slot word read: the two bytes, high byte first (M68000UM, "Data
+    /// Organization").
     ///
-    /// The two bytes are looked up separately rather than as a slice so that a
-    /// word straddling the end of the image still returns the byte that is
+    /// The cartridge area is the one region of this bus where a word really is its
+    /// two bytes - the image and the save RAM are both byte-addressed memory - so
+    /// this is the two byte reads, and that is what makes a half-width save RAM
+    /// window work: over an odd-only window one half of the word is the save and
+    /// the other is not. The struct docs' "a word is never built from two byte
+    /// calls" is about the device regions, where one register answers the whole
+    /// word.
+    ///
+    /// Looking the two halves up separately rather than as a slice is also what
+    /// lets a word straddling the end of the image still return the byte that is
     /// there, with [`OPEN_BUS`] in the half that is not.
     fn read_rom_word(&mut self, addr: u32) -> u16 {
-        let offset = (addr - ROM_START) as usize;
-        let high = self.rom.get(offset).copied().unwrap_or(OPEN_BUS);
-        let low = self.rom.get(offset + 1).copied().unwrap_or(OPEN_BUS);
+        let high = self.read_rom_byte(addr);
+        let low = self.read_rom_byte(addr + 1);
         u16::from_be_bytes([high, low])
     }
 
-    /// Cartridge slot byte write: ignored, ROM is read-only.
-    fn write_rom_byte(&mut self, _addr: u32, _value: u8) {}
+    /// Cartridge slot byte write: the save RAM, if the window is mapped and
+    /// `addr` is inside it, and otherwise nothing at all - the image, like the
+    /// mapper that will sit where [`Bus::read_rom_byte`] says, is read-only.
+    fn write_rom_byte(&mut self, addr: u32, value: u8) {
+        // `Sram::write` answers true for the whole of a mapped window, so a save
+        // under the `0xA130F1` write protect and the dead half of a half-width
+        // window are both refused here rather than falling through to the image.
+        if let Some(save) = self.sram.as_mut() {
+            save.write(addr, value);
+        }
+    }
 
-    /// Cartridge slot word write: ignored, ROM is read-only.
-    fn write_rom_word(&mut self, _addr: u32, _value: u16) {}
+    /// Cartridge slot word write: both bytes, high byte first, for the reason
+    /// [`Bus::read_rom_word`] gives - a 16-bit save stores both halves and a
+    /// half-width one stores the half that is its own.
+    fn write_rom_word(&mut self, addr: u32, value: u16) {
+        self.write_rom_byte(addr, (value >> 8) as u8);
+        self.write_rom_byte(addr + 1, value as u8);
+    }
 
     /// The index of `addr` in [`Bus::ram`]: the 2 MiB window at 0xE00000 mirrors
     /// the same 64 KiB, so only the low 16 bits name a byte (plutiedev "Memory
@@ -789,21 +911,43 @@ impl Bus {
         self.write_z80_ctrl_byte(addr, (value >> 8) as u8);
     }
 
-    /// Cartridge slot extra byte read. Placeholder for [`Region::CartExtra`].
+    /// Cartridge slot extra byte read: nothing in the block is readable.
+    ///
+    /// The save RAM control at [`SRAM_CONTROL`] is a write-only register - MAME
+    /// installs a write handler for the pair and no read handler - and a cart with
+    /// no save RAM has no register to read either. Genesis Plus GX's cart
+    /// registers do read back; no game has ever needed this one, which is why
+    /// `stub_regions_read_open_bus_until_their_ticket` can keep the whole area at
+    /// [`OPEN_BUS`] whatever lives here.
     fn read_cart_extra_byte(&mut self, _addr: u32) -> u8 {
         OPEN_BUS
     }
 
-    /// Cartridge slot extra word read. Placeholder for [`Region::CartExtra`].
+    /// Cartridge slot extra word read: nothing is readable, as
+    /// [`Bus::read_cart_extra_byte`].
     fn read_cart_extra_word(&mut self, _addr: u32) -> u16 {
         OPEN_BUS_WORD
     }
 
-    /// Cartridge slot extra byte write. Placeholder for [`Region::CartExtra`].
-    fn write_cart_extra_byte(&mut self, _addr: u32, _value: u8) {}
+    /// Cartridge slot extra byte write: the save RAM control register, for a cart
+    /// that has save RAM for it to control.
+    ///
+    /// TODO(M3-12 #72): the Sega SSF2 mapper's bank registers, in this same block
+    /// and behind the same kind of decode.
+    fn write_cart_extra_byte(&mut self, addr: u32, value: u8) {
+        if (addr & EVEN_LANE) == SRAM_CONTROL
+            && let Some(save) = self.sram.as_mut()
+        {
+            save.write_control(value);
+        }
+    }
 
-    /// Cartridge slot extra word write. Placeholder for [`Region::CartExtra`].
-    fn write_cart_extra_word(&mut self, _addr: u32, _value: u16) {}
+    /// Cartridge slot extra word write: the low byte of `value`, which is the byte
+    /// at `addr + 1` - the odd lane of [`SRAM_CONTROL`], where the register lives,
+    /// as [`Bus::write_io_word`] takes for its register pair.
+    fn write_cart_extra_word(&mut self, addr: u32, value: u16) {
+        self.write_cart_extra_byte(addr, value as u8);
+    }
 
     /// TMSS port byte read: nothing here is readable.
     ///
@@ -1113,6 +1257,13 @@ impl m68k::Bus for Bus {
         self.tmss_unlocked = false;
         self.locked_up = false;
         self.tmss_cart_selected = false;
+        // The cart slot's `0xA130F1` goes back to 0 with the rest of the register
+        // state, but the save itself and its dirty flag do not: `RESET` is not a
+        // power cycle, and the battery is still holding those bytes. See
+        // [`crate::cart::sram::Sram::reset`].
+        if let Some(save) = self.sram.as_mut() {
+            save.reset();
+        }
     }
 }
 
@@ -2080,5 +2231,413 @@ mod tests {
         let mut bus = Bus::new(Vec::new(), version);
         touch_vdp(&mut bus);
         assert!(!bus.locked_up(), "a default console does not lock its VDP");
+    }
+
+    // Save RAM: the header at 0x1B0, the window it declares inside the cartridge
+    // area, the `0xA130F1` switch in front of it, and the view the front end
+    // persists. The decoding itself is `cart::sram`'s own tests; these are the
+    // ones about what the bus does with it.
+
+    /// A ROM image `len` bytes long declaring save RAM the way plutiedev "Saving
+    /// progress with SRAM" tells authors to: `RA`, the type byte `kind`, the
+    /// blank, and the window. Every other byte of the image is `fill`, so a test
+    /// can tell ROM data from save data at a glance.
+    fn sram_rom(len: usize, kind: u8, start: u32, end: u32, fill: u8) -> Vec<u8> {
+        let mut rom = vec![fill; len];
+        rom[0x1B0..0x1B4].copy_from_slice(&[b'R', b'A', kind, 0x20]);
+        rom[0x1B4..0x1B8].copy_from_slice(&start.to_be_bytes());
+        rom[0x1B8..0x1BC].copy_from_slice(&end.to_be_bytes());
+        rom
+    }
+
+    /// The usual cart: the 32 KiB odd-only window of plutiedev's example, on a
+    /// 2 MB image that stops short of it, so that `0xA130F1` is not needed to
+    /// reach it and one test can hold that fact.
+    fn odd_sram_bus() -> Bus {
+        Bus::new(
+            sram_rom(0x20_0000, 0xF8, 0x20_0001, 0x20_FFFF, 0x5A),
+            TEST_VERSION,
+        )
+    }
+
+    /// A cart whose header says nothing about save RAM has none: `sram()` is
+    /// `None`, the cartridge area keeps answering as the image, and the control
+    /// register has nothing to control.
+    #[test]
+    fn no_header_means_no_sram() {
+        let image = rom_image(0x40_0000);
+        let rom_byte = image[0x20_0001];
+        let mut bus = Bus::new(image, TEST_VERSION);
+        assert_eq!(bus.sram(), None);
+        assert_eq!(bus.read_byte(0x20_0001), rom_byte);
+
+        bus.write_byte(0xA130F1, 3);
+        bus.write_byte(0x20_0001, 0x00);
+        assert_eq!(bus.read_byte(0x20_0001), rom_byte, "a cart with no save");
+        assert_eq!(bus.sram(), None, "has no save to map either");
+        assert!(!bus.take_dirty());
+    }
+
+    /// [`rom_image`] is `i % 251` rather than zeros, so the header sniff
+    /// [`Bus::new`] does runs over arbitrary bytes. Pin that nothing the tests
+    /// here build decodes as save RAM: at 0x1B0 the image has 0xB5 0xB6, which is
+    /// the first thing [`crate::cart::sram::SramInfo::from_extra_memory`] looks
+    /// at and is not `RA`.
+    #[test]
+    fn no_bus_test_rom_decodes_as_sram() {
+        let image = rom_image(0x200);
+        assert_ne!(&image[0x1B0..0x1B2], &b"RA"[..]);
+        // The lengths the bus and Z80-view tests build images at: `z80_bus` uses
+        // 0x10000 of the same generator, which is long enough for the sniff to run
+        // over.
+        for len in [
+            0, 1, 4, 0x1FF, 0x200, 0x1000, 0x1_0000, 0x20_0000, 0x40_0000,
+        ] {
+            let mut bus = Bus::new(rom_image(len), TEST_VERSION);
+            assert!(
+                bus.sram().is_none(),
+                "a {len} byte image declares no save RAM"
+            );
+            bus.write_byte(0xA130F1, 3);
+            assert!(bus.sram().is_none(), "and 0xA130F1 cannot give it one");
+        }
+    }
+
+    /// The odd-only window of plutiedev's example, with no `0xA130F1` write
+    /// anywhere: 0x200001 is save byte 0 and 0x200003 is save byte 1, packed
+    /// rather than a stride, and the last address of the window is its last byte.
+    #[test]
+    fn odd_sram_byte_mapping() {
+        let mut bus = odd_sram_bus();
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(32 * 1024));
+
+        bus.write_byte(0x20_0001, 0xAB);
+        bus.write_byte(0x20_0003, 0xCD);
+        assert_eq!(bus.read_byte(0x20_0001), 0xAB);
+        assert_eq!(bus.read_byte(0x20_0003), 0xCD);
+        assert_eq!(&bus.sram().unwrap()[0..2], &[0xAB, 0xCD]);
+        assert_eq!(
+            bus.sram().unwrap()[0x7FFF],
+            0xFF,
+            "0x20FFFF is save byte 0x7FFF"
+        );
+    }
+
+    /// An even address inside an odd-only window is the half the save RAM is not
+    /// wired to. The window is the save's, so the image does not answer there
+    /// either: nothing drives the bus, and a write to it does nothing.
+    #[test]
+    fn even_address_in_odd_sram_reads_open_bus() {
+        let mut bus = odd_sram_bus();
+        bus.write_byte(0x20_0001, 0xAB);
+        assert!(bus.take_dirty(), "the live half took its write");
+        assert_eq!(bus.read_byte(0x20_0002), OPEN_BUS);
+        bus.write_byte(0x20_0002, 0x11);
+        assert_eq!(bus.read_byte(0x20_0002), OPEN_BUS);
+        assert_eq!(
+            &bus.sram().unwrap()[0..2],
+            &[0xAB, 0xFF],
+            "and nothing was stored"
+        );
+        assert!(!bus.take_dirty(), "and nothing was changed either");
+
+        // A word is its two bytes here, so the even address below the first save
+        // byte is the open bus past the end of the image over save byte 0.
+        assert_eq!(bus.read_word(0x20_0000), 0xFF_AB);
+        bus.write_byte(0x20_0003, 0x34);
+        assert_eq!(bus.read_word(0x20_0002), 0xFF_34);
+    }
+
+    /// A 4 MB cart fills the whole cartridge area, so its own ROM is what answers
+    /// the save RAM's addresses until the program writes `0xA130F1` (plutiedev
+    /// "Games larger than 2MB": "when we write 1 to it, SRAM shows up in the
+    /// upper 2MB of the cartridge, and when we write 0 the upper part of the ROM
+    /// shows up instead").
+    #[test]
+    fn a130f1_maps_sram_over_rom_for_large_rom() {
+        let mut bus = Bus::new(
+            sram_rom(0x40_0000, 0xF8, 0x20_0001, 0x20_FFFF, 0x5A),
+            TEST_VERSION,
+        );
+        assert_eq!(
+            bus.sram().map(<[u8]>::len),
+            Some(32 * 1024),
+            "the cart declares a save"
+        );
+        assert_eq!(
+            bus.read_byte(0x20_0001),
+            0x5A,
+            "with the ROM in front of it"
+        );
+
+        bus.write_byte(0x20_0001, 0x11);
+        assert_eq!(bus.read_byte(0x20_0001), 0x5A);
+        assert!(
+            !bus.take_dirty(),
+            "and that write went to ROM, which is read-only"
+        );
+
+        bus.write_byte(0xA130F1, 1);
+        assert_eq!(
+            bus.read_byte(0x20_0001),
+            0xFF,
+            "switched, and nothing saved yet"
+        );
+        bus.write_byte(0x20_0001, 0x11);
+        assert_eq!(bus.read_byte(0x20_0001), 0x11);
+        assert_eq!(bus.sram().unwrap()[0], 0x11);
+        assert!(bus.take_dirty());
+
+        bus.write_byte(0xA130F1, 0);
+        assert_eq!(bus.read_byte(0x20_0001), 0x5A, "and back to the ROM");
+        assert_eq!(bus.sram().unwrap()[0], 0x11, "the save is still there");
+    }
+
+    /// `0xA130F0` and `0xA130F1` are the two lanes of one byte register, so they
+    /// answer as one, and a 16 bit write to the pair carries its data in the byte
+    /// at the odd lane - the rule of the I/O registers ([`Bus::write_io_word`]).
+    /// Genesis Plus GX accepts the whole 0xA13060-0xA130F1 range for the
+    /// register; nothing decodes the rest of the block.
+    #[test]
+    fn sram_control_is_a_pair_and_a_word_write_uses_its_odd_lane() {
+        let mut bus = Bus::new(
+            sram_rom(0x40_0000, 0xF8, 0x20_0001, 0x20_FFFF, 0x5A),
+            TEST_VERSION,
+        );
+        bus.write_byte(0xA130F0, 1);
+        assert_eq!(
+            bus.read_byte(0x20_0001),
+            0xFF,
+            "the even lane is the register too"
+        );
+        bus.write_byte(0xA130F1, 0);
+        assert_eq!(bus.read_byte(0x20_0001), 0x5A);
+
+        bus.write_word(0xA130F0, 0x0001);
+        assert_eq!(bus.read_byte(0x20_0001), 0xFF, "the odd byte of the word");
+        bus.write_word(0xA130F0, 0x0100);
+        assert_eq!(bus.read_byte(0x20_0001), 0x5A, "and not the even one");
+
+        for addr in [0xA13001, 0xA13060, 0xA130F2, 0xA130FF] {
+            bus.write_byte(addr, 1);
+            assert_eq!(
+                bus.read_byte(0x20_0001),
+                0x5A,
+                "{addr:#08x} is not the register"
+            );
+        }
+    }
+
+    /// The control register is write-only: reading it back is open bus, which is
+    /// what MAME installs (a write handler for the pair, nothing for reads) and
+    /// what [`stub_regions_read_open_bus_until_their_ticket`] already pins for a
+    /// cart with no save RAM. Genesis Plus GX's cart registers are readable; no
+    /// game reads this one back.
+    #[test]
+    fn sram_control_register_reads_open_bus() {
+        let mut bus = odd_sram_bus();
+        bus.write_byte(0xA130F1, 3);
+        assert_eq!(bus.read_byte(0xA130F1), OPEN_BUS);
+        assert_eq!(bus.read_byte(0xA130F0), OPEN_BUS);
+        assert_eq!(bus.read_word(0xA130F0), OPEN_BUS_WORD);
+    }
+
+    /// Bit 1 of `0xA130F1` is the write protect: reads go on answering and the
+    /// save stops changing. Genesis Plus GX's `mapper_sega_w` takes it from the
+    /// same write as the map bit, which is how they are read here too.
+    #[test]
+    fn write_protect_bit_blocks_writes() {
+        let mut bus = odd_sram_bus();
+        bus.write_byte(0x20_0001, 0x11);
+        assert!(bus.take_dirty());
+
+        bus.write_byte(0xA130F1, 2);
+        assert_eq!(bus.read_byte(0x20_0001), 0x11, "reads are unaffected");
+        bus.write_byte(0x20_0001, 0x22);
+        bus.write_word(0x20_0002, 0x3344);
+        assert_eq!(bus.read_byte(0x20_0001), 0x11, "the byte write is refused");
+        assert_eq!(
+            bus.sram().unwrap()[0..2],
+            [0x11, 0xFF],
+            "and so is the word one"
+        );
+        assert!(!bus.take_dirty(), "a refused write is not a change");
+
+        bus.write_byte(0xA130F1, 0);
+        bus.write_byte(0x20_0001, 0x22);
+        assert_eq!(bus.read_byte(0x20_0001), 0x22);
+        assert!(bus.take_dirty());
+    }
+
+    /// The save reads 0xFF before the game has written it, through the bus as
+    /// well as through [`Bus::sram`]: the choice [`crate::cart::sram::Sram::new`]
+    /// documents, that emulators fill save RAM as if nothing were driving it
+    /// rather than with the garbage real SRAM powers up to.
+    #[test]
+    fn sram_powers_up_as_ff_through_the_bus() {
+        let mut bus = odd_sram_bus();
+        assert_eq!(bus.read_byte(0x20_0001), 0xFF);
+        assert_eq!(bus.read_word(0x20_0002), OPEN_BUS_WORD);
+        assert!(bus.sram().unwrap().iter().all(|&byte| byte == 0xFF));
+        assert!(!bus.take_dirty(), "and filling it in is not a change");
+    }
+
+    /// The even-only window, $F0 of segaretro's table: `start + 2n` is storage,
+    /// and the odd bytes of the window are the dead half. Acceptance criterion
+    /// "odd, even and word layouts".
+    #[test]
+    fn even_sram_layout() {
+        let mut bus = Bus::new(
+            sram_rom(0x20_0000, 0xF0, 0x20_0000, 0x20_FFFF, 0x5A),
+            TEST_VERSION,
+        );
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(32 * 1024));
+
+        bus.write_byte(0x20_0000, 0xAA);
+        bus.write_byte(0x20_0002, 0xBB);
+        assert_eq!(bus.read_byte(0x20_0000), 0xAA);
+        assert_eq!(bus.read_byte(0x20_0002), 0xBB);
+        assert_eq!(&bus.sram().unwrap()[0..2], &[0xAA, 0xBB]);
+        assert_eq!(
+            bus.read_byte(0x20_0001),
+            OPEN_BUS,
+            "the odd half of the window is dead"
+        );
+        bus.write_byte(0x20_0001, 0x11);
+        assert_eq!(
+            &bus.sram().unwrap()[0..2],
+            &[0xAA, 0xBB],
+            "and takes no write"
+        );
+
+        // The window starts at 0x200000, so the image ends where it begins.
+        assert_eq!(bus.read_byte(0x1F_FFFF), 0x5A);
+    }
+
+    /// The 16-bit window, $E0: every byte of it is storage, in address order, and
+    /// a word is a word like anywhere else on the bus.
+    #[test]
+    fn word_sram_layout() {
+        let mut bus = Bus::new(
+            sram_rom(0x20_0000, 0xE0, 0x20_0000, 0x20_1FFF, 0x5A),
+            TEST_VERSION,
+        );
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(8 * 1024));
+
+        bus.write_byte(0x20_0000, 0xAA);
+        bus.write_byte(0x20_0001, 0xBB);
+        assert_eq!(bus.read_byte(0x20_0000), 0xAA);
+        assert_eq!(bus.read_byte(0x20_0001), 0xBB);
+        assert_eq!(
+            bus.read_word(0x20_0000),
+            0xAA_BB,
+            "big endian, as every word here is"
+        );
+
+        bus.write_word(0x20_0002, 0xCC_DD);
+        assert_eq!(&bus.sram().unwrap()[0..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(bus.read_word(0x20_0002), 0xCC_DD);
+    }
+
+    /// `dirty` is the front end's reason to persist: set by any write the save
+    /// takes, cleared by `take_dirty` alone, and set by nothing else at all.
+    #[test]
+    fn sram_dirty_flag_tracks_accepted_writes() {
+        let mut bus = odd_sram_bus();
+        assert!(!bus.take_dirty());
+
+        bus.read_byte(0x20_0001);
+        bus.read_word(0x20_0002);
+        assert!(!bus.take_dirty(), "reads are not changes");
+
+        bus.write_byte(0x20_0001, 0x11);
+        assert!(bus.take_dirty());
+        assert!(
+            !bus.take_dirty(),
+            "and reading back what was written is not either"
+        );
+        bus.write_byte(0x20_0001, 0x11);
+        assert!(
+            bus.take_dirty(),
+            "even a write of the byte that was already there"
+        );
+
+        bus.load_sram(&vec![0x00; 32 * 1024]);
+        assert!(!bus.take_dirty(), "a restore is not a change to persist");
+
+        bus.write_byte(0x20_0002, 0x11);
+        assert!(
+            !bus.take_dirty(),
+            "nor is a write to the dead half of the window"
+        );
+
+        bus.write_byte(0xA130F1, 2);
+        bus.write_byte(0x20_0001, 0x22);
+        assert!(!bus.take_dirty(), "nor one the protect bit refused");
+    }
+
+    /// `load_sram` puts a save back where it came from. A blob of any other length
+    /// is another cart's save, so it is refused whole rather than half applied,
+    /// and a cart with no save RAM has nowhere for one to land.
+    #[test]
+    fn load_sram_restores_contents() {
+        let mut bus = odd_sram_bus();
+        bus.write_byte(0x20_0001, 0x11);
+        let saved: Vec<u8> = bus.sram().unwrap().to_vec();
+        assert_eq!(saved.len(), 32 * 1024);
+
+        for wrong in [saved.len() - 1, saved.len() + 1, 0] {
+            bus.load_sram(&vec![0x00; wrong]);
+            assert_eq!(
+                bus.sram().unwrap(),
+                &saved[..],
+                "a {wrong} byte load changed nothing"
+            );
+        }
+
+        let mut restored = odd_sram_bus();
+        restored.load_sram(&saved);
+        assert_eq!(
+            restored.read_byte(0x20_0001),
+            0x11,
+            "the save is where the cart reads it"
+        );
+        assert!(
+            !restored.take_dirty(),
+            "and restoring it is not a change of our own"
+        );
+
+        let mut plain = Bus::new(Vec::new(), TEST_VERSION);
+        plain.load_sram(&[0xFF]);
+        assert_eq!(plain.sram(), None);
+        assert!(!plain.take_dirty());
+    }
+
+    /// `RESET` restarts the console, and with it the cart slot's register: the
+    /// write protect is off and the map bit is 0 again. The save itself survives -
+    /// `RESET` is not a power cycle, and the battery is still holding it - as does
+    /// the fact that it changed.
+    #[test]
+    fn reset_clears_the_sram_control_register() {
+        let mut bus = Bus::new(
+            sram_rom(0x40_0000, 0xF8, 0x20_0001, 0x20_FFFF, 0x5A),
+            TEST_VERSION,
+        );
+        bus.write_byte(0xA130F1, 1);
+        bus.write_byte(0x20_0001, 0x11);
+        bus.write_byte(0xA130F1, 3);
+        bus.write_byte(0x20_0001, 0x22);
+        assert_eq!(bus.read_byte(0x20_0001), 0x11);
+
+        bus.reset_devices();
+        assert_eq!(bus.read_byte(0x20_0001), 0x5A, "the map bit is back to 0");
+        bus.write_byte(0xA130F1, 1);
+        assert_eq!(
+            bus.read_byte(0x20_0001),
+            0x11,
+            "the save survived the reset"
+        );
+        bus.write_byte(0x20_0001, 0x33);
+        assert_eq!(bus.read_byte(0x20_0001), 0x33, "and it is writable again");
     }
 }
