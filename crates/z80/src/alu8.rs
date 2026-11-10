@@ -206,6 +206,41 @@ impl Z80 {
         19
     }
 
+    /// `ALU A,IXH` / `ALU A,IXL` and the `IY` forms: `DD`/`FD` plus `80`-`BF`
+    /// with `z` naming `H` or `L`. 8 T-states, the prefix's 4 on top of the ALU
+    /// op (M2-15, #58).
+    ///
+    /// Here `y` is the operation, so the only operand slot is `z` and the whole
+    /// group is `ADD A,IXH` through `CP IYL`. `wz` does not move: no memory is
+    /// touched, and the 16 files agree.
+    pub(crate) fn alu_a_index_half(&mut self, op: u8, mode: IndexMode) -> u32 {
+        let value = self.index_reg_slot(mode, z(op));
+        self.alu8(y(op), value);
+        8
+    }
+
+    /// `INC IXH` (`DD 24`) and `INC IXL` (`DD 2C`), with `IY` for `FD`: 8
+    /// T-states. The flags are the unprefixed instruction's, computed from the
+    /// half that moved (`dd 24`: 1000 cases).
+    pub(crate) fn inc_index_half(&mut self, op: u8, mode: IndexMode) -> u32 {
+        let slot = y(op);
+        let (result, flags) = inc_flags(self.index_reg_slot(mode, slot));
+        self.set_index_reg_slot(mode, slot, result);
+        self.update_flags(FLAGS_KEEP_C, flags);
+        self.latch_flags();
+        8
+    }
+
+    /// `DEC IXH` (`DD 25`) / `DEC IXL` (`DD 2D`): as [`Z80::inc_index_half`].
+    pub(crate) fn dec_index_half(&mut self, op: u8, mode: IndexMode) -> u32 {
+        let slot = y(op);
+        let (result, flags) = dec_flags(self.index_reg_slot(mode, slot));
+        self.set_index_reg_slot(mode, slot, result);
+        self.update_flags(FLAGS_KEEP_C, flags);
+        self.latch_flags();
+        8
+    }
+
     /// `INC r` (`04 0C 14 1C 24 2C 3C`): 4 T-states.
     ///
     /// Named `_reg`, not `inc_r`: `Z80::inc_r` is the `R` refresh counter bump
@@ -701,5 +736,73 @@ mod tests {
             );
             assert_eq!(cpu.get_flag(FLAG_N), index == 2 || index == 3 || index == 7);
         }
+    }
+
+    /// `ADD A,IYL` (`FD 85`): 8 T-states, the index half as an ordinary operand.
+    ///
+    /// The `IXH`/`IXL` half of the ALU space (M2-15, #58). Only the `z = 4` and
+    /// `z = 5` operand slots move, because they are the two the prefix can name:
+    /// `y` is the operation here, not a register.
+    #[test]
+    fn add_a_iyl() {
+        let (mut cpu, mut bus) = cpu_at(0x0100, &[0xFD, 0x85]);
+        cpu.set_a(0xF0);
+        cpu.set_iy(0x3420);
+
+        assert_eq!(cpu.step(&mut bus), 8);
+
+        assert_eq!(cpu.a(), 0x10, "0xF0 + 0x20 wrapped");
+        assert!(cpu.get_flag(FLAG_C), "and out");
+        assert!(!cpu.get_flag(FLAG_H), "no half carry out of 0 + 0");
+        assert_eq!(cpu.iy(), 0x3420, "IY is not disturbed");
+        assert_eq!(
+            cpu.hl(),
+            0,
+            "neither is HL, which is what an unprefixed 85 reads"
+        );
+        assert_eq!(cpu.pc(), 0x0102);
+
+        // CP is the same instruction with the result thrown away, which is the
+        // cheapest proof the operand really is the index half.
+        let (mut cpu, mut bus) = cpu_at(0x0100, &[0xFD, 0xBC]);
+        cpu.set_a(0x34);
+        cpu.set_iy(0x3400);
+        assert_eq!(cpu.step(&mut bus), 8, "FD BC is CP IYH");
+        assert!(cpu.get_flag(FLAG_Z), "0x34 - 0x34");
+        assert_eq!(cpu.a(), 0x34, "CP leaves A alone");
+    }
+
+    /// `INC IXH` (`DD 24`) and `DEC IXH` (`DD 25`): 8 T-states, the flags the
+    /// unprefixed instruction computes, and only the one half of `IX` moving.
+    #[test]
+    fn inc_ixh_flags() {
+        let (mut cpu, mut bus) = cpu_at(0x0100, &[0xDD, 0x24]);
+        cpu.set_ix(0xFF34);
+        cpu.set_flags(FLAG_C);
+
+        assert_eq!(cpu.step(&mut bus), 8);
+
+        assert_eq!(cpu.ix(), 0x0034, "IXH wrapped to zero, IXL kept");
+        assert!(cpu.get_flag(FLAG_Z), "the result is zero");
+        assert!(cpu.get_flag(FLAG_H), "0xFF carries out of bit 3");
+        assert!(!cpu.get_flag(FLAG_N), "INC clears N");
+        assert!(cpu.get_flag(FLAG_C), "INC leaves C alone");
+        assert_eq!(cpu.h(), 0, "H is a different register");
+
+        let (mut cpu, mut bus) = cpu_at(0x0100, &[0xDD, 0x25]);
+        cpu.set_ix(0x8034);
+        cpu.set_flags(0);
+        assert_eq!(cpu.step(&mut bus), 8, "DD 25 is DEC IXH");
+        assert_eq!(cpu.ix(), 0x7F34, "DEC on 0x80");
+        assert!(cpu.get_flag(FLAG_PV), "signed underflow");
+        assert!(!cpu.get_flag(FLAG_S));
+
+        // FD mirrors it on IY.
+        let (mut cpu, mut bus) = cpu_at(0x0100, &[0xFD, 0x2C]);
+        cpu.set_iy(0x127E);
+        cpu.set_ix(0x9999);
+        assert_eq!(cpu.step(&mut bus), 8, "FD 2C is INC IXL");
+        assert_eq!(cpu.iy(), 0x127F);
+        assert_eq!(cpu.ix(), 0x9999, "and IX is not involved");
     }
 }
