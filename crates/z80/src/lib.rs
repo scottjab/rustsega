@@ -16,6 +16,7 @@ mod bitops;
 mod block;
 mod decode;
 mod flow;
+mod interrupt;
 mod io;
 mod ld16;
 mod ld8;
@@ -94,6 +95,21 @@ pub struct Z80 {
     /// `EI` does not open the interrupt gate until the instruction after it
     /// has run, so acceptance has to be delayed by one instruction.
     ei_pending: bool,
+    /// The `/INT` pin, as a level. The bus holds it up for as long as its own
+    /// interrupt source is live, so it is re-read at every instruction boundary
+    /// rather than consumed like `nmi_pending`.
+    int_line: bool,
+    /// A `/NMI` edge, latched until taken. `NMI` is edge-triggered and has no
+    /// acknowledge the core can see, so the bus says "an edge happened" and this
+    /// is what clears it ([`Z80::nmi`]).
+    nmi_pending: bool,
+    /// The byte the bus drives during an `IM 0` / `IM 2` acknowledge.
+    ///
+    /// `0xFF` because that is what a floating Z80 data bus reads as, which is
+    /// all a Genesis ever gives it in `IM 0` (`RST 38h`); `IM 2` uses it as the
+    /// low byte of the vector table address. It is a property of the bus rather
+    /// than of the CPU, so [`Z80::reset`] leaves it alone.
+    int_vector: u8,
 }
 
 impl Z80 {
@@ -122,6 +138,9 @@ impl Z80 {
             q: 0,
             p: false,
             ei_pending: false,
+            int_line: false,
+            nmi_pending: false,
+            int_vector: 0xFF,
         };
         cpu.reset();
         cpu
@@ -159,6 +178,10 @@ impl Z80 {
         self.q = 0;
         self.p = false;
         self.ei_pending = false;
+        // Pin state goes with the flip-flops: the bus is holding nothing on its
+        // own account, and `int_vector` is wiring rather than state so it stays.
+        self.int_line = false;
+        self.nmi_pending = false;
     }
 
     /// Run one instruction and return the T-states it took.
@@ -169,7 +192,14 @@ impl Z80 {
     ///
     /// The fetch and the dispatch tree live in [`decode`](crate::decode);
     /// `R` is counted there, by the opcode fetch, not here.
+    ///
+    /// An interrupt is looked for first, and takes the slot the fetch would
+    /// have had: an accepted interrupt means the instruction under `PC` did not
+    /// run, and its address is the one pushed on the stack (M2-14, #57).
     pub fn step(&mut self, bus: &mut impl Z80Bus) -> u32 {
+        if let Some(cycles) = self.service_interrupts(bus) {
+            return cycles;
+        }
         self.exec(bus)
     }
 
@@ -544,6 +574,36 @@ impl Z80 {
     /// Whether `EI` has an interrupt gate opening after the next instruction.
     pub fn ei_pending(&self) -> bool {
         self.ei_pending
+    }
+
+    /// Drive the `/INT` pin.
+    ///
+    /// A level, not a pulse: hold it up and the next instruction boundary after
+    /// the gate opens takes the interrupt, however many times that is. Passing
+    /// `false` is how the bus says it is done asking.
+    pub fn set_int_line(&mut self, asserted: bool) {
+        self.int_line = asserted;
+    }
+
+    /// Latch an edge on the `/NMI` pin, taken before any pending `/INT` and
+    /// whatever the interrupt enable flip-flops say.
+    pub fn nmi(&mut self) {
+        self.nmi_pending = true;
+    }
+
+    /// Whether a `/NMI` edge is waiting to be taken.
+    pub fn nmi_pending(&self) -> bool {
+        self.nmi_pending
+    }
+
+    /// The byte the bus drives for an `IM 0` / `IM 2` acknowledge.
+    pub fn int_vector(&self) -> u8 {
+        self.int_vector
+    }
+
+    /// Set that byte ([`Z80::int_vector`] says why it defaults to `0xFF`).
+    pub fn set_int_vector(&mut self, value: u8) {
+        self.int_vector = value;
     }
 
     /// Arm or clear the one-instruction interrupt delay `EI` imposes.

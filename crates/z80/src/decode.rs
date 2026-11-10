@@ -453,7 +453,9 @@ impl Z80 {
     /// missing instruction into a line saying which opcode is missing, instead
     /// of a register mismatch 40 fields later. The conformance harness catches
     /// these, so a whole-suite run still reports per file instead of aborting.
-    fn unimplemented(&self, opcode: &str) -> ! {
+    /// Interrupt acceptance (module `interrupt`) uses it for the one `IM 0` bus
+    /// byte it cannot execute.
+    pub(crate) fn unimplemented(&self, opcode: &str) -> ! {
         panic!(
             "unimplemented z80 opcode {opcode}; PC is now {:#06X}",
             self.pc
