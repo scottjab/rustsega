@@ -1,11 +1,18 @@
-//! Cartridge: the ROM image and the header that describes it. The mappers and
-//! the save RAM it declares are decoded in their own tickets.
+//! Cartridge: the ROM image and the header that describes it. What a cart's
+//! hardware adds to the slot - the save RAM of [`sram`] and the bank registers of
+//! [`mapper`], each decoded from the image and each living behind [`crate::Bus`]'s
+//! cartridge area - has its own module.
+//!
+//! [`mapper`] holds the one mapper the console's own cart hardware has - the
+//! unlicensed mappers of M3-17 are not in it.
 
 pub mod header;
+pub mod mapper;
 pub mod smd;
 pub mod sram;
 
 pub use header::{Regions, RomHeader, compute_checksum, parse_header};
+pub use mapper::Mapper;
 pub use smd::{deinterleave, is_smd, normalize_rom};
 pub use sram::{Sram, SramInfo, SramKind};
 

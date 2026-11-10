@@ -39,17 +39,19 @@
 //!
 //! ## The cartridge slot, in order
 //!
-//! 0x000000-0x3FFFFF is one region with two owners: the ROM image, and - for the
-//! window its header declares - the battery-backed save RAM of [`crate::cart`].
-//! The order the slot answers them in, and where the M3-12 (#72) mapper goes,
-//! is on [`Bus::read_rom_byte`].
+//! 0x000000-0x3FFFFF is one region with three owners: the [mapper] of a cart
+//! bigger than the area, the ROM image behind it, and - for the window its header
+//! declares - the battery-backed save RAM of [`crate::cart`] in front. The order
+//! the slot answers them in is on [`Bus::read_rom_byte`].
+//!
+//! [mapper]: crate::cart::mapper
 //!
 //! [`m68k::Bus::int_ack`] is deliberately left at the trait default: returning
 //! `None` *is* what a Genesis does, always autovectoring.
 //! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`] and the Z80's control
 //! lines; the VDP joins them with M3-09 (#69).
 
-use crate::cart::{Sram, sram};
+use crate::cart::{Mapper, Sram, mapper, sram};
 use crate::io::Io;
 use crate::z80_bus::{self, YM_STATUS_IDLE, Z80Side};
 use m68k::ADDR_MASK;
@@ -195,13 +197,16 @@ enum Region {
     /// 0xA11000-0xA11FFF, Z80 bus control: [`Z80_BUSREQ`] and [`Z80_RESET_REG`],
     /// which decide whether a 68k access to [`Region::Z80`] is allowed at all.
     Z80Ctrl,
-    /// 0xA13000-0xA130FF, the cartridge slot extra.
+    /// 0xA13000-0xA130FF, the cartridge slot extra: the registers a cart's own
+    /// hardware watches, on the /TIME signal of the slot (plutiedev "$A130xx area
+    /// usage", which lists `$A130F0 to $A130FF` as "Sega mapper").
     ///
-    /// [`SRAM_CONTROL`] answers here for a cart that declares save RAM; for one
-    /// that does not the whole block is nothing's, reading [`OPEN_BUS`] and
-    /// dropping writes.
-    ///
-    /// TODO(M3-12 #72): the Sega SSF2 mapper in the same block.
+    /// [`SRAM_CONTROL`] is the save RAM control of a cart that declares save RAM,
+    /// and [`mapper::bank_slot`] is the seven bank registers of a cart that has
+    /// the Sega mapper. Anything else - the corners other hardware is reserved
+    /// for, and either register on a cart that has neither - is nothing's: it
+    /// reads [`OPEN_BUS`] and drops writes. Nothing in the block is readable, so
+    /// both are write-only ([`Bus::read_cart_extra_byte`]).
     CartExtra,
     /// 0xA14000-0xA14FFF, TMSS ports: the security register at
     /// [`TMSS_SECURITY`] and the ROM select register at [`TMSS_ROM_SELECT`].
@@ -263,6 +268,25 @@ pub struct Bus {
     /// Private behind [`Bus::sram`], [`Bus::load_sram`] and [`Bus::take_dirty`]:
     /// the only writes that may reach a save are ones that can say so.
     sram: Option<Sram>,
+    /// The cart's bank registers, from [`crate::cart::mapper::detect`] on
+    /// [`Bus::rom`]: the Sega mapper for a cart too big for the cartridge area,
+    /// and [`Mapper::None`] for one that is not.
+    ///
+    /// Not a region either, and not a second translation of the address space:
+    /// the mapper is the one step of [`Bus::read_rom_byte`] between the save RAM
+    /// overlay and the image, and the seven registers of
+    /// [`Region::CartExtra`] that [`mapper::bank_slot`] names are the only thing
+    /// that writes it. [`crate::z80_bus`] reaches the cartridge through the same
+    /// read, which is what makes a bank switch visible to the sound CPU as it is
+    /// to the 68k - the hazard plutiedev "Going beyond 4MB", "Things to watch out
+    /// for" warns about.
+    ///
+    /// A cart with a save RAM window and a mapper is possible in principle and
+    /// shipped by nobody: the overlay is asked first, so a save always covers the
+    /// bank underneath it rather than trading places with it, which is what
+    /// Genesis Plus GX does in `mapper_sega_w` ("save current cartridge ROM bank
+    /// mapped to $200000-$20ffff" to put back later).
+    mapper: Mapper,
     /// 64 KiB of work RAM, mapped at 0xE00000 and mirrored every 0x10000.
     pub ram: Box<[u8; 0x10000]>,
     /// The byte 0xA10001 reports: [`crate::Region::version_register`] for the
@@ -385,9 +409,15 @@ impl Bus {
         // The save RAM of a cart is declared in its header, which is 0x200 bytes
         // into the image and may not be there at all.
         let sram = sram::detect(&rom).map(|info| Sram::new(info, rom.len()));
+        // The mapper is read out of the image the same way, and for the same
+        // reason: it is either the size of the cart or the cart's own request for
+        // it in the system type, and both are in front of the code that turns a
+        // file into a machine rather than next to it.
+        let mapper = Mapper::detect(&rom);
         Self {
             rom,
             sram,
+            mapper,
             ram: Box::new([0; 0x10000]),
             version,
             io: Io::new(),
@@ -614,25 +644,30 @@ impl Bus {
     ///    [`crate::cart::sram::Sram::read`] answers `None` for every address the
     ///    save has no claim on, so the one call is the whole overlay and never a
     ///    scattered `if sram`.
-    /// 2. **the mapper** - M3-12 (#72) belongs here, between the overlay and the
-    ///    image, as a translation of `addr` to an offset in [`Bus::rom`]. Below
-    ///    the overlay and not above it because `0xA130F1` bit 0 *is* the switch
-    ///    that picks ROM or save RAM for this window, and a mapper only decides
-    ///    which ROM is on the other side of it: that is how Genesis Plus GX's
-    ///    `mapper_sega_w` treats the same register, which maps the save over the
-    ///    bank and remembers which bank was underneath to put back.
+    /// 2. **the mapper**, between the overlay and the image, as a translation of
+    ///    `addr` to an offset in [`Bus::rom`] ([`crate::cart::mapper`], M3-12).
+    ///    Below the overlay and not above it because `0xA130F1` bit 0 *is* the
+    ///    switch that picks ROM or save RAM for this window, and a mapper only
+    ///    decides which ROM is on the other side of it: that is how Genesis Plus
+    ///    GX's `mapper_sega_w` treats the same register, which maps the save over
+    ///    the bank and remembers which bank was underneath to put back. The
+    ///    mapper answers `None` for a cart that has no mapper, and the address is
+    ///    then its own offset - the plain image.
     /// 3. **the image**, in address order. A read above its end is [`OPEN_BUS`]:
     ///    real hardware leaves the bus floating there, some dumps are sold as
     ///    mirrored copies of the ROM, and either way an image shorter than the
     ///    slot is the common case and 0xFF is what nothing driving the lines reads
-    ///    as.
+    ///    as. This is also what a bank number pointing past the end of the cart
+    ///    reads as, which is why [`crate::cart::mapper::Mapper::map`] never sees
+    ///    the image at all.
     fn read_rom_byte(&mut self, addr: u32) -> u8 {
         if let Some(value) = self.sram.as_ref().and_then(|save| save.read(addr)) {
             return value;
         }
-        // M3-12 (#72): the mapper turns `addr` into an offset here; the overlay
-        // above has already had its say and must keep its priority.
-        let offset = (addr - ROM_START) as usize;
+        // The one place a cart's addresses are translated, and the only place the
+        // mapper is consulted on the way to a byte: the overlay above has already
+        // had its say and keeps its priority.
+        let offset = self.mapper.map(addr).unwrap_or((addr - ROM_START) as usize);
         self.rom.get(offset).copied().unwrap_or(OPEN_BUS)
     }
 
@@ -930,23 +965,35 @@ impl Bus {
     }
 
     /// Cartridge slot extra byte write: the save RAM control register, for a cart
-    /// that has save RAM for it to control.
+    /// that has save RAM for it to control, and the Sega mapper's bank registers,
+    /// for a cart that has a mapper.
     ///
-    /// TODO(M3-12 #72): the Sega SSF2 mapper's bank registers, in this same block
-    /// and behind the same kind of decode.
+    /// The two decodes are independent, and nothing gates the block: no unlock
+    /// byte makes either register answer. Every reference that decodes it writes
+    /// straight through, and plutiedev "Saving progress with SRAM" requires it of
+    /// `0xA130F1` - see "Nothing unlocks these registers" in
+    /// [`crate::cart::mapper`] for what each one does. A cart with neither has
+    /// nothing here, and the write is dropped like any other to the block.
     fn write_cart_extra_byte(&mut self, addr: u32, value: u8) {
-        if (addr & EVEN_LANE) == SRAM_CONTROL
-            && let Some(save) = self.sram.as_mut()
-        {
-            save.write_control(value);
+        if (addr & EVEN_LANE) == SRAM_CONTROL {
+            if let Some(save) = self.sram.as_mut() {
+                save.write_control(value);
+            }
+        } else if let Some(slot) = mapper::bank_slot(addr) {
+            self.mapper.set_bank(slot, value);
         }
     }
 
     /// Cartridge slot extra word write: the low byte of `value`, which is the byte
-    /// at `addr + 1` - the odd lane of [`SRAM_CONTROL`], where the register lives,
-    /// as [`Bus::write_io_word`] takes for its register pair.
+    /// at `addr + 1` - the odd lane of the register pair, where every register of
+    /// this block lives, as [`Bus::write_io_word`] takes for its own.
+    ///
+    /// That is one rule for the whole block: `0xA130F0` as a word is the save RAM
+    /// control at `0xA130F1`, and `0xA130F2` as a word is the bank register at
+    /// `0xA130F3`. An odd `addr` is an address error the 68k never completes, so
+    /// the pair the access names is all that is left to decode.
     fn write_cart_extra_word(&mut self, addr: u32, value: u16) {
-        self.write_cart_extra_byte(addr, value as u8);
+        self.write_cart_extra_byte(addr + 1, value as u8);
     }
 
     /// TMSS port byte read: nothing here is readable.
@@ -1264,6 +1311,12 @@ impl m68k::Bus for Bus {
         if let Some(save) = self.sram.as_mut() {
             save.reset();
         }
+        // The mapper's bank registers go back to slot `n` on page `n` with them:
+        // a cart boots from a reset assuming nothing is switched out from under
+        // it, which is why slot 0 is pinned in the first place. Genesis Plus GX
+        // asks for the same with `cart.hw.bankshift` on the carts that have the
+        // mapper - "cartridge ROM mapping is reinitialized on /VRES".
+        self.mapper.reset();
     }
 }
 
@@ -2639,5 +2692,260 @@ mod tests {
         );
         bus.write_byte(0x20_0001, 0x33);
         assert_eq!(bus.read_byte(0x20_0001), 0x33, "and it is writable again");
+    }
+
+    // The Sega mapper: an image larger than the cartridge area, the seven bank
+    // registers of 0xA130F3-0xA130FF in front of it, and the pinning of slot 0.
+    // The translation itself is [`crate::cart::mapper`]'s own tests; these are
+    // the ones about the register block and the seam in
+    // [`Bus::read_rom_byte`].
+
+    /// The 5 MB cart of the ticket: every byte of each 512 KiB page is its own
+    /// page number, so any read of it says which page answered - at the top of a
+    /// page, which is what the ticket asks for, or anywhere else in one.
+    ///
+    /// No header, so no save RAM: the bytes at 0x1B0 are zero, which is not `RA`.
+    fn banked_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x50_0000];
+        for page in 0..10u8 {
+            let start = usize::from(page) * 0x8_0000;
+            rom[start..start + 0x8_0000].fill(page);
+        }
+        rom
+    }
+
+    /// The bus of the 5 MB cart, mapper and all.
+    fn banked_bus() -> Bus {
+        Bus::new(banked_rom(), TEST_VERSION)
+    }
+
+    /// A cart that fits the cartridge area and says nothing about the mapper has
+    /// no mapper: writes to the bank registers do nothing at all, and the image
+    /// keeps answering in address order.
+    #[test]
+    fn mapper_disabled_for_small_rom() {
+        let image = rom_image(0x40_0000);
+        let mut bus = Bus::new(image.clone(), TEST_VERSION);
+
+        // The 4 MiB cart is the common case, and 0xA130F3 is where the mapper
+        // would be if this cart had one.
+        for (offset, addr) in (0xA130F3..=0xA130FF).step_by(2).enumerate() {
+            bus.write_byte(addr, (offset + 1) as u8);
+        }
+        bus.write_word(0xA130FE, 0x0009);
+
+        for addr in [0, 0x08_0000, 0x20_0001, 0x3F_FFFE, ROM_END] {
+            assert_eq!(bus.read_byte(addr), image[addr as usize], "{addr:#08x}");
+        }
+        assert_eq!(
+            bus.read_word(0x1_2340),
+            u16::from_be_bytes([image[0x1_2340], image[0x1_2341]])
+        );
+
+        // And under 4 MiB, where the same is truer still.
+        let small = rom_image(0x10_0000);
+        let mut small_bus = Bus::new(small.clone(), TEST_VERSION);
+        for addr in 0xA130F3..=0xA130FF {
+            small_bus.write_byte(addr, 9);
+        }
+        assert_eq!(small_bus.read_byte(0x08_0000), small[0x08_0000]);
+    }
+
+    /// A 5 MB cart comes up with slot `n` on page `n`, which is the first 4 MiB
+    /// read exactly as a cart that size would be: the ticket's case, `0x080000`
+    /// answering 1 because page 1 starts with a 1.
+    #[test]
+    fn default_banks_identity() {
+        let rom = banked_rom();
+        let mut bus = banked_bus();
+
+        assert_eq!(bus.read_byte(0x00_0000), 0, "slot 0 on page 0");
+        assert_eq!(bus.read_byte(0x08_0000), 1, "slot 1 on page 1");
+        assert_eq!(bus.read_byte(0x38_0000), 7, "slot 7 on page 7");
+
+        // Every slot, and not just at the top of it: the translation is the
+        // whole 512 KiB, so the byte within the slot survives too.
+        for slot in 0..8usize {
+            for offset in [0usize, 1, 0x7_FFFE, 0x7_FFFF] {
+                let addr = (slot * 0x8_0000 + offset) as u32;
+                assert_eq!(
+                    bus.read_byte(addr),
+                    rom[slot * 0x8_0000 + offset],
+                    "{addr:#08x}"
+                );
+            }
+        }
+        // Words too, and across a page boundary: 0x080000 is page 1's first byte
+        // followed by its second, and 0x07FFFE is the last word of page 0.
+        assert_eq!(bus.read_word(0x08_0000), 0x0101);
+        assert_eq!(bus.read_word(0x28_0000), 0x0505);
+        assert_eq!(bus.read_byte(0x3F_FFFF), rom[0x3F_FFFF]);
+    }
+
+    /// The ticket's case: `move.b #9, (MapperBank7)`, and 0x380000 - which was
+    /// page 7 - is page 9: the top megabyte of the 5 MB cart, which nothing else
+    /// can reach.
+    #[test]
+    fn switch_slot_7_to_bank_9() {
+        let mut bus = banked_bus();
+        assert_eq!(bus.read_byte(0x38_0000), 7);
+
+        bus.write_byte(0xA130FF, 9);
+        assert_eq!(bus.read_byte(0x38_0000), 9, "page 9 answers slot 7 now");
+        assert_eq!(
+            bus.read_byte(0x3F_FFFF),
+            9,
+            "the whole 512 KiB moved, not just its first byte"
+        );
+        assert_eq!(bus.read_byte(0x30_0000), 6, "slot 6 is where it was");
+
+        // The other six registers, each into its own slot: page 0 is what makes
+        // the move visible, since identity has slot `n` on page `n`.
+        for (offset, addr) in (0xA130F3..0xA130FF).step_by(2).enumerate() {
+            let slot = 1 + offset as u32;
+            bus.write_byte(addr, 0);
+            assert_eq!(
+                bus.read_byte(slot * 0x8_0000),
+                0,
+                "{addr:#010x} is the register of slot {slot}"
+            );
+        }
+        assert_eq!(
+            bus.read_byte(0x38_0000),
+            9,
+            "and slot 7 stayed where it was put"
+        );
+    }
+
+    /// Slot 0 is fixed to page 0: the cart has to boot, and there is no register
+    /// for it - the lane its register would be on is the save RAM control at
+    /// `0xA130F0`, so every write in the block leaves slot 0 alone.
+    #[test]
+    fn slot_0_fixed() {
+        let mut bus = banked_bus();
+
+        for addr in (0xA130F0..=0xA130FF).step_by(2) {
+            bus.write_byte(addr, 9);
+            bus.write_word(addr, 9);
+        }
+        bus.write_byte(0xA130F1, 0xFF);
+
+        assert_eq!(bus.read_byte(0x00_0000), 0, "slot 0 is still page 0");
+        assert_eq!(bus.read_byte(0x07_FFFF), 0, "the whole of it");
+        assert_eq!(bus.read_byte(0x08_0000), 9, "and slot 1 moved");
+    }
+
+    /// A bank number past the end of the image is nothing driving the bus, not a
+    /// panic and not a mirror back into the cart: `0xA130FF` holds a byte, so a
+    /// 5 MB cart has nine pages and 200 is not one of them.
+    #[test]
+    fn bank_past_end_of_image_reads_open_bus() {
+        let mut bus = banked_bus();
+        bus.write_byte(0xA130FF, 200);
+
+        assert_eq!(bus.read_byte(0x38_0000), OPEN_BUS);
+        assert_eq!(bus.read_word(0x3F_FFFE), OPEN_BUS_WORD);
+        assert_eq!(
+            bus.read_byte(0x30_0000),
+            6,
+            "the other slots are unaffected"
+        );
+
+        // Page 9 is the last one the cart has, and it does answer.
+        bus.write_byte(0xA130FF, 9);
+        assert_eq!(bus.read_byte(0x38_0000), 9);
+    }
+
+    /// The registers go back to slot `n` on page `n` with the rest of the
+    /// console's register state, because `RESET` is the 68k starting over and the
+    /// cart boots from a reset on the assumption that nothing is switched.
+    #[test]
+    fn reset_devices_restores_the_bank_identity() {
+        let mut bus = banked_bus();
+        bus.write_byte(0xA130F3, 8);
+        bus.write_byte(0xA130FF, 9);
+        assert_eq!(bus.read_byte(0x08_0000), 8);
+        assert_eq!(bus.read_byte(0x38_0000), 9);
+
+        bus.reset_devices();
+        assert_eq!(bus.read_byte(0x08_0000), 1, "slot 1 is back on page 1");
+        assert_eq!(bus.read_byte(0x38_0000), 7, "and slot 7 on page 7");
+    }
+
+    /// A bank register is a byte register on the odd lane of its pair, so a word
+    /// write to the even lane carries its data in the low byte - the rule of
+    /// [`Bus::write_io_word`] and of [`Bus::write_cart_extra_word`] for the save
+    /// RAM control - and 0xA130F2 as a word agrees with 0xA130F3 as a byte.
+    #[test]
+    fn word_write_to_a_bank_register_uses_its_odd_lane() {
+        let mut bus = banked_bus();
+
+        bus.write_word(0xA130F2, 0x0005);
+        assert_eq!(bus.read_byte(0x08_0000), 5, "the low byte, at 0xA130F3");
+
+        bus.write_byte(0xA130F3, 6);
+        assert_eq!(
+            bus.read_byte(0x08_0000),
+            6,
+            "the odd lane is the same register"
+        );
+
+        bus.write_word(0xA130F2, 0x0900);
+        assert_eq!(
+            bus.read_byte(0x08_0000),
+            0,
+            "and so the high byte is not the register's data"
+        );
+
+        // The save RAM control keeps its pair: a word write to 0xA130F0 is a
+        // write to 0xA130F1, and neither is a bank register.
+        bus.write_word(0xA130F0, 0x0009);
+        assert_eq!(bus.read_byte(0x08_0000), 0, "unchanged by the SRAM pair");
+    }
+
+    /// The mapper is at the seam in [`Bus::read_rom_byte`] and nowhere else, so a
+    /// cart with a save RAM window and a mapper - which no shipped cart is, since
+    /// the carts big enough for the mapper declare no save - keeps the save in
+    /// front of the banks rather than behind them.
+    #[test]
+    fn sram_keeps_priority_over_the_mapper() {
+        // 5 MB of image, and a header at 0x1B0 declaring the odd window of
+        // plutiedev's example inside it.
+        let mut rom = banked_rom();
+        rom[0x1B0..0x1B4].copy_from_slice(&[b'R', b'A', 0xF8, 0x20]);
+        rom[0x1B4..0x1B8].copy_from_slice(&0x20_0001u32.to_be_bytes());
+        rom[0x1B8..0x1BC].copy_from_slice(&0x20_FFFFu32.to_be_bytes());
+        let mut bus = Bus::new(rom, TEST_VERSION);
+
+        // Slot 4 is 0x200000-0x27FFFF, so 0x200001 is where the save window and
+        // a bank of the mapper overlap. With the image reaching past the window -
+        // as any image over 4 MB must - the save is not mapped by default, and
+        // the page answers.
+        assert_eq!(bus.read_byte(0x20_0001), 4, "identity: slot 4 on page 4");
+        bus.write_byte(0xA130F9, 8);
+        assert_eq!(bus.read_byte(0x20_0001), 8, "and the mapper's answer");
+
+        bus.write_byte(0xA130F1, 1);
+        assert_eq!(
+            bus.read_byte(0x20_0001),
+            0xFF,
+            "the save is in front of the bank the mapper is on"
+        );
+        assert_eq!(
+            bus.read_byte(0x20_0000),
+            8,
+            "and only in front of the window it declared"
+        );
+        bus.write_byte(0x20_0001, 0x77);
+        assert_eq!(bus.read_byte(0x20_0001), 0x77);
+        assert_eq!(bus.sram().unwrap()[0], 0x77, "stored in the save");
+        assert!(bus.take_dirty());
+
+        bus.write_byte(0xA130F1, 0);
+        assert_eq!(
+            bus.read_byte(0x20_0001),
+            8,
+            "and the bank is back, where the mapper put it"
+        );
     }
 }
