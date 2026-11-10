@@ -35,11 +35,15 @@
 //! behind the bus; the rest arrive with M3-08 (#68) and M3-09 (#69).
 
 use crate::io::Io;
+use crate::z80_bus::Z80Side;
 use m68k::ADDR_MASK;
 
 /// What an undriven data bus reads as: the placeholder for every area that
 /// nothing drives yet. See the module docs, and M3-16 (#77) for the real thing.
-const OPEN_BUS: u8 = 0xFF;
+///
+/// Crate-visible because the Z80's own unused areas float to the same value
+/// ([`crate::z80_bus`]) and the two sides should not disagree about a placeholder.
+pub(crate) const OPEN_BUS: u8 = 0xFF;
 /// A word read entirely from an area that nothing drives.
 const OPEN_BUS_WORD: u16 = 0xFFFF;
 
@@ -176,6 +180,14 @@ pub struct Bus {
     /// the scheduler, is the thing that will know what time it is, and it says so
     /// with `bus.io.set_time(cycles)` ([`Io::set_time`]).
     pub io: Io,
+    /// The sound CPU's own hardware: 8 KiB of RAM, the bank shift register, and
+    /// the YM2612 and PSG until those crates exist.
+    ///
+    /// Owned by the 68k's bus rather than by a [`crate::Z80View`] so that the one
+    /// machine has one bank register and one RAM, reachable from both sides; see
+    /// the module docs of [`crate::z80_bus`]. The Z80 runs on the same board as
+    /// this bus, and stepping it is `Z80View::new(&mut bus)`.
+    pub z80: Z80Side,
 }
 
 impl Bus {
@@ -201,6 +213,7 @@ impl Bus {
             ram: Box::new([0; 0x10000]),
             version,
             io: Io::new(),
+            z80: Z80Side::new(),
         }
     }
 
