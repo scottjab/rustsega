@@ -2,10 +2,10 @@
 //! per region for the device tickets to fill in.
 //!
 //! The layout is the "68000 address space overview" table of plutiedev "Memory
-//! map", which is what [`Region`] reproduces. The 68000 has a 24 bit address bus
-//! (M68000UM, "Address Definition": A23-A1 are decoded, A0 selects the byte
-//! lane), so the top 8 bits of a `u32` address are never meaningful and every
-//! address decodes exactly once.
+//! map", which is what the private `Region` enum reproduces. The 68000 has a 24
+//! bit address bus (M68000UM, "Address Definition": A23-A1 are decoded, A0
+//! selects the byte lane), so the top 8 bits of a `u32` address are never
+//! meaningful and every address decodes exactly once.
 //!
 //! ## Who masks
 //!
@@ -21,8 +21,9 @@
 //!
 //! ## Reading what is not there
 //!
-//! Reads from an area nothing drives return [`OPEN_BUS`] and writes there are
-//! dropped. That is a placeholder, not a model: on a real console the data bus
+//! Reads from an area nothing drives return `OPEN_BUS` (0xFF) and writes there
+//! are dropped. That is a placeholder, not a model: on a real console the data
+//! bus
 //! floats, so the value read is whatever the previous transfer left on the
 //! lines, and some decoded-but-unpopulated corners stall the bus instead -
 //! plutiedev "Memory map" documents 0xC00020-0xC0003F, inside the VDP area, as
@@ -80,11 +81,13 @@ enum Region {
     ///
     /// TODO(M3-08 #68): Z80 RAM, YM2612 and PSG through the sound CPU's side.
     Z80,
-    /// 0xA10000-0xA10FFF, I/O: version register and the three controller ports.
+    /// 0xA10000-0xA10FFF, I/O: version register and the three controller ports -
+    /// the whole decoded area, of which the 0xA10000-0xA1001F block #63 lists is
+    /// the part that answers today.
     ///
-    /// TODO(M3-04 #64): the hardware version register.
-    /// TODO(M3-05 #65): controller port data and direction pins, the registers
-    /// at 0xA10001-0xA1000D.
+    /// TODO(M3-04 #64): the hardware version register at 0xA10001.
+    /// TODO(M3-05 #65): controller port data and direction pins, the byte
+    /// registers at 0xA10001-0xA1000D (plutiedev "I/O ports").
     Io,
     /// 0xA11000-0xA11FFF, Z80 bus control.
     ///
@@ -129,10 +132,10 @@ impl Region {
 
 /// The 68k memory map.
 ///
-/// Only what exists today is a field; the device tickets add theirs. Byte and
-/// word accesses go to the same region function pair, never one through the
-/// other, because the devices that land here (VDP, I/O) answer a word
-/// differently from two bytes.
+/// Only what exists today is a field; the device tickets add theirs. Every
+/// region has a byte function and a word function, and a word is never built
+/// from two byte calls, because the devices that land here (VDP, I/O) answer a
+/// word differently from two bytes.
 ///
 /// `Debug` prints all 64 KiB of RAM, so assert on `&bus.ram[a..b]` slices.
 #[derive(Debug)]
@@ -159,191 +162,188 @@ impl Bus {
     }
 
     /// Cartridge slot byte read.
+    ///
+    /// A read above the end of the loaded image returns [`OPEN_BUS`]. Real
+    /// hardware leaves the bus floating there, and some dumps are sold as
+    /// mirrored copies of the ROM; either way an image shorter than the slot is
+    /// the common case and 0xFF is what nothing driving the lines reads as.
     fn read_rom_byte(&mut self, addr: u32) -> u8 {
-        todo!()
+        let offset = (addr - ROM_START) as usize;
+        self.rom.get(offset).copied().unwrap_or(OPEN_BUS)
     }
 
-    /// Cartridge slot word read.
+    /// Cartridge slot word read, big endian: the byte at the lower address is
+    /// the high byte (M68000UM, "Data Organization").
+    ///
+    /// The two bytes are looked up separately rather than as a slice so that a
+    /// word straddling the end of the image still returns the byte that is
+    /// there, with [`OPEN_BUS`] in the half that is not.
     fn read_rom_word(&mut self, addr: u32) -> u16 {
-        todo!()
+        let offset = (addr - ROM_START) as usize;
+        let high = self.rom.get(offset).copied().unwrap_or(OPEN_BUS);
+        let low = self.rom.get(offset + 1).copied().unwrap_or(OPEN_BUS);
+        u16::from_be_bytes([high, low])
     }
 
-    /// Cartridge slot byte write.
-    fn write_rom_byte(&mut self, addr: u32, value: u8) {
-        todo!()
-    }
+    /// Cartridge slot byte write: ignored, ROM is read-only.
+    fn write_rom_byte(&mut self, _addr: u32, _value: u8) {}
 
-    /// Cartridge slot word write.
-    fn write_rom_word(&mut self, addr: u32, value: u16) {
-        todo!()
-    }
+    /// Cartridge slot word write: ignored, ROM is read-only.
+    fn write_rom_word(&mut self, _addr: u32, _value: u16) {}
 
-    /// The index of `addr` in [`Bus::ram`].
+    /// The index of `addr` in [`Bus::ram`]: the 2 MiB window at 0xE00000 mirrors
+    /// the same 64 KiB, so only the low 16 bits name a byte (plutiedev "Memory
+    /// map"). `addr` is masked and already decoded as [`Region::Ram`].
     fn ram_index(addr: u32) -> usize {
-        todo!()
+        (addr & RAM_MASK) as usize
     }
 
     /// Work RAM byte read.
     fn read_ram_byte(&mut self, addr: u32) -> u8 {
-        todo!()
+        self.ram[Self::ram_index(addr)]
     }
 
-    /// Work RAM word read.
+    /// Work RAM word read, big endian (M68000UM, "Data Organization").
+    ///
+    /// Masking with [`RAM_MASK`] keeps the parity of the address, so an even
+    /// `addr` always lands on an even index and the second byte is inside the
+    /// array: the highest word the window can address is 0xFFFFFE. An odd
+    /// address here is a caller bug and panics on the index.
     fn read_ram_word(&mut self, addr: u32) -> u16 {
-        todo!()
+        let index = Self::ram_index(addr);
+        u16::from_be_bytes([self.ram[index], self.ram[index + 1]])
     }
 
     /// Work RAM byte write.
     fn write_ram_byte(&mut self, addr: u32, value: u8) {
-        todo!()
+        self.ram[Self::ram_index(addr)] = value;
     }
 
-    /// Work RAM word write.
+    /// Work RAM word write, big endian, at an even `addr`.
     fn write_ram_word(&mut self, addr: u32, value: u16) {
-        todo!()
+        let index = Self::ram_index(addr);
+        self.ram[index..index + 2].copy_from_slice(&value.to_be_bytes());
     }
 
-    /// VDP port byte read. Placeholder for [`Region::Vdp`].
+    /// VDP port byte read. Placeholder for [`Region::Vdp`]: returns open bus,
+    /// where a real console reads the VDP data port, the status register, the HV
+    /// counter or nothing, and 0xC00020-0xC0003F hangs the bus (plutiedev
+    /// "Memory map").
     fn read_vdp_byte(&mut self, _addr: u32) -> u8 {
-        todo!()
+        OPEN_BUS
     }
 
     /// VDP port word read. Placeholder for [`Region::Vdp`].
     fn read_vdp_word(&mut self, _addr: u32) -> u16 {
-        todo!()
+        OPEN_BUS_WORD
     }
 
-    /// VDP port byte write. Placeholder for [`Region::Vdp`].
-    fn write_vdp_byte(&mut self, _addr: u32, _value: u8) {
-        todo!()
-    }
+    /// VDP port byte write. Placeholder for [`Region::Vdp`]: dropped, where a
+    /// real console would push a byte to the PSG at 0xC00011.
+    fn write_vdp_byte(&mut self, _addr: u32, _value: u8) {}
 
     /// VDP port word write. Placeholder for [`Region::Vdp`].
-    fn write_vdp_word(&mut self, _addr: u32, _value: u16) {
-        todo!()
-    }
+    fn write_vdp_word(&mut self, _addr: u32, _value: u16) {}
 
     /// Z80 bus byte read. Placeholder for [`Region::Z80`].
     fn read_z80_byte(&mut self, _addr: u32) -> u8 {
-        todo!()
+        OPEN_BUS
     }
 
     /// Z80 bus word read. Placeholder for [`Region::Z80`].
     fn read_z80_word(&mut self, _addr: u32) -> u16 {
-        todo!()
+        OPEN_BUS_WORD
     }
 
     /// Z80 bus byte write. Placeholder for [`Region::Z80`].
-    fn write_z80_byte(&mut self, _addr: u32, _value: u8) {
-        todo!()
-    }
+    fn write_z80_byte(&mut self, _addr: u32, _value: u8) {}
 
     /// Z80 bus word write. Placeholder for [`Region::Z80`].
-    fn write_z80_word(&mut self, _addr: u32, _value: u16) {
-        todo!()
-    }
+    fn write_z80_word(&mut self, _addr: u32, _value: u16) {}
 
     /// I/O byte read. Placeholder for [`Region::Io`].
     fn read_io_byte(&mut self, _addr: u32) -> u8 {
-        todo!()
+        OPEN_BUS
     }
 
     /// I/O word read. Placeholder for [`Region::Io`].
     fn read_io_word(&mut self, _addr: u32) -> u16 {
-        todo!()
+        OPEN_BUS_WORD
     }
 
     /// I/O byte write. Placeholder for [`Region::Io`].
-    fn write_io_byte(&mut self, _addr: u32, _value: u8) {
-        todo!()
-    }
+    fn write_io_byte(&mut self, _addr: u32, _value: u8) {}
 
     /// I/O word write. Placeholder for [`Region::Io`].
-    fn write_io_word(&mut self, _addr: u32, _value: u16) {
-        todo!()
-    }
+    fn write_io_word(&mut self, _addr: u32, _value: u16) {}
 
     /// Z80 bus control byte read. Placeholder for [`Region::Z80Ctrl`].
     fn read_z80_ctrl_byte(&mut self, _addr: u32) -> u8 {
-        todo!()
+        OPEN_BUS
     }
 
     /// Z80 bus control word read. Placeholder for [`Region::Z80Ctrl`].
     fn read_z80_ctrl_word(&mut self, _addr: u32) -> u16 {
-        todo!()
+        OPEN_BUS_WORD
     }
 
     /// Z80 bus control byte write. Placeholder for [`Region::Z80Ctrl`].
-    fn write_z80_ctrl_byte(&mut self, _addr: u32, _value: u8) {
-        todo!()
-    }
+    fn write_z80_ctrl_byte(&mut self, _addr: u32, _value: u8) {}
 
     /// Z80 bus control word write. Placeholder for [`Region::Z80Ctrl`].
-    fn write_z80_ctrl_word(&mut self, _addr: u32, _value: u16) {
-        todo!()
-    }
+    fn write_z80_ctrl_word(&mut self, _addr: u32, _value: u16) {}
 
     /// Cartridge slot extra byte read. Placeholder for [`Region::CartExtra`].
     fn read_cart_extra_byte(&mut self, _addr: u32) -> u8 {
-        todo!()
+        OPEN_BUS
     }
 
     /// Cartridge slot extra word read. Placeholder for [`Region::CartExtra`].
     fn read_cart_extra_word(&mut self, _addr: u32) -> u16 {
-        todo!()
+        OPEN_BUS_WORD
     }
 
     /// Cartridge slot extra byte write. Placeholder for [`Region::CartExtra`].
-    fn write_cart_extra_byte(&mut self, _addr: u32, _value: u8) {
-        todo!()
-    }
+    fn write_cart_extra_byte(&mut self, _addr: u32, _value: u8) {}
 
     /// Cartridge slot extra word write. Placeholder for [`Region::CartExtra`].
-    fn write_cart_extra_word(&mut self, _addr: u32, _value: u16) {
-        todo!()
-    }
+    fn write_cart_extra_word(&mut self, _addr: u32, _value: u16) {}
 
     /// TMSS port byte read. Placeholder for [`Region::Tmss`].
     fn read_tmss_byte(&mut self, _addr: u32) -> u8 {
-        todo!()
+        OPEN_BUS
     }
 
     /// TMSS port word read. Placeholder for [`Region::Tmss`].
     fn read_tmss_word(&mut self, _addr: u32) -> u16 {
-        todo!()
+        OPEN_BUS_WORD
     }
 
     /// TMSS port byte write. Placeholder for [`Region::Tmss`].
-    fn write_tmss_byte(&mut self, _addr: u32, _value: u8) {
-        todo!()
-    }
+    fn write_tmss_byte(&mut self, _addr: u32, _value: u8) {}
 
     /// TMSS port word write. Placeholder for [`Region::Tmss`].
-    fn write_tmss_word(&mut self, _addr: u32, _value: u16) {
-        todo!()
-    }
+    fn write_tmss_word(&mut self, _addr: u32, _value: u16) {}
 
     /// Undecoded byte read. Placeholder for [`Region::Unmapped`].
     fn read_unmapped_byte(&mut self, _addr: u32) -> u8 {
-        todo!()
+        OPEN_BUS
     }
 
     /// Undecoded word read. Placeholder for [`Region::Unmapped`].
     fn read_unmapped_word(&mut self, _addr: u32) -> u16 {
-        todo!()
+        OPEN_BUS_WORD
     }
 
     /// Undecoded byte write. Placeholder for [`Region::Unmapped`].
-    fn write_unmapped_byte(&mut self, _addr: u32, _value: u8) {
-        todo!()
-    }
+    fn write_unmapped_byte(&mut self, _addr: u32, _value: u8) {}
 
     /// Undecoded word write. Placeholder for [`Region::Unmapped`].
-    fn write_unmapped_word(&mut self, _addr: u32, _value: u16) {
-        todo!()
-    }
+    fn write_unmapped_word(&mut self, _addr: u32, _value: u16) {}
 }
 
+// `int_ack` and `reset_devices` are deliberately left at the `m68k::Bus`
+// defaults; the module docs say why.
 impl m68k::Bus for Bus {
     fn read_byte(&mut self, addr: u32) -> u8 {
         let addr = addr & ADDR_MASK;
@@ -500,12 +500,15 @@ mod tests {
 
     #[test]
     fn reads_past_rom_end_return_ff() {
-        let mut bus = Bus::new(vec![0x12, 0x34]);
+        // An odd number of bytes on purpose: it is the only way a word access
+        // straddles the end of the image.
+        let mut bus = Bus::new(vec![0x12, 0x34, 0x56]);
         assert_eq!(bus.read_byte(0x000001), 0x34);
-        assert_eq!(bus.read_byte(0x000002), OPEN_BUS);
+        assert_eq!(bus.read_byte(0x000002), 0x56);
+        assert_eq!(bus.read_byte(0x000003), OPEN_BUS);
         assert_eq!(bus.read_byte(ROM_END), OPEN_BUS);
         // A word straddling the end keeps the byte that is in the image.
-        assert_eq!(bus.read_word(0x000002), 0x34FF);
+        assert_eq!(bus.read_word(0x000002), 0x56FF);
         assert_eq!(bus.read_word(0x000004), OPEN_BUS_WORD);
     }
 
@@ -539,10 +542,18 @@ mod tests {
             0xA00000, 0xA10000, 0xA11100, 0xA11200, 0xA130F1, 0xA14000, 0xA14101, 0xC00000,
         ] {
             assert_eq!(bus.read_byte(addr), OPEN_BUS, "byte at {addr:#08x}");
-            assert_eq!(bus.read_word(addr + 2), OPEN_BUS_WORD, "word at {addr:#08x}");
+            assert_eq!(
+                bus.read_word(addr + 2),
+                OPEN_BUS_WORD,
+                "word at {addr:#08x}"
+            );
             bus.write_byte(addr, 0x11);
             bus.write_word(addr + 2, 0x2222);
-            assert_eq!(bus.read_byte(addr), OPEN_BUS, "byte at {addr:#08x} after write");
+            assert_eq!(
+                bus.read_byte(addr),
+                OPEN_BUS,
+                "byte at {addr:#08x} after write"
+            );
         }
         assert!(bus.ram.iter().all(|&b| b == 0), "stub writes reached RAM");
     }
