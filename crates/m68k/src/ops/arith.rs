@@ -91,6 +91,23 @@ pub(crate) const fn one_operand_clocks(size: Size, ea: Ea) -> u32 {
     }
 }
 
+/// Clocks `TAS` pays on top of its bus traffic: [`ALU_PASS_CLOCKS`] when the
+/// operand is in memory and nothing when it is a data register — the mirror of
+/// [`one_operand_clocks`], which charges the register form instead.
+///
+/// Measured over every case of `TAS.json.gz` for M1-31c (#41): `TAS D0` is the
+/// 4-clock fetch alone, and every memory mode is 2 over the read + write +
+/// advance its operand already accounts for — `(An)` and `(A0)+` 14, `-(A0)` 16,
+/// `d16(A0)` 18, `d8(A0,Xn)` 20, `(xxx).W` 18, `(xxx).l` 22. A byte
+/// read-modify-write's two memory cycles are not the long ones that hide a
+/// `NEG`/`CLR` pass, so this one shows up.
+pub(crate) const fn tas_clocks(ea: Ea) -> u32 {
+    match ea {
+        Ea::DataReg(_) => 0,
+        _ => ALU_PASS_CLOCKS,
+    }
+}
+
 /// Clocks the two-operand ALU instructions (`ADD`, `SUB` and their `#imm`/`Q`
 /// forms, and via [`crate::ops::logic`] `AND`, `OR` and `EOR`) pay on top of
 /// their bus traffic: a long operation is two passes of [`ALU_PASS_CLOCKS`], and
@@ -815,7 +832,7 @@ impl M68k {
         self.write_ea(bus, ea, Size::Byte, value | 0x0080);
 
         self.advance_opcode(bus);
-        0
+        tas_clocks(ea)
     }
 
     /// `CHK.W Dn,<ea>`: `0100 ddd 110 mmm rrr` (M68000UM "CHK — Check Data

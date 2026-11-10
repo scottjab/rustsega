@@ -2,7 +2,8 @@
 //! `TRAPV`, `TAS` and `RESET` from the pinned 680x0 suite (M1-27, #35).
 //!
 //! One test per suite file, in the style of `status.rs`, checked with
-//! [`harness::Check::StateSkipAddressErrors`]. They live together because none of
+//! [`harness::Check::StateAndCyclesSkipAddressErrors`] (clocks since #41). They
+//! live together because none of
 //! them belongs to a family another test file already covers — `TAS` is the only
 //! member of the `TST` group that stores, and `TRAPV` and `RESET` are single
 //! opcodes in the `$4E` system block that `jmp_jsr_returns.rs` has no room for.
@@ -41,21 +42,21 @@ mod harness;
 /// and Set").
 #[test]
 fn tas_file_passes() {
-    harness::assert_file_passes("TAS", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("TAS", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `TRAPV`: `$4E76`, `0100 1110 0111 0110` — trap on overflow, vector 4, and a
 /// no-op when `V` is clear (M68000UM "TRAPV — Trap on Overflow").
 #[test]
 fn trapv_file_passes() {
-    harness::assert_file_passes("TRAPV", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("TRAPV", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// `RESET`: `$4E70`, `0100 1110 0111 0000` — reset peripherals, no architectural
 /// effect (M68000UM "RESET — Reset Peripherals").
 #[test]
 fn reset_file_passes() {
-    harness::assert_file_passes("RESET", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("RESET", harness::Check::StateAndCyclesSkipAddressErrors);
 }
 
 /// The three file names above are what the suite ships, so a rename fails here
