@@ -261,7 +261,7 @@ impl Vdp {
     /// RGBA. All of that is M4-17 (#95).
     pub fn render_plane_line(&self, plane: Plane, line: u16, out: &mut [u8; WIDTH_H40]) {
         let len = out.len();
-        self.render_plane_run(plane, line, 0..len, 0, out);
+        self.render_plane_run(plane, usize::from(line), 0..len, 0, out);
     }
 
     /// [`Vdp::render_plane_line`] for part of a line only: `range` is the range of
@@ -272,11 +272,11 @@ impl Vdp {
     ///
     /// The vscroll lookup still keys on the screen pixel: the bug of that section
     /// moves the name table fetch alone, and nothing says it moves the VSRAM read
-    /// with it. `range` must lie inside `out`.
+    /// with it. `out` is the whole line and `range` indexes it.
     pub(crate) fn render_plane_run(
         &self,
         plane: Plane,
-        line: u16,
+        line: usize,
         range: core::ops::Range<usize>,
         plane_x_shift: usize,
         out: &mut [u8],
@@ -284,7 +284,6 @@ impl Vdp {
         let base = plane.name_table(self);
         let width = usize::from(self.plane_width_cells());
         let height = usize::from(self.plane_height_cells());
-        let line = usize::from(line);
         let hscroll = self.line_hscroll(plane, line);
         let columns = self.vscroll_per_cell_column();
         // The plane is `width * 8` pixels wide and `height * 8` lines tall, and
@@ -300,7 +299,6 @@ impl Vdp {
             0
         };
 
-        let x0 = range.start;
         let mut x = range.start;
         let end = range.end;
         while x < end {
@@ -327,8 +325,7 @@ impl Vdp {
             let offset = plane_x % CELL_ROWS;
             let run = (CELL_ROWS - offset).min(ends_at - x).min(end - x);
             let entry_index = (row_base + plane_x / CELL_ROWS) & (MAX_ENTRIES - 1);
-            let start = x - x0;
-            self.fill_cell_run(base, entry_index, cell_row, offset, &mut out[start..start + run]);
+            self.fill_cell_run(base, entry_index, cell_row, offset, &mut out[x..x + run]);
             x += run;
         }
     }
@@ -360,10 +357,7 @@ impl Vdp {
             CELL_ROWS,
         );
         let layer_base = (entry.palette << 4) | (u8::from(entry.priority) << PRIORITY_SHIFT);
-        for (pixel, index) in pixels
-            .iter_mut()
-            .zip(indices[offset..].iter().copied())
-        {
+        for (pixel, index) in pixels.iter_mut().zip(indices[offset..].iter().copied()) {
             *pixel = if index == 0 { 0 } else { layer_base | index };
         }
     }

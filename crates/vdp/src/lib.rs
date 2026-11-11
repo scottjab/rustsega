@@ -28,6 +28,7 @@ mod ports;
 mod regs;
 mod status;
 mod timing;
+mod window;
 
 pub use color::{ColorLut, Intensity};
 pub use dma::DmaBus;
