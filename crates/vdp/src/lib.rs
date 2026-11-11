@@ -13,8 +13,8 @@
 //! (`planes`), and the sprite attribute table and the sprite layer of a line
 //! (`sprites`), and the priority compositor that turns the three layer buffers of
 //! a line into the pixels of a frame-buffer row (`compose`), shadow and highlight
-//! and the mode sizes and edges of M4-19 (#97) included. The interlaced fields of
-//! M4-20 (#98) are still to come.
+//! and the mode sizes and edges of M4-19 (#97) and the interlaced fields of
+//! M4-20 (#98) included.
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
@@ -678,14 +678,51 @@ impl Vdp {
     /// it: the bit is legal to write, a game may hold it set across a mode
     /// change, and there is no console-side diagnostic to warn (M4-19, #97).
     ///
-    /// TODO(M4-20 #98): interlace mode 2 draws 480 lines, which this does not
-    /// report yet.
+    /// This is the height of the *beam*: the number of lines the raster scans
+    /// before VBlank, which is what `timing` starts VBlank on and what
+    /// [`Vdp::render_line`] is called with. Interlace mode 2 does not change it -
+    /// it draws two lines of the picture per line of the beam, and
+    /// [`Vdp::frame_height`] is the height of the picture those lines make (#98).
     #[inline]
     pub fn active_height(&self) -> usize {
         if self.pal && self.v30_mode() {
             LINES_V30
         } else {
             LINES_V28
+        }
+    }
+
+    /// Height of the picture the frame buffer holds: [`Vdp::active_height`] for
+    /// the two modes that are not interlaced, and double it for interlace mode 2,
+    /// whose 448 lines (480 with PAL in V30) are written one per field
+    /// (genvdp.txt section 2 "Display Modes": "480 (interlace)", and ticket #98).
+    ///
+    /// The two fields of that mode share one frame buffer, so this is the height
+    /// of a frame rather than of a field: [`Vdp::display_line`] is where a field
+    /// puts its lines.
+    #[inline]
+    pub fn frame_height(&self) -> usize {
+        match self.interlace_mode() {
+            InterlaceMode::Mode2 => 2 * self.active_height(),
+            InterlaceMode::Off | InterlaceMode::Mode1 => self.active_height(),
+        }
+    }
+
+    /// The line of the picture that beam line `line` of the current field draws:
+    /// `line` itself except in interlace mode 2, where a field is half a frame and
+    /// each line of the beam is two lines of the picture - `line * 2 + field`, the
+    /// field being status bit 4 (ODD) of genvdp.txt section 6, which `timing`
+    /// toggles every frame of a mode that is interlaced (M4-20, #98).
+    ///
+    /// Everything below the compositor works in these lines: the plane fetch, the
+    /// vscroll and the y of a sprite all count the doubled lines of the picture,
+    /// which is why [`Vdp::frame_height`] and not [`Vdp::active_height`] is the
+    /// distance round them.
+    #[inline]
+    pub fn display_line(&self, line: u16) -> u16 {
+        match self.interlace_mode() {
+            InterlaceMode::Mode2 => line * 2 + u16::from(self.odd_frame),
+            InterlaceMode::Off | InterlaceMode::Mode1 => line,
         }
     }
 }
@@ -857,6 +894,42 @@ mod tests {
             ntsc.active_height(),
             224,
             "a NTSC VDP cannot drive 240 lines"
+        );
+    }
+
+    /// Interlace mode 2 doubles the picture and leaves the beam alone:
+    /// [`Vdp::active_height`] is the lines `timing` counts to VBlank and stays
+    /// where it was, [`Vdp::frame_height`] is the height of the picture the two
+    /// fields of #98 share, and [`Vdp::display_line`] is which half of it a field
+    /// of one beam line writes.
+    #[test]
+    fn interlace_mode_2_doubles_the_picture_and_not_the_beam() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(12, 0x06);
+        assert_eq!(vdp.active_height(), 224, "the beam still scans 224 lines");
+        assert_eq!(vdp.frame_height(), 448, "the picture is 448 of them");
+
+        assert_eq!(vdp.display_line(0), 0, "line 0 of the even field");
+        vdp.odd_frame = true;
+        assert_eq!(
+            vdp.display_line(0),
+            1,
+            "and line 0 of the odd one are a pair"
+        );
+        assert_eq!(
+            vdp.display_line(223),
+            447,
+            "and the frame ends where it can go"
+        );
+
+        vdp.write_register(12, 0x02);
+        vdp.odd_frame = false;
+        assert_eq!(vdp.frame_height(), 224, "mode 1 is progressive");
+        vdp.odd_frame = true;
+        assert_eq!(
+            vdp.display_line(100),
+            100,
+            "and its field flag moves nothing"
         );
     }
 

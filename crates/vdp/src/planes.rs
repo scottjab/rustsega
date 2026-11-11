@@ -9,15 +9,27 @@
 //! repeats either.
 
 use crate::pattern::{NameEntry, read_word, tile_row};
-use crate::{HScrollMode, Vdp, WIDTH_H40};
+use crate::{HScrollMode, InterlaceMode, Vdp, WIDTH_H40};
 
-/// Rows of a plane cell, and so of the pattern a plane cell names.
+/// Pixels across a plane cell: 8, in every mode.
 ///
-/// 8, always, until interlace mode 2 makes a plane pattern 8x16: genvdp.txt
-/// section 12 ("A pattern is an 8x8 or 8x16 (interlace mode 2 only) pixel
-/// block"). TODO(M4-20 #98): read [`Vdp::interlace_mode`] and pass 16 there,
-/// which [`crate::pattern::tile_addr`] already handles.
+/// genvdp.txt section 12 doubles the height of a pattern for interlace mode 2
+/// ("A pattern is an 8x8 or 8x16 (interlace mode 2 only) pixel block") and never
+/// its width, and R16 counts the columns of a name table in cells of this width
+/// whatever the mode.
+pub(crate) const CELL_WIDTH: usize = 8;
+
+/// Rows of a plane cell, and so of the pattern a cell names, of the two modes
+/// that are not interlace mode 2.
+///
+/// The pair of [`CELL_ROWS_MODE2`]; [`Vdp::cell_height`] is the side that reads
+/// [`Vdp::interlace_mode`] and picks between them, and every fetch takes the
+/// height from it rather than from either constant.
 pub(crate) const CELL_ROWS: usize = 8;
+/// Rows of a plane cell of interlace mode 2: double [`CELL_ROWS`], for the 8x16
+/// pattern of genvdp.txt section 12 that [`crate::pattern::tile_addr`] addresses
+/// by dropping bit 0 of the name.
+pub(crate) const CELL_ROWS_MODE2: usize = 16;
 
 /// Name table entries of the largest valid plane: genvdp.txt section 13, "The
 /// name table size cannot exceed 8192 bytes, so while a 64x64 or 128x32 name
@@ -41,22 +53,28 @@ const HSCROLL_MASK: u16 = 0x3FF;
 const HSCROLL_ENTRY: usize = 4;
 
 /// Bits of a VSRAM word that the plane fetch reads: genvdp.txt section 10,
-/// "y = Vertical scroll factor (0-3FFh)". The 11th bit of the word belongs to
-/// interlace mode 2 alone (see the note on [`crate::Vdp::vsram`]), so it is not
-/// part of the scroll value here.
-///
-/// TODO(M4-20 #98): what the 11th bit does once interlace mode 2 is modelled.
+/// "y = Vertical scroll factor (0-3FFh)", which is the scroll of every mode but
+/// interlace mode 2.
 const VSCROLL_MASK: u16 = 0x3FF;
+
+/// The 11 bits of a vertical scroll value in interlace mode 2, where the value
+/// counts the lines of the 448-line picture rather than the 224 of the beam
+/// (ticket #98; genvdp.txt section 10 stops at the 10 and SpritesMind "Interlace
+/// mode (LSMx=3)" gives the 11th). Bit 10 is all that differs from the mask
+/// above, and it only shows on a plane of more than 512 lines - 128 cells of the
+/// 16-line cells of the mode - which is what
+/// `interlace_mode_2_vertical_scroll_is_eleven_bits_wide` sets up.
+const VSCROLL_MASK_MODE2: u16 = 0x7FF;
 
 /// Width in pixels of the column one VSRAM word scrolls in 2-cell column mode:
 /// genvdp.txt section 17 "$0B" bit 2 "selects between full screen vertical
 /// scrolling when clear, and 2-cell column based vertical scrolling when set",
-/// and a cell is [`CELL_ROWS`] pixels wide.
+/// and a cell is [`CELL_WIDTH`] pixels wide.
 ///
 /// This is also the unit of the R17 window split and of the window bug of
 /// section 17 "$11", which both speak of "2-cell columns" of 16 pixels: the same
 /// granularity the VDP walks the playfield with.
-pub(crate) const CELL_COLUMN: usize = 2 * CELL_ROWS;
+pub(crate) const CELL_COLUMN: usize = 2 * CELL_WIDTH;
 
 /// The two VSRAM words the partial 2-cell column at the left edge of an H40 line
 /// is fetched with: see [`Vdp::left_column_vscroll`], which is as uncertain as
@@ -118,6 +136,21 @@ impl Plane {
 }
 
 impl Vdp {
+    /// Rows of a plane, window or sprite cell, and of the pattern one names: 8,
+    /// or 16 in interlace mode 2 (genvdp.txt section 12: "A pattern is an 8x8 or
+    /// 8x16 (interlace mode 2 only) pixel block", M4-20 #98).
+    ///
+    /// Only the height of a cell moves: [`CELL_WIDTH`] is the width in every
+    /// mode, so the `8` of R16's cell counts and of the 2-cell column of a
+    /// scroll value stays 8 while the cell row is walked twice as slowly.
+    #[inline]
+    pub(crate) fn cell_height(&self) -> usize {
+        match self.interlace_mode() {
+            InterlaceMode::Mode2 => CELL_ROWS_MODE2,
+            InterlaceMode::Off | InterlaceMode::Mode1 => CELL_ROWS,
+        }
+    }
+
     /// The horizontal scroll value of `plane` on `line`: the 10-bit value of the
     /// table entry that R11's mode says this line reads, at
     /// [`Vdp::hscroll_base`] plus `index * HSCROLL_ENTRY` plus this plane's word.
@@ -133,14 +166,21 @@ impl Vdp {
     ///   line of the display", and sixteen 16-bit words are exactly the eight
     ///   lines of two words that `line & 7` addresses, so its prose and its
     ///   pseudocode agree;
-    /// - `10` per cell: `index = line & !7`, one entry per 8-line cell row;
+    /// - `10` per cell: `index = line & !7`, one entry per cell row;
     /// - `11` per line: `index = line`.
+    ///
+    /// `line` is the display line of [`Vdp::display_line`], so in interlace mode
+    /// 2 the per-line walk reads one entry per line of the picture and the cell
+    /// walk one per 16 of them. INFERRED - section 13 says `line` and no more -
+    /// pinned by `interlace_mode_2_walks_the_horizontal_scroll_table_by_display_line`,
+    /// and TODO(M6-06 #125) to confirm it on hardware with a scroll test ROM.
     #[inline]
     pub(crate) fn line_hscroll(&self, plane: Plane, line: usize) -> usize {
+        let cell_rows = self.cell_height();
         let index = match self.hscroll_mode() {
             HScrollMode::Full => 0,
-            HScrollMode::EightLines => line & (CELL_ROWS - 1),
-            HScrollMode::PerCell => line & !(CELL_ROWS - 1),
+            HScrollMode::EightLines => line & (cell_rows - 1),
+            HScrollMode::PerCell => line & !(cell_rows - 1),
             HScrollMode::PerLine => line,
         };
         let addr = usize::from(self.hscroll_base()) + index * HSCROLL_ENTRY + plane.scroll_word();
@@ -173,7 +213,24 @@ impl Vdp {
         } else {
             0
         } + plane.scroll_vsram_word();
-        usize::from(self.vsram[index] & VSCROLL_MASK)
+        usize::from(self.vsram[index] & self.vscroll_mask())
+    }
+
+    /// The width of a vertical scroll value: 11 bits in interlace mode 2, where
+    /// it counts the lines of the doubled picture, and the 10 of genvdp.txt
+    /// section 10 in the other two modes (#98).
+    ///
+    /// TODO(M6-06 #125): the note on [`crate::Vdp::vsram`] quotes SpritesMind as
+    /// "VSRAM width is 11-bit but bit0 is ignored in interlaced mode 2", which
+    /// would drop the half-line step the ticket gives bit 0; a scroll test ROM is
+    /// what settles the two.
+    #[inline]
+    fn vscroll_mask(&self) -> u16 {
+        if self.interlace_mode() == InterlaceMode::Mode2 {
+            VSCROLL_MASK_MODE2
+        } else {
+            VSCROLL_MASK
+        }
     }
 
     /// The vertical scroll value of the partially visible 2-cell column at the
@@ -199,12 +256,17 @@ impl Vdp {
             return 0;
         }
         let [first, second] = LEFT_COLUMN_WORDS;
-        usize::from(self.vsram[first] & self.vsram[second] & VSCROLL_MASK)
+        let mask = self.vscroll_mask();
+        usize::from(self.vsram[first] & self.vsram[second] & mask)
     }
 
     /// Fill `out` with one line of `plane`: one [`u8`] per pixel, bits 5-0 the
     /// CRAM index (`palette * 16 + colour`, the 6-bit index of CRAM's 64 words,
     /// genvdp.txt section 9) and bit 6 the cell's priority flag.
+    ///
+    /// `line` is a line of the picture, which [`Vdp::display_line`] makes from the
+    /// beam line: the same number except in interlace mode 2, where the picture is
+    /// 448 lines to the beam's 224 and a cell row is 16 of them (#98).
     ///
     /// Colour 0 of any palette draws nothing (genvdp.txt section 12: "A pixel
     /// within a pattern that uses value zero isn't shown"), and a pixel that
@@ -226,20 +288,21 @@ impl Vdp {
     /// so that a larger one moves the plane right, is what #90 works to and what
     /// the tests here fix in. It is INFERRED, not documented.
     ///
-    /// Vertical scroll: plane y is `(line + vscroll) & (height * 8 - 1)`, where
-    /// `vscroll` is [`Vdp::column_vscroll`] for the 16 pixel column the pixel is
-    /// in, or [`Vdp::left_column_vscroll`] for the partial column at the left edge
-    /// of the line. Adding the value, so that a larger one moves the plane up, is
-    /// what #91 works to: like the horizontal scroll its direction is INFERRED,
-    /// and unlike it the value comes from VSRAM 10 bits at a time instead of from
-    /// a VRAM table. A 2-cell column can name any plane row, so `row_base` and
-    /// `cell_row` belong to the run being fetched and not to the line, and one
-    /// line can change plane row at every [`CELL_COLUMN`] pixels.
+    /// Vertical scroll: plane y is `(line + vscroll) & (height * cell_height - 1)`,
+    /// where `vscroll` is [`Vdp::column_vscroll`] for the 16 pixel column the pixel
+    /// is in, or [`Vdp::left_column_vscroll`] for the partial column at the left
+    /// edge of the line. Adding the value, so that a larger one moves the plane up,
+    /// is what #91 works to: like the horizontal scroll its direction is INFERRED,
+    /// and unlike it the value comes from VSRAM 10 bits at a time - 11 in interlace
+    /// mode 2 - instead of from a VRAM table. A 2-cell column can name any plane
+    /// row, so `row_base` and `cell_row` belong to the run being fetched and not to
+    /// the line, and one line can change plane row at every [`CELL_COLUMN`] pixels.
     ///
-    /// A cell is still 8 pixels by 8 pixels and both axes wrap at the plane size
-    /// of R16. The fetch runs one cell of the plane at a time - eight pixels, or
-    /// the remainder of one at the left edge of a line or of a 2-cell column - and
-    /// allocates nothing.
+    /// A cell is [`CELL_WIDTH`] pixels across and [`Vdp::cell_height`] lines down -
+    /// 8 by 8, or the 8 by 16 of interlace mode 2 (#98) - and both axes wrap at the
+    /// plane size of R16. The fetch runs one cell of the plane at a time - eight
+    /// pixels, or the remainder of one at the left edge of a line or of a 2-cell
+    /// column - and allocates nothing.
     ///
     /// Invalid plane sizes, which genvdp.txt section 13 calls the combinations
     /// over its 8192-byte table (128x128 and 64x128), have no documented
@@ -284,12 +347,14 @@ impl Vdp {
         let base = plane.name_table(self);
         let width = usize::from(self.plane_width_cells());
         let height = usize::from(self.plane_height_cells());
+        let cell_rows = self.cell_height();
         let hscroll = self.line_hscroll(plane, line);
         let columns = self.vscroll_per_cell_column();
-        // The plane is `width * 8` pixels wide and `height * 8` lines tall, and
-        // every valid size of R16 is a power of two, so masking is wrapping.
-        let plane_x_mask = width * CELL_ROWS - 1;
-        let plane_y_mask = height * CELL_ROWS - 1;
+        // The plane is `width * CELL_WIDTH` pixels wide and `height * cell_rows`
+        // lines tall, and every valid size of R16 is a power of two, so masking is
+        // wrapping.
+        let plane_x_mask = width * CELL_WIDTH - 1;
+        let plane_y_mask = height * cell_rows - 1;
         // Width of the partial column at the left edge: 0 when there are no 2-cell
         // columns, or when the horizontal scroll lands on a column boundary and
         // the whole of the first column is visible.
@@ -318,13 +383,13 @@ impl Vdp {
                 end
             };
             let plane_y = line.wrapping_add(vscroll) & plane_y_mask;
-            let row_base = (plane_y / CELL_ROWS) * width;
-            let cell_row = plane_y % CELL_ROWS;
+            let row_base = (plane_y / cell_rows) * width;
+            let cell_row = plane_y % cell_rows;
 
             let plane_x = (x + plane_x_shift).wrapping_sub(hscroll) & plane_x_mask;
-            let offset = plane_x % CELL_ROWS;
-            let run = (CELL_ROWS - offset).min(ends_at - x).min(end - x);
-            let entry_index = (row_base + plane_x / CELL_ROWS) & (MAX_ENTRIES - 1);
+            let offset = plane_x % CELL_WIDTH;
+            let run = (CELL_WIDTH - offset).min(ends_at - x).min(end - x);
+            let entry_index = (row_base + plane_x / CELL_WIDTH) & (MAX_ENTRIES - 1);
             self.fill_cell_run(base, entry_index, cell_row, offset, &mut out[x..x + run]);
             x += run;
         }
@@ -333,8 +398,9 @@ impl Vdp {
     /// Fill `pixels` with the layer values of the cell that the entry at
     /// `base + entry_index * 2` names: the fetch every reader of a name table -
     /// the two scroll planes and the window alike - ends with. `row` is the row of
-    /// the pattern to draw and `offset` how many pixels of it to skip, so
-    /// `pixels.len()` never exceeds [`CELL_ROWS`] - `offset`.
+    /// the pattern to draw, `0..Vdp::cell_height()` of them, and `offset` how many
+    /// pixels of it to skip, so `pixels.len()` never exceeds [`CELL_WIDTH`] -
+    /// `offset`.
     ///
     /// A pixel of colour 0 draws nothing (genvdp.txt section 12: "A pixel within
     /// a pattern that uses value zero isn't shown") and is written as a whole zero
@@ -354,7 +420,7 @@ impl Vdp {
             row,
             entry.vflip,
             entry.hflip,
-            CELL_ROWS,
+            self.cell_height(),
         );
         let layer_base = (entry.palette << 4) | (u8::from(entry.priority) << PRIORITY_SHIFT);
         for (pixel, index) in pixels.iter_mut().zip(indices[offset..].iter().copied()) {
@@ -481,12 +547,38 @@ pub(crate) mod testutil {
         put_tile_row(vdp, tile, row, &[colour; 8]);
     }
 
+    /// [`fill_tile_row`] for a pattern of `height` rows: the 8x16 cells of
+    /// interlace mode 2 (genvdp.txt section 12) hold their rows at the stride
+    /// [`tile_addr`] gives from the height, which is the one difference from the
+    /// 8x8 pattern of [`put_tile_row`].
+    pub(crate) fn fill_tile_row_of_height(
+        vdp: &mut Vdp,
+        tile: u16,
+        row: usize,
+        colour: u8,
+        height: usize,
+    ) {
+        put_tile_row_of_height(vdp, tile, row, height, &[colour; 8]);
+    }
+
     /// One row of `tile`, set to 8 colour indices: the four bytes of a pattern
     /// row (genvdp.txt section 12) with the high nibble of each byte the left
     /// pixel, the convention of [`crate::pattern::tile_row`] and INFERRED there.
     pub(crate) fn put_tile_row(vdp: &mut Vdp, tile: u16, row: usize, pixels: &[u8; 8]) {
+        put_tile_row_of_height(vdp, tile, row, CELL_TILE_ROWS, pixels);
+    }
+
+    /// [`put_tile_row`] for a pattern of `height` rows, the address of which
+    /// [`tile_addr`] decides.
+    pub(crate) fn put_tile_row_of_height(
+        vdp: &mut Vdp,
+        tile: u16,
+        row: usize,
+        height: usize,
+        pixels: &[u8; 8],
+    ) {
         let mask = VRAM_SIZE - 1;
-        let start = tile_addr(tile, 8) + row * 4;
+        let start = tile_addr(tile, height) + row * 4;
         for (byte, pair) in pixels.chunks(2).enumerate() {
             vdp.vram[(start + byte) & mask] = (pair[0] << 4) | pair[1];
         }
@@ -1323,6 +1415,169 @@ mod tests {
             &out[0..4],
             &[1; 4],
             "H40 in full screen mode: vsram[19] & vsram[39] is 3, and plane y stays 0"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Interlace mode 2 (M4-20 #98): the 8x16 cell and the 11-bit vscroll.
+    // ---------------------------------------------------------------------
+
+    /// A plane pattern row of interlace mode 2, filled with `colour`.
+    const MODE2_ROWS: usize = 16;
+    /// A colour of [`crate::pattern`] patterns: 7, since colour 0 is transparent
+    /// and every other index of a palette line would do as well.
+    const COLOUR: u8 = 7;
+
+    /// [`plane_vdp`] switched to interlace mode 2, R12 LSM = `11` (genvdp.txt
+    /// section 17 "$0C"): the mode whose plane cells are 8x16 and whose vertical
+    /// scroll counts the 448 lines of the picture rather than the 224 of the beam.
+    fn interlaced_plane_vdp() -> Vdp {
+        let mut vdp = plane_vdp();
+        vdp.write_register(12, 0x06);
+        vdp
+    }
+
+    /// `tile` as a 16-row pattern, one [`row_colour`] per row: every row of an
+    /// interlace mode 2 cell a different colour, so the row a pixel came from is
+    /// readable from the pixel itself.
+    fn fill_cell_16(vdp: &mut Vdp, tile: u16) {
+        for row in 0..MODE2_ROWS {
+            fill_tile_row_of_height(vdp, tile, row, row_colour(row), MODE2_ROWS);
+        }
+    }
+
+    /// Interlace mode 2: a plane cell is 8x16, so a plane row takes 16 display
+    /// lines and the pattern it names is 64 bytes at `(name & !1) * 32`
+    /// (genvdp.txt sections 12 and 13). Cell (0,0) names tile 3 and its rows are
+    /// written at 64, the address of tile 2, so a fetch that used `name * 32` or
+    /// `tile * 64` reads nothing here; the cell row under it is the empty entry,
+    /// so a fetch that kept the 8-line cell reads nothing either.
+    #[test]
+    fn interlace_mode_2_reads_an_8x16_cell_from_the_even_name() {
+        let mut vdp = interlaced_plane_vdp();
+        put_entry(&mut vdp, PLANE_A_BASE, 0, palette_entry(2, 3));
+        fill_cell_16(&mut vdp, 3);
+
+        for line in 0..MODE2_ROWS {
+            let mut out = blank_line();
+            vdp.render_plane_line(Plane::A, line as u16, &mut out);
+            assert_eq!(
+                &out[0..8],
+                &[cram_index(2, row_colour(line)); 8],
+                "display line {line} of cell (0,0) is pattern row {line} of 16"
+            );
+        }
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, MODE2_ROWS as u16, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[0; 8],
+            "line 16 is the next cell row, which is the empty entry"
+        );
+    }
+
+    /// Interlace mode 2 vertical scroll counts the lines of the picture, so a
+    /// vscroll of 1 moves the plane by one row of a 16-line cell and a vscroll of
+    /// 16 by a whole cell (ticket #98: "Vertical scroll is 11 bits and in half
+    /// lines"). Bit 0 of the value therefore moves the plane like any other bit,
+    /// which is what the SpritesMind note that "bit0 is ignored in interlaced mode
+    /// 2" would have done differently; the ticket decides it.
+    #[test]
+    fn interlace_mode_2_vertical_scroll_counts_the_lines_of_the_picture() {
+        let mut vdp = interlaced_plane_vdp();
+        put_entry(&mut vdp, PLANE_A_BASE, 0, palette_entry(2, 3));
+        fill_cell_16(&mut vdp, 3);
+
+        vdp.vsram[0] = 1;
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[cram_index(2, row_colour(1)); 8],
+            "vscroll 1 shows pattern row 1 of the cell at plane y 0"
+        );
+
+        vdp.vsram[0] = MODE2_ROWS as u16;
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[0; 8],
+            "16 of them is the cell row under it, the empty entry"
+        );
+    }
+
+    /// The 11th bit of genvdp.txt section 10's "40x10 bits of on-chip vertical
+    /// scroll RAM" belongs to interlace mode 2 alone (see the note on
+    /// [`crate::Vdp::vsram`]). A 128-cell plane of 16-line cells is 2048 lines
+    /// tall, so a vscroll of `0x400` is 64 whole cell rows and reaches the one
+    /// cell this plane names.
+    #[test]
+    fn interlace_mode_2_vertical_scroll_is_eleven_bits_wide() {
+        let mut vdp = interlaced_plane_vdp();
+        vdp.write_register(16, 0x30); // 32 cells wide, 128 cells tall
+        put_entry(
+            &mut vdp,
+            PLANE_A_BASE,
+            64 * PLANE_COLUMNS,
+            palette_entry(2, 3),
+        );
+        for row in 0..MODE2_ROWS {
+            fill_tile_row_of_height(&mut vdp, 3, row, COLOUR, MODE2_ROWS);
+        }
+
+        vdp.vsram[0] = 0x400;
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[cram_index(2, COLOUR); 8],
+            "plane y 1024 of a 2048-line plane is cell row 64, the only cell that draws"
+        );
+    }
+
+    /// INFERRED, and pinned so that a change of reading cannot be quiet: the
+    /// horizontal scroll table is walked with the display line, the same doubled
+    /// number the name table fetch and the vscroll use, so the two display lines
+    /// of one beam line read two different entries of a per-line table. Nothing in
+    /// genvdp.txt addresses which line the scroll table counts - section 13 gives
+    /// the walk as `index = line` and stops there.
+    #[test]
+    fn interlace_mode_2_walks_the_horizontal_scroll_table_by_display_line() {
+        let mut vdp = interlaced_plane_vdp();
+        vdp.write_register(11, 0x03); // per-line horizontal scroll
+        vdp.write_register(13, 0x3F); // the table of `put_scroll`, at HSCROLL_BASE
+        put_scroll(&mut vdp, 0, 8, 0);
+        put_scroll(&mut vdp, 1, 0, 0);
+
+        // One colour per cell column, as `fill_columns` does it but at the 8x16
+        // address of interlace mode 2, and naming the even tiles so that no two
+        // columns share a pattern once bit 0 of the name is dropped.
+        for column in 0..PLANE_COLUMNS {
+            let tile = 2 * (column as u16 + 1);
+            for row in 0..PLANE_ROWS {
+                put_entry(&mut vdp, PLANE_A_BASE, row * PLANE_COLUMNS + column, tile);
+            }
+            for row in 0..MODE2_ROWS {
+                fill_tile_row_of_height(&mut vdp, tile, row, column_colour(column), MODE2_ROWS);
+            }
+        }
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[..8],
+            &[column_colour(1); 8],
+            "display line 0 reads scroll entry 0, which scrolls plane A by 8"
+        );
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 1, &mut out);
+        assert_eq!(
+            &out[..8],
+            &[column_colour(0); 8],
+            "and display line 1 reads scroll entry 1, which does not"
         );
     }
 }

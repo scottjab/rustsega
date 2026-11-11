@@ -24,7 +24,7 @@
 //!
 use crate::Vdp;
 use crate::WIDTH_H40;
-use crate::planes::{CELL_COLUMN, CELL_ROWS, Plane};
+use crate::planes::{CELL_COLUMN, CELL_WIDTH, Plane};
 
 /// Cells in a row of the window name table, by display width: genvdp.txt section
 /// 13, "The name table for plane W is 32x32 in 32-cell mode, and 64x32 in
@@ -61,10 +61,13 @@ impl Vdp {
     }
 
     /// The line of the R18 split: "The WVP field defines the vertical range of the
-    /// window, in units of eight lines." (genvdp.txt section 17 "$12").
+    /// window, in units of eight lines." (genvdp.txt section 17 "$12") - eight
+    /// lines of a cell, which is 16 of the lines of the picture in interlace mode 2
+    /// and is INFERRED to mean the cell there as everywhere else (#98, and
+    /// TODO(M6-06 #125) to confirm it with a window test ROM).
     #[inline]
     fn window_split_line(&self) -> usize {
-        usize::from(self.window_v_position()) * CELL_ROWS
+        usize::from(self.window_v_position()) * self.cell_height()
     }
 
     /// The screen columns of a line the window is shown on that the window covers:
@@ -116,7 +119,8 @@ impl Vdp {
         }
     }
 
-    /// Plane A of `line` with the window over it, in one buffer: genvdp.txt
+    /// Plane A of `line` - a line of the picture, [`Vdp::display_line`] of the beam
+    /// line - with the window over it, in one buffer: genvdp.txt
     /// section 13, "plane A cannot be displayed in any area where plane W is
     /// located", so the compositor of M4-17 (#95) gets one 6-bit CRAM index plus
     /// priority bit per pixel and does not have to know which of the two it came
@@ -157,14 +161,18 @@ impl Vdp {
     fn render_window_run(&self, line: usize, columns: core::ops::Range<usize>, out: &mut [u8]) {
         let base = usize::from(self.window_base());
         let width = self.window_table_cells();
-        let row = (line / CELL_ROWS) % TABLE_ROWS;
-        let tile_row = line % CELL_ROWS;
+        // The cell row of the table and the row of its pattern, from the line of
+        // the picture: a window cell is as tall as a plane cell, 16 lines of it in
+        // interlace mode 2 (genvdp.txt section 12, and [`Vdp::cell_height`]).
+        let cell_rows = self.cell_height();
+        let row = (line / cell_rows) % TABLE_ROWS;
+        let tile_row = line % cell_rows;
 
         let mut x = columns.start;
         while x < columns.end {
-            let offset = x % CELL_ROWS;
-            let cell = (x / CELL_ROWS) % width;
-            let run = (CELL_ROWS - offset).min(columns.end - x);
+            let offset = x % CELL_WIDTH;
+            let cell = (x / CELL_WIDTH) % width;
+            let run = (CELL_WIDTH - offset).min(columns.end - x);
             self.fill_cell_run(
                 base,
                 row * width + cell,
@@ -674,5 +682,85 @@ mod tests {
         let mut out = blank_line();
         vdp.render_plane_a_line_with_window(0, &mut out);
         assert_eq!(out, plane_a_line(&vdp, 0));
+    }
+
+    // ---------------------------------------------------------------------
+    // Interlace mode 2 (M4-20 #98): the window cell is 8x16 too.
+    // ---------------------------------------------------------------------
+
+    /// Rows of a window cell of interlace mode 2, the plane cell of #98: genvdp.txt
+    /// section 13 gives plane W a name table of the same kind as the two planes, so
+    /// the 8x16 pattern of section 12 reaches it the same way.
+    const MODE2_ROWS: usize = 16;
+
+    /// Interlace mode 2: a window cell row is 16 display lines, not 8. The table is
+    /// filled with one colour for its first cell row and another for the rest, so
+    /// the line the colour changes on is the height of a cell row.
+    #[test]
+    fn interlace_mode_2_window_cells_are_16_display_lines_tall() {
+        let mut vdp = plane_vdp();
+        vdp.write_register(3, WINDOW_REG);
+        vdp.write_register(12, 0x06);
+        vdp.write_register(17, 0x80); // RIGT, WHP = 0: the window over every column
+        vdp.write_register(18, 0x80); // DOWN, WVP = 0: and over every line
+        for cell in 0..H32_CELLS * WINDOW_ROWS {
+            let tile = if cell < H32_CELLS {
+                WINDOW_TILE
+            } else {
+                WINDOW_TILE + 2
+            };
+            put_entry(&mut vdp, WINDOW_BASE, cell, tile);
+        }
+        for row in 0..MODE2_ROWS {
+            fill_tile_row_of_height(&mut vdp, WINDOW_TILE, row, WINDOW_COLOUR, MODE2_ROWS);
+            fill_tile_row_of_height(&mut vdp, WINDOW_TILE + 2, row, PLANE_COLOUR, MODE2_ROWS);
+        }
+
+        let mut out = blank_line();
+        vdp.render_plane_a_line_with_window(15, &mut out);
+        assert!(
+            out.iter().all(|&p| p == WINDOW_COLOUR),
+            "display line 15 is the last line of the first window cell row: {out:02x?}"
+        );
+
+        let mut out = blank_line();
+        vdp.render_plane_a_line_with_window(16, &mut out);
+        assert!(
+            out.iter().all(|&p| p == PLANE_COLOUR),
+            "and display line 16 starts the next one: {out:02x?}"
+        );
+    }
+
+    /// The unit of the R18 split is a cell too, so a window that starts at WVP = 1
+    /// starts 16 lines of the picture down in interlace mode 2 rather than 8. Also
+    /// INFERRED from "in units of eight lines" (genvdp.txt section 17 "$12"), and
+    /// pinned with the cell height above for the same reason.
+    #[test]
+    fn interlace_mode_2_counts_the_r18_split_in_cells_of_16_lines() {
+        let mut vdp = plane_vdp();
+        vdp.write_register(3, WINDOW_REG);
+        vdp.write_register(12, 0x06);
+        vdp.write_register(17, 0x80);
+        vdp.write_register(18, 0x80 | 1); // DOWN, from the second unit of the split
+        for cell in 0..H32_CELLS * WINDOW_ROWS {
+            put_entry(&mut vdp, WINDOW_BASE, cell, WINDOW_TILE);
+        }
+        for row in 0..MODE2_ROWS {
+            fill_tile_row_of_height(&mut vdp, WINDOW_TILE, row, WINDOW_COLOUR, MODE2_ROWS);
+        }
+
+        let mut out = blank_line();
+        vdp.render_plane_a_line_with_window(15, &mut out);
+        assert!(
+            out.iter().all(|&p| p == 0),
+            "line 15 is inside the first unit, where plane A is left alone: {out:02x?}"
+        );
+
+        let mut out = blank_line();
+        vdp.render_plane_a_line_with_window(16, &mut out);
+        assert!(
+            out.iter().all(|&p| p == WINDOW_COLOUR),
+            "and line 16 has reached the second, where the window shows: {out:02x?}"
+        );
     }
 }

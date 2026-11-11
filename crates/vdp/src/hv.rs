@@ -84,7 +84,7 @@ const V_JUMP_NTSC: u8 = 0xE5;
 /// frame. These two PAL tables are the ones the ticket specifies, and each is
 /// arithmetically closed: the 0x00..=0xFF run and the 0x00..=0x02 repeat take
 /// 259 lines and 0xCA..=0xFF is the last 54, which is 313 lines (genvdp.txt
-/// section 5 for the shape, nothing for the numbers). TODO(M4-20 #98): confirm
+/// section 5 for the shape, nothing for the numbers). TODO(M6-06 #125): confirm
 /// against hardware; treat as inferred until then.
 const V_JUMP_PAL_V28_LINE: u16 = 259;
 /// Value the V counter jumps to, PAL in V28 (see [`V_JUMP_PAL_V28_LINE`]).
@@ -157,7 +157,7 @@ fn v_count(line: u16, pal: bool, v30: bool) -> u8 {
 /// bit 8 of the internal counter goes into it. Mode 1 is the same replacement
 /// without the doubling, which is what the ticket says and is not something
 /// genvdp.txt says at all - it names mode 2 and nothing else. Both are therefore
-/// inferred, TODO(M4-20 #98) to confirm them on hardware.
+/// inferred, TODO(M6-06 #125) to confirm them on hardware.
 ///
 /// `field` is bit 8 of the internal counter, `VC8`: the second half of the
 /// frame, which is the half that the 8-bit V counter cannot name and which
