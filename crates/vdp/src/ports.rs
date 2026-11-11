@@ -470,16 +470,22 @@ impl Vdp {
         }
     }
 
-    /// A data port write that goes to the memory in the call rather than onto
-    /// the write FIFO.
+    /// The data port write a DMA makes: the memory the code register names, now
+    /// rather than at an access slot of the write FIFO.
     ///
-    /// Only the 68k-to-VDP transfer of `dma` (#85) uses it: a transfer is
-    /// thousands of port writes run in one call, and the FIFO is four entries
-    /// deep, so queueing them would hold or lose all but the first four. The
-    /// transfer's own timing, and with it the slots its writes really do cost,
-    /// is M4-22 (#101).
+    /// Only the 68k-to-VDP transfer of `dma` uses it (#85): a transfer is
+    /// thousands of port writes and the FIFO is four entries deep, so queueing
+    /// them would hold or lose all but the first four. It does not wait for the
+    /// slots because the DMA has already paid for them - one per word, or two for
+    /// a VRAM word, spent by `dma::Vdp::dma_clock` out of the schedule of
+    /// `slots` (M4-22, #101).
+    ///
+    /// The write-pending flag is left alone, which a real port write does not do:
+    /// the flag is set and cleared by command port and data port accesses
+    /// (genvdp.txt section 7 "VDP port access") and a DMA word is neither, so a
+    /// command word that was half written while a transfer runs is still half
+    /// written when the next of its words lands.
     pub(crate) fn write_data_now(&mut self, value: u16) {
-        self.pending = false;
         self.fifo_last = value;
         self.write_target_word(value);
     }

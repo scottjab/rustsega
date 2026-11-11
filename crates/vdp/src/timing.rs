@@ -15,6 +15,8 @@
 //! The write FIFO is not: every clock the beam moves takes the FIFO's external
 //! access slots with it, so `advance` hands its clocks to `fifo::Vdp::fifo_clock`
 //! before it looks at line events (M4-21a, #99, timed by `slots` for M4-21b #100).
+//! A DMA in flight is paid out of the same slots, one segment of the line at a
+//! time (`dma::Vdp::dma_clock`, M4-22 #101).
 
 use crate::hv::MCLKS_PER_LINE;
 use crate::{InterlaceMode, Vdp};
@@ -99,6 +101,10 @@ impl Vdp {
 
             let stop = self.next_event_mclk();
             let step = (stop - self.line_mclk).min(left);
+            // A DMA in flight is spent from the same slots the FIFO drains on,
+            // segment by segment so that the line they are counted against is the
+            // line the beam is on (`dma::Vdp::dma_clock`).
+            self.dma_clock(self.line_mclk, self.line_mclk + step);
             self.line_mclk += step;
             left -= step;
 
