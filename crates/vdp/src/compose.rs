@@ -324,9 +324,8 @@ impl Vdp {
         }
         let width = self.active_width();
         if y == 0 {
-            let frame = &mut self.frame_buffer;
-            frame.width = width;
-            frame.height = height;
+            self.frame_buffer.width = width;
+            self.frame_buffer.height = height;
         }
 
         let stride = self.frame_buffer.width;
