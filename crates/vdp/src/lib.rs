@@ -5,8 +5,10 @@
 //! reads, the two ports the 68k reaches them with (`ports`: control port
 //! writes and data port writes and reads), the status register the control port
 //! reads answer (`status`), the beam position and the HV counter port (`hv`),
-//! and the 68k to VDP DMA (`dma`). The fill and copy DMA modes are M4-08 (#86),
-//! rendering starts at M4-10 (#88), and timing after that.
+//! and the 68k to VDP DMA (`dma`), and the beam timing that drives the status
+//! flags and raises the interrupts (`timing`). The fill and copy DMA modes are
+//! M4-08 (#86); rendering is M4-10 (#88) onwards, so the line renderer that
+//! `timing` calls is the backdrop stub of M4-17 (#95).
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
@@ -18,6 +20,7 @@ mod hv;
 mod ports;
 mod regs;
 mod status;
+mod timing;
 
 pub use dma::DmaBus;
 pub use framebuffer::FrameBuffer;
@@ -106,8 +109,25 @@ pub struct Vdp {
     /// Set at VBlank start and cleared by the interrupt acknowledge, never by
     /// the status read that shows it (genvdp.txt section 6: "Bit 7 is set when a
     /// vertical interrupt occurs ... Reading the control port does not clear
-    /// this bit"). TODO(M4-06 #84): the interrupt that sets and clears it.
+    /// this bit"). `timing` is what sets it and [`Vdp::ack_irq`] what clears it.
     vint_pending: bool,
+    /// A line interrupt is waiting for the 68k: the HINT counter expired on a
+    /// line and nobody has acknowledged level 4 since.
+    ///
+    /// Set whatever R0 bit 4 (IE1) says, because genvdp.txt section 4 gates the
+    /// interrupt on the bit rather than the counter running ("When the counter
+    /// has expired, and if bit 4 (IE1) of register #0 is set, then a level 4
+    /// interrupt will occur"), so the enable is read at [`Vdp::pending_irq`].
+    /// There is no status bit for it: the 68k just gets the interrupt.
+    hint_pending: bool,
+    /// The line interrupt counter: decremented on every line of the active
+    /// display and reloaded from R10 when it expires (genvdp.txt section 4
+    /// "Line interrupts"; [`Vdp::hint_reload`]).
+    hint_counter: u8,
+    /// A frame has finished drawing and the scheduler has not been told yet.
+    ///
+    /// Set at VBlank start by `timing`, taken by [`Vdp::frame_done`].
+    frame_ready: bool,
     /// Status bit 6 (SOVR): too many sprites on the scan line just drawn.
     ///
     /// "Set when too many sprites are on the current scan line, meaning when the
@@ -138,12 +158,14 @@ pub struct Vdp {
     /// counter cycle AAh" (genvdp.txt section 6). A switched-off display reads
     /// as blanking whatever this field says; `status` says where that comes from.
     ///
-    /// TODO(M4-05 #83): the frame counter that sets and clears it.
+    /// Driven by `timing`, line-based for now: the H counter cycle of that rule
+    /// is M4-23's.
     in_vblank: bool,
     /// Status bit 2 (HB): the horizontal blanking signal is live.
     ///
     /// "Set at H counter cycle E4h and cleared at H counter cycle 08h"
-    /// (genvdp.txt section 6). TODO(M4-05 #83): the dot counter that sets it.
+    /// (genvdp.txt section 6). Driven by `timing` at the two points of the line
+    /// it names.
     in_hblank: bool,
     /// Status bit 1: a DMA is running. "Set for the duration of a DMA
     /// operation ... only useful for fills and copies, since the 68000 is frozen
@@ -153,12 +175,15 @@ pub struct Vdp {
     /// transfers of M4-07 (#85) run in one call and so are never seen busy.
     dma_busy: bool,
     /// The scanline the beam is on: 0 is the first line of the frame, and the
-    /// frame is 262 lines on NTSC and 313 on PAL. Only [`Vdp::set_position`]
-    /// moves it, so until M4-06 (#84) runs the scheduler that calls it the beam
-    /// sits at the start of line 0 and the HV counter reads 0 (M4-05, #83).
+    /// frame is 262 lines on NTSC and 313 on PAL. [`Vdp::advance`] walks it and
+    /// [`Vdp::set_position`] jumps it (M4-05 #83, M4-06 #84).
     line: u16,
     /// Master clocks into [`Vdp::line`], `0..hv::MCLKS_PER_LINE`.
     line_mclk: u32,
+    /// Whether the once-a-line work of `timing::start_line` has run for
+    /// [`Vdp::line`]: false for the line 0 of a VDP that has never been
+    /// advanced, and cleared each time the beam moves to a new line (M4-06 #84).
+    line_started: bool,
     /// The HV counter frozen by R0 bit 1 (M3), `None` while the bit is clear.
     ///
     /// `Some` from the moment M3 goes up to the moment it comes down, which is
@@ -199,8 +224,12 @@ impl Vdp {
             in_vblank: false,
             in_hblank: false,
             dma_busy: false,
+            hint_pending: false,
+            hint_counter: 0,
+            frame_ready: false,
             line: 0,
             line_mclk: 0,
+            line_started: false,
             hv_latch: None,
             frame_buffer: FrameBuffer::new(),
             pal,
@@ -256,7 +285,8 @@ impl Vdp {
     /// R0 bit 4 (IE1): enable the HINT horizontal-blank interrupt
     /// (genvdp.txt section 4 "Interrupts"; plutiedev "$80xx").
     ///
-    /// TODO(M4-06 #84): the interrupt itself.
+    /// Read by [`Vdp::pending_irq`], which is the side that decides whether a
+    /// pending HINT reaches the 68k.
     #[inline]
     pub fn hint_enabled(&self) -> bool {
         self.regs[regs::R0] & (1 << 4) != 0
@@ -303,7 +333,8 @@ impl Vdp {
     /// R1 bit 5 (IE0): enable the VINT vertical-blank interrupt (genvdp.txt
     /// section 4 "Interrupts"; plutiedev "$81xx").
     ///
-    /// TODO(M4-06 #84): the interrupt itself.
+    /// Read by [`Vdp::pending_irq`], so a VINT that was masked when it happened
+    /// is delivered as soon as this goes up.
     #[inline]
     pub fn vint_enabled(&self) -> bool {
         self.regs[regs::R1] & (1 << 5) != 0
@@ -394,9 +425,7 @@ impl Vdp {
 
     /// R10: value reloaded into the HINT counter after every HINT
     /// (genvdp.txt section 4 "Interrupts", section 17 "$0A"; plutiedev
-    /// "$8Axx").
-    ///
-    /// TODO(M4-06 #84): the counter that is loaded from it.
+    /// "$8Axx"). The counter it is loaded into is `timing`'s.
     #[inline]
     pub fn hint_reload(&self) -> u8 {
         self.regs[regs::R10]
