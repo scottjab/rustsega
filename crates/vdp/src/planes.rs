@@ -157,10 +157,11 @@ impl Vdp {
     ///   clamps `column` because the line of [`WIDTH_H40`] pixels is 20 columns
     ///   wide, so the largest index is `2 * 19 + 1` = 39.
     ///
-    /// Both the walk and the A/B choice are INFERRED: the doc describes the
-    /// hardware as "Vertical Scroll RAM ... used to store vertical scroll values
-    /// for the playfield" (section 10) and leaves the addressing to the reader.
-    /// They are pinned by the tests of #91 rather than by prose.
+    /// Both the walk and the A/B choice are INFERRED: all section 10 says is
+    /// that "The VDP has 40x10 bits of on-chip vertical scroll RAM. It is
+    /// accessed as 40 16-bit words through the data port", and no other section
+    /// addresses the playfield's use of them. They are pinned by the tests of #91
+    /// instead of by prose.
     #[inline]
     fn column_vscroll(&self, plane: Plane, column: usize) -> usize {
         let index = if self.vscroll_per_cell_column() {
@@ -178,9 +179,9 @@ impl Vdp {
     /// UNCERTAIN, and NOT hardware fact. genvdp.txt does not mention a partial
     /// column at all - it says only that the lower bits of a scroll value are a
     /// pixel offset (section 13) - and says nothing about what VSRAM word that
-    /// half-fetched column is read with. The model #91 works to, and which
-    /// [`tests::h40_fetches_the_partial_left_column_with_vsram_19_and_39`] pins
-    /// so that a change here cannot be quiet:
+    /// half-fetched column is read with. The model #91 works to, and which the
+    /// `h40_fetches_the_partial_left_column_with_vsram_19_and_39` test pins so
+    /// that a change here cannot be quiet:
     ///
     /// - H40: both planes use `vsram[19] & vsram[39]`, the two words of
     ///   [`LEFT_COLUMN_WORDS`];
@@ -222,14 +223,14 @@ impl Vdp {
     /// the tests here fix in. It is INFERRED, not documented.
     ///
     /// Vertical scroll: plane y is `(line + vscroll) & (height * 8 - 1)`, where
-    /// `vscroll` is [`Vdp::column_vscroll`] of the 16 pixel column the pixel is
-    /// in - or of the partial column at the left edge, which is where
-    /// [`Vdp::left_column_vscroll`] takes over. Adding the value, so that a larger
-    /// one moves the plane up, is what #91 works to; like the horizontal case the
-    /// direction is INFERRED, and unlike it the value is not 8 pixels wide but 10.
-    /// Because a 2-cell column can name any plane row, the fetch of a line may
-    /// change plane row four times, so `row_base` and `cell_row` belong to the run
-    /// being fetched and not to the line.
+    /// `vscroll` is [`Vdp::column_vscroll`] for the 16 pixel column the pixel is
+    /// in, or [`Vdp::left_column_vscroll`] for the partial column at the left edge
+    /// of the line. Adding the value, so that a larger one moves the plane up, is
+    /// what #91 works to: like the horizontal scroll its direction is INFERRED,
+    /// and unlike it the value comes from VSRAM 10 bits at a time instead of from
+    /// a VRAM table. A 2-cell column can name any plane row, so `row_base` and
+    /// `cell_row` belong to the run being fetched and not to the line, and one
+    /// line can change plane row at every [`CELL_COLUMN`] pixels.
     ///
     /// A cell is still 8 pixels by 8 pixels and both axes wrap at the plane size
     /// of R16. The fetch runs one cell of the plane at a time - eight pixels, or
@@ -995,8 +996,8 @@ mod tests {
     /// 17 "$0B") and section 10 gives the value as "y = Vertical scroll factor
     /// (0-3FFh)": one value for the whole plane, `vsram[0]` for plane A. A value
     /// of 8 is one whole cell row, so line 0 shows what was on line 8 - plane y
-    /// `line + vscroll`, the direction #91 works to and INFERRED like the
-    /// opposite one of [`Vdp::render_plane_line`].
+    /// `line + vscroll`, the direction #91 works to; like the horizontal one of
+    /// [`Vdp::render_plane_line`] it is INFERRED, not documented.
     #[test]
     fn full_vscroll_of_8_shows_plane_row_8_on_line_0() {
         let mut vdp = plane_a_two_cell_rows();
