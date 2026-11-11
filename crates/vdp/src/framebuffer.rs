@@ -1,6 +1,6 @@
 //! The picture the VDP produces.
 
-use crate::{Vdp, LINES_V30, WIDTH_H40};
+use crate::{LINES_V30, Vdp, WIDTH_H40};
 
 /// Widest picture the VDP can produce: 40 cells in H40 (R12, genvdp.txt
 /// section 17 "$0C").
@@ -17,8 +17,9 @@ pub const MAX_HEIGHT: usize = 2 * LINES_V30;
 /// frame, which is how a game changing mode mid-frame costs no allocation. The
 /// row stride is `width`.
 ///
-/// Filling it in is the rendering tickets (M4-10, #88 onwards); nothing before
-/// that draws anything, so a fresh VDP hands out a black frame.
+/// Filling it in properly is the rendering tickets (M4-10, #88 onwards): the
+/// only thing that writes it today is [`Vdp::render_line`], the backdrop stub of
+/// M4-06 (#84), so a VDP that has not drawn a frame hands out a black one.
 #[derive(Debug)]
 pub struct FrameBuffer {
     /// Active width in pixels: 256 (H32) or 320 (H40).

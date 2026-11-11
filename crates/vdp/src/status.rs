@@ -73,9 +73,9 @@ impl Vdp {
     ///   other side of that rule.
     ///
     /// `vint_pending` is explicitly not cleared: only the acknowledge of
-    /// interrupt level 6 clears it (genvdp.txt section 6, and TODO(M4-06 #84)
-    /// for the interrupt). The blanking, frame and DMA bits are read-only
-    /// snapshots of state the timing tickets drive.
+    /// interrupt level 6 clears it (genvdp.txt section 6, and [`Vdp::ack_irq`]
+    /// in `timing`). The blanking, frame and DMA bits are read-only snapshots of
+    /// state that `timing` drives.
     pub fn read_status(&mut self) -> u16 {
         self.pending = false;
 

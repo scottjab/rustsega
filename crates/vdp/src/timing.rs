@@ -125,13 +125,21 @@ impl Vdp {
     /// The back-porch point of the line, where status bit 2 goes up.
     #[inline]
     fn hblank_set_mclk(&self) -> u32 {
-        if self.h40() { HBLANK_SET_MCLK_H40 } else { HBLANK_SET_MCLK_H32 }
+        if self.h40() {
+            HBLANK_SET_MCLK_H40
+        } else {
+            HBLANK_SET_MCLK_H32
+        }
     }
 
     /// The front-porch point of the line, where status bit 2 comes down.
     #[inline]
     fn hblank_clear_mclk(&self) -> u32 {
-        if self.h40() { HBLANK_CLEAR_MCLK_H40 } else { HBLANK_CLEAR_MCLK_H32 }
+        if self.h40() {
+            HBLANK_CLEAR_MCLK_H40
+        } else {
+            HBLANK_CLEAR_MCLK_H32
+        }
     }
 
     /// The line the beam has just finished: draw it, then move along.
@@ -237,7 +245,11 @@ impl Vdp {
     /// The last line of the frame, so the beam wraps after it.
     #[inline]
     fn frame_lines(&self) -> u16 {
-        if self.pal { FRAME_LINES_PAL } else { FRAME_LINES_NTSC }
+        if self.pal {
+            FRAME_LINES_PAL
+        } else {
+            FRAME_LINES_NTSC
+        }
     }
 
     /// The first line of VBlank: the first line past the active display, 224 in
@@ -294,10 +306,11 @@ impl Vdp {
     /// A frame has been drawn: true once per frame, at VBlank start, which is
     /// what the scheduler of M3-14 (#75) ends `run_frame` with.
     ///
-    /// Reading it is what consumes it, so a caller that misses the moment still
-    /// sees the next frame as a frame and not as two.
+    /// Reading it is what consumes it, so the answer is true for one call per
+    /// frame however the clocks are chopped up between calls.
     pub fn frame_done(&mut self) -> bool {
-        let done = std::mem::take(&mut self.frame_ready);
+        let done = self.frame_ready;
+        self.frame_ready = false;
         done
     }
 
@@ -425,7 +438,11 @@ mod tests {
         }
 
         assert!(vdp.vint_pending, "the vertical interrupt happened");
-        assert_eq!(vdp.pending_irq(), None, "but IE0 is clear, so nobody is told");
+        assert_eq!(
+            vdp.pending_irq(),
+            None,
+            "but IE0 is clear, so nobody is told"
+        );
 
         vdp.write_register(1, 0x60);
         assert_eq!(
@@ -484,7 +501,10 @@ mod tests {
     #[test]
     fn blanking_flags_follow_the_beam() {
         let mut vdp = running(false);
-        assert!(!vdp.in_hblank, "reset is not a beam position, see status_read tests");
+        assert!(
+            !vdp.in_hblank,
+            "reset is not a beam position, see status_read tests"
+        );
 
         vdp.advance(1710);
         assert!(!vdp.in_hblank, "mid-line is active");
