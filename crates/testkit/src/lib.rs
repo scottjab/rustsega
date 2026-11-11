@@ -18,6 +18,10 @@ pub use golden::{Golden, assert_golden, dump_png, frame_hash};
 /// `scripts/fetch-test-data.sh`.
 const TEST_ROM_DIR_ENV: &str = "RUSTSEGA_TEST_ROM_DIR";
 
+/// Directory name `scripts/fetch-test-data.sh` writes into, and the name
+/// [`find_test_rom_dir`] looks for while walking up the tree.
+const TEST_ROM_DIR_NAME: &str = "test-roms";
+
 /// Commercial ROMs, local only. Files use the `.md` extension but are raw
 /// binary ROMs.
 const ROM_DIR_ENV: &str = "RUSTSEGA_ROM_DIR";
@@ -33,13 +37,102 @@ pub fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Directory holding public test data: `$RUSTSEGA_TEST_ROM_DIR`, else
-/// `<workspace_root>/test-roms`.
+/// Directory holding public test data: `$RUSTSEGA_TEST_ROM_DIR` when set, else
+/// [`find_test_rom_dir`] from the current directory.
+///
+/// The dev shell used to default this variable to `$PWD/test-roms`, which is
+/// what broke a linked worktree: `$PWD` there has no `test-roms`, every lookup
+/// missed, and the data-driven tests reported missing data while looking like a
+/// CPU regression (#236). Discovery lives here instead so it can follow the
+/// worktree to the checkout that does have the data.
 pub fn test_rom_dir() -> PathBuf {
     match std::env::var_os(TEST_ROM_DIR_ENV) {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => workspace_root().join("test-roms"),
+        _ => {
+            let workspace = workspace_root();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| workspace.clone());
+            find_test_rom_dir(&cwd, &workspace)
+        }
     }
+}
+
+/// Discover the test-data directory from arguments instead of the environment.
+///
+/// 1. `test-roms` at `cwd` or the nearest ancestor holding one. For a normal
+///    run that is the checkout itself; for a worktree nested in the checkout it
+///    is the parent's copy, and a `test-roms` fetched into the worktree wins
+///    over the parent's because the closest match is taken first.
+/// 2. `test-roms` in the checkout that owns `workspace` ([`checkout_root`]), for
+///    worktrees that live outside the main checkout altogether —
+///    `git worktree add ../worktrees/branch`.
+/// 3. `<workspace>/test-roms`, which may well not exist.
+///
+/// Step 3 is deliberately not a lookup that "finds" something: a suite with no
+/// data anywhere still gets `None` from [`test_rom`] and reports missing data
+/// exactly as it did before. Discovery is only about where to look, never about
+/// turning a miss into a pass.
+fn find_test_rom_dir(cwd: &Path, workspace: &Path) -> PathBuf {
+    for dir in cwd.ancestors() {
+        let candidate = dir.join(TEST_ROM_DIR_NAME);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    if let Some(root) = checkout_root(workspace) {
+        let candidate = root.join(TEST_ROM_DIR_NAME);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    workspace.join(TEST_ROM_DIR_NAME)
+}
+
+/// Root of the checkout that owns `dir`, walking up ancestors to find its `.git`.
+///
+/// A regular checkout has a `.git` directory and is its own answer. A linked
+/// worktree has a `.git` *file* reading `gitdir: <common>/worktrees/<name>`
+/// (gitworktrees(7)), and the checkout is the directory above that common dir,
+/// however far away it is. `None` when `dir` is not in a working tree at all, or
+/// the shared git dir is a bare repo's rather than a `*.git` inside a checkout.
+fn checkout_root(dir: &Path) -> Option<PathBuf> {
+    let common = git_common_dir(dir)?;
+    // The usual shape is `<checkout>/.git`, so the checkout is one up. A bare
+    // repo's shared dir is not inside a checkout, so there is nothing to return
+    // for it.
+    if !common.file_name()?.to_string_lossy().ends_with(".git") {
+        return None;
+    }
+    common.parent().map(PathBuf::from)
+}
+
+/// The git directory that owns `dir`, resolving a linked worktree's `gitdir:`
+/// pointer to the shared directory it names (gitrepository-layout(5)).
+fn git_common_dir(dir: &Path) -> Option<PathBuf> {
+    let owner = dir.ancestors().find(|p| p.join(".git").exists())?;
+    let dot_git = owner.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let target = text.trim().strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target = Path::new(target);
+    // Pointers are normally absolute; a relative one is read against the
+    // directory holding the file.
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        owner.join(target)
+    };
+    // `<common>/worktrees/<name>` is the linked-worktree shape; anything else
+    // (a moved or hand-written `.git` file) names the git dir itself.
+    let worktrees = target.parent()?;
+    if worktrees.file_name()? == "worktrees" {
+        return worktrees.parent().map(PathBuf::from);
+    }
+    Some(target)
 }
 
 /// Directory holding the owner's commercial ROMs: `$RUSTSEGA_ROM_DIR`, else
@@ -198,6 +291,111 @@ mod tests {
             Some(v) => assert_eq!(test_rom_dir(), PathBuf::from(v)),
             None => assert!(test_rom_dir().ends_with("test-roms")),
         }
+    }
+
+    /// Layout helper: a checkout at `root/checkout` holding `data` when `data`
+    /// is true, so a test can describe where the copies are rather than repeat
+    /// `create_dir_all` six times.
+    fn checkout(root: &Path, name: &str, data: bool) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).expect("create checkout");
+        fs::create_dir_all(dir.join("crates/testkit")).expect("create crate dir");
+        if data {
+            fs::create_dir_all(dir.join("test-roms")).expect("create test-roms");
+        }
+        dir
+    }
+
+    /// A linked worktree of `main` at `root/name`, complete with the `.git`
+    /// file git writes (`gitdir: <main>/.git/worktrees/<name>`, #236).
+    fn linked_worktree(root: &Path, name: &str, main: &Path, data: bool) -> PathBuf {
+        let dir = checkout(root, name, data);
+        let pointer = main.join(".git/worktrees").join(name);
+        fs::create_dir_all(&pointer).expect("create common worktree dir");
+        fs::write(dir.join(".git"), format!("gitdir: {}\n", pointer.display()))
+            .expect("write .git file");
+        dir
+    }
+
+    #[test]
+    fn find_test_rom_dir_walks_up_from_the_current_directory() {
+        let root = TempDir::new("discover-up");
+        let main = checkout(&root, "main", true);
+        let pkg = main.join("crates/m68k");
+        assert_eq!(find_test_rom_dir(&pkg, &main), main.join("test-roms"));
+    }
+
+    #[test]
+    fn find_test_rom_dir_prefers_the_closest_copy() {
+        let root = TempDir::new("discover-closest");
+        let main = checkout(&root, "main", true);
+        // A worktree nested under the main checkout that fetched its own copy:
+        // that copy is the one in play, not the parent's.
+        let worktree = checkout(&main.join(".wt"), "branch", true);
+        assert_eq!(
+            find_test_rom_dir(&worktree, &worktree),
+            worktree.join("test-roms")
+        );
+    }
+
+    #[test]
+    fn find_test_rom_dir_finds_the_parent_copy_from_a_nested_worktree() {
+        let root = TempDir::new("discover-nested");
+        let main = checkout(&root, "main", true);
+        let worktree = checkout(&main.join(".wt"), "branch", false);
+        assert_eq!(
+            find_test_rom_dir(&worktree.join("crates/testkit"), &worktree),
+            main.join("test-roms")
+        );
+    }
+
+    #[test]
+    fn find_test_rom_dir_follows_a_linked_worktree_outside_the_checkout() {
+        let root = TempDir::new("discover-pointer");
+        fs::create_dir_all(root.join("main/.git")).expect("create .git");
+        let main = root.join("main");
+        fs::create_dir_all(main.join("test-roms")).expect("create test-roms");
+        // `git worktree add ../worktrees/branch`: no ancestor of the worktree
+        // holds the data, only the checkout its `.git` file points at does.
+        let worktree = linked_worktree(&root, "branch", &main, false);
+        assert_eq!(
+            find_test_rom_dir(&worktree.join("crates/testkit"), &worktree),
+            main.join("test-roms")
+        );
+    }
+
+    #[test]
+    fn find_test_rom_dir_falls_back_to_the_workspace_when_nothing_is_fetched() {
+        let root = TempDir::new("discover-absent");
+        let main = checkout(&root, "main", false);
+        // Not a skip that hides data: the plain answer, which does not exist on
+        // disk, so every caller reports missing data exactly as before.
+        assert_eq!(find_test_rom_dir(&main, &main), main.join("test-roms"));
+    }
+
+    #[test]
+    fn checkout_root_of_a_regular_checkout_is_itself() {
+        let root = TempDir::new("checkout-plain");
+        let main = checkout(&root, "main", false);
+        fs::create_dir_all(main.join(".git")).expect("create .git");
+        assert_eq!(checkout_root(&main.join("crates/testkit")), Some(main));
+    }
+
+    #[test]
+    fn checkout_root_of_a_linked_worktree_is_the_main_checkout() {
+        let root = TempDir::new("checkout-linked");
+        fs::create_dir_all(root.join("main/.git")).expect("create .git");
+        let main = root.join("main");
+        let worktree = linked_worktree(&root, "branch", &main, false);
+        assert_eq!(checkout_root(&worktree.join("crates/testkit")), Some(main));
+    }
+
+    #[test]
+    fn checkout_root_is_none_outside_a_git_tree() {
+        let root = TempDir::new("checkout-none");
+        let dir = root.join("not-a-repo");
+        fs::create_dir_all(&dir).expect("create dir");
+        assert_eq!(checkout_root(&dir), None);
     }
 
     #[test]

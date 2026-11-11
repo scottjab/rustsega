@@ -230,7 +230,9 @@ pub fn skip_line(name: &str) -> String {
     format!("SKIPPED: {name} not found")
 }
 
-/// The data root: `$RUSTSEGA_TEST_ROM_DIR`, else `<workspace>/test-roms`.
+/// The data root: `$RUSTSEGA_TEST_ROM_DIR`, else the `test-roms` `testkit`
+/// discovers (nearest at or above the cwd, then the checkout owning this
+/// worktree), which is what lets a worktree share the main checkout's data.
 ///
 /// From `testkit`, which is also what resolves it for every other suite, so the
 /// two CPU harnesses cannot disagree about where the data is.

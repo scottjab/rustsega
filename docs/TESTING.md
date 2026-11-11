@@ -50,9 +50,15 @@ full sweeps.
 
 Nothing copyrighted gets committed. Test data is fetched or found at test time.
 
-- `RUSTSEGA_TEST_ROM_DIR` (default `./test-roms`, gitignored): downloaded
+- `RUSTSEGA_TEST_ROM_DIR` (default: discovered, gitignored): downloaded
   conformance suites and homebrew test ROMs. Fetched by
   `scripts/fetch-test-data.sh`, which pins every download by SHA-256.
+  With the variable unset, `testkit::test_rom_dir` takes the nearest
+  `test-roms/` at or above the current directory and then the one in the checkout
+  that owns a linked worktree, so a worktree uses the main checkout's copy
+  instead of failing for want of its own (#236). An explicit value always wins,
+  and discovery never invents a directory that is not there: data that cannot be
+  found is still reported missing, never skipped as if it had run.
   `docs/test-roms.md` documents every hardware test ROM: what it checks, how it
   reports, its licence, and the ones that have to be placed by hand.
 - `RUSTSEGA_ROM_DIR` (default `~/games/roms/genesis`): the owner's commercial
