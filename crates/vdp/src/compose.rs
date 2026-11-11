@@ -195,23 +195,39 @@ fn compose_pixel(
     }
 }
 
+/// What the mode registers say about the line being drawn, read once by
+/// [`Vdp::render_line`] for it and taken as one by [`compose_row`].
+#[derive(Debug, Clone, Copy)]
+struct LineMode {
+    /// Pixels the line itself draws, [`Vdp::active_width`], which a mode change
+    /// mid-frame makes less than the frame is wide.
+    width: usize,
+    /// Columns of the left edge that go to the backdrop: 8 for R0 bit 5
+    /// ([`Vdp::left_column_blank`]) and 0 for a display that has it clear.
+    blank: usize,
+    /// The CRAM entry the backdrop shows from, [`Vdp::backdrop_index`].
+    backdrop: u8,
+    /// Whether R12 bit 3 makes the two extra intensities of genvdp.txt section
+    /// 16 live, [`Vdp::shadow_highlight_enabled`].
+    shadow_highlight: bool,
+}
+
 /// Paint `row`, one row of the frame buffer, from the three layer buffers of one
-/// line and the shadow/highlight mode of R12 bit 3.
+/// line and its [`LineMode`].
 ///
 /// `cram` is [`Vdp::cram_pixels`], so a pixel costs one index into a table of
-/// 64 instead of a CRAM read and a LUT read, and `backdrop` is
-/// [`Vdp::backdrop_index`]: the entry of that table the backdrop shows from, at
-/// whatever intensity [`compose_pixel`] settled on.
+/// 64 instead of a CRAM read and a LUT read, and the entry the backdrop shows
+/// from is `mode.backdrop`, at whatever intensity [`compose_pixel`] settled.
 ///
 /// `row` is as wide as the frame ([`crate::FrameBuffer::width`], the mode of its
-/// first line) while `width` is as wide as the mode of this line draws, two
+/// first line) while `mode.width` is as wide as this line's own mode draws, two
 /// numbers that part company the moment a game writes R12 mid-frame:
 ///
-/// * columns `width..` of the row are not overscan data but nothing at all, the
-///   display of the line having ended, so they are read as empty layers and
+/// * columns `mode.width..` of the row are not overscan data but nothing at all,
+///   the display of the line having ended, so they are read as empty layers and
 ///   compose to the backdrop;
-/// * columns `..blank` of it are R0 bit 5, [`Vdp::left_column_blank`], which
-///   shows the backdrop colour and nothing else.
+/// * columns `..mode.blank` of it are R0 bit 5, [`Vdp::left_column_blank`],
+///   which shows the backdrop colour and nothing else.
 ///
 /// The blank takes the colour only, not the intensity: genvdp.txt section 16
 /// settles the two for a pixel separately, so the left column of a shadowed line
@@ -219,15 +235,18 @@ fn compose_pixel(
 /// plain R7.
 fn compose_row(
     row: &mut [u32],
-    width: usize,
-    blank: usize,
+    mode: LineMode,
     plane_b: &[u8; WIDTH_H40],
     plane_a: &[u8; WIDTH_H40],
     sprites: &[u8; WIDTH_H40],
     cram: &[[u32; Intensity::ALL.len()]; CRAM_WORDS],
-    backdrop: u8,
-    shadow_highlight: bool,
 ) {
+    let LineMode {
+        width,
+        blank,
+        backdrop,
+        shadow_highlight,
+    } = mode;
     for (x, pixel) in row.iter_mut().enumerate() {
         // A column past the width of this line has no layer data: the buffers
         // are as wide as the widest mode, and what they hold beyond the display
@@ -336,25 +355,18 @@ impl Vdp {
         self.render_sprite_line(line, &mut sprites);
 
         let cram = self.cram_pixels();
-        let backdrop = self.backdrop_index();
-        let shadow_highlight = self.shadow_highlight_enabled();
-        let blank = if self.left_column_blank() {
-            LEFT_COLUMN
-        } else {
-            0
+        let mode = LineMode {
+            width,
+            blank: if self.left_column_blank() {
+                LEFT_COLUMN
+            } else {
+                0
+            },
+            backdrop: self.backdrop_index(),
+            shadow_highlight: self.shadow_highlight_enabled(),
         };
         let row = &mut self.frame_buffer.pixels[start..start + stride];
-        compose_row(
-            row,
-            width,
-            blank,
-            &plane_b,
-            &plane_a,
-            &sprites,
-            &cram,
-            backdrop,
-            shadow_highlight,
-        );
+        compose_row(row, mode, &plane_b, &plane_a, &sprites, &cram);
     }
 }
 
