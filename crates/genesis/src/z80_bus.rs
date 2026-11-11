@@ -610,8 +610,14 @@ mod tests {
         assert!(bus.z80.psg_log.is_empty());
         assert!(bus.z80.ym_log.is_empty());
 
-        // What the 68k's VDP ports answer is what the Z80 gets: open bus today.
-        assert_eq!(read(&mut bus, 0x7F00), 0xFF);
+        // What the 68k's VDP ports answer is what the Z80 gets. The data port has
+        // a read of the chip's own since M4-03 (#81), so it no longer answers open
+        // bus: after `Bus::new` the code register is a VRAM read and VRAM is
+        // zeroed, so the port answers a real VRAM word and the Z80 sees its high
+        // byte - the same answer the 68k gets at 0xC00000, which is what this
+        // window exists to guarantee. The status register (M4-04, #82) and the HV
+        // counter (M4-05, #83) lanes are still the open-bus placeholder.
+        assert_eq!(read(&mut bus, 0x7F00), 0x00);
         assert_eq!(read(&mut bus, 0x7F04), 0xFF);
         assert_eq!(read(&mut bus, 0x7F08), 0xFF);
         // The PSG is write-only, so reading its port answers the same way.
