@@ -58,7 +58,13 @@
           # Where the emulator tests look for commercial ROMs. Override if needed.
           shellHook = ''
             export RUSTSEGA_ROM_DIR="''${RUSTSEGA_ROM_DIR:-$HOME/games/roms/genesis}"
-            export RUSTSEGA_TEST_ROM_DIR="''${RUSTSEGA_TEST_ROM_DIR:-$PWD/test-roms}"
+            # RUSTSEGA_TEST_ROM_DIR is deliberately not defaulted here.
+            # testkit::test_rom_dir finds test-roms itself: the nearest one at or
+            # above the current directory, then the checkout that owns a linked
+            # worktree. A $PWD-based default cannot do that -- a worktree has no
+            # test-roms of its own, and pointing every data-driven test at one
+            # that does not exist made `just check` fail in worktrees (#236).
+            # Set the variable to override discovery; nix develop inherits it.
             # Point wasm-bindgen-test-runner at the geckodriver this shell pins,
             # so browser tests use the same driver version on every machine and
             # never pick up one off $PATH. Unlike the ROM dirs this is not
