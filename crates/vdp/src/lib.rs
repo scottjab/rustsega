@@ -129,6 +129,11 @@ pub struct Vdp {
     /// the 68k transfer and the copy run, and the fill goes to
     /// [`Vdp::dma_fill_pending`] because it waits for a data port write.
     dma_requested: bool,
+    /// The DMA that is running: what the beam's access slots are spent on
+    /// (`dma`, M4-22 #101). [`Vdp::run_dma`] and [`Vdp::run_fill`] put something
+    /// here and [`Vdp::dma_clock`] takes it away again once the transfer's slots
+    /// have all come round, which is also when [`Vdp::dma_busy`] comes down.
+    dma: Option<dma::Running>,
     /// A DMA fill that is waiting for the data port write which starts it.
     ///
     /// Set when a command word with CD5 asks for the fill mode (R23 bits 7-6
@@ -215,11 +220,11 @@ pub struct Vdp {
     /// operation ... only useful for fills and copies, since the 68000 is frozen
     /// during 68k -> VDP transfers" (genvdp.txt section 6).
     ///
-    /// Only a fill is ever seen busy, and only between the command word that
-    /// arms it and the data port write that runs it (`dma::Vdp::arm_fill`,
-    /// M4-08 #86). TODO(M4-22 #101): DMA timing, which is what would set and
-    /// clear it for the transfers of M4-07 (#85) and the copies of #86 too -
-    /// both of which run in one call and so finish before anything can read it.
+    /// Up from the command word that arms a fill (`dma::Vdp::arm_fill`, M4-08
+    /// #86) and from the moment any of the three starts, and down on the last
+    /// access slot of the transfer (`dma::Vdp::finish_dma`, M4-22 #101). The 68k
+    /// does not ask for it during a 68k transfer - it is frozen for the whole of
+    /// one, which [`Vdp::dma_68k_stall_mclk`] reports instead.
     dma_busy: bool,
     /// The scanline the beam is on: 0 is the first line of the frame, and the
     /// frame is 262 lines on NTSC and 313 on PAL. [`Vdp::advance`] walks it and
@@ -273,6 +278,7 @@ impl Vdp {
             fifo_last: 0,
             fifo: fifo::Fifo::new(),
             dma_requested: false,
+            dma: None,
             dma_fill_pending: false,
             vint_pending: false,
             sprite_overflow: false,

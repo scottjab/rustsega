@@ -14,10 +14,15 @@
 //! it, and the next word to the data port is what runs it, so [`Vdp::run_fill`]
 //! is called from the data port instead.
 //!
-//! Not modelled: when any of the three runs and how long it takes, the 68k bus
-//! stall that goes with the transfer, and the read FIFO quirk that makes the
-//! first word of a 68k-to-VRAM transfer wrong on real hardware. All three are
-//! M4-22 (#101).
+//! When they run, and how long they take, is M4-22 (#101) and is the second half
+//! of this file: [`Vdp::run_dma`] and [`Vdp::run_fill`] *start* a transfer rather
+//! than finishing one, [`Vdp::dma_clock`] spends the access slots of `slots` on
+//! it as the beam goes past them, and [`Vdp::dma_68k_stall_mclk`] is how long the
+//! 68k is frozen while one runs - the number the bus glue of M3-16 (#77) waits.
+//!
+//! Not modelled: the read FIFO quirk that makes the first word of a
+//! 68k-to-VRAM transfer wrong on real hardware (#303), and the CRAM "dots" a
+//! write during active display leaves behind (out of scope for #101).
 
 use crate::DmaMode;
 use crate::Vdp;
@@ -93,6 +98,110 @@ const fn bytes_to_move(length: u16) -> u32 {
     }
 }
 
+/// Access slots a copied byte costs: one to read the source and one to write the
+/// destination. It is why the Sega DMA bandwidth table's copy figures are half a
+/// transfer's - 9 bytes on an active H40 line out of its 18 slots, and 102 of a
+/// blank line's 205.
+const COPY_SLOTS: u8 = 2;
+
+/// Access slots one unit of a DMA costs, a unit being a word of a 68k transfer
+/// and a byte of a fill or a copy.
+///
+/// VRAM is byte wide, so its word is two writes and two slots (genvdp.txt
+/// section 8); CRAM and VSRAM are word wide and cost one (sections 9 and 10),
+/// which is the table's "the same slot counts but in words". A step of a fill is
+/// one byte, or one word of CRAM or VSRAM, and one slot; that a fill's line
+/// holds one slot *less* than a transfer's is not this function's business, it is
+/// [`Vdp::dma_slot_table`] that pays it.
+const fn slots_per_unit(mode: DmaMode, target: DataTarget) -> u8 {
+    match mode {
+        DmaMode::Mc68kTransfer => match target {
+            DataTarget::Vram => 2,
+            // A code register that names no memory still costs the slot, for the
+            // reason `Vdp::fill_step` gives for the address still moving.
+            DataTarget::Cram | DataTarget::Vsram | DataTarget::Ignored => 1,
+        },
+        DmaMode::Fill => 1,
+        DmaMode::Copy => COPY_SLOTS,
+    }
+}
+
+/// A DMA that has started and has not finished: what [`Vdp::dma_clock`] spends
+/// access slots on, one unit at a time.
+///
+/// The three differ by what a unit of theirs is, what it costs
+/// ([`slots_per_unit`]) and what it writes ([`Vdp::dma_move_unit`]).
+#[derive(Debug)]
+pub(crate) enum Running {
+    /// A 68k to VDP transfer.
+    ///
+    /// Its source words are read when the transfer starts, because
+    /// [`Vdp::advance`] has no bus to read them with and the 68k is frozen for
+    /// the whole of a transfer (genvdp.txt section 6: "the 68000 is frozen
+    /// during 68k -> VDP transfers"), so reading them all here and reading them
+    /// one a slot are the same reads in the same order. That is a promise
+    /// [`DmaBus`] carries from #101 as well: a read may not do anything that the
+    /// first of those reads would not have done.
+    ///
+    /// `words` is reversed, so that the next word to land is the one `pop`
+    /// gives rather than a `remove(0)`.
+    Transfer {
+        /// Access slots still owed before the transfer is in memory.
+        slots: u32,
+        /// Slots each word costs, from [`slots_per_unit`].
+        per_unit: u8,
+        /// The source address the transfer ends at, which is what R21/R22 come
+        /// back as when it does.
+        ends_at: u32,
+        /// The source words, the next to land last.
+        words: Vec<u16>,
+    },
+    /// A fill: `value` repeated along the address register, one slot a step. The
+    /// byte, or word, that it repeats is the data port write that started it
+    /// ([`Vdp::run_fill`]).
+    Fill { slots: u32, value: u16 },
+    /// A copy: `source` walked a byte at a time to the address register.
+    Copy { slots: u32, source: u16 },
+}
+
+impl Running {
+    /// The fill, and only the fill, pays one slot of every line to the machine:
+    /// see [`Vdp::dma_slot_table`].
+    fn is_fill(&self) -> bool {
+        matches!(self, Self::Fill { .. })
+    }
+
+    /// Access slots still owed before the last unit reaches memory.
+    fn slots(&self) -> u32 {
+        match self {
+            Self::Transfer { slots, .. } | Self::Fill { slots, .. } | Self::Copy { slots, .. } => {
+                *slots
+            }
+        }
+    }
+
+    /// One access slot spent: the transfer is a slot closer to memory.
+    fn spend_slot(&mut self) {
+        match self {
+            Self::Transfer { slots, .. } | Self::Fill { slots, .. } | Self::Copy { slots, .. } => {
+                *slots -= 1;
+            }
+        }
+    }
+
+    /// Whether the unit at the head of the DMA lands on this slot rather than on
+    /// a later one: it lands on the last of the slots it costs, because a VRAM
+    /// word is not in memory after one byte-wide slot and a copied byte is not
+    /// copied before the slot that writes it.
+    fn unit_is_due(&self) -> bool {
+        match self {
+            Self::Transfer { slots, per_unit, .. } => *slots % u32::from(*per_unit) == 0,
+            Self::Fill { .. } => true,
+            Self::Copy { slots, .. } => *slots % u32::from(COPY_SLOTS) == 0,
+        }
+    }
+}
+
 /// The source address of the next word in a 68k transfer.
 ///
 /// Add 2 to the offset, keep the block: see [`DMA_BLOCK_MASK`] and
@@ -114,8 +223,8 @@ const fn source_fields(src: u32) -> (u8, u8) {
 
 impl Vdp {
     /// Run the DMA that the last control port write asked for, whatever mode
-    /// R23 says it was: the 68k transfer and the copy run here, and the fill is
-    /// armed for [`Vdp::run_fill`] to run at the next data port write.
+    /// R23 says it was: the 68k transfer and the copy start here, and the fill is
+    /// armed for [`Vdp::run_fill`] to start at the next data port write.
     ///
     /// Called by the bus glue after every control port write, which only
     /// records the request ([`Vdp::dma_requested`]) because it has no bus to
@@ -127,21 +236,115 @@ impl Vdp {
     /// consuming: no bus read, no write, no register write-back. Leaving the
     /// request standing would let a later, permitted command carry out a
     /// transfer the game never asked for.
+    ///
+    /// Starting one is not finishing one: the transfer is recorded ([`Running`])
+    /// and its access slots pay for it afterwards, in [`Vdp::dma_clock`]. Only
+    /// the 68k words are read here, because here is the one place a DMA has a
+    /// bus - see [`Running::Transfer`] for why that has to be the case.
     pub fn run_dma(&mut self, bus: &mut impl DmaBus) {
         if !self.dma_requested {
             return;
         }
         self.dma_requested = false;
         match self.dma_mode() {
-            // A fill does not run here: it waits for the data port write that
+            // A fill does not start here: it waits for the data port write that
             // starts it (`Vdp::run_fill`). Being armed is as far as the command
             // word gets, and it is the R1 M1 bit that allows it, the same bit
             // `transfer_allowed` reads for the 68k transfer.
             DmaMode::Fill if self.dma_enabled() => self.arm_fill(),
-            DmaMode::Copy if self.dma_enabled() => self.run_copy(),
-            _ if transfer_allowed(self.dma_enabled(), self.dma_mode()) => self.run_transfer(bus),
+            DmaMode::Copy if self.dma_enabled() => self.start_copy(),
+            _ if transfer_allowed(self.dma_enabled(), self.dma_mode()) => self.start_transfer(bus),
             _ => {}
         }
+    }
+
+    /// Take over the DMA in flight with `running`.
+    ///
+    /// Whatever the port has queued reaches memory first: a DMA writes the same
+    /// memories through the same rules of M4-02 (#80) and must not overtake the
+    /// writes that were made before its own command word. And a DMA started
+    /// while one is running replaces it - a corner nothing documents, because
+    /// hardware has the 68k frozen for a transfer and tells it to keep off the
+    /// data port for the other two (status bit 1), so nobody is supposed to get
+    /// here at all.
+    fn start_running(&mut self, running: Running) {
+        self.fifo_drain();
+        self.dma = Some(running);
+        // "Bit 1 is set for the duration of a DMA operation" (genvdp.txt
+        // section 6), and the duration ends at [`Vdp::finish_dma`].
+        self.dma_busy = true;
+    }
+
+    /// Start the 68k to VDP transfer: [`Vdp::dma_source`] to the address
+    /// register, [`words_to_transfer`] of them, [`slots_per_unit`] slots a word.
+    ///
+    /// The words are all read here, for the reason [`Running::Transfer`] gives,
+    /// and land a unit at a time in [`Vdp::dma_move_unit`]. The destination
+    /// memory, its masking and the move of the address register stay the data
+    /// port rules of M4-02 (#80), applied one word per slot by
+    /// [`Vdp::write_data_now`].
+    ///
+    /// The control port latch and a fill waiting for the port are left alone: a
+    /// transfer goes to the memories without either (genvdp.txt section 7 "VDP
+    /// port access"), so a command word that was half written when the DMA
+    /// started is still half written while it runs.
+    fn start_transfer(&mut self, bus: &mut impl DmaBus) {
+        let words = words_to_transfer(self.dma_length());
+        let per_unit = slots_per_unit(DmaMode::Mc68kTransfer, data_target(self.code));
+
+        let mut source = self.dma_source();
+        let mut staged = Vec::with_capacity(words as usize);
+        for _ in 0..words {
+            staged.push(bus.read_word(source));
+            source = next_source(source);
+        }
+        // Reversed, so that the word that lands next is the one `pop` gives
+        // (`Running::Transfer`).
+        staged.reverse();
+
+        self.start_running(Running::Transfer {
+            slots: words * u32::from(per_unit),
+            per_unit,
+            ends_at: source,
+            words: staged,
+        });
+    }
+
+    /// Start the VRAM to VRAM copy: [`Vdp::dma_copy_source`] to the address
+    /// register, [`bytes_to_move`] of them, [`COPY_SLOTS`] slots a byte.
+    ///
+    /// genvdp.txt section 11 "VRAM copy" is short: "The VDP will read a byte
+    /// from the source address which is then incremented by one. The data will
+    /// then be written to the destination address, which is incremented by
+    /// register #15."
+    ///
+    /// What it does not say is that both addresses are used one byte off: the
+    /// copy reads `src ^ 1` and writes `dst ^ 1`, the same adjacent-byte rule
+    /// as the fill. Nothing in genvdp.txt covers this, so it is **inferred** -
+    /// from the ticket and from Genesis Plus GX's `vdp_dma_copy`, which reads
+    /// `READ_BYTE(vram, source ^ 1)` and writes `WRITE_BYTE(vram, addr ^ 1,
+    /// data)`. For the common set-up, where the step is 1 and the source and
+    /// destination parities match, the two readings give the same VRAM and only
+    /// the order of the writes differs; with a step of 2 they do not, and a test
+    /// pins this one.
+    ///
+    /// Starts from [`Vdp::run_dma`], straight away, because "In the case of DMA
+    /// transfer or DMA copy, the operation will start immediately after writing
+    /// this value" (plutiedev "Start DMA") - unlike the fill, which waits for
+    /// the data port.
+    ///
+    /// Only R19/R20 are written back, and only when the copy is over. Whether the
+    /// source registers move during a DMA is one of genvdp.txt's own open
+    /// questions - "Source and length registers being updated during DMA" is on
+    /// its to-do list - and Genesis Plus GX adds the whole length to R21/R22 for
+    /// every mode without convincing anybody. A game that chained copies without
+    /// reloading them would want that; if one turns up, that is the follow-up.
+    fn start_copy(&mut self) {
+        let bytes = bytes_to_move(self.dma_length());
+        self.start_running(Running::Copy {
+            slots: bytes * u32::from(COPY_SLOTS),
+            source: self.dma_copy_source(),
+        });
     }
 
     /// Arm the DMA fill that the next data port write starts.
@@ -204,6 +407,10 @@ impl Vdp {
     /// "8-bit port access"), and a byte write arrives here as that byte
     /// duplicated in both halves.
     ///
+    /// Like the other two modes this *starts* the fill rather than finishing it:
+    /// [`bytes_to_move`] steps of one access slot each go onto [`Running`] and
+    /// [`Vdp::dma_move_unit`] does them as the slots come round.
+    ///
     /// Two things about the counts, both of which the tests pin:
     ///
     /// - The length is a **byte** count here, not the word count of a 68k
@@ -225,137 +432,146 @@ impl Vdp {
             return;
         }
         self.dma_fill_pending = false;
-        // M4-22 (#101) is what will make a fill take time; until then the write
-        // that starts it is the write that finishes it.
-        self.dma_busy = false;
 
+        // One access slot a step, [`Vdp::fill_step`] being the step; the busy bit
+        // that armed the fill came from the command word and stays up until the
+        // last of those slots has been spent (`Vdp::finish_dma`).
         let steps = bytes_to_move(self.dma_length());
+        self.start_running(Running::Fill {
+            slots: steps,
+            value,
+        });
+    }
+
+    /// One step of a fill: the repeated byte, or word, one address further on.
+    ///
+    /// `addr ^ 1` is the byte on the other side of the pair the address sits in,
+    /// and the address register then moves on by R15: the two lines of the
+    /// genvdp.txt pseudocode [`Vdp::run_fill`] quotes.
+    ///
+    /// CRAM and VSRAM take the whole word every step, for the reasons that
+    /// function gives. A code register that names no memory still costs the step:
+    /// the address moves on whatever the fill wrote (Genesis Plus GX's default
+    /// case: "invalid destination does nothing ... address is still
+    /// incremented").
+    fn fill_step(&mut self, value: u16) {
         match data_target(self.code) {
             DataTarget::Vram => {
                 let byte = (value >> 8) as u8;
-                for _ in 0..steps {
-                    // `addr ^ 1` is the byte on the other side of the pair the
-                    // address sits in, and the address register then moves on by
-                    // R15: the two lines of the pseudocode quoted above.
-                    self.vram[usize::from(self.addr ^ 1)] = byte;
-                    self.addr = increment(self.addr, self.auto_increment());
-                }
+                self.vram[usize::from(self.addr ^ 1)] = byte;
+                self.addr = increment(self.addr, self.auto_increment());
             }
-            DataTarget::Cram | DataTarget::Vsram => {
-                for _ in 0..steps {
-                    self.write_target_word(value);
-                }
-            }
-            // A code register that names no memory still costs the step: the
-            // address moves on whatever the fill wrote (Genesis Plus GX's
-            // default case: "invalid destination does nothing ... address is
-            // still incremented").
+            DataTarget::Cram | DataTarget::Vsram => self.write_target_word(value),
             DataTarget::Ignored => {
-                for _ in 0..steps {
-                    self.addr = increment(self.addr, self.auto_increment());
-                }
+                self.addr = increment(self.addr, self.auto_increment());
             }
         }
-
-        // The count is spent, as it is after a 68k transfer: "After either:
-        // length regs 0" is how the ticket puts it, and the same write-back of
-        // R19/R20 is what a game that polls the DMA sees.
-        self.regs[regs::R19] = 0;
-        self.regs[regs::R20] = 0;
     }
 
-    /// Copy VRAM to VRAM: [`Vdp::dma_copy_source`] to the address register,
-    /// [`bytes_to_move`] of them, one byte per step.
+    /// The DMA's share of the beam moving on: every access slot the line gives a
+    /// DMA between `from` and `to` moves one unit of the transfer in flight.
     ///
-    /// genvdp.txt section 11 "VRAM copy" is short: "The VDP will read a byte
-    /// from the source address which is then incremented by one. The data will
-    /// then be written to the destination address, which is incremented by
-    /// register #15."
-    ///
-    /// What it does not say is that both addresses are used one byte off: the
-    /// copy reads `src ^ 1` and writes `dst ^ 1`, the same adjacent-byte rule
-    /// as the fill. Nothing in genvdp.txt covers this, so it is **inferred** -
-    /// from the ticket and from Genesis Plus GX's `vdp_dma_copy`, which reads
-    /// `READ_BYTE(vram, source ^ 1)` and writes `WRITE_BYTE(vram, addr ^ 1,
-    /// data)`. For the common set-up, where the step is 1 and the source and
-    /// destination parities match, the two readings give the same VRAM and only
-    /// the order of the writes differs; with a step of 2 they do not, and a
-    /// test pins this one.
-    ///
-    /// Runs from [`Vdp::run_dma`], straight out, because "In the case of DMA
-    /// transfer or DMA copy, the operation will start immediately after writing
-    /// this value" (plutiedev "Start DMA") - unlike the fill, which waits for
-    /// the data port.
-    ///
-    /// Only R19/R20 are written back. Whether the source registers move during a
-    /// DMA is one of genvdp.txt's own open questions - "Source and length
-    /// registers being updated during DMA" is on its to-do list - and Genesis
-    /// Plus GX adds the whole length to R21/R22 for every mode without
-    /// convincing anybody. A game that chained copies without reloading them
-    /// would want that; if one turns up, that is the follow-up.
-    fn run_copy(&mut self) {
-        let steps = bytes_to_move(self.dma_length());
-        let mut src = self.dma_copy_source();
-        for _ in 0..steps {
-            let byte = self.vram[usize::from(src ^ 1)];
-            self.vram[usize::from(self.addr ^ 1)] = byte;
-            src = src.wrapping_add(1);
-            self.addr = increment(self.addr, self.auto_increment());
+    /// Called by [`Vdp::advance`] for each segment of the line it walks, so the
+    /// slots are counted against the line the beam is standing on rather than the
+    /// one the call started in: a transfer that outlives VBlank goes from 205
+    /// slots a line to 18 part way through, which is what hardware does.
+    pub(crate) fn dma_clock(&mut self, from: u32, to: u32) {
+        let Some(running) = self.dma.as_ref() else {
+            return;
+        };
+        let fill = running.is_fill();
+        let slots = self.dma_slots_in(fill, from, to);
+        for _ in 0..slots {
+            if !self.dma_take_slot() {
+                break;
+            }
         }
+    }
 
-        self.regs[regs::R19] = 0;
-        self.regs[regs::R20] = 0;
+    /// One access slot of the DMA in flight: the unit at the head reaches memory
+    /// if this was the last of the slots it costs, and the transfer is over when
+    /// its slots run out. Whether another DMA still wants a slot is the answer.
+    fn dma_take_slot(&mut self) -> bool {
+        // Taken out rather than borrowed, so that writing memory and moving the
+        // running state on are not both borrowing `self`.
+        let Some(mut running) = self.dma.take() else {
+            return false;
+        };
+        running.spend_slot();
+        if running.unit_is_due() {
+            self.dma_move_unit(&mut running);
+        }
+        if running.slots() == 0 {
+            self.finish_dma(&running);
+            return false;
+        }
+        self.dma = Some(running);
+        true
+    }
+
+    /// One unit of `running` reaches memory: a word of a 68k transfer through the
+    /// port rules of M4-02 (#80), one step of a fill, or one byte of a copy, from
+    /// `source ^ 1` to `addr ^ 1`.
+    fn dma_move_unit(&mut self, running: &mut Running) {
+        match running {
+            Running::Transfer { words, .. } => {
+                if let Some(word) = words.pop() {
+                    self.write_data_now(word);
+                }
+            }
+            Running::Fill { value, .. } => self.fill_step(*value),
+            Running::Copy { source, .. } => {
+                let byte = self.vram[usize::from(*source ^ 1)];
+                self.vram[usize::from(self.addr ^ 1)] = byte;
+                *source = source.wrapping_add(1);
+                self.addr = increment(self.addr, self.auto_increment());
+            }
+        }
+    }
+
+    /// The last slot of `running` has been spent, so the length is spent with it
+    /// and a transfer's source registers say where it got to.
+    ///
+    /// "After either: length regs 0" is how the ticket puts the write-back of
+    /// R19/R20, which is what a game waiting for a DMA reads, and the source
+    /// moving on is genvdp.txt section 11 "DMA" and plutiedev "$93xx" to
+    /// "$96xx". Both happen on the last access slot rather than on the command
+    /// word, which is the whole point of a DMA that takes time.
+    fn finish_dma(&mut self, running: &Running) {
         self.dma_busy = false;
-    }
-
-    /// The 68k to VDP transfer itself: [`Vdp::dma_source`] to the address
-    /// register, [`words_to_transfer`] of them.
-    ///
-    /// The words arrive through [`Vdp::write_data_now`], so the destination
-    /// memory, its masking and the move of the address register are the data
-    /// port rules of M4-02 (#80) and are not restated here. It is the data port
-    /// write that skips the write FIFO of M4-21a (#99), and skips it because a
-    /// transfer is thousands of words run in one call and the FIFO is four
-    /// entries deep: what a transfer costs the bus, and what the first word of
-    /// one really reads, is M4-22 (#101).
-    fn run_transfer(&mut self, bus: &mut impl DmaBus) {
-        let words = words_to_transfer(self.dma_length());
-        let mut src = self.dma_source();
-
-        // The control port latch is not part of a DMA. Its flag is set and
-        // cleared by command port and data port accesses (genvdp.txt section 7
-        // "VDP port access"), and a transfer goes to the memories without
-        // either, so it keeps whatever it held: a command word that was half
-        // written when the DMA ran is still half written when it ends. In the
-        // flow the glue uses, a call straight after the command word, that
-        // word has just cleared the flag, so this is the same value twice.
-        let pending = self.pending;
-        // Nor is a fill left waiting by a transfer. Only a data port write
-        // starts one (genvdp.txt section 11 "VRAM fill") and these words come
-        // from the bus, so the transfer has to leave the pending fill for the
-        // next port write to find - which matters because the two modes are
-        // the same CD5 command read with a different R23, so a game can ask
-        // for one and then the other without a write in between.
-        let fill_pending = self.dma_fill_pending;
-        self.dma_fill_pending = false;
-        for _ in 0..words {
-            let value = bus.read_word(src);
-            // TODO(M4-22 #101): the first word of a 68k-to-VRAM transfer is
-            // often wrong on real hardware, because of the read FIFO, and the
-            // transfer is not instant either. Neither is modelled here.
-            self.write_data_now(value);
-            src = next_source(src);
-        }
-        self.pending = pending;
-        self.dma_fill_pending = fill_pending;
-
-        // The count is spent and the source moved on, both of which software
-        // can see (genvdp.txt section 11 "DMA"; plutiedev "$93xx" to "$96xx").
-        let (source_low, source_high) = source_fields(src);
         self.regs[regs::R19] = 0;
         self.regs[regs::R20] = 0;
-        self.regs[regs::R21] = source_low;
-        self.regs[regs::R22] = source_high;
+        if let Running::Transfer { ends_at, .. } = running {
+            let (source_low, source_high) = source_fields(*ends_at);
+            self.regs[regs::R21] = source_low;
+            self.regs[regs::R22] = source_high;
+        }
+    }
+
+    /// Master clocks the 68k is frozen for by the transfer in flight, `0` when
+    /// nothing is holding the bus: the time left until the last of the
+    /// transfer's access slots.
+    ///
+    /// "The 68000 is frozen during 68k -> VDP transfers" (genvdp.txt section 6),
+    /// and this is for how long: the bus glue of M3-16 (#77) adds it to the cycle
+    /// count of the command word that started the DMA. It is the same shape as
+    /// [`Vdp::data_port_stall_mclk`], on the other side of the same chip.
+    ///
+    /// A fill and a copy answer 0. They keep the 68k off the *data port* for
+    /// their duration, which is what status bit 1 is for, and leave it running:
+    /// the busy bit is "only useful for fills and copies, since the 68000 is
+    /// frozen during 68k -> VDP transfers" (genvdp.txt section 6).
+    ///
+    /// The time is counted along the DMA's own slot schedule one line at a time
+    /// ([`Vdp::dma_slot_table`]), so a transfer that started mid-active-line ends
+    /// where 18 slots a line put it rather than where a flat rate would.
+    pub fn dma_68k_stall_mclk(&self) -> u32 {
+        match &self.dma {
+            Some(running @ Running::Transfer { .. }) => {
+                self.dma_mclk_to_slots(running.is_fill(), running.slots())
+            }
+            Some(Running::Fill { .. } | Running::Copy { .. }) | None => 0,
+        }
     }
 }
 
@@ -433,6 +649,7 @@ mod tests {
 
         let mut bus = FakeBus::laid_at(0x000100, &[1, 2, 3, 4]);
         vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             &vdp.vram[0x1000..0x1008],
@@ -450,6 +667,7 @@ mod tests {
 
         let mut bus = FakeBus::laid_at(0x000100, &[0x0EEE, 0xFFFF, 0x1234, 0x000F]);
         vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             &vdp.cram[0..4],
@@ -466,6 +684,7 @@ mod tests {
 
         let mut bus = FakeBus::laid_at(0x000100, &[0x0102, 0x03FF]);
         vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(&vdp.vsram[0..2], [0x0102, 0x03FF]);
     }
@@ -482,6 +701,7 @@ mod tests {
         bus.words.push((0x0003_FFFE, 0x1111));
         bus.words.push((0x0002_0000, 0x2222));
         vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             bus.reads,
@@ -561,6 +781,7 @@ mod tests {
 
         let mut bus = FakeBus::laid_at(0x000100, &[1, 2, 3, 4]);
         vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             (vdp.reg(19), vdp.reg(20)),
@@ -577,6 +798,7 @@ mod tests {
 
         let mut bus = FakeBus::laid_at(0x000100, &[1, 2, 3, 4]);
         vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             (vdp.reg(21), vdp.reg(22), vdp.reg(23)),
@@ -593,6 +815,7 @@ mod tests {
 
         let mut bus = FakeBus::default();
         vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             (vdp.reg(21), vdp.reg(22)),
@@ -637,6 +860,7 @@ mod tests {
 
         let mut bus = FakeBus::laid_at(0x000100, &[1, 2, 3, 4]);
         vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             &vdp.vram[0x2000..0x2008],
@@ -738,6 +962,27 @@ mod tests {
         );
     }
 
+    /// Give the beam the clocks the DMA it has just started is made of, so that a
+    /// test can look at the memory it finished in.
+    ///
+    /// Since M4-22 (#101) a DMA runs one access slot at a time rather than inside
+    /// the call that started it, so the instant-DMA tests of #85 and #86 have to
+    /// advance. These are all a handful of words: a line of slots with the
+    /// display off, and four of them is more than enough of a margin.
+    fn run_dma_to_end(vdp: &mut Vdp) {
+        for _ in 0..4 {
+            if vdp.dma.is_none() {
+                return;
+            }
+            vdp.advance(MCLKS_PER_LINE);
+        }
+        assert!(
+            vdp.dma.is_none(),
+            "these tests move a handful of words, not four lines of slots"
+        );
+    }
+
+
     /// A 68k transfer writes the memories, not the data port, so it does not
     /// run a fill that is already waiting for a port write: "Any write to the
     /// data port will then start a VRAM fill" (genvdp.txt section 11 "VRAM
@@ -760,6 +1005,7 @@ mod tests {
         start_dma(&mut vdp, vram_write_cmd(0x3000));
         let mut bus = FakeBus::laid_at(0x000100, &[0x1111, 0x2222]);
         vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             &vdp.vram[0x3000..0x3004],
@@ -792,6 +1038,7 @@ mod tests {
         start_and_run(&mut vdp, vram_write_cmd(0x2000));
 
         vdp.write_data(0xAB00);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             &vdp.vram[0x2000..0x2006],
@@ -811,6 +1058,7 @@ mod tests {
         start_and_run(&mut vdp, vram_write_cmd(0x2000));
 
         vdp.write_data(0xAB00);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             &vdp.vram[0x2000..0x200A],
@@ -827,6 +1075,7 @@ mod tests {
         assert_eq!((vdp.reg(19), vdp.reg(20)), (4, 0));
 
         vdp.write_data(0xAB00);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             (vdp.reg(19), vdp.reg(20)),
@@ -843,6 +1092,7 @@ mod tests {
         start_and_run(&mut vdp, cram_write_cmd(0x0000));
 
         vdp.write_data(0x1234);
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             &vdp.cram[0..5],
@@ -859,6 +1109,7 @@ mod tests {
         copy_source(&mut vdp, 0x0100);
 
         start_and_run(&mut vdp, copy_write_cmd(0x0200));
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             &vdp.vram[0x0200..0x0204],
@@ -876,6 +1127,7 @@ mod tests {
         copy_source(&mut vdp, 0x0100);
 
         start_and_run(&mut vdp, copy_write_cmd(0x0200));
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             &vdp.vram[0x0200..0x0208],
@@ -892,6 +1144,7 @@ mod tests {
         assert_eq!((vdp.reg(19), vdp.reg(20)), (4, 0));
 
         start_and_run(&mut vdp, copy_write_cmd(0x0200));
+        run_dma_to_end(&mut vdp);
 
         assert_eq!(
             (vdp.reg(19), vdp.reg(20)),
@@ -907,5 +1160,303 @@ mod tests {
         assert_eq!(bytes_to_move(1), 1);
         assert_eq!(bytes_to_move(4), 4);
         assert_eq!(bytes_to_move(0xFFFF), 0xFFFF);
+    }
+
+    // ---- timing, busy and the 68k stall (M4-22, #101) ----
+
+    use crate::hv::MCLKS_PER_LINE;
+
+    /// The beam at the head of an active H40 line, display on and DMA allowed,
+    /// with a `words`-word 68k-to-VRAM transfer armed and the command word
+    /// written: the state a mid-frame transfer is started in, which is the one
+    /// the DMA bandwidth table measures against the 18 slots an active line
+    /// leaves free.
+    ///
+    /// The bus is `laid_at` the source with 0x1000, 0x1001, ... so a word of the
+    /// transfer can be recognised in VRAM by its own value.
+    fn transfer_on_the_active_h40_display(words: u16) -> (Vdp, FakeBus) {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(12, 0x81);
+        dma_from(&mut vdp, 0x000100, words);
+        // R1 again, with bit 6 (DISP) up alongside the M1 `dma_from` set: with
+        // the display off the transfer would be timed against a blank line.
+        vdp.write_register(1, 0x50);
+        vdp.in_hblank = false;
+        vdp.in_vblank = false;
+        start_dma(&mut vdp, vram_write_cmd(0x2000));
+
+        let source: Vec<u16> = (0..words).map(|index| 0x1000 + index).collect();
+        let bus = FakeBus::laid_at(0x000100, &source);
+        (vdp, bus)
+    }
+
+    /// The beam at the head of a line in VBlank in H40, display on: the 205
+    /// slots of a blank line, which is what a VBlank transfer is timed against.
+    fn h40_in_vblank() -> Vdp {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(12, 0x81);
+        vdp.in_vblank = true;
+        vdp
+    }
+
+    /// A 68k-to-VRAM transfer is 2 access slots a word over the 18 an active H40
+    /// line leaves free, so 100 words are 200 slots and eighteen of them a line
+    /// is [`ceil(200 / 18)`] = twelve lines: the ticket's first timing test, and
+    /// the reason `run_dma` no longer finishes anything.
+    #[test]
+    fn a_hundred_word_transfer_over_the_active_display_is_twelve_lines() {
+        let (mut vdp, mut bus) = transfer_on_the_active_h40_display(100);
+        vdp.run_dma(&mut bus);
+
+        assert_eq!(
+            bus.reads.len(),
+            100,
+            "the source is read once, at the moment the transfer starts"
+        );
+        assert!(
+            vdp.vram[0x2000..0x20C8].iter().all(|&byte| byte == 0),
+            "and nothing has been written yet: the words are on the DMA, waiting for slots"
+        );
+        assert!(
+            vdp.dma_68k_stall_mclk() > 0,
+            "and the 68k is frozen for the whole of it"
+        );
+
+        // Five lines is 90 of the slots, which is 45 of the words: the transfer
+        // is slow, and "some games depend on the DMA being slow" (genvdp.txt
+        // section 11) is about VRAM being half-written while it runs.
+        for _ in 0..5 {
+            vdp.advance(MCLKS_PER_LINE);
+        }
+        assert_eq!(
+            &vdp.vram[0x2058..0x205A],
+            [0x10, 0x2C],
+            "the 45th word, 0x102C, is in"
+        );
+        assert_eq!(
+            &vdp.vram[0x205A..0x205C],
+            [0, 0],
+            "and the 46th is not: it is the next two slots that put it there"
+        );
+
+        let mut lines = 5;
+        while vdp.dma_68k_stall_mclk() != 0 {
+            vdp.advance(MCLKS_PER_LINE);
+            lines += 1;
+            assert!(lines < 40, "twelve was expected, not {}", lines);
+        }
+
+        assert_eq!(
+            lines, 12,
+            "ceil(200 / 18): the twelfth line counting the one it started on"
+        );
+        assert!(!vdp.dma_busy, "and the busy bit comes down with it");
+        assert_eq!(
+            &vdp.vram[0x20C6..0x20C8],
+            [0x10, 0x63],
+            "the last of the hundred words, at the end of 200 slots"
+        );
+        assert_eq!(
+            (vdp.reg(19), vdp.reg(20)),
+            (0, 0),
+            "the length is spent when the last slot is, not when the command word is"
+        );
+    }
+
+    /// The same hundred words in VBlank: a blank H40 line offers 205 of the 200
+    /// slots the transfer owes, so it is over inside the line it started on.
+    #[test]
+    fn a_hundred_word_transfer_in_vblank_fits_inside_one_line() {
+        let mut vdp = h40_in_vblank();
+        dma_from(&mut vdp, 0x000100, 100);
+        vdp.write_register(1, 0x50);
+        start_dma(&mut vdp, vram_write_cmd(0x2000));
+
+        let source: Vec<u16> = (0..100).map(|index| 0x1000 + index).collect();
+        let mut bus = FakeBus::laid_at(0x000100, &source);
+        vdp.run_dma(&mut bus);
+
+        let stall = vdp.dma_68k_stall_mclk();
+        assert!(
+            stall > 0 && stall < MCLKS_PER_LINE,
+            "one line of blanking, not more: {stall} of {MCLKS_PER_LINE}"
+        );
+        vdp.advance(stall - 1);
+        assert!(vdp.dma_busy, "one clock short of the last slot of the last word");
+        vdp.advance(1);
+        assert!(!vdp.dma_busy, "and on that clock the transfer is done");
+        assert_eq!(vdp.line, 0, "inside the line it started on");
+        assert_eq!(
+            &vdp.vram[0x20C6..0x20C8],
+            [0x10, 0x63],
+            "every word of it in VRAM"
+        );
+    }
+
+    /// Status bit 1 is "set for the duration of a DMA operation ... only useful
+    /// for fills and copies" (genvdp.txt section 6), and a duration is what a
+    /// slot-timed DMA has: 300 bytes of fill is two lines of a blank H32 line's
+    /// 166, so the bit is up between them and down after.
+    #[test]
+    fn the_fill_is_busy_for_as_long_as_its_slots_take() {
+        let mut vdp = Vdp::new(false);
+        dma_set_up(&mut vdp, FILL, 300, 1);
+        start_and_run(&mut vdp, vram_write_cmd(0x2000));
+        assert!(vdp.dma_busy, "armed by the command word, as before");
+
+        vdp.write_data(0xAB00);
+        assert!(vdp.dma_busy, "the fill has started, not finished");
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(
+            vdp.dma_busy,
+            "166 slots of a blank H32 line is not 300 bytes of fill"
+        );
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(!vdp.dma_busy, "and two lines of them is");
+        assert_eq!(
+            (vdp.reg(19), vdp.reg(20)),
+            (0, 0),
+            "the count is spent on the last slot, not on the write that started it"
+        );
+        assert_eq!(
+            vdp.read_status() & (1 << 1),
+            0,
+            "and status bit 1 follows it down"
+        );
+    }
+
+    /// "The 68000 is frozen during 68k -> VDP transfers" (genvdp.txt section 6),
+    /// which is what [`Vdp::dma_68k_stall_mclk`] reports and which a fill and a
+    /// copy do not do: they hold the data port through the busy bit and nobody
+    /// else at all.
+    #[test]
+    fn only_a_transfer_holds_the_68k() {
+        let (mut vdp, mut bus) = transfer_on_the_active_h40_display(4);
+        vdp.run_dma(&mut bus);
+        assert!(
+            vdp.dma_68k_stall_mclk() > 0,
+            "right after the command word the bus is taken"
+        );
+
+        let mut fill = Vdp::new(false);
+        dma_set_up(&mut fill, FILL, 4, 1);
+        start_and_run(&mut fill, vram_write_cmd(0x2000));
+        fill.write_data(0xAB00);
+        assert!(fill.dma_busy, "the fill is running,");
+        assert_eq!(
+            fill.dma_68k_stall_mclk(),
+            0,
+            "but it is not the 68k's to wait for"
+        );
+
+        let mut copy = Vdp::new(false);
+        dma_set_up(&mut copy, COPY, 4, 1);
+        copy_source(&mut copy, 0x0100);
+        start_and_run(&mut copy, copy_write_cmd(0x0200));
+        assert!(copy.dma_busy, "and a copy runs, busy,");
+        assert_eq!(copy.dma_68k_stall_mclk(), 0, "and holds the 68k for nothing");
+    }
+
+    /// A copy moves one byte per *two* slots - one to read the source and one to
+    /// write the destination - so the Sega table's 102 bytes are the 204 of the
+    /// 205 a blank H40 line offers, and fit inside it exactly.
+    #[test]
+    fn a_copy_of_102_bytes_in_h40_vblank_is_one_line() {
+        let mut vdp = h40_in_vblank();
+        for (offset, byte) in vdp.vram[0x0100..0x0166].iter_mut().enumerate() {
+            *byte = offset as u8 + 1;
+        }
+        dma_set_up(&mut vdp, COPY, 102, 1);
+        copy_source(&mut vdp, 0x0100);
+        start_and_run(&mut vdp, copy_write_cmd(0x0200));
+        assert!(vdp.dma_busy, "the copy is running");
+
+        vdp.advance(MCLKS_PER_LINE);
+
+        assert!(
+            !vdp.dma_busy,
+            "102 bytes x 2 slots is 204 of a blank H40 line's 205"
+        );
+        assert_eq!(vdp.vram[0x0200], 1, "the first byte across");
+        assert_eq!(
+            vdp.vram[0x0200 + 101],
+            102,
+            "and the last, all of it inside the one line"
+        );
+    }
+
+    /// The other half of the same measurement: one byte more is 206 slots, which
+    /// does not fit a blank H40 line, so the copy runs into the next one.
+    #[test]
+    fn a_copy_of_103_bytes_does_not_fit_in_that_line() {
+        let mut vdp = h40_in_vblank();
+        dma_set_up(&mut vdp, COPY, 103, 1);
+        copy_source(&mut vdp, 0x0100);
+        start_and_run(&mut vdp, copy_write_cmd(0x0200));
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(vdp.dma_busy, "206 slots is two lines of 205");
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(!vdp.dma_busy, "and two lines of them is enough");
+    }
+
+    /// The slot budget of a line is the Sega DMA bandwidth table read in slots
+    /// rather than in bytes: 18 of them on an active H40 line and 205 on a blank
+    /// one, 16 and 167 in H32, and one less in every column for a fill - 17,
+    /// 204, 15 and 166. With a unit costing 2 slots for a VRAM word and a
+    /// copied byte and 1 for a CRAM or VSRAM word ([`slots_per_unit`]), those
+    /// are the table's 18 / 205, 17 / 204, 9 / 102 and 16 / 167, 15 / 166,
+    /// 8 / 83.
+    #[test]
+    fn the_dma_line_budget_is_the_bandwidth_table() {
+        let mut active = Vdp::new(false);
+        active.write_register(1, 0x40);
+        active.write_register(12, 0x81);
+        assert_eq!(active.dma_slot_table(false).len(), 18, "active H40");
+        assert_eq!(active.dma_slot_table(true).len(), 17, "and a fill, one less");
+
+        active.write_register(12, 0x00);
+        assert_eq!(active.dma_slot_table(false).len(), 16, "active H32");
+        assert_eq!(active.dma_slot_table(true).len(), 15, "and a fill, one less");
+
+        let mut blank = h40_in_vblank();
+        assert_eq!(blank.dma_slot_table(false).len(), 205, "blank H40");
+        assert_eq!(blank.dma_slot_table(true).len(), 204, "and a fill, one less");
+
+        blank.write_register(12, 0x00);
+        assert_eq!(blank.dma_slot_table(false).len(), 167, "blank H32");
+        assert_eq!(blank.dma_slot_table(true).len(), 166, "and a fill, one less");
+
+        assert_eq!(
+            Vdp::new(false).dma_slot_table(false).len(),
+            167,
+            "a line with the display off is a blank one: nothing is being fetched"
+        );
+    }
+
+    /// Two slots for the VRAM word of a 68k transfer, because VRAM is byte wide
+    /// (genvdp.txt section 8), and two for a copied byte, because a copy reads
+    /// as well as writes. One for a CRAM or VSRAM word, which are word wide
+    /// (sections 9 and 10), and one for a fill step.
+    #[test]
+    fn a_unit_costs_what_its_memory_costs() {
+        assert_eq!(
+            slots_per_unit(DmaMode::Mc68kTransfer, DataTarget::Vram),
+            2,
+            "a 68k transfer of VRAM words: 9 of them an active H40 line, which is the table's 18 bytes"
+        );
+        assert_eq!(
+            slots_per_unit(DmaMode::Mc68kTransfer, DataTarget::Cram),
+            1,
+            "CRAM and VSRAM are the same slot counts in words"
+        );
+        assert_eq!(slots_per_unit(DmaMode::Mc68kTransfer, DataTarget::Vsram), 1);
+        assert_eq!(slots_per_unit(DmaMode::Fill, DataTarget::Vram), 1);
+        assert_eq!(
+            slots_per_unit(DmaMode::Copy, DataTarget::Vram),
+            2,
+            "read and write: the table's 9 bytes an active H40 line out of 18 slots"
+        );
     }
 }

@@ -185,6 +185,96 @@ impl Vdp {
         if self.h40() { &ACTIVE_H40 } else { &ACTIVE_H32 }
     }
 
+    /// The access slots a DMA is given for the line the beam is on.
+    ///
+    /// Two differences from the port's schedule of [`Vdp::free_slot_indices`],
+    /// and both are the Sega DMA bandwidth table's:
+    ///
+    /// * the table is a property of the *line*, not of the point the beam has
+    ///   reached. An active line has [`ACTIVE_H40`] free slots for the whole of
+    ///   itself - the scroll fetches out in its blanking are fetches like any
+    ///   other - which is why the table quotes 18 bytes a line for a transfer
+    ///   with the display on and 205 with it off. Choosing on `in_hblank` the way
+    ///   the port does would hand an active line's blanking slots to a DMA as
+    ///   well and turn 18 into 46;
+    /// * a fill pays one slot of every line and moves nothing: 17 and 15 active,
+    ///   204 and 166 blank, one short of the transfer in all four columns.
+    ///   Nothing says where in the line that slot goes, so it is the first one
+    ///   and the four counts come out right. INFERRED - see the module note,
+    ///   TODO(#101).
+    ///
+    /// A line with the display off is a blank one here: nothing is being fetched
+    /// so [`BLANK_H40`] is the schedule, which is the same reading
+    /// [`Vdp::fifo_clock`] makes. Hardware charges a little more for it -
+    /// [`OFF_TRANSFERS_H40`]'s 198 rather than 205 - and #302 is where that is
+    /// paid.
+    pub(crate) fn dma_slot_table(&self, fill: bool) -> &'static [u16] {
+        let line = if self.in_vblank || !self.display_enabled() {
+            if self.h40() {
+                &BLANK_H40 as &[u16]
+            } else {
+                &BLANK_H32
+            }
+        } else if self.h40() {
+            &ACTIVE_H40 as &[u16]
+        } else {
+            &ACTIVE_H32
+        };
+        if fill {
+            &line[1..]
+        } else {
+            line
+        }
+    }
+
+    /// How many of the DMA's access slots the master clocks in `(from, to]` of
+    /// the current line take: `to` is the beam's next clock and never past the
+    /// end of the line, because [`Vdp::advance`] runs the DMA one segment of a
+    /// line at a time.
+    pub(crate) fn dma_slots_in(&self, fill: bool, from: u32, to: u32) -> u32 {
+        let h40 = self.h40();
+        u32::try_from(
+            self.dma_slot_table(fill)
+                .iter()
+                .filter(|&&slot| {
+                    let at = slot_mclk(usize::from(slot), h40);
+                    at > from && at <= to
+                })
+                .count(),
+        )
+        .expect("a line has at most 210 slots")
+    }
+
+    /// Master clocks from the beam to the `slots`th DMA access slot in front of
+    /// it, over as many lines as it takes: how long a transfer of `slots` still
+    /// has to run, and so how long the 68k stays frozen
+    /// ([`Vdp::dma_68k_stall_mclk`]).
+    pub(crate) fn dma_mclk_to_slots(&self, fill: bool, slots: u32) -> u32 {
+        let table = self.dma_slot_table(fill);
+        let h40 = self.h40();
+        let mut left = slots;
+        let mut from = self.line_mclk;
+        let mut clocks = 0;
+        loop {
+            let mut ahead = 0;
+            for &slot in table {
+                let at = slot_mclk(usize::from(slot), h40);
+                if at <= from {
+                    continue;
+                }
+                ahead += 1;
+                if ahead == left {
+                    return clocks + (at - from);
+                }
+            }
+            // Every slot this line had is spent on it: carry the rest of the
+            // transfer, and the rest of the line's clocks, into the next one.
+            left -= ahead;
+            clocks += MCLKS_PER_LINE - from;
+            from = 0;
+        }
+    }
+
     /// Master clocks from the beam to the `slots`th free access slot in front of
     /// it, counting over as many lines as it takes.
     ///
