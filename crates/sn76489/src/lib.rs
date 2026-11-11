@@ -1,12 +1,12 @@
 //! SN76489 programmable sound generator (PSG).
 //!
-//! What lives here today is the register interface and the three square wave
-//! tone channels of M5-01 (#105): the latch/data byte decoder that owns the
-//! eight registers (`write`), the 4-bit attenuation with its 2 dB-per-step
-//! table, and the per-channel tone generator that turns one /16 clock tick into
-//! a signed sample (`clock`). The noise channel of M5-02 (#106) and the
-//! resampling and mixing of M5-14 are not here yet, so channel 3 is a tone
-//! channel and `clock` returns the raw sum of the four.
+//! What lives here today is the register interface, the three square wave tone
+//! channels of M5-01 (#105) and the noise channel of M5-02 (#106): the
+//! latch/data byte decoder that owns the eight registers (`write`), the 4-bit
+//! attenuation with its 2 dB-per-step table, the per-channel tone generator and
+//! the 16-bit noise shift register that together turn one /16 clock tick into a
+//! signed sample (`clock`). The resampling and mixing of M5-14 are not here
+//! yet, so `clock` returns the raw sum of the four channels.
 //!
 //! Citations are to the SMS Power "SN76489" development document
 //! (<https://www.smspower.org/Development/SN76489>) by section name, and to the
@@ -17,6 +17,34 @@
 /// The four channels of the chip: three tone, plus the noise channel that
 /// shares channel 3's output.
 const CHANNELS: usize = 4;
+
+/// Channel whose output pin the noise generator drives and whose tone register
+/// it shares: `1 1 0 dddd` is a write to both, and the chip cannot tell them
+/// apart (SMS Power "SN76489", noise).
+const NOISE_CHANNEL: usize = 3;
+
+/// Channel whose tone period becomes the noise shift period when the noise
+/// control register selects shift rate 3 (#106).
+const NOISE_RATE_TONE_CHANNEL: usize = 2;
+
+/// Bit 2 of the noise control register: 1 for white noise, 0 for periodic noise
+/// (SMS Power "SN76489", noise).
+const NOISE_WHITE_BIT: u8 = 0b100;
+
+/// The noise control register is three bits: `N H H`.
+const NOISE_CONTROL_BITS: u8 = 0b111;
+
+/// Shift period of noise shift rates 0, 1 and 2; rate 3 takes
+/// [`NOISE_RATE_TONE_CHANNEL`]'s tone period instead (#106).
+const NOISE_SHIFT_PERIODS: [u16; 3] = [0x10, 0x20, 0x40];
+
+/// White noise feedback taps: bits 0 and 3. The Genesis part uses the same bit
+/// pattern as the SMS and Game Gear parts (SMS Power "SN76489", change log).
+const NOISE_WHITE_TAPS: u16 = 0x0009;
+
+/// What every write to the noise register leaves in the shift register, and so
+/// the state the noise cycle is measured from (#106).
+const NOISE_RESET: u16 = 0x8000;
 
 /// Bit 7 of a write: set means the byte latches channel and register type.
 const LATCH_BIT: u8 = 0x80;
@@ -107,9 +135,82 @@ impl Channel {
     /// wave-shaped real one - the chip's output "is centred around zero" and
     /// the leakage that shapes the real wave is out of scope (SMS Power
     /// "SN76489", output), and the mixer removes the DC either way.
-    fn output(self) -> i16 {
+    /// The channel's sample for an explicit output bit: the two levels of the
+    /// pin are plus and minus the attenuation level. Channel 3 uses this with
+    /// the noise bit once [`Sn76489::noise_connected`] has connected the noise
+    /// generator to its output.
+    fn level(self, high: bool) -> i16 {
         let level = VOLUME_TABLE[usize::from(self.attenuation)];
-        if self.high { level } else { -level }
+        if high { level } else { -level }
+    }
+}
+
+/// The noise generator: a 16-bit shift register clocked by its own divider, and
+/// the three-bit control register that sets its feedback and its shift rate.
+#[derive(Clone, Copy, Debug)]
+struct Noise {
+    /// The noise control register: bit 2 = 1 white / 0 periodic, bits 1-0 =
+    /// shift rate, as written by `1 1 0 dddd`.
+    control: u8,
+    /// The shift register; bit 0 is the output.
+    lfsr: u16,
+    /// Ticks left before the divider flips, counted the way [`Channel::counter`]
+    /// is.
+    counter: u16,
+    /// The divider's output bit; the shift register moves on its low to high
+    /// transition.
+    high: bool,
+}
+
+impl Noise {
+    /// The power-on state: a zero control register, which is periodic noise at
+    /// the slowest shift rate (SMS Power "SN76489": the Sega integrated part
+    /// starts with zeroes in the noise registers). The value of the shift
+    /// register is not specified anywhere and is not observable, because channel
+    /// 3 does not carry the noise generator until its register has been written
+    /// and that write reloads it with [`NOISE_RESET`].
+    const POWER_ON: Self = Self {
+        control: 0,
+        lfsr: NOISE_RESET,
+        counter: 0,
+        high: false,
+    };
+
+    /// Whether the control register selects white noise.
+    fn white(self) -> bool {
+        self.control & NOISE_WHITE_BIT != 0
+    }
+
+    /// The output bit: bit 0 of the shift register.
+    fn bit(self) -> bool {
+        self.lfsr & 1 != 0
+    }
+
+    /// Advance the divider by one /16 tick. It flips like a tone channel does,
+    /// and the shift register moves on the flip to high only, so a divider
+    /// period of N shifts the register once every 2N ticks (#106).
+    fn tick(&mut self, period: u16) {
+        if self.counter == 0 {
+            self.counter = period - 1;
+            self.high = !self.high;
+            if self.high {
+                self.shift();
+            }
+        } else {
+            self.counter -= 1;
+        }
+    }
+
+    /// One shift of the register: white noise feeds back the parity of
+    /// [`NOISE_WHITE_TAPS`], periodic noise feeds back bit 0 unchanged, and
+    /// either way the feedback enters at bit 15 (#106).
+    fn shift(&mut self) {
+        let feedback = if self.white() {
+            (self.lfsr & NOISE_WHITE_TAPS).count_ones() as u16 & 1
+        } else {
+            self.lfsr & 1
+        };
+        self.lfsr = (self.lfsr >> 1) | (feedback << 15);
     }
 }
 
@@ -143,6 +244,19 @@ impl Latch {
 pub struct Sn76489 {
     channels: [Channel; CHANNELS],
     latch: Latch,
+    noise: Noise,
+    /// Whether channel 3's output pin carries the noise generator rather than
+    /// channel 3's tone generator. Writing the shared channel 3 register
+    /// connects it (SMS Power "SN76489", noise).
+    ///
+    /// INFERRED: nothing in the ticket or the retrieved facts says what, if
+    /// anything, disconnects it again, so nothing does - a write that intends
+    /// channel 3's tone period is indistinguishable from one that intends the
+    /// noise control, and this model picks the noise generator for both. The
+    /// chip has one register and two consumers, so the alternative reading is
+    /// that both are mixed. TODO(#106): pin on hardware or on a PSG test ROM,
+    /// filed as #323.
+    noise_connected: bool,
 }
 
 impl Sn76489 {
@@ -152,13 +266,24 @@ impl Sn76489 {
         Self {
             channels: [Channel::POWER_ON; CHANNELS],
             latch: Latch::POWER_ON,
+            noise: Noise::POWER_ON,
+            noise_connected: false,
         }
     }
 
-    /// The tone period of `channel` as written, all 10 bits (channel 3 is the
-    /// shared tone/noise register until #106 gives it a mode of its own).
+    /// The tone period of `channel` as written, all 10 bits.
+    ///
+    /// Channel 3 has one register shared by the tone period and the noise
+    /// control, so for `channel == 3` this is that raw shared register: the low
+    /// nibble of every noise write lands in it, exactly as it does in the chip.
     pub fn tone_period(&self, channel: usize) -> u16 {
         self.channels[channel].tone
+    }
+
+    /// The noise control register: bit 2 = 1 white / 0 periodic noise, bits 1-0
+    /// = shift rate.
+    pub fn noise_control(&self) -> u8 {
+        self.noise.control
     }
 
     /// The attenuation code of `channel`, 0 loudest to 15 silent.
@@ -168,7 +293,17 @@ impl Sn76489 {
 
     /// The signed sample `channel` is driving into the sum right now.
     pub fn channel_output(&self, channel: usize) -> i16 {
-        self.channels[channel].output()
+        self.channels[channel].level(self.output_bit(channel))
+    }
+
+    /// The output bit `channel` is driving. For channel 3 that is the noise
+    /// shift register once the noise register has been written (#106).
+    fn output_bit(&self, channel: usize) -> bool {
+        if channel == NOISE_CHANNEL && self.noise_connected {
+            self.noise.bit()
+        } else {
+            self.channels[channel].high
+        }
     }
 
     /// Write one byte to the PSG data port.
@@ -186,12 +321,12 @@ impl Sn76489 {
     /// a complete period as far as the tone generator is concerned (SMS Power
     /// "SN76489", register writes, "tones update immediately after latch byte").
     ///
-    /// TODO(#106): channel 3 has one register shared by the tone period and the
-    /// noise control, and once noise exists a data byte under a channel 3 latch
-    /// writes the low four bits of the noise control instead of the high six bits
-    /// of a period - and it is not ignored, which is how "Micro Machines" gets
-    /// its noise right (SMS Power "SN76489", change log). Until then channel 3
-    /// is a tone channel and follows the tone rule.
+    /// Channel 3's register is shared by its tone period and the noise control,
+    /// so a write to it is a write to both: the chip has no way to tell them
+    /// apart, and a data byte under a channel 3 latch updates the low four bits
+    /// of the noise control as well as the high six of the period. That data
+    /// byte is not ignored - "Micro Machines" depends on it (SMS Power
+    /// "SN76489", change log).
     pub fn write(&mut self, value: u8) {
         if value & LATCH_BIT != 0 {
             self.write_latch_byte(value);
@@ -209,11 +344,14 @@ impl Sn76489 {
             volume: value & VOLUME_BIT != 0,
         };
         let nibble = value & 0x0F;
-        let channel = &mut self.channels[self.latch.channel];
+        let channel = self.latch.channel;
         if self.latch.volume {
-            channel.attenuation = nibble;
-        } else {
-            channel.tone = (channel.tone & !0x0F) | u16::from(nibble);
+            self.channels[channel].attenuation = nibble;
+            return;
+        }
+        self.channels[channel].tone = (self.channels[channel].tone & !0x0F) | u16::from(nibble);
+        if channel == NOISE_CHANNEL {
+            self.write_noise(nibble);
         }
     }
 
@@ -221,11 +359,39 @@ impl Sn76489 {
     /// the last latch byte named: the high six bits of a tone period, the low
     /// four bits of a volume (SMS Power "SN76489", register writes).
     fn write_data_byte(&mut self, value: u8) {
-        let channel = &mut self.channels[self.latch.channel];
+        let channel = self.latch.channel;
         if self.latch.volume {
-            channel.attenuation = value & 0x0F;
-        } else {
-            channel.tone = (channel.tone & 0x000F) | (u16::from(value & 0x3F) << 4);
+            self.channels[channel].attenuation = value & 0x0F;
+            return;
+        }
+        self.channels[channel].tone =
+            (self.channels[channel].tone & 0x000F) | (u16::from(value & 0x3F) << 4);
+        if channel == NOISE_CHANNEL {
+            self.write_noise(value & 0x0F);
+        }
+    }
+
+    /// Write the noise control register and reset the shift register to
+    /// [`NOISE_RESET`] (#106). Only the low three bits are the register; bit 3
+    /// of the nibble is not part of it.
+    ///
+    /// INFERRED: neither the ticket nor the retrieved facts say whether a write
+    /// also restarts the shift divider, so the divider keeps running and only
+    /// the register is reloaded. TODO(#106): pin on hardware or on a PSG test
+    /// ROM, filed as #323.
+    fn write_noise(&mut self, control: u8) {
+        self.noise.control = control & NOISE_CONTROL_BITS;
+        self.noise.lfsr = NOISE_RESET;
+        self.noise_connected = true;
+    }
+
+    /// How often the noise divider reloads: one of [`NOISE_SHIFT_PERIODS`], or
+    /// the tone period of [`NOISE_RATE_TONE_CHANNEL`] for shift rate 3 (#106).
+    /// At least 1 for the reason given on [`Channel::tick`].
+    fn noise_shift_period(&self) -> u16 {
+        match self.noise.control & 0b11 {
+            3 => self.channels[NOISE_RATE_TONE_CHANNEL].tone.max(1),
+            rate => NOISE_SHIFT_PERIODS[usize::from(rate)],
         }
     }
 
@@ -233,10 +399,14 @@ impl Sn76489 {
     /// 16, about 223722 Hz (SMS Power "SN76489", tone generator) - and return
     /// the summed output of the four channels.
     pub fn clock(&mut self) -> i16 {
+        let period = self.noise_shift_period();
+        self.noise.tick(period);
+
         let mut sum = 0i16;
-        for channel in &mut self.channels {
-            channel.tick();
-            sum += channel.output();
+        for channel in 0..CHANNELS {
+            self.channels[channel].tick();
+            let bit = self.output_bit(channel);
+            sum += self.channels[channel].level(bit);
         }
         sum
     }
@@ -433,6 +603,16 @@ mod tests {
         }
     }
 
+    /// `clock` is the sum of the four channels, with every channel pinned: the
+    /// three tone channels at full scale and channel 3 on the noise generator.
+    ///
+    /// This test of #105 used to expect plus or minus four times
+    /// `VOLUME_TABLE[0]` on every tick, which asked channel 3 to keep being a
+    /// tone channel. It cannot: the noise control register is channel 3's tone
+    /// register, so the `set_tone(_, 3, _)` below is a write to the noise
+    /// register, and that connects the noise generator to channel 3's output for
+    /// the life of the chip (#106). Measured before the change: 16382 where
+    /// 32764 was expected.
     #[test]
     fn clock_returns_the_sum_of_the_channels() {
         let mut psg = Sn76489::new();
@@ -441,13 +621,30 @@ mod tests {
             set_tone(&mut psg, ch, 1);
         }
 
-        let mut previous = psg.clock();
-        assert_eq!(previous.abs(), 4 * VOLUME_TABLE[0]);
-        for _ in 0..7 {
+        // Power-on output bit low for every channel, and channel 3 is the noise
+        // bit 0 of the shift register the last write left at 0x8000.
+        let mut tone = -VOLUME_TABLE[0];
+        let noise = -VOLUME_TABLE[0];
+
+        for _ in 0..8 {
             let sample = psg.clock();
-            assert_eq!(sample.abs(), 4 * VOLUME_TABLE[0]);
-            assert_eq!(sample, -previous);
-            previous = sample;
+
+            assert_eq!(
+                sample,
+                (0..CHANNELS).map(|ch| psg.channel_output(ch)).sum::<i16>(),
+                "clock is not the sum of the channels"
+            );
+
+            tone = -tone;
+            for ch in 0..3 {
+                assert_eq!(psg.channel_output(ch), tone, "tone channel {ch}");
+            }
+
+            assert_eq!(
+                psg.channel_output(3),
+                noise,
+                "channel 3 is on the noise generator, not on the tone period it was written as"
+            );
         }
     }
 
@@ -467,5 +664,187 @@ mod tests {
             assert_eq!(psg.tone_period(ch), 0);
             assert_eq!(psg.channel_output(ch), 0);
         }
+    }
+
+    // Noise channel (#106).
+
+    /// Longest wait for the noise shift register to move before a test gives up:
+    /// the slowest fixed shift rate is 0x40 and a shift is due within twice
+    /// that, so a register that has not moved in this many ticks is stopped
+    /// rather than slow. Bounded so a wrong tap fails a named test instead of
+    /// hanging CI.
+    const MAX_SHIFT_TICKS: usize = 4096;
+
+    /// Hard cap on walking a 16-bit shift register round: there are 65536
+    /// states, so a cycle that has not closed by here never will.
+    const MAX_SHIFT_CYCLE: usize = 1 << 16;
+
+    /// Latch byte writing `control` to the noise control register: `1 1 0 dddd`,
+    /// the channel 3 tone register that the noise generator shares.
+    fn noise_latch(control: u8) -> u8 {
+        0xE0 | (control & 0x0F)
+    }
+
+    /// Clock until the noise shift register moves - one shift - and report how
+    /// many /16 ticks that took. Hard-capped: a shift register that has stopped
+    /// must fail this test, not hang the run.
+    fn ticks_to_noise_shift(psg: &mut Sn76489) -> usize {
+        let start = psg.noise.lfsr;
+        for tick in 1..=MAX_SHIFT_TICKS {
+            psg.clock();
+            if psg.noise.lfsr != start {
+                return tick;
+            }
+        }
+        panic!("the noise shift register did not move in {MAX_SHIFT_TICKS} ticks");
+    }
+
+    /// The output bit of the noise generator, sampled once at each of the next
+    /// `count` shifts.
+    fn noise_bits(psg: &mut Sn76489, count: usize) -> Vec<bool> {
+        (0..count)
+            .map(|_| {
+                ticks_to_noise_shift(psg);
+                psg.noise.lfsr & 1 != 0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn noise_write_resets_lfsr() {
+        let mut psg = Sn76489::new();
+        psg.write(noise_latch(0b101));
+        ticks_to_noise_shift(&mut psg);
+        assert_ne!(psg.noise.lfsr, NOISE_RESET, "the shift register must run");
+
+        psg.write(noise_latch(0b100));
+        assert_eq!(psg.noise.lfsr, NOISE_RESET);
+    }
+
+    /// SMS Power "SN76489": setting the noise register to 101 and then updating
+    /// it to 100 with a plain data byte has to take effect - the data byte is
+    /// not ignored - or "Micro Machines" gets the wrong sound on its noise
+    /// channel.
+    #[test]
+    fn noise_data_byte_is_not_ignored() {
+        let mut psg = Sn76489::new();
+        psg.write(noise_latch(0b101));
+        assert_eq!(psg.noise_control(), 0b101);
+        ticks_to_noise_shift(&mut psg);
+        assert_ne!(psg.noise.lfsr, NOISE_RESET);
+
+        psg.write(0x04);
+
+        assert_eq!(psg.noise_control(), 0b100);
+        assert_eq!(
+            psg.noise.lfsr, NOISE_RESET,
+            "a noise update through a data byte resets the shift register too"
+        );
+    }
+
+    /// The three fixed shift rates of the noise control register: 0 -> 0x10,
+    /// 1 -> 0x20, 2 -> 0x40, counted in ticks between two shifts of a divider
+    /// that shifts once per two periods (#106).
+    #[test]
+    fn noise_shift_rates() {
+        for (rate, period) in NOISE_SHIFT_PERIODS.iter().enumerate() {
+            let mut psg = Sn76489::new();
+            psg.write(noise_latch(rate as u8));
+            ticks_to_noise_shift(&mut psg);
+            assert_eq!(ticks_to_noise_shift(&mut psg), 2 * usize::from(*period));
+        }
+    }
+
+    #[test]
+    fn periodic_noise_period_16() {
+        let mut psg = Sn76489::new();
+        psg.write(noise_latch(0b001));
+
+        let bits = noise_bits(&mut psg, 48);
+        for index in 0..32 {
+            assert_eq!(
+                bits[index],
+                bits[index + 16],
+                "periodic noise bit {index} did not repeat after 16 shifts"
+            );
+        }
+        let one = bits[..16].iter().any(|bit| *bit);
+        let zero = bits[..16].iter().any(|bit| !*bit);
+        assert!(one && zero, "periodic noise is a constant, not a cycle");
+    }
+
+    #[test]
+    fn white_noise_first_values() {
+        let mut psg = Sn76489::new();
+        psg.write(noise_latch(0b100));
+
+        let mut want = Vec::new();
+        let mut lfsr = NOISE_RESET;
+        for _ in 0..32 {
+            let feedback = (lfsr & NOISE_WHITE_TAPS).count_ones() as u16 & 1;
+            lfsr = (lfsr >> 1) | (feedback << 15);
+            want.push(lfsr & 1 != 0);
+        }
+
+        assert_eq!(noise_bits(&mut psg, 32), want);
+    }
+
+    /// The cycle of the white noise shift register, walked to its end: 57337
+    /// shifts before the register is back at the value a write left it at
+    /// (#106, from SMS Power's noise channel figures).
+    ///
+    /// A good check on the taps, because the number is a property of them: the
+    /// feedback polynomial of this register factors into an irreducible of
+    /// degree 13 and one of degree 3, so the cycle the reset value 0x8000 sits
+    /// in is lcm(8191, 7) = 57337 shifts, and any other tap pair gives some
+    /// other number. The walk is capped at one pass over the 16-bit state space,
+    /// so a wrong tap fails this test by name rather than hanging.
+    #[test]
+    fn white_noise_period_57337() {
+        let mut psg = Sn76489::new();
+        psg.write(noise_latch(0b100));
+        let start = psg.noise.lfsr;
+
+        let mut shifts = 0;
+        loop {
+            shifts += 1;
+            assert!(
+                shifts <= MAX_SHIFT_CYCLE,
+                "white noise had not returned to {start:#06x} after {shifts} shifts"
+            );
+            ticks_to_noise_shift(&mut psg);
+            if psg.noise.lfsr == start {
+                break;
+            }
+        }
+
+        assert_eq!(shifts, 57337, "white noise cycle length");
+    }
+
+    #[test]
+    fn rate3_follows_tone2() {
+        let mut psg = Sn76489::new();
+        set_tone(&mut psg, 2, 8);
+        psg.write(noise_latch(0b011));
+
+        ticks_to_noise_shift(&mut psg);
+        assert_eq!(ticks_to_noise_shift(&mut psg), 2 * 8);
+
+        set_tone(&mut psg, 2, 32);
+        ticks_to_noise_shift(&mut psg);
+        assert_eq!(ticks_to_noise_shift(&mut psg), 2 * 32);
+    }
+
+    /// Channel 3's pin carries the noise bit once the noise register has been
+    /// written, through channel 3's own attenuator (#106).
+    #[test]
+    fn noise_drives_channel_3_output() {
+        let mut psg = Sn76489::new();
+        psg.write(volume_latch(3, 0));
+        psg.write(noise_latch(0b100));
+
+        assert_eq!(psg.channel_output(3), -VOLUME_TABLE[0]);
+        ticks_to_noise_shift(&mut psg);
+        assert_eq!(psg.channel_output(3) > 0, psg.noise.lfsr & 1 != 0);
     }
 }
