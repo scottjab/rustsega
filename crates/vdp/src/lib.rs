@@ -11,15 +11,17 @@
 //! and the name table entries and the pattern rows they point at (`pattern`),
 //! and the plane A and plane B layer buffers read from those tables
 //! (`planes`), and the sprite attribute table and the sprite layer of a line
-//! (`sprites`).
-//! Rendering is M4-10 (#88) onwards, so the line renderer that `timing` calls
-//! is the backdrop stub of M4-17 (#95).
+//! (`sprites`), and the priority compositor that turns the three layer buffers of
+//! a line into the pixels of a frame-buffer row (`compose`). Shadow and
+//! highlight, the left column and the interlaced fields are still to come
+//! (M4-18 #96, M4-19 #97, M4-20 #98).
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
 //! of the register (`$83xx` is R3), which is how each is usually quoted.
 
 pub mod color;
+mod compose;
 mod dma;
 mod framebuffer;
 mod hv;

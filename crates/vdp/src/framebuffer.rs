@@ -18,9 +18,9 @@ pub const MAX_HEIGHT: usize = 2 * LINES_V30;
 /// frame, which is how a game changing mode mid-frame costs no allocation. The
 /// row stride is `width`.
 ///
-/// Filling it in properly is the rendering tickets (M4-10, #88 onwards): the
-/// only thing that writes it today is [`Vdp::render_line`], the backdrop stub of
-/// M4-06 (#84), so a VDP that has not drawn a frame hands out a black one.
+/// [`Vdp::render_line`] fills it a line at a time, from the backdrop up through
+/// the planes and the sprites (M4-17, #95); a VDP that has not drawn a frame
+/// still hands out a black one.
 #[derive(Debug)]
 pub struct FrameBuffer {
     /// Active width in pixels: 256 (H32) or 320 (H40).
@@ -62,35 +62,6 @@ impl Default for FrameBuffer {
 }
 
 impl Vdp {
-    /// Draw one line of the picture: the backdrop colour, right across it.
-    ///
-    /// Public and callable on its own, as `docs/ARCHITECTURE.md` puts it
-    /// ("Render one line directly. Public for tests; the scheduler uses
-    /// advance()"). `timing::advance` calls it once for each line of the active
-    /// display as the beam finishes it (M4-06, #84).
-    ///
-    /// The body is the stub of the ticket: the planes and the sprites are the
-    /// rendering tickets (M4-10 #88 onwards) and M4-17 (#95) replaces this
-    /// whole function. What it does today is enough for the timing to be
-    /// testable and for the frame to be the size the mode says: the row is
-    /// written, and `width` and `height` describe it.
-    pub fn render_line(&mut self, line: u16) {
-        let height = self.active_height();
-        let y = usize::from(line);
-        if y >= height {
-            return;
-        }
-
-        let width = self.active_width();
-        let colour = self.backdrop_pixel();
-        let frame = &mut self.frame_buffer;
-        frame.width = width;
-        frame.height = height;
-
-        let start = y * width;
-        frame.pixels[start..start + width].fill(colour);
-    }
-
     /// The backdrop colour as a frame-buffer pixel: R7's index into CRAM
     /// (genvdp.txt section 17 "$07": "Bits 5-0 of this register select a palette
     /// entry to be used as the backdrop color") through the colour LUT, so the
@@ -102,8 +73,8 @@ impl Vdp {
     /// always shown at normal intensity" and "if a background tile has high
     /// priority, then the corresponding 8x8 block of the backdrop color will be
     /// shown at normal intensity". Picking between the two per pixel needs the
-    /// plane priority data, which is the renderer's; M4-17 (#95) replaces this
-    /// whole function.
+    /// plane priority data, which is the compositor's; M4-18 (#96) picks between
+    /// the two.
     pub(crate) fn backdrop_pixel(&self) -> u32 {
         let colour = self.cram[usize::from(self.backdrop_index())];
         self.color_lut.pixel(colour, Intensity::Normal)
