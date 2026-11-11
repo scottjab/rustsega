@@ -17,7 +17,7 @@ use crate::{HScrollMode, Vdp, WIDTH_H40};
 /// section 12 ("A pattern is an 8x8 or 8x16 (interlace mode 2 only) pixel
 /// block"). TODO(M4-20 #98): read [`Vdp::interlace_mode`] and pass 16 there,
 /// which [`crate::pattern::tile_addr`] already handles.
-const CELL_ROWS: usize = 8;
+pub(crate) const CELL_ROWS: usize = 8;
 
 /// Name table entries of the largest valid plane: genvdp.txt section 13, "The
 /// name table size cannot exceed 8192 bytes, so while a 64x64 or 128x32 name
@@ -52,7 +52,11 @@ const VSCROLL_MASK: u16 = 0x3FF;
 /// genvdp.txt section 17 "$0B" bit 2 "selects between full screen vertical
 /// scrolling when clear, and 2-cell column based vertical scrolling when set",
 /// and a cell is [`CELL_ROWS`] pixels wide.
-const CELL_COLUMN: usize = 2 * CELL_ROWS;
+///
+/// This is also the unit of the R17 window split and of the window bug of
+/// section 17 "$11", which both speak of "2-cell columns" of 16 pixels: the same
+/// granularity the VDP walks the playfield with.
+pub(crate) const CELL_COLUMN: usize = 2 * CELL_ROWS;
 
 /// The two VSRAM words the partial 2-cell column at the left edge of an H40 line
 /// is fetched with: see [`Vdp::left_column_vscroll`], which is as uncertain as
@@ -132,7 +136,7 @@ impl Vdp {
     /// - `10` per cell: `index = line & !7`, one entry per 8-line cell row;
     /// - `11` per line: `index = line`.
     #[inline]
-    fn line_hscroll(&self, plane: Plane, line: usize) -> usize {
+    pub(crate) fn line_hscroll(&self, plane: Plane, line: usize) -> usize {
         let index = match self.hscroll_mode() {
             HScrollMode::Full => 0,
             HScrollMode::EightLines => line & (CELL_ROWS - 1),
@@ -256,6 +260,27 @@ impl Vdp {
     /// compositor drops - shadow and highlight, the window, the sprites, and any
     /// RGBA. All of that is M4-17 (#95).
     pub fn render_plane_line(&self, plane: Plane, line: u16, out: &mut [u8; WIDTH_H40]) {
+        let len = out.len();
+        self.render_plane_run(plane, line, 0..len, 0, out);
+    }
+
+    /// [`Vdp::render_plane_line`] for part of a line only: `range` is the range of
+    /// *screen* pixels to fill - the 16 pixel column the window bug re-fetches -
+    /// and `plane_x_shift` is added to the plane x of every pixel of it, which is
+    /// how a column is fetched from the next 2-cell column over (genvdp.txt
+    /// section 17 "$11", modelled by [`crate::window`]).
+    ///
+    /// The vscroll lookup still keys on the screen pixel: the bug of that section
+    /// moves the name table fetch alone, and nothing says it moves the VSRAM read
+    /// with it. `range` must lie inside `out`.
+    pub(crate) fn render_plane_run(
+        &self,
+        plane: Plane,
+        line: u16,
+        range: core::ops::Range<usize>,
+        plane_x_shift: usize,
+        out: &mut [u8],
+    ) {
         let base = plane.name_table(self);
         let width = usize::from(self.plane_width_cells());
         let height = usize::from(self.plane_height_cells());
@@ -275,8 +300,10 @@ impl Vdp {
             0
         };
 
-        let mut x = 0;
-        while x < out.len() {
+        let x0 = range.start;
+        let mut x = range.start;
+        let end = range.end;
+        while x < end {
             let partial = x < left_partial;
             let vscroll = if partial {
                 self.left_column_vscroll()
@@ -290,27 +317,54 @@ impl Vdp {
             } else if columns {
                 x + CELL_COLUMN - x % CELL_COLUMN
             } else {
-                out.len()
+                end
             };
             let plane_y = line.wrapping_add(vscroll) & plane_y_mask;
             let row_base = (plane_y / CELL_ROWS) * width;
             let cell_row = plane_y % CELL_ROWS;
 
-            let plane_x = x.wrapping_sub(hscroll) & plane_x_mask;
+            let plane_x = (x + plane_x_shift).wrapping_sub(hscroll) & plane_x_mask;
             let offset = plane_x % CELL_ROWS;
-            let run = (CELL_ROWS - offset).min(ends_at - x).min(out.len() - x);
+            let run = (CELL_ROWS - offset).min(ends_at - x).min(end - x);
             let entry_index = (row_base + plane_x / CELL_ROWS) & (MAX_ENTRIES - 1);
-            let entry = read_word(&self.vram, base + entry_index * 2);
-            let cell = NameEntry::decode(entry);
-            let indices = tile_row(
-                &self.vram, cell.tile, cell_row, cell.vflip, cell.hflip, CELL_ROWS,
-            );
-            let layer_base = (cell.palette << 4) | (u8::from(cell.priority) << PRIORITY_SHIFT);
-            let pixels = &mut out[x..x + run];
-            for (pixel, index) in pixels.iter_mut().zip(indices[offset..].iter().copied()) {
-                *pixel = if index == 0 { 0 } else { layer_base | index };
-            }
+            let start = x - x0;
+            self.fill_cell_run(base, entry_index, cell_row, offset, &mut out[start..start + run]);
             x += run;
+        }
+    }
+
+    /// Fill `pixels` with the layer values of the cell that the entry at
+    /// `base + entry_index * 2` names: the fetch every reader of a name table -
+    /// the two scroll planes and the window alike - ends with. `row` is the row of
+    /// the pattern to draw and `offset` how many pixels of it to skip, so
+    /// `pixels.len()` never exceeds [`CELL_ROWS`] - `offset`.
+    ///
+    /// A pixel of colour 0 draws nothing (genvdp.txt section 12: "A pixel within
+    /// a pattern that uses value zero isn't shown") and is written as a whole zero
+    /// byte; see [`Vdp::render_plane_line`] for why that is a byte and not a flag.
+    pub(crate) fn fill_cell_run(
+        &self,
+        base: usize,
+        entry_index: usize,
+        row: usize,
+        offset: usize,
+        pixels: &mut [u8],
+    ) {
+        let entry = NameEntry::decode(read_word(&self.vram, base + entry_index * 2));
+        let indices = tile_row(
+            &self.vram,
+            entry.tile,
+            row,
+            entry.vflip,
+            entry.hflip,
+            CELL_ROWS,
+        );
+        let layer_base = (entry.palette << 4) | (u8::from(entry.priority) << PRIORITY_SHIFT);
+        for (pixel, index) in pixels
+            .iter_mut()
+            .zip(indices[offset..].iter().copied())
+        {
+            *pixel = if index == 0 { 0 } else { layer_base | index };
         }
     }
 }
