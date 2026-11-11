@@ -822,10 +822,12 @@ mod tests {
         cpu.reset(&mut bus);
         let mut z80 = Z80::new();
         z80.reset();
-        // The mode a real program's `IM 1` would ask for. It is armed from here
-        // rather than by the program because this checkout's z80 ED table does not
-        // decode `$ED $55` to it, and changing `crates/z80` is outside this ticket.
-        // The wire is what #75 owns; how it was armed is not.
+        // The mode a real program would ask for with `IM 1`, armed from the test
+        // rather than by an opcode so this stays a test of the wire (#75 owns that)
+        // and not of the ED decoder. For the record the decoder is not the obstacle:
+        // `$ED $56` and `$ED $76` are `IM 1` here (`decode.rs`, and all 1000 cases of
+        // the suite's `ed 56`/`ed 76` end with `im` = 1); executing one would just
+        // put a second thing under test.
         z80.set_im(z80::IntMode::Mode1);
 
         let mut s = Scheduler::new(Region::Usa);
