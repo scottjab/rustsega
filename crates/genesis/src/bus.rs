@@ -69,6 +69,64 @@ pub(crate) const OPEN_BUS: u8 = 0xFF;
 /// A word read entirely from an area that nothing drives.
 const OPEN_BUS_WORD: u16 = 0xFFFF;
 
+// ---- Bus timing (M3-16, #77) ------------------------------------------------
+//
+// The waits below are master clocks rather than 68000 clocks or T-states: the
+// scheduler keeps one clock (`crate::Scheduler`) and the two numbers the VDP
+// hands over for its own waits (`vdp::Vdp::dma_68k_stall_mclk` and
+// `vdp::Vdp::data_port_stall_mclk`) are master clocks, so a figure a source
+// quotes in a chip's own clocks is converted on the way in and never back out.
+//
+// Two of the three constants come from the ticket rather than from a page; each
+// says so, and TODO(M3-16 #77) on it names the follow-up of checking it.
+
+/// Master clocks in one 68000 clock: the 68000 runs at master / 7
+/// (docs/ARCHITECTURE.md, "Clocks and timing"), so one 68000 wait state is this
+/// many master clocks.
+const MCLK_PER_68K: u32 = 7;
+/// Master clocks in one Z80 T-state: the Z80 runs at master / 15 (same source).
+const MCLK_PER_Z80: u32 = 15;
+
+/// Master clocks a 68000 access to the sound side at `0xA00000` costs beyond the
+/// access itself: one wait state.
+///
+/// Z80 RAM, the YM2612 and the bank register are 8-bit devices on the Z80's own
+/// bus, so a 68000 cycle that reaches one of them is stretched by the width
+/// conversion - the same reason the area takes byte accesses only (plutiedev,
+/// "Using the Z80": "you must use byte accesses when touching Z80 RAM, word
+/// accesses won't work").
+///
+/// INFERRED as one 68000 clock, which is what "one wait state" means on a CPU
+/// whose bus cycle is counted in its own clocks; the number of wait states is the
+/// ticket's and is not something this ticket could reach a page for.
+///
+/// TODO(M3-16 #77): verify against a hardware source.
+pub(crate) const Z80_AREA_WAIT_MCLK: u32 = MCLK_PER_68K;
+
+/// Master clocks a Z80 access to the 68k bus costs the Z80: about 3.3 T-states,
+/// which at [`MCLK_PER_Z80`] is 49.5 and is paid as 50.
+///
+/// The 3.3 is the ticket's "about 3.3 extra Z80 cycles on average" - an average
+/// over a burst of accesses rather than a per-access minimum, hence rounding to
+/// whole master clocks instead of carrying the fraction over thousands of
+/// accesses (see [`Bus::pending_z80_stall`]).
+///
+/// TODO(M3-16 #77): verify against a hardware source.
+pub(crate) const Z80_WINDOW_WAIT_MCLK: u32 = (33 * MCLK_PER_Z80 + 5) / 10;
+
+/// Master clocks a Z80 access to the 68k bus costs the 68000: about 11 of its
+/// clocks, the 68000 stopping for the width conversion while the sound CPU has
+/// the line.
+///
+/// The 11 is the ticket's number, "commonly cited" with the 3.3 of
+/// [`Z80_WINDOW_WAIT_MCLK`] and by the same average-per-access rule. The pair is
+/// not internally consistent - 11 68000 clocks is 77 master clocks and 3.3
+/// T-states is 50 - which is what both being averages gets up to; both are
+/// charged because both are what the ticket names.
+///
+/// TODO(M3-16 #77): verify against a hardware source.
+pub(crate) const Z80_WINDOW_STEAL_MCLK: u32 = 11 * MCLK_PER_68K;
+
 // Region boundaries, from plutiedev "Memory map".
 const ROM_START: u32 = 0x00_0000;
 const ROM_END: u32 = 0x3F_FFFF;
@@ -547,6 +605,28 @@ pub struct Bus {
     /// the bus and not just a dropped access. See [`Bus::locked_up`] for who acts on
     /// it.
     locked_up: bool,
+    /// Master clocks the 68000 has been held off its own bus for by accesses this
+    /// bus has already answered, waiting for the scheduler to take them out of its
+    /// clock: a 68k -> VDP DMA ([`vdp::Vdp::dma_68k_stall_mclk`]), a data port
+    /// write to a full FIFO ([`vdp::Vdp::data_port_stall_mclk`]), the one wait
+    /// state of the sound side at `0xA00000` ([`Z80_AREA_WAIT_MCLK`]), and the
+    /// 68000's share of every access the Z80 makes to the 68k bus
+    /// ([`Z80_WINDOW_STEAL_MCLK`]).
+    ///
+    /// A one-way door rather than something the CPU asks for, so that the timing
+    /// lives here and the 68000 core stays unaware of the bus under it: the access
+    /// is what costs the time, and the scheduler spends it by moving the chip's
+    /// clock without running the instruction ([`Bus::take_68k_stall`]). A total
+    /// rather than a maximum because one instruction can make several contended
+    /// accesses, and master clocks because that is the one unit the scheduler
+    /// counts in.
+    pending_68k_stall: u32,
+    /// The sound CPU's half of [`Bus::pending_68k_stall`]: the extra T-states a
+    /// Z80 access to the 68k bus costs the Z80 ([`Z80_WINDOW_WAIT_MCLK`]) and the
+    /// rest of a 68k -> VDP transfer it has to wait out before the 68k bus answers
+    /// it ([`vdp::Vdp::dma_68k_stall_mclk`]). Taken after every Z80 step by the
+    /// scheduler ([`Bus::take_z80_stall`]).
+    pending_z80_stall: u32,
     /// Bit 0 of [`TMSS_ROM_SELECT`]: 1 for the cartridge at 0x000000, 0 for the
     /// TMSS boot ROM. Stored and nothing more - this emulator ships no boot ROM, so
     /// the cart stays mapped whatever this says (see [`Bus::write_tmss_byte`]).
@@ -632,6 +712,8 @@ impl Bus {
             tmss_seek: 0,
             tmss_unlocked: false,
             locked_up: false,
+            pending_68k_stall: 0,
+            pending_z80_stall: 0,
             // A TMSS console comes out of reset with its own boot ROM in front of the
             // cart (Genesis Plus GX's `gen_reset` maps `boot_rom` at 0x000000 again),
             // so the select bit starts at 0. The cart is what answers 0x000000 here
@@ -778,13 +860,63 @@ impl Bus {
 
     /// Has a VDP access frozen the 68k, so that it must not be stepped any more?
     ///
-    /// This is the question the scheduler asks; it has no other effect today, which
-    /// is why the flag lives on the bus rather than stopping anything itself.
-    ///
-    /// TODO(M3-14 #75): freeze the 68k while this is set. Nothing clears it but
-    /// `RESET` - see [`m68k::Bus::reset_devices`].
+    /// This is the question the scheduler asks (M3-16, #77), and it answers it by
+    /// moving the 68000's clock along without running it, the way the stopped Z80
+    /// stays clocked ([`Bus::z80_can_run`]). Freezing is not stopping the machine:
+    /// the beam goes on, and nothing clears the flag but `RESET` - see
+    /// [`m68k::Bus::reset_devices`].
     pub fn locked_up(&self) -> bool {
         self.locked_up
+    }
+
+    /// Take the master clocks the 68000 has been held off its own bus for, and
+    /// clear them.
+    ///
+    /// The scheduler asks after every 68000 step and adds what it gets to the
+    /// 68000's clock without running another instruction
+    /// ([`crate::Scheduler::charge_mclk`]), which is the whole of what these waits
+    /// are: the access was answered, and the chip was simply not allowed to do
+    /// anything else for a while. See [`Bus::pending_68k_stall`] for what goes
+    /// into the total.
+    pub fn take_68k_stall(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_68k_stall)
+    }
+
+    /// Take the master clocks the sound CPU has been held off the bus for, and
+    /// clear them. The Z80 half of [`Bus::take_68k_stall`].
+    pub fn take_z80_stall(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_z80_stall)
+    }
+
+    /// Hold the 68000 for `mclk` master clocks on top of the access being made.
+    fn stall_68k(&mut self, mclk: u32) {
+        self.pending_68k_stall = self.pending_68k_stall.saturating_add(mclk);
+    }
+
+    /// Hold the sound CPU for `mclk` master clocks on top of the access being made.
+    fn stall_z80(&mut self, mclk: u32) {
+        self.pending_z80_stall = self.pending_z80_stall.saturating_add(mclk);
+    }
+
+    /// One access by the sound CPU to the 68k address space through its bank
+    /// window at `0x8000-0xFFFF`: both chips pay for it, and the 68000 may still
+    /// be holding the line for a transfer it is not running.
+    ///
+    /// The Z80 pays [`Z80_WINDOW_WAIT_MCLK`] for the width conversion and the
+    /// 68000 pays [`Z80_WINDOW_STEAL_MCLK`] for the bus it just lost; and a 68k ->
+    /// VDP DMA is the 68000's bus read at its most jealous - "The 68000 is frozen
+    /// during 68k -> VDP transfers" (genvdp.txt section 6) covers the whole of the
+    /// bus, including the part the Z80 is asking through, so a window access made
+    /// while one runs waits out the rest of it
+    /// ([`vdp::Vdp::dma_68k_stall_mclk`]) rather than arriving in the middle.
+    ///
+    /// Called from [`crate::z80_bus::Z80View`] for the window alone: the Z80's own
+    /// RAM, the YM2612 and the PSG are on its side of the arbitration and cost it
+    /// nothing extra.
+    pub(crate) fn z80_window_access(&mut self) {
+        let dma = self.vdp.dma_68k_stall_mclk();
+        self.stall_z80(Z80_WINDOW_WAIT_MCLK + dma);
+        self.stall_68k(Z80_WINDOW_STEAL_MCLK);
     }
 
     /// May the Z80 run: it is neither held in reset nor has the 68k taken its bus.
@@ -1070,10 +1202,10 @@ impl Bus {
     /// A data port write is queued rather than performed - it is a write FIFO
     /// entry on its way to a memory (`vdp::fifo`, M4-21a #99) - and this does not
     /// wait for it. [`Vdp::data_port_stall_mclk`] is the wait, and M3-16 (#77) is
-    /// the ticket that adds it to the 68k's cycles.
+    /// the ticket that adds it to the 68k's cycles: see [`Bus::vdp_data_write`].
     fn write_vdp_byte(&mut self, addr: u32, value: u8) {
         match vdp_port(addr) {
-            Some(VdpPort::Data) => self.vdp.write_data(u16::from_be_bytes([value, value])),
+            Some(VdpPort::Data) => self.vdp_data_write(u16::from_be_bytes([value, value])),
             Some(VdpPort::Control) => self.vdp_control_write(u16::from_be_bytes([value, value])),
             // The PSG is one byte wide and it is the odd lane of the pair, so an
             // even-lane byte is not the PSG at all (plutiedev "Memory map": "PSG
@@ -1095,7 +1227,7 @@ impl Bus {
     /// same block and is one byte wide.
     fn write_vdp_word(&mut self, addr: u32, value: u16) {
         match vdp_port(addr) {
-            Some(VdpPort::Data) => self.vdp.write_data(value),
+            Some(VdpPort::Data) => self.vdp_data_write(value),
             Some(VdpPort::Control) => self.vdp_control_write(value),
             // A word write to the PSG pair feeds the PSG the low byte of the word.
             // That byte is the one at `$C00011`, the lane the port lives on, so a
@@ -1116,21 +1248,58 @@ impl Bus {
     /// no-op touching nothing whenever the write asked for no DMA. So it follows
     /// every control port write, and nothing else.
     ///
+    /// One data port word, and the wait the write FIFO charges for a write that
+    /// finds it full.
+    ///
+    /// [`Vdp::write_data`] queues the word, and [`Vdp::data_port_stall_mclk`] is a
+    /// level rather than an answer: it says the port is full, which it is from the
+    /// write that fills the four entries onwards (`vdp::fifo::Fifo::push`). The
+    /// write that *fills* the FIFO is still taken, so the level is asked for on
+    /// both sides of the write and only a port that was already full holds the
+    /// 68000 - the fifth write of a burst, not the fourth, which is what the full
+    /// bit of genvdp.txt section 6 and Nemesis's VDP FIFO research on SpritesMind
+    /// are describing.
+    fn vdp_data_write(&mut self, value: u16) {
+        let held = self.vdp.data_port_stall_mclk() != 0;
+        self.vdp.write_data(value);
+        if held {
+            let stall = self.vdp.data_port_stall_mclk();
+            self.stall_68k(stall);
+        }
+    }
+
+    /// The write also starts a 68k -> VDP transfer if the command word asked for
+    /// one, and that freezes the 68000 for the whole of it: see
+    /// [`Bus::vdp_control_write`], which charges the transfer's own wait.
+    ///
     /// Taking the fields apart rather than calling through `self` is the point of
-    /// this function being a function: `run_dma` holds `&mut self.vdp` for the
-    /// whole transfer, and [`VdpDmaSource`] holds `rom`, `ram` and `mapper` across
-    /// it, which only separate field borrows allow at the same time.
+    /// [`Bus::vdp_control_write`] being a function: `run_dma` holds `&mut self.vdp`
+    /// for the whole transfer, and [`VdpDmaSource`] holds `rom`, `ram` and `mapper`
+    /// across it, which only separate field borrows allow at the same time.
     fn vdp_control_write(&mut self, value: u16) {
         let Bus {
             vdp,
             rom,
             ram,
             mapper,
+            pending_68k_stall,
             ..
         } = self;
         let mut source = VdpDmaSource { rom, ram, mapper };
         vdp.write_control(value);
         vdp.run_dma(&mut source);
+        // A write that started a 68k -> VDP transfer freezes the 68000 for the
+        // whole of it - "The 68000 is frozen during 68k -> VDP transfers"
+        // (genvdp.txt section 6) - and `dma_68k_stall_mclk` is for how long.
+        // Reading it after every control write rather than only the one that
+        // starts a transfer is safe rather than merely easy: the 68000 cannot make
+        // a second control write while it is frozen for the first, so by the time
+        // another arrives the beam has been walked to the end of the transfer and
+        // the number is back to 0. A fill and a copy report 0 and leave the 68000
+        // running, which is what genvdp.txt means by the busy bit being "only
+        // useful for fills and copies".
+        let stall = vdp.dma_68k_stall_mclk();
+        *pending_68k_stall = pending_68k_stall.saturating_add(stall);
     }
 
     /// One byte to the PSG, from the VDP's PSG port at `$C00011`.
@@ -1149,7 +1318,12 @@ impl Bus {
     /// Z80 bus byte read: one of the sound side's devices, or open bus if the 68k does
     /// not hold the Z80's bus. See [`Bus::z80_bus_granted`] for the gate and
     /// [`SoundSide`] for what each address is.
+    /// The wait state of [`Z80_AREA_WAIT_MCLK`] is charged before the grant is
+    /// asked, because the 68000 has spent the bus cycle either way: the access is
+    /// slow because the device on the other end is 8-bit, not because the sound
+    /// CPU happened to be holding it.
     fn read_z80_byte(&mut self, addr: u32) -> u8 {
+        self.stall_68k(Z80_AREA_WAIT_MCLK);
         if !self.z80_bus_granted() {
             return OPEN_BUS;
         }
@@ -1180,8 +1354,11 @@ impl Bus {
     }
 
     /// Z80 bus byte write: the sound side's device, dropped entirely unless the 68k
-    /// holds the Z80's bus. See [`Bus::z80_bus_granted`] and [`SoundSide`].
+    /// holds the Z80's bus. See [`Bus::z80_bus_granted`] and [`SoundSide`], and
+    /// [`Bus::read_z80_byte`] for the wait state charged before the grant either
+    /// way.
     fn write_z80_byte(&mut self, addr: u32, value: u8) {
+        self.stall_68k(Z80_AREA_WAIT_MCLK);
         if !self.z80_bus_granted() {
             return;
         }
@@ -1714,6 +1891,11 @@ impl m68k::Bus for Bus {
         self.tmss_unlocked = false;
         self.locked_up = false;
         self.tmss_cart_selected = false;
+        // And so does any wait that had not reached a clock yet. The transfer or
+        // held write it was waiting for is gone with the chip, and a stall carried
+        // across a `RESET` would freeze a 68000 that `RESET` has just restarted.
+        self.pending_68k_stall = 0;
+        self.pending_z80_stall = 0;
         // The cart slot's `0xA130F1` goes back to 0 with the rest of the register
         // state, but the save itself and its dirty flag do not: `RESET` is not a
         // power cycle, and the battery is still holding those bytes. See
@@ -4071,6 +4253,197 @@ mod tests {
             &bus.vdp.vram[0..8],
             &[0xCA, 0xFE, 0xBA, 0xBE, 0x11, 0x22, 0x33, 0x44],
             "the four words of the cart are in VRAM"
+        );
+    }
+
+    // ---- Who pays for an access (M3-16, #77) --------------------------------
+    //
+    // [`Bus::take_68k_stall`] and [`Bus::take_z80_stall`] are the whole of the
+    // bus's side of a wait: what the scheduler adds to a chip's clock without
+    // running it (`crate::Scheduler::charge_mclk`). These measure the time in the
+    // place it is decided; the scheduler's own tests (`crate::scheduler`) hold the
+    // two together on a running machine.
+
+    /// The set-up of a 68k -> VDP transfer of `words` words from the 0xE00000
+    /// block to VRAM 0, through the ports a game uses: R1 M1 allows DMA, R15 is
+    /// the step, R19/R20 the length and R21-R23 the source (genvdp.txt section 11,
+    /// plutiedev "$93xx" to "$97xx"), the `0x70` of R23 being address bits 23-17 of
+    /// the work RAM block.
+    fn start_dma(bus: &mut Bus, words: u16) {
+        set_reg(bus, 1, 0x10);
+        set_reg(bus, 15, 2);
+        set_reg(bus, 19, words as u8);
+        set_reg(bus, 20, (words >> 8) as u8);
+        set_reg(bus, 21, 0);
+        set_reg(bus, 22, 0);
+        set_reg(bus, 23, 0x70);
+        let (first, second) = dma_cmd(0x0000);
+        bus.write_word(0xC00004, first);
+        bus.write_word(0xC00004, second);
+    }
+
+    /// One 68000 access to the sound side at `0xA00000` costs one wait state beyond
+    /// the access itself, and one wait state per *access*: the word forms are one
+    /// trip to the slow 8-bit side rather than two (see [`Bus::read_z80_word`]), so
+    /// they pay once.
+    #[test]
+    fn a00000_access_adds_wait_state() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+
+        // Z80 RAM, the YM2612 and the bank register: the three devices of the
+        // area, all three behind the same width conversion.
+        for addr in [Z80_START, Z80_START + 0x4000, Z80_START + 0x6000] {
+            bus.read_byte(addr);
+            assert_eq!(
+                bus.take_68k_stall(),
+                Z80_AREA_WAIT_MCLK,
+                "one wait state for a byte read of {addr:#08x}"
+            );
+
+            bus.write_byte(addr, 0x00);
+            assert_eq!(
+                bus.take_68k_stall(),
+                Z80_AREA_WAIT_MCLK,
+                "and for a byte write to {addr:#08x}"
+            );
+
+            bus.read_word(addr);
+            assert_eq!(
+                bus.take_68k_stall(),
+                Z80_AREA_WAIT_MCLK,
+                "and for the one word access {addr:#08x} is"
+            );
+        }
+
+        // A 16 bit device of the same machine pays nothing, and so does the
+        // cartridge: the wait state is the sound side's, not the 68000's.
+        bus.read_word(RAM_START);
+        assert_eq!(bus.take_68k_stall(), 0, "work RAM is a 16 bit device");
+        bus.read_word(ROM_START);
+        assert_eq!(bus.take_68k_stall(), 0, "and so is the cart");
+    }
+
+    /// Six back-to-back data port writes cost the 68000 nothing until the four
+    /// entries of the write FIFO are taken, and what they cost after that depends
+    /// on where the beam is: clearing a head entry means waiting for two free
+    /// access slots, and two of the 16 an active H32 line offers is a much longer
+    /// wait than two of the 167 of a blank one.
+    ///
+    /// The two numbers are the slot tables' (`vdp::slots`): 310 master clocks into
+    /// an active line the next free slots are slot 22 and slot 30 of `ACTIVE_H32`
+    /// at 440 and 600, and 310 into a blank line they are the two next slots of
+    /// `BLANK_H32` at 320 and 340. The writes are made at a fixed beam either way,
+    /// so the two lines differ by the schedule and nothing else.
+    #[test]
+    fn fifo_full_stalls_68k() {
+        /// What `writes` VRAM words pushed at a beam `mclk` into `line` cost the
+        /// 68000, in the master clocks the scheduler will spend.
+        fn burst(line: u32, mclk: u32, writes: u32) -> u32 {
+            let mut bus = Bus::new(Vec::new(), NO_TMSS);
+            // Display enable, R1 bit 6: with the display off the memories are free
+            // for the port the moment it asks (#99's rule), and there is no wait
+            // here to measure.
+            set_reg(&mut bus, 1, 0x40);
+            bus.vdp.advance(line * TEST_VDP_LINE + mclk);
+            vram_write_at(&mut bus, 0x0000);
+            assert_eq!(bus.take_68k_stall(), 0, "a command word holds nobody");
+
+            (0..writes)
+                .map(|_| {
+                    bus.write_word(0xC0_0000, 0x1234);
+                    bus.take_68k_stall()
+                })
+                .sum()
+        }
+
+        // The FIFO is four entries deep (`vdp::fifo::FIFO_DEPTH`), and a write that
+        // finds room is not held at all.
+        assert_eq!(burst(0, 310, 4), 0, "four writes fit");
+
+        let active = burst(0, 310, 6);
+        let blank = burst(230, 310, 6);
+        assert!(blank > 0, "the fifth and sixth writes are held even in VBlank");
+        assert!(
+            active > 5 * blank,
+            "two slots of an active line is not two slots of a blank one: {active} vs {blank}"
+        );
+    }
+
+    /// The control word that starts a 68k -> VDP transfer freezes the 68000 for the
+    /// whole of it (genvdp.txt section 6), and the bus charges for it on that write
+    /// alone: [`vdp::Vdp::dma_68k_stall_mclk`] is the number, and the command word
+    /// is the moment it is known.
+    #[test]
+    fn dma_command_word_charges_the_68k() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        set_reg(&mut bus, 1, 0x10);
+        set_reg(&mut bus, 15, 2);
+        for (reg, value) in [(19, 64), (20, 0), (21, 0), (22, 0), (23, 0x70)] {
+            set_reg(&mut bus, reg, value);
+            assert_eq!(bus.take_68k_stall(), 0, "a register write holds nobody");
+        }
+
+        let (first, _) = dma_cmd(0x0000);
+        bus.write_word(0xC0_0004, first);
+        assert_eq!(
+            bus.take_68k_stall(),
+            0,
+            "the first half of the command does not start the transfer"
+        );
+
+        let (_, second) = dma_cmd(0x0000);
+        bus.write_word(0xC0_0004, second);
+        let stall = bus.take_68k_stall();
+        assert!(stall > 0, "and the second freezes the 68000 for something");
+        assert_eq!(
+            stall,
+            bus.vdp.dma_68k_stall_mclk(),
+            "the VDP's own number, and charged once"
+        );
+    }
+
+    /// A Z80 access to the 68k bus window costs both chips: the sound CPU pays for
+    /// the width conversion and the 68000 loses the bus behind it. The Z80's own
+    /// RAM, the YM2612 and the PSG are on its side of the arbitration and cost
+    /// neither anything.
+    #[test]
+    fn z80_window_access_costs_both_cpus() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+
+        for _ in 0..4 {
+            Z80View::new(&mut bus).write(0x0100, 0x12);
+            assert_eq!(Z80View::new(&mut bus).read(0x0100), 0x12);
+            assert_eq!(bus.take_z80_stall(), 0, "sound RAM is not contention");
+            assert_eq!(bus.take_68k_stall(), 0, "and it steals no 68000 clock");
+        }
+
+        // The window at 0x8000, at bank 0: the bottom of the 68k address space.
+        Z80View::new(&mut bus).read(0x8000);
+        assert_eq!(bus.take_z80_stall(), Z80_WINDOW_WAIT_MCLK);
+        assert_eq!(bus.take_68k_stall(), Z80_WINDOW_STEAL_MCLK);
+
+        Z80View::new(&mut bus).write(0x8000, 0x34);
+        assert_eq!(bus.take_z80_stall(), Z80_WINDOW_WAIT_MCLK);
+        assert_eq!(bus.take_68k_stall(), Z80_WINDOW_STEAL_MCLK);
+    }
+
+    /// The 68000's transfer owns the whole of its side of the bus, including the
+    /// part the Z80 is asking through: a window access made while a 68k -> VDP DMA
+    /// is running waits for the rest of it as well as paying its own T-states.
+    #[test]
+    fn z80_window_access_waits_for_a_running_dma() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        // The beam unmoved, so the transfer the command word started is running.
+        start_dma(&mut bus, 256);
+        let dma = bus.vdp.dma_68k_stall_mclk();
+        assert!(dma > 0, "and it is a transfer that takes time");
+        bus.take_68k_stall();
+
+        Z80View::new(&mut bus).read(0x8000);
+        assert_eq!(
+            bus.take_z80_stall(),
+            Z80_WINDOW_WAIT_MCLK + dma,
+            "the wait for the 68000's transfer on top of the access's own"
         );
     }
 

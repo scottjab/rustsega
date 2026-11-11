@@ -120,6 +120,10 @@ enum Region {
     /// [`vdp_port_addr`]. The PSG is in here at 0x7F11.
     Vdp,
     /// 0x8000-0xFFFF: 32 KiB of the 68k space, at the bank register's address.
+    ///
+    /// The one region of the Z80 map that is not on the Z80's own side of the
+    /// arbitration, so the one that costs time: see
+    /// [`crate::bus::Bus::z80_window_access`].
     Window,
 }
 
@@ -271,6 +275,7 @@ impl Z80Bus for Z80View<'_> {
             Region::Vdp => self.sys.read_byte(vdp_port_addr(addr)),
             Region::Window => {
                 let addr = self.sys.z80.window_addr(addr);
+                self.sys.z80_window_access();
                 self.sys.read_byte(addr)
             }
         }
@@ -291,6 +296,7 @@ impl Z80Bus for Z80View<'_> {
             }
             Region::Window => {
                 let addr = self.sys.z80.window_addr(addr);
+                self.sys.z80_window_access();
                 self.sys.write_byte(addr, value);
             }
         }

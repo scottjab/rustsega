@@ -32,11 +32,17 @@
 //! VINT/HINT level onto the 68000's `ipl` pins and the VBlank pulse onto the Z80's
 //! `/INT`. Rendering is inside [`vdp::Vdp::advance`] and never called from here.
 //!
-//! ## What the line loop does not do yet
+//! ## Waiting, which is also clocked
 //!
-//! Freezing the 68k on [`Bus::locked_up`] is still M3-16's, and it has to move the
-//! 68k's clock rather than skip it, for exactly the reason the stopped Z80's clock
-//! moves.
+//! Three of the bus's timing effects are a chip being held rather than running: a
+//! 68k -> VDP DMA, a data port write to a full FIFO, and an access on the wrong
+//! side of the arbitration between the two CPUs. None of them changes what the
+//! machine does, only what it spends, and they arrive here as master clocks
+//! through [`Bus::take_68k_stall`] and [`Bus::take_z80_stall`] (M3-16, #77) to be
+//! paid by [`Scheduler::charge_mclk`] - the same rule the stopped Z80 and the
+//! TMSS-frozen 68k ([`Bus::locked_up`]) already follow: move the clock, do not
+//! skip it, because a chip that is owed the time will be paid it back as a burst
+//! of instructions the moment it is let go.
 
 use crate::bus::Bus;
 use crate::config::Region;
@@ -151,6 +157,7 @@ impl Scheduler {
                         MASTER_CLOCKS_PER_Z80,
                         line_end,
                     );
+                    Self::charge_mclk(&mut self.z80_clock, bus.take_z80_stall());
                 } else {
                     // Stopped, but still clocked. The chip runs no instructions while
                     // the 68k holds it in reset or on its bus, yet the hardware is
@@ -160,9 +167,16 @@ impl Scheduler {
                     // moment the 68k let go.
                     self.z80_clock = line_end;
                 }
+            } else if bus.locked_up() {
+                // The 68k is frozen by the TMSS lock-up: like the stopped Z80 it
+                // runs nothing and is still clocked, so the position goes to the
+                // end of the line rather than being left where it was. Skipping it
+                // is what the hardware cannot be doing, and what would hand the
+                // frozen chip every clock of the frame as a burst of instructions
+                // at the reset that frees it (M3-16, #77).
+                self.m68k_clock = line_end;
+                bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
             } else {
-                // TODO(M3-16 #77): freeze the 68k while `bus.locked_up()` is set, by
-                // taking its clock to the end of the line rather than by skipping it.
                 let cycles = cpu.step(bus);
                 Self::charge(
                     &mut self.m68k_clock,
@@ -170,6 +184,10 @@ impl Scheduler {
                     MASTER_CLOCKS_PER_68K,
                     line_end,
                 );
+                // The bus waits are paid in the same master clocks the instruction
+                // was just charged in: the access is over, and it is the chip that
+                // is held.
+                Self::charge_mclk(&mut self.m68k_clock, bus.take_68k_stall());
                 bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
             }
 
@@ -290,6 +308,21 @@ impl Scheduler {
         );
     }
 
+    /// Move one chip's clock on by a bus wait of `mclk` master clocks.
+    ///
+    /// The 68000 and the Z80 are held off the bus by things they are not running:
+    /// a 68k -> VDP DMA and a data port write to a full FIFO
+    /// ([`vdp::Vdp::dma_68k_stall_mclk`], [`vdp::Vdp::data_port_stall_mclk`]), the
+    /// wait state of an access to the sound side at `0xA00000`, and the two
+    /// contended halves of a Z80 access to the 68k bus. All of it arrives here in
+    /// master clocks through [`Bus::take_68k_stall`] and [`Bus::take_z80_stall`],
+    /// which is what keeps the CPU cores unaware of the bus underneath them, and it
+    /// is spent the way a frozen chip's time always is: the clock moves and the
+    /// chip does not.
+    fn charge_mclk(clock: &mut u64, mclk: u32) {
+        *clock += u64::from(mclk);
+    }
+
     /// Move one chip's clock on by a slice of `cycles` at its own rate,
     /// `masters_per_cycle`. The slice may run past `line_end`, and does: an
     /// instruction cannot be stopped half way, and what it ran past is carried into
@@ -320,6 +353,7 @@ fn step_z80(z80: &mut Z80, bus: &mut Bus) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::{Z80_WINDOW_STEAL_MCLK, Z80_WINDOW_WAIT_MCLK};
     // The 68k's own view of the machine, for the writes that drive the Z80's two
     // control lines the way a program would.
     use m68k::Bus as _;
@@ -356,7 +390,13 @@ mod tests {
     /// Z80 looping `INC A; JR -3` (`3C 18 FD`) at the bottom of sound RAM, and the
     /// Z80's reset line released so both chips have something to do.
     fn machine() -> (M68k, Z80, Bus) {
-        let mut bus = Bus::new(rom_image(), VERSION);
+        machine_at(VERSION)
+    }
+
+    /// [`machine`] on a console whose version register reports `version`, for the
+    /// one test that needs the TMSS of [`Bus`] as well as its clocks.
+    fn machine_at(version: u8) -> (M68k, Z80, Bus) {
+        let mut bus = Bus::new(rom_image(), version);
         // `INC A; JR -3` at $0000 of sound RAM, where a reset Z80 starts (`Z80::reset`
         // puts PC at 0, and plutiedev "Using the Z80" loads its program there).
         bus.z80.ram[0..3].copy_from_slice(&[0x3C, 0x18, 0xFD]);
@@ -925,5 +965,218 @@ mod tests {
             !row_is_red(224),
             "and no line past the active display was painted"
         );
+    }
+
+    // ---- Bus waits, on a running machine (M3-16, #77) -----------------------
+    //
+    // The bus decides what an access costs ([`Bus::take_68k_stall`] and
+    // [`Bus::take_z80_stall`]); the line loop is what spends it, by moving a chip's
+    // clock without running it. These tests hold the two together: each one
+    // measures a chip's own work over a known number of lines, so a wait that was
+    // never paid shows up as iterations that should not have been there, and one
+    // paid twice as iterations that should have been.
+
+    /// One `ADDQ.L #1,D0` and the `BRA.B` back to it - the loop [`machine`] runs -
+    /// is 8 + 10 = 18 68000 clocks, so this is what one iteration of that loop costs
+    /// in the master clocks the scheduler counts.
+    const LOOP_68K: u64 = 18 * MASTER_CLOCKS_PER_68K;
+
+    /// `bus.write_word(VDP_CONTROL, ..)` for one register, as a game's `move.w`
+    /// writes it (genvdp.txt section 7 "Programming VDP registers").
+    fn set_reg(bus: &mut Bus, reg: u8, value: u8) {
+        bus.write_word(
+            VDP_CONTROL,
+            0x8000 | (u16::from(reg) & 0x1F) << 8 | u16::from(value),
+        );
+    }
+
+    /// A 68k -> VDP transfer of `words` words of the 0xE00000 block to VRAM 0: R1
+    /// M1 allows DMA, R19/R20 the length, R21-R23 the source, and the two command
+    /// words with CD5 set are what start it (genvdp.txt section 11, plutiedev
+    /// "$93xx" to "$97xx"). Started from the test because the 68k's program here is
+    /// a counter, and `bus.write_word` to the control port is the `move.w` that a
+    /// program would use.
+    fn start_dma(bus: &mut Bus, words: u16) {
+        set_reg(bus, 1, 0x10);
+        set_reg(bus, 15, 2);
+        set_reg(bus, 19, words as u8);
+        set_reg(bus, 20, (words >> 8) as u8);
+        set_reg(bus, 21, 0);
+        set_reg(bus, 22, 0);
+        set_reg(bus, 23, 0x70);
+        // CD1-CD0 = `01` for a VRAM write at address 0, and CD5 for the transfer:
+        // the second word is the one that triggers it.
+        bus.write_word(VDP_CONTROL, 0x4000);
+        bus.write_word(VDP_CONTROL, 0x0080);
+    }
+
+    /// How many times the 68k's loop ran over `lines` of the machine.
+    fn iterations(
+        s: &mut Scheduler,
+        cpu: &mut M68k,
+        z80: &mut Z80,
+        bus: &mut Bus,
+        lines: u16,
+    ) -> u32 {
+        let before = cpu.d[0];
+        run_lines(s, cpu, z80, bus, lines);
+        cpu.d[0].wrapping_sub(before)
+    }
+
+    /// `INC HL; LD A,(addr); JR -6`: one read of `addr` and one count of it round,
+    /// 6 + 13 + 12 = 31 T-states (`crates/z80/src/alu16.rs` for `INC rr`, `ld8.rs`
+    /// for `LD A,(nn)`, `flow.rs` for a taken `JR`). The displacement is -6 because
+    /// a `JR` counts from the byte after it, which is where `-3` would land - on the
+    /// operand of the load, not on the `INC`.
+    fn z80_read_loop(addr: u16) -> [u8; 6] {
+        let mut program = [0_u8; 6];
+        program[0] = 0x23;
+        program[1] = 0x3A;
+        program[2..4].copy_from_slice(&addr.to_le_bytes());
+        program[4] = 0x18;
+        program[5] = 0xFA;
+        program
+    }
+
+    /// The 68k counting out of ROM and the Z80 reading `addr` once a time round,
+    /// both running: the machine the Z80 contention tests measure, the two counters
+    /// being the two things a wait can take away.
+    fn z80_contender(addr: u16) -> (M68k, Z80, Bus) {
+        let mut bus = Bus::new(rom_image(), VERSION);
+        let program = z80_read_loop(addr);
+        bus.z80.ram[..program.len()].copy_from_slice(&program);
+        release_z80_reset(&mut bus);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        let mut z80 = Z80::new();
+        z80.reset();
+        (cpu, z80, bus)
+    }
+
+    /// One frame of [`z80_contender`]: the 68k's iterations, the Z80's, and the
+    /// master clock the frame was.
+    fn one_frame(addr: u16) -> (u32, u16, u64) {
+        let (mut cpu, mut z80, mut bus) = z80_contender(addr);
+        let mut s = Scheduler::new(Region::Usa);
+        run_frame(&mut s, &mut cpu, &mut z80, &mut bus);
+        (cpu.d[0], z80.hl(), s.master_clock)
+    }
+
+    /// "During 68k-to-VDP DMA the 68k is halted until the DMA ends" (genvdp.txt
+    /// section 6), and [`vdp::Vdp::dma_68k_stall_mclk`] is for how long: over the
+    /// same 20 lines the 68000 runs the clocks and none of its instructions while
+    /// the transfer has the bus.
+    ///
+    /// The transfer is 1024 words, which at the 167 slots a H32 line with the
+    /// display off spends on it is twelve lines and a bit - most of the twenty - so
+    /// the loop's iterations go from several hundred to a handful. Time is not lost,
+    /// only spent: the 68000's clock still covers the 20 lines, so what the freeze
+    /// takes out of the counter is exactly the time it reports.
+    #[test]
+    fn dma_halts_68k_for_reported_time() {
+        let lines = 20_u16;
+
+        let (mut cpu, mut z80, mut bus) = machine();
+        let mut s = Scheduler::new(Region::Usa);
+        let free = iterations(&mut s, &mut cpu, &mut z80, &mut bus, lines);
+
+        let (mut cpu, mut z80, mut bus) = machine();
+        let mut s = Scheduler::new(Region::Usa);
+        run_lines(&mut s, &mut cpu, &mut z80, &mut bus, 1);
+        start_dma(&mut bus, 1024);
+        // Deliberately not [`Bus::take_68k_stall`]: the scheduler is the thing that
+        // has to spend it, and taking it here would spend it instead.
+        // [`crate::bus::tests::dma_command_word_charges_the_68k`] is what pins the
+        // number the bus records to this one.
+        let reported = bus.vdp.dma_68k_stall_mclk();
+        assert!(
+            reported > 0,
+            "the command word that starts the transfer freezes the 68000"
+        );
+
+        let held = iterations(&mut s, &mut cpu, &mut z80, &mut bus, lines);
+        assert!(held < free / 2, "{held} iterations with a DMA, {free} without");
+
+        // The freeze and the loop share the line budget, so the iterations the
+        // freeze cost are the freeze: `reported` master clocks, to within the one
+        // instruction each of the two runs may have run past the last line.
+        let lost = u64::from(free - held) * LOOP_68K;
+        assert!(
+            lost.abs_diff(u64::from(reported)) <= 3 * LOOP_68K,
+            "{lost} master clocks of loop lost to a freeze of {reported}"
+        );
+        assert!(held > 0, "and the 68000 comes back when the transfer ends");
+    }
+
+    /// A Z80 reading the 68k bus window gets through less of its loop in a frame
+    /// than the same Z80 reading its own RAM, by the extra T-states
+    /// [`crate::bus::Z80_WINDOW_WAIT_MCLK`] charges it for the width conversion.
+    #[test]
+    fn z80_bank_access_slows_z80() {
+        let (_, bank_reads, _) = one_frame(0x8000);
+        let (_, ram_reads, frame) = one_frame(0x0100);
+        assert!(
+            bank_reads < ram_reads,
+            "{bank_reads} reads through the window against {ram_reads} of sound RAM"
+        );
+
+        // Both against the model: the frame's master clocks over the T-states of a
+        // turn round, with the wait on the 68k bus and without it.
+        let loop_mclk = 31 * MASTER_CLOCKS_PER_Z80;
+        let model = |wait: u64| frame / (loop_mclk + wait);
+        assert!(
+            u64::from(ram_reads).abs_diff(model(0)) <= 3,
+            "uncontended: {ram_reads} against the model's {}",
+            model(0)
+        );
+        assert!(
+            u64::from(bank_reads).abs_diff(model(u64::from(Z80_WINDOW_WAIT_MCLK))) <= 3,
+            "contended: {bank_reads} against the model's {}",
+            model(u64::from(Z80_WINDOW_WAIT_MCLK))
+        );
+    }
+
+    /// And the same loop's reads take 68000 iterations with them. The 68000 keeps
+    /// its clock - the frame is still a frame - but loses the bus for
+    /// [`crate::bus::Z80_WINDOW_STEAL_MCLK`] of it per read the sound CPU makes.
+    #[test]
+    fn z80_bank_access_steals_68k_cycles() {
+        let (free, _, _) = one_frame(0x0100);
+        let (held, accesses, _) = one_frame(0x8000);
+
+        assert!(
+            held < free,
+            "{held} iterations of the 68k's loop while the Z80 hammers the window, {free} while it does not"
+        );
+        let lost = u64::from(free - held) * LOOP_68K;
+        let expected = u64::from(accesses) * u64::from(Z80_WINDOW_STEAL_MCLK);
+        assert!(
+            lost.abs_diff(expected) <= 4 * LOOP_68K,
+            "{lost} master clocks of 68000 lost to {accesses} window accesses of {Z80_WINDOW_STEAL_MCLK}, which is {expected}"
+        );
+    }
+
+    /// A 68000 frozen by the TMSS lock-up runs nothing and is still clocked: the
+    /// line ends, the beam goes on, and the chip is not owed the line back as a
+    /// burst of instructions (M3-16, #77).
+    #[test]
+    fn a_locked_up_68k_is_frozen_and_still_clocked() {
+        let (mut cpu, mut z80, mut bus) = machine_at(Region::Usa.version_register(true));
+
+        // The first touch of a VDP held by TMSS is the lock-up, and this is the
+        // `move.w $C00000, d0` that makes it.
+        assert_eq!(bus.read_word(VDP_DATA), 0xFFFF, "refused, and frozen");
+        assert!(bus.locked_up());
+
+        let mut s = Scheduler::new(Region::Usa);
+        s.run_line(&mut cpu, &mut z80, &mut bus);
+
+        assert_eq!(cpu.d[0], 0, "the frozen 68000 ran no instructions");
+        assert!(
+            s.m68k_clock >= MASTER_CLOCKS_PER_LINE,
+            "and it was still clocked: {}",
+            s.m68k_clock
+        );
+        assert_ne!(z80_a(&z80), A_RESET, "and the rest of the machine ran");
     }
 }
