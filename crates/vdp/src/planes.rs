@@ -28,7 +28,7 @@ const MAX_ENTRIES: usize = 4096;
 /// Bit 6 of a layer pixel: the priority of the cell it came from, as M4-17
 /// (#95) wants it. genvdp.txt section 14 moves a plane's pixels from `B`/`C`
 /// to `E'`/`F'` when the entry sets the flag.
-const PRIORITY_SHIFT: u32 = 6;
+pub(crate) const PRIORITY_SHIFT: u32 = 6;
 
 /// Bits of a horizontal scroll table entry that the VDP reads: genvdp.txt
 /// section 13 "Horizontal Scrolling", "x = Horizontal scroll value (0-3FFh)"
