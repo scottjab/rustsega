@@ -91,7 +91,7 @@ impl Channel {
     /// write does to a counter that is already running, so a write is treated as
     /// changing the reload value only - it sets the length of the next half
     /// period, not the phase of the current one. TODO(#105): pin this on
-    /// hardware or on a PSG test ROM.
+    /// hardware or on a PSG test ROM, follow-up filed as #321.
     fn tick(&mut self) {
         let period = self.tone.max(1);
         if self.counter == 0 {
