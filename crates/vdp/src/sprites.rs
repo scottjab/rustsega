@@ -177,9 +177,9 @@ pub(crate) fn sprite_at(vram: &[u8], cache: &SpriteCache, base: usize, index: us
 ///   first four bytes of one of its entries, updates that entry's line;
 /// - moving the SAT with R5 refills nothing, so a table moved to under one that
 ///   was never written is drawn with the y, the size and the link of the old one
-///   until the game writes the new entries. [`crate::latch`] is the same trick
-///   played on the scroll tables by #102, and the tests of this file are what fix
-///   the two apart.
+///   until the game writes the new entries. [`crate::latch`], the per-line read of
+///   the scroll tables of #102, is the other place the VDP stops treating VRAM as
+///   something it may re-read at any moment.
 ///
 /// It follows that the cache is chip state rather than line state: the chip takes
 /// no VRAM write while a line is being drawn, so there is nothing for
@@ -190,6 +190,15 @@ pub(crate) fn sprite_at(vram: &[u8], cache: &SpriteCache, base: usize, index: us
 /// agree before the chip has been talked to, and [`Vdp::new`] is the only thing
 /// that clears VRAM, so a reset - which rebuilds the chip, `genesis::Bus` - leaves
 /// them agreeing again.
+///
+/// **INFERRED**: the 80 lines, the four-byte window they cover and the fact that
+/// R5 refills none of them are the reading of genvdp.txt and Nemesis's notes that
+/// ticket #103 gives, and only the shape of the table they cache - 640 bytes of
+/// 8-byte entries - is quoted from section 15 at the top of this file. Nothing
+/// else was consulted, so all three are open to a measurement.
+///
+/// TODO(#103): pin the size of the cache, the width of the window and what a link
+/// past the 80 entries reads with the sprite ROM of M6-06.
 #[derive(Debug)]
 pub(crate) struct SpriteCache {
     /// One line per entry, holding `line[0..2]` the y word and `line[2..4]` the
