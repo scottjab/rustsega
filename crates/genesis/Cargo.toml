@@ -10,6 +10,8 @@ publish.workspace = true
 # other, but `genesis` composing them is the point of the crate
 # (docs/ARCHITECTURE.md).
 m68k = { path = "../m68k" }
+# `bus.rs` answers the 68k's VDP ports from the chip itself (M3-09, #69).
+vdp = { path = "../vdp" }
 # `z80_bus.rs` implements `z80::Z80Bus` for the sound CPU's view of the system.
 z80 = { path = "../z80" }
 

@@ -77,7 +77,11 @@ const VDP_PORTS: u32 = 0xC0_0000;
 /// These bits of a Z80 VDP window address name a port: the ports are at
 /// 0xC00000-0xC0001C and the area mirrors every $40 (plutiedev "Memory map",
 /// "VDP mirrors every $40 up to $DFFFFF").
-const VDP_PORT_MASK: u32 = 0x1F;
+///
+/// Crate-visible because they are the same five bits the 68k's own addresses name
+/// the same ports with, and `crate::bus`'s VDP decode (`vdp_port`, M3-09 #69) is
+/// the one table of them.
+pub(crate) const VDP_PORT_MASK: u32 = 0x1F;
 
 /// A decoded region of the Z80's 16 bit address space.
 ///
@@ -612,6 +616,41 @@ mod tests {
         assert_eq!(read(&mut bus, 0x7F08), 0xFF);
         // The PSG is write-only, so reading its port answers the same way.
         assert_eq!(read(&mut bus, 0x7F11), 0xFF);
+    }
+
+    /// The window reaches the VDP the 68k has at 0xC00000 (M3-09 #69): both
+    /// sides go through [`vdp_port_addr`], so a data port write from the sound
+    /// CPU lands in the same VRAM a 68k write lands in, a control port write
+    /// sets the same register, and the PSG byte keeps the one log the 68k's
+    /// `0xC00011` writes to as well.
+    ///
+    /// Byte writes only, which is what the Z80 has: a byte to one of the VDP's
+    /// 16-bit ports is the byte in both halves of the word (genvdp.txt section 7
+    /// "8-bit port access"), and that duplication is [`crate::bus`]'s rule
+    /// rather than one this window adds.
+    #[test]
+    fn z80_7f00_window_reaches_vdp() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+
+        // The set-up from the 68k, so that only the access under test comes
+        // through the window: R15 = 2 and a VRAM write command for address 0.
+        bus.write_word(0xC00004, 0x8F02);
+        bus.write_word(0xC00004, 0x4000);
+        bus.write_word(0xC00004, 0x0000);
+
+        write(&mut bus, 0x7F00, 0x12);
+        write(&mut bus, 0x7F00, 0x34);
+        assert_eq!(
+            &bus.vdp.vram[0..4],
+            &[0x12, 0x12, 0x34, 0x34],
+            "two byte writes to the data port, doubled by the 68k's own rule"
+        );
+
+        write(&mut bus, 0x7F04, 0x8F);
+        assert_eq!(bus.vdp.reg(15), 0x8F, "0x7F04 is the control port");
+
+        write(&mut bus, 0x7F11, 0x2A);
+        assert_eq!(bus.z80.psg_log, vec![0x2A], "and 0x7F11 is the PSG");
     }
 
     #[test]

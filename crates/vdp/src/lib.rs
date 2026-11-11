@@ -38,6 +38,10 @@ pub const LINES_V28: usize = 224;
 pub const LINES_V30: usize = 240;
 
 /// The VDP: its memories, its registers, and the frame it is drawing.
+///
+/// `Debug` is for the `genesis` bus, which owns a `Vdp` and derives its own
+/// (docs/ARCHITECTURE.md: "`genesis` ... Depends on all chip crates").
+#[derive(Debug)]
 pub struct Vdp {
     /// VRAM, 64 KiB, holding the pattern, name and sprite tables
     /// (genvdp.txt section 8).
