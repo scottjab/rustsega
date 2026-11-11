@@ -1268,14 +1268,29 @@ impl Bus {
         }
     }
 
-    /// The write also starts a 68k -> VDP transfer if the command word asked for
-    /// one, and that freezes the 68000 for the whole of it: see
-    /// [`Bus::vdp_control_write`], which charges the transfer's own wait.
+    /// One word to the control port, and then the DMA that write asked for.
+    ///
+    /// [`Vdp::write_control`] records the request and cannot run it, because the
+    /// chip has no bus to read a source through; the glue that has one is what
+    /// calls [`Vdp::run_dma`] (#85 says so on the method), and that call is a
+    /// no-op touching nothing whenever the write asked for no DMA. So it follows
+    /// every control port write, and nothing else.
+    ///
+    /// A write that started a 68k -> VDP transfer also freezes the 68000 for the
+    /// whole of it - "The 68000 is frozen during 68k -> VDP transfers" (genvdp.txt
+    /// section 6) - and [`Vdp::dma_68k_stall_mclk`] is for how long, charged here
+    /// for the scheduler to spend. It is read after every control write rather than
+    /// only the one that starts a transfer, and that is safe rather than merely
+    /// easy: the 68000 cannot make a second control write while it is frozen for
+    /// the first, so by the time another arrives the beam has been walked to the
+    /// end of the transfer and the number is back to 0. A fill and a copy report 0
+    /// and leave the 68000 running, which is what genvdp.txt means by the busy bit
+    /// being "only useful for fills and copies".
     ///
     /// Taking the fields apart rather than calling through `self` is the point of
-    /// [`Bus::vdp_control_write`] being a function: `run_dma` holds `&mut self.vdp`
-    /// for the whole transfer, and [`VdpDmaSource`] holds `rom`, `ram` and `mapper`
-    /// across it, which only separate field borrows allow at the same time.
+    /// this function being a function: `run_dma` holds `&mut self.vdp` for the
+    /// whole transfer, and [`VdpDmaSource`] holds `rom`, `ram` and `mapper` across
+    /// it, which only separate field borrows allow at the same time.
     fn vdp_control_write(&mut self, value: u16) {
         let Bus {
             vdp,
@@ -1288,16 +1303,8 @@ impl Bus {
         let mut source = VdpDmaSource { rom, ram, mapper };
         vdp.write_control(value);
         vdp.run_dma(&mut source);
-        // A write that started a 68k -> VDP transfer freezes the 68000 for the
-        // whole of it - "The 68000 is frozen during 68k -> VDP transfers"
-        // (genvdp.txt section 6) - and `dma_68k_stall_mclk` is for how long.
-        // Reading it after every control write rather than only the one that
-        // starts a transfer is safe rather than merely easy: the 68000 cannot make
-        // a second control write while it is frozen for the first, so by the time
-        // another arrives the beam has been walked to the end of the transfer and
-        // the number is back to 0. A fill and a copy report 0 and leave the 68000
-        // running, which is what genvdp.txt means by the busy bit being "only
-        // useful for fills and copies".
+        // The freeze the transfer just started, if it started one (#101 made the
+        // VDP report it, M3-16 #77 is the bus spending it).
         let stall = vdp.dma_68k_stall_mclk();
         *pending_68k_stall = pending_68k_stall.saturating_add(stall);
     }
