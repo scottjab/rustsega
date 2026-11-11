@@ -7,7 +7,8 @@
 //! reads answer (`status`), the beam position and the HV counter port (`hv`),
 //! and the three DMA modes, the 68k transfer, the fill and the copy (`dma`),
 //! and the beam timing that drives the status flags and raises the interrupts
-//! (`timing`), and the CRAM to pixel conversion with its colour LUT (`color`).
+//! (`timing`), and the CRAM to pixel conversion with its colour LUT (`color`),
+//! and the name table entries and the pattern rows they point at (`pattern`).
 //! Rendering is M4-10 (#88) onwards, so the line renderer that `timing` calls
 //! is the backdrop stub of M4-17 (#95).
 //!
@@ -19,6 +20,7 @@ pub mod color;
 mod dma;
 mod framebuffer;
 mod hv;
+pub mod pattern;
 mod ports;
 mod regs;
 mod status;
