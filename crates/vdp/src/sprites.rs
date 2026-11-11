@@ -647,6 +647,7 @@ mod tests {
 
     /// [`put_sprite`] for a table at `base` rather than at [`SPRITE_BASE`], for
     /// the tests that move the SAT with R5 (#103).
+    #[allow(clippy::too_many_arguments, reason = "one SAT entry is six fields, and a test that lays one down should name all of them")]
     fn put_sprite_at(
         vdp: &mut Vdp,
         base: usize,
