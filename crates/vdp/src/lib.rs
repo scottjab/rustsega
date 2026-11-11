@@ -2,19 +2,22 @@
 //!
 //! What lives here today is the state layer: the three memories, the 24
 //! registers, the register writes, and the mode getters every later VDP ticket
-//! reads, and the two ports the 68k reaches them with (`ports`: control port
-//! writes and data port writes). Data port reads are M4-03 (#81), the status
-//! register M4-04 (#82), DMA execution M4-07 (#85) and M4-08 (#86), rendering
-//! starts at M4-10 (#88), and timing after that.
+//! reads, the two ports the 68k reaches them with (`ports`: control port
+//! writes and data port writes), and the 68k to VDP DMA (`dma`). Data port
+//! reads are M4-03 (#81), the status register M4-04 (#82), the fill and copy
+//! DMA modes M4-08 (#86), rendering starts at M4-10 (#88), and timing after
+//! that.
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
 //! of the register (`$83xx` is R3), which is how each is usually quoted.
 
+mod dma;
 mod framebuffer;
 mod ports;
 mod regs;
 
+pub use dma::DmaBus;
 pub use framebuffer::FrameBuffer;
 pub use regs::{DmaMode, HScrollMode, InterlaceMode};
 
@@ -79,8 +82,9 @@ pub struct Vdp {
     /// (genvdp.txt section 7).
     pending: bool,
     /// Set by a command word with CD5 while R1 M1 allows DMA (genvdp.txt
-    /// section 7: "Setting CD5 will trigger a DMA operation"). The DMA tickets
-    /// run the transfer and clear it.
+    /// section 7: "Setting CD5 will trigger a DMA operation"). [`Vdp::run_dma`]
+    /// consumes it; the fill and copy modes of M4-08 (#86) will take their turn
+    /// with it too.
     dma_requested: bool,
     /// The frame the renderer draws into. Read through [`Vdp::frame`].
     frame_buffer: FrameBuffer,
@@ -373,12 +377,8 @@ impl Vdp {
     }
 
     /// True when a control port command word asked for a DMA and nobody has
-    /// run it yet.
-    ///
-    /// TODO(M4-07 #85): the 68k transfer that clears it; TODO(M4-08 #86): the
-    /// fill and copy. Until then this is only the request a command word with
-    /// CD5 raises (genvdp.txt section 7: "Setting CD5 will trigger a DMA
-    /// operation").
+    /// run it yet (genvdp.txt section 7: "Setting CD5 will trigger a DMA
+    /// operation"). [`Vdp::run_dma`] (`dma`) is what runs it and clears this.
     #[inline]
     pub fn dma_requested(&self) -> bool {
         self.dma_requested
@@ -430,7 +430,8 @@ impl Vdp {
     /// DMA length in words, R19 low and R20 high (genvdp.txt section 11
     /// "DMA"; plutiedev "$93xx/$94xx").
     ///
-    /// TODO(M4-07 #85): the transfer that counts it down.
+    /// The raw field: a transfer reads it through `dma::words_to_transfer`,
+    /// which is where the 0-means-0x10000 rule lives.
     #[inline]
     pub fn dma_length(&self) -> u16 {
         u16::from(self.regs[regs::R19]) | (u16::from(self.regs[regs::R20]) << 8)
@@ -454,7 +455,7 @@ impl Vdp {
     /// R23 bits 7-6 (DMD1-0): which DMA the command asked for (genvdp.txt
     /// section 11; plutiedev "$97xx").
     ///
-    /// TODO(M4-07 #85): 68000 transfer; TODO(M4-08 #86): fill and copy.
+    /// TODO(M4-08 #86): the fill and copy modes; the 68000 transfer is `dma`.
     #[inline]
     pub fn dma_mode(&self) -> DmaMode {
         regs::decode_dma_mode(self.regs[regs::R23])
