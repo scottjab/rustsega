@@ -83,7 +83,11 @@ impl Genesis {
     /// 4. [`Bus::new`] - which reads the rest of the cartridge itself: the save
     ///    RAM, the serial EEPROM and the bank registers all come out of the
     ///    image, so none of them can disagree with it.
-    /// 5. The 68000's own reset, which is what turns those vectors into a
+    /// 5. [`vdp::Vdp::start_in_vblank`] - the beam goes to the first line of
+    ///    VBlank, so that the 68000's first instruction, and every register the
+    ///    ROM writes from it, is written during blanking and is in time for line 0
+    ///    of the first frame (#310).
+    /// 6. The 68000's own reset, which is what turns those vectors into a
     ///    running program: `SSP` from `$000000` and `PC` from `$000004`
     ///    (M68000UM section 5 "Reset").
     ///
@@ -96,6 +100,11 @@ impl Genesis {
         let header = cart::parse_header(&rom)?;
         let region = config.resolve_region(&header);
         let mut bus = Bus::new(rom, region.version_register(config.tmss));
+        // A VDP that has never been talked to sits at line 0, which is a line of
+        // active display: leave it there and the program below starts 40 master
+        // clocks into line 0, past the point that line is drawn from, and its whole
+        // start-up register set is a frame late (#310). Blank first, then run.
+        bus.vdp.start_in_vblank();
         let mut cpu = M68k::new();
         cpu.reset(&mut bus);
         Ok(Self {
@@ -137,6 +146,11 @@ impl Genesis {
     /// any pad still attached, and the mapper's bank registers return to the
     /// pages the image starts on. All of that is [`Bus::reset_devices`]'
     /// business and documented there.
+    ///
+    /// The VDP that reset rebuilds comes back where [`Genesis::new`] leaves a fresh
+    /// one, on the first line of VBlank - [`Bus::reset_devices`] parks it there - so
+    /// the register set the restarted program writes from its first instruction is in
+    /// time for line 0 of the first frame after the reset (#310).
     pub fn reset(&mut self) {
         self.bus.reset_devices();
         self.scheduler.restart_frame();
@@ -144,16 +158,17 @@ impl Genesis {
     }
 
     /// Run one frame: the two CPUs and the VDP, for one whole raster of the
-    /// console's region, until the beam comes back to the top of the screen.
+    /// console's region, until the beam comes back to the blanking it started in.
     ///
     /// The VDP says when a frame is drawn at VBlank start, 224 lines into a 262
-    /// line NTSC frame, and [`Scheduler::run_frame`] takes that as the signal
-    /// to stop waiting and drains the rest of the raster so that one call is
-    /// exactly one frame and one `frame_done`. docs/ARCHITECTURE.md's "runs
-    /// until the next VBlank start" describes the wait, not the end of the call;
-    /// the ~38 lines of phase between the two are deliberate, are what keeps
-    /// consecutive returns a whole frame apart, and are documented on
-    /// [`Scheduler::run_frame`].
+    /// line NTSC frame, and [`Scheduler::run_frame`] takes that as the signal to
+    /// stop waiting and pays for the rest of the raster as well so that one call is
+    /// exactly one frame and one `frame_done` however far the beam had to go to
+    /// raise it. On this machine the two are the same moment: the console starts its
+    /// rasters in blanking (#310), so the wait is the whole 262 lines, the drain has
+    /// nothing left to pay for, and docs/ARCHITECTURE.md's "runs until the next
+    /// VBlank start" is the end of the call as well as the wait. The two are held
+    /// together by [`Scheduler::run_frame`] and [`Scheduler::restart_frame`].
     pub fn run_frame(&mut self) {
         self.scheduler
             .run_frame(&mut self.cpu, &mut self.z80, &mut self.bus);

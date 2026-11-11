@@ -1878,6 +1878,14 @@ impl m68k::Bus for Bus {
         // rebuilt with is the one this bus was built with, because `RESET` does not
         // change the crystal.
         self.vdp = Vdp::new(version_is_pal(self.version));
+        // ...except for where that chip's beam is: `Vdp::new` sits it at line 0, a
+        // line of active display 40 master clocks deep before anything may be latched
+        // for it, and the 68000 this reset is about to restart starts writing its VDP
+        // registers at its own first instruction. Parked in VBlank instead, that write
+        // is in time for line 0 of the first frame after the reset - which is what
+        // `crate::Genesis::new` does with a machine it has just built, and for the
+        // same reason (#310).
+        self.vdp.start_in_vblank();
         self.z80_busreq = false;
         self.z80_reset = true;
         self.z80_reset_pulse = false;
@@ -4474,6 +4482,31 @@ mod tests {
         assert!(
             bus.vdp.vram.iter().all(|&b| b == 0),
             "and so does the memory they point at"
+        );
+    }
+
+    /// `RESET` restarts the VDP's beam in VBlank rather than at line 0, so whatever
+    /// the restarted 68000 writes to the chip from its first instruction is written
+    /// during blanking and is in time for line 0 of the first frame after the reset
+    /// (#310). The console's own reset button reaches here through
+    /// [`crate::Genesis::reset`], which is why it does not have to park the beam a
+    /// second time.
+    #[test]
+    fn reset_devices_starts_the_beam_in_vblank() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        // Somewhere else first, so the reset has a position to change: a chip whose
+        // beam has been walked a hundred lines.
+        bus.vdp.advance(100 * TEST_VDP_LINE);
+        assert_ne!(bus.vdp.hv_counter() >> 8, 0, "and not already there");
+
+        bus.reset_devices();
+
+        // The V half of the HV counter is the line the beam is on (genvdp.txt
+        // section 5), and `E0` is where section 4 puts the first line of VBlank.
+        assert_eq!(
+            bus.vdp.hv_counter() >> 8,
+            0xE0,
+            "the rebuilt chip comes back on the first line of VBlank"
         );
     }
 }
