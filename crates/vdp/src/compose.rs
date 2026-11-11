@@ -197,10 +197,10 @@ mod tests {
         plane_vdp, put_entry, put_word,
     };
 
-    /// The three layer pixels of the priority tests, each colour 1 of a palette of
-    /// its own and [`CRAM_COLOURS`] filled to match, so a pixel of the frame says
-    /// which layer drew it: plane B palette 1, plane A palette 2, sprites palette
-    /// 3 (genvdp.txt section 15: sprites use the last two palettes only).
+    /// The palette each layer of these tests draws from, one apiece, with
+    /// [`COLOURS`] filled to match: a pixel of the frame says which layer drew it.
+    /// Plane B palette 1, plane A palette 2, sprites palette 3 (genvdp.txt section
+    /// 15 gives sprites the last two palettes only).
     const PLANE_B: u8 = 1;
     const PLANE_A: u8 = 2;
     const SPRITE: u8 = 3;
@@ -372,11 +372,11 @@ mod tests {
     /// SAT entry `index` as one 1x1 cell of `pattern` at the screen position
     /// `(x, y)`, its link ending the list (genvdp.txt section 15).
     fn put_sprite(vdp: &mut Vdp, index: usize, x: u16, y: u16, pattern: u16) {
-        let entry = SPRITE_BASE + index * 8;
-        put_word(vdp, entry, y + 128);
-        put_word(vdp, entry + 2, 0);
-        put_word(vdp, entry + 4, pattern);
-        put_word(vdp, entry + 6, x + 128);
+        let slot = SPRITE_BASE + index * 8;
+        put_word(vdp, slot, y + 128);
+        put_word(vdp, slot + 2, 0);
+        put_word(vdp, slot + 4, pattern);
+        put_word(vdp, slot + 6, x + 128);
     }
 
     /// Plane A and the sprite of [`compose_vdp`] at `(0, 0)`, each 8 pixels wide,
@@ -435,6 +435,14 @@ mod tests {
             row(&vdp, 224).iter().all(|&p| p == 0),
             "line 224 is past the active display"
         );
+
+        vdp.write_register(12, 0x81);
+        vdp.render_line(0);
+        assert_eq!(
+            row(&vdp, 0),
+            vec![red; 320],
+            "and an H40 line is the 320 pixels of the mode it was drawn in"
+        );
     }
 
     /// The three layers of one pixel, in every priority combination that the
@@ -443,11 +451,12 @@ mod tests {
     /// it is opaque.
     #[test]
     fn render_line_sorts_planes_and_a_sprite_by_priority() {
-        let cases: [(bool, bool, bool, u8); 6] = [
+        let cases: [(bool, bool, bool, u8); 7] = [
             (false, false, false, SPRITE),
             (true, false, false, PLANE_B),
             (false, true, false, PLANE_A),
             (false, false, true, SPRITE),
+            (true, true, false, PLANE_A),
             (true, true, true, SPRITE),
             (true, false, true, SPRITE),
         ];
@@ -464,7 +473,9 @@ mod tests {
                 "plane B priority {plane_b}, plane A priority {plane_a}, sprite priority {sprite}"
             );
             assert!(
-                line[8..].iter().all(|&p| p == pixel_of((PLANE_B << 4) | COLOUR)),
+                line[8..]
+                    .iter()
+                    .all(|&p| p == pixel_of((PLANE_B << 4) | COLOUR)),
                 "only plane B is opaque from pixel 8 on, and it showed as {:?}",
                 &line[8..12]
             );
@@ -509,7 +520,10 @@ mod tests {
         let line = row(&vdp, 0);
         let plane_a = pixel_of((PLANE_A << 4) | COLOUR);
         let window = pixel_of((SPRITE << 4) | COLOUR);
-        assert!(line[..128].iter().all(|&p| p == plane_a), "x < 128 is plane A");
+        assert!(
+            line[..128].iter().all(|&p| p == plane_a),
+            "x < 128 is plane A"
+        );
         assert!(
             line[128..].iter().all(|&p| p == window),
             "x >= 128 is the window"
