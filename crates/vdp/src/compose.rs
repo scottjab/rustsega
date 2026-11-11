@@ -19,8 +19,9 @@
 //! and painted at one of the three intensities of [`Intensity`]: shadow where no
 //! plane has its priority bit, normal where one does, and highlight where a sprite
 //! operator raised what was already normal (genvdp.txt section 16, M4-18 #96). The
-//! left column and the rest of the mode detail are M4-19 (#97) and the interlaced
-//! fields M4-20 (#98).
+//! row is then cut to the width of the line's mode, blanked at the left for R0 bit
+//! 5 and padded with the backdrop for whatever the frame has room for but the mode
+//! does not (M4-19 #97). The interlaced fields are M4-20 (#98).
 //!
 //! Two oddities of that section are outside the ticket and are not modelled: a
 //! sprite pixel of colour 14 of any palette line shows at normal intensity
@@ -56,6 +57,11 @@ const HIGHLIGHT_OPERATOR: u8 = 0x3E;
 /// [`HIGHLIGHT_OPERATOR`] going down instead of up: palette 3 colour 15, and down
 /// is all the way - "shadow + shadow = shadow" (SpritesMind thread 2692).
 const SHADOW_OPERATOR: u8 = 0x3F;
+
+/// The width of the column R0 bit 5 (LCB) blanks: one cell, the leftmost one,
+/// "filled with the backdrop color" whatever the layers hold in it (genvdp.txt
+/// section 17 "$00"; plutiedev "$80xx").
+const LEFT_COLUMN: usize = 8;
 
 /// Which layer of genvdp.txt section 14 shows at one screen position.
 ///
@@ -189,32 +195,77 @@ fn compose_pixel(
     }
 }
 
-/// Paint `row`, the active pixels of one line, from the three layer buffers of
-/// that line and the shadow/highlight mode of R12 bit 3.
+/// What the mode registers say about the line being drawn, read once by
+/// [`Vdp::render_line`] for it and taken as one by [`compose_row`].
+#[derive(Debug, Clone, Copy)]
+struct LineMode {
+    /// Pixels the line itself draws, [`Vdp::active_width`], which a mode change
+    /// mid-frame makes less than the frame is wide.
+    width: usize,
+    /// Columns of the left edge that go to the backdrop: 8 for R0 bit 5
+    /// ([`Vdp::left_column_blank`]) and 0 for a display that has it clear.
+    blank: usize,
+    /// The CRAM entry the backdrop shows from, [`Vdp::backdrop_index`].
+    backdrop: u8,
+    /// Whether R12 bit 3 makes the two extra intensities of genvdp.txt section
+    /// 16 live, [`Vdp::shadow_highlight_enabled`].
+    shadow_highlight: bool,
+}
+
+/// Paint `row`, one row of the frame buffer, from the three layer buffers of one
+/// line and its [`LineMode`].
 ///
 /// `cram` is [`Vdp::cram_pixels`], so a pixel costs one index into a table of
-/// 64 instead of a CRAM read and a LUT read, and `backdrop` is
-/// [`Vdp::backdrop_index`]: the entry of that table the backdrop shows from, at
-/// whatever intensity [`compose_pixel`] settled on. `row` is as wide as the mode
-/// says, which is how an H32 line drops the 64 overscan columns that
-/// [`Vdp::render_plane_line`] fills in every mode.
+/// 64 instead of a CRAM read and a LUT read, and the entry the backdrop shows
+/// from is `mode.backdrop`, at whatever intensity [`compose_pixel`] settled.
+///
+/// `row` is as wide as the frame ([`crate::FrameBuffer::width`], the mode of its
+/// first line) while `mode.width` is as wide as this line's own mode draws, two
+/// numbers that part company the moment a game writes R12 mid-frame:
+///
+/// * columns `mode.width..` of the row are not overscan data but nothing at all,
+///   the display of the line having ended, so they are read as empty layers and
+///   compose to the backdrop;
+/// * columns `..mode.blank` of it are R0 bit 5, [`Vdp::left_column_blank`],
+///   which shows the backdrop colour and nothing else.
+///
+/// The blank takes the colour only, not the intensity: genvdp.txt section 16
+/// settles the two for a pixel separately, so the left column of a shadowed line
+/// is the shadowed backdrop and, with shadow/highlight off as everywhere else,
+/// plain R7.
 fn compose_row(
     row: &mut [u32],
+    mode: LineMode,
     plane_b: &[u8; WIDTH_H40],
     plane_a: &[u8; WIDTH_H40],
     sprites: &[u8; WIDTH_H40],
     cram: &[[u32; Intensity::ALL.len()]; CRAM_WORDS],
-    backdrop: u8,
-    shadow_highlight: bool,
 ) {
-    let layers = plane_b.iter().zip(plane_a).zip(sprites);
-    for (pixel, ((&b, &a), &s)) in row.iter_mut().zip(layers) {
+    let LineMode {
+        width,
+        blank,
+        backdrop,
+        shadow_highlight,
+    } = mode;
+    for (x, pixel) in row.iter_mut().enumerate() {
+        // A column past the width of this line has no layer data: the buffers
+        // are as wide as the widest mode, and what they hold beyond the display
+        // of the line is the overscan of a display this line is not drawing.
+        let (b, a, s) = if x < width {
+            (plane_b[x], plane_a[x], sprites[x])
+        } else {
+            (0, 0, 0)
+        };
         let (layer, level) = compose_pixel(shadow_highlight, b, a, s);
-        let index = match layer {
-            Layer::Backdrop => backdrop,
-            Layer::PlaneB => b & CRAM_INDEX_MASK,
-            Layer::PlaneA => a & CRAM_INDEX_MASK,
-            Layer::Sprite => s & CRAM_INDEX_MASK,
+        let index = if x < blank {
+            backdrop
+        } else {
+            match layer {
+                Layer::Backdrop => backdrop,
+                Layer::PlaneB => b & CRAM_INDEX_MASK,
+                Layer::PlaneA => a & CRAM_INDEX_MASK,
+                Layer::Sprite => s & CRAM_INDEX_MASK,
+            }
         };
         *pixel = cram[usize::from(index)][level.index()];
     }
@@ -255,10 +306,16 @@ impl Vdp {
     /// walked either, so a switched-off display spends no sprite slot and sets no
     /// SOVR or collision status of its own.
     ///
-    /// `frame.width` and `frame.height` are set from the mode on every call, not
-    /// once at line 0: the stride of a row is the frame width, so a line drawn
-    /// after a mid-frame mode change has to describe the mode it was drawn in,
-    /// and [`Vdp::render_line`] stays callable on its own.
+    /// `frame.width` and `frame.height` are the mode of the first line of the
+    /// frame, latched by the `line == 0` call and left alone for the rest of it.
+    /// The stride of a row is the frame width, so a mid-frame mode change may not
+    /// move it or the lines already drawn would be read back at the wrong offset;
+    /// a line narrower than the frame is padded with the backdrop, by
+    /// [`compose_row`], and a line wider than it - the switch the other way, which
+    /// shows nothing of the extra 64 columns - is cut short.
+    ///
+    /// Everything else of the line is read at the moment it is drawn, R12
+    /// included, as [`Vdp::window_base`] and [`Vdp::sprite_base`] do too.
     pub fn render_line(&mut self, line: u16) {
         let height = self.active_height();
         let y = usize::from(line);
@@ -266,20 +323,22 @@ impl Vdp {
             return;
         }
         let width = self.active_width();
-        {
-            let frame = &mut self.frame_buffer;
-            frame.width = width;
-            frame.height = height;
+        if y == 0 {
+            self.frame_buffer.width = width;
+            self.frame_buffer.height = height;
         }
 
-        let start = y * width;
+        let stride = self.frame_buffer.width;
+        let start = y * stride;
         if !self.display_enabled() {
             // The backdrop of a switched-off display is the whole line, at the
             // normal intensity of [`Vdp::backdrop_pixel`]: the half of section 16
             // belongs to the display, and "the overscan region outside of the
-            // display area is always shown at normal intensity".
+            // display area is always shown at normal intensity". It is the whole
+            // row of the frame, so a display switched off on an H32 line of an
+            // H40 frame leaves no live pixels at its right edge either.
             let backdrop = self.backdrop_pixel();
-            self.frame_buffer.pixels[start..start + width].fill(backdrop);
+            self.frame_buffer.pixels[start..start + stride].fill(backdrop);
             return;
         }
 
@@ -295,24 +354,25 @@ impl Vdp {
         self.render_sprite_line(line, &mut sprites);
 
         let cram = self.cram_pixels();
-        let backdrop = self.backdrop_index();
-        let shadow_highlight = self.shadow_highlight_enabled();
-        let row = &mut self.frame_buffer.pixels[start..start + width];
-        compose_row(
-            row,
-            &plane_b,
-            &plane_a,
-            &sprites,
-            &cram,
-            backdrop,
-            shadow_highlight,
-        );
+        let mode = LineMode {
+            width,
+            blank: if self.left_column_blank() {
+                LEFT_COLUMN
+            } else {
+                0
+            },
+            backdrop: self.backdrop_index(),
+            shadow_highlight: self.shadow_highlight_enabled(),
+        };
+        let row = &mut self.frame_buffer.pixels[start..start + stride];
+        compose_row(row, mode, &plane_b, &plane_a, &sprites, &cram);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WIDTH_H32;
     use crate::color::color;
     use crate::planes::testutil::{
         CELL_TILE_ROWS, PLANE_A_BASE, PLANE_B_BASE, PLANE_COLUMNS, PLANE_ROWS, fill_tile_row,
@@ -649,6 +709,124 @@ mod tests {
         assert!(
             line[128..].iter().all(|&p| p == window),
             "x >= 128 is the window"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Display modes: the size of the frame and the edges of it (M4-19, #97).
+    // ---------------------------------------------------------------------
+
+    /// Plane A over the whole display: every active pixel of every line is
+    /// [`PLANE_A`]'s colour, which is what makes the backdrop of a blanked left
+    /// column and of the padding of a short line stand out.
+    fn plane_a_everywhere(vdp: &mut Vdp) {
+        solid(vdp, 3, COLOUR);
+        for cell in 0..PLANE_COLUMNS * PLANE_ROWS {
+            put_entry(vdp, PLANE_A_BASE, cell, entry(PLANE_A, 3, false));
+        }
+    }
+
+    /// The width the frame reports is the width of the mode, R12's resolution
+    /// bits: 256 for `00` and 320 for `0x81` (genvdp.txt section 17 "$0C", and
+    /// [`Vdp::active_width`]).
+    #[test]
+    fn line_zero_sizes_the_frame_to_the_horizontal_resolution() {
+        let mut vdp = compose_vdp();
+        vdp.render_line(0);
+        assert_eq!(vdp.frame().width, 256, "R12 = 0 is the 32-cell display");
+
+        let mut vdp = compose_vdp();
+        vdp.write_register(12, 0x81);
+        vdp.render_line(0);
+        assert_eq!(vdp.frame().width, 320, "R12 = 0x81 is the 40-cell one");
+    }
+
+    /// R1 bit 3 (M2) is V30, 30 cells of 8 lines: 240 lines on a PAL chip, and
+    /// still 224 on NTSC, which cannot clock out the extra 16 and shows no stable
+    /// picture with the bit set (genvdp.txt section 17 "$01"; plutiedev "$81xx":
+    /// "V30 mode only works properly on PAL systems").
+    #[test]
+    fn line_zero_sizes_the_frame_to_the_vertical_resolution_of_the_crystal() {
+        for (pal, height) in [(true, 240), (false, 224)] {
+            let mut vdp = Vdp::new(pal);
+            vdp.write_register(1, 0x48);
+            vdp.render_line(0);
+            assert_eq!(
+                vdp.frame().height,
+                height,
+                "{} with R1 bit 3 set",
+                if pal { "PAL" } else { "NTSC" }
+            );
+        }
+
+        let mut vdp = Vdp::new(true);
+        vdp.write_register(1, 0x40);
+        vdp.render_line(0);
+        assert_eq!(vdp.frame().height, 224, "PAL in V28 is 224 like NTSC");
+    }
+
+    /// R0 bit 5 (LCB): "the leftmost 8 pixels ... are filled with the backdrop
+    /// color" (genvdp.txt section 17 "$00"; plutiedev "$80xx"). Plane A and a
+    /// sprite both cover the column here, and both go.
+    #[test]
+    fn the_left_column_blank_replaces_the_first_eight_pixels_with_the_backdrop() {
+        let mut vdp = compose_vdp();
+        plane_a_everywhere(&mut vdp);
+        solid(&mut vdp, 4, COLOUR);
+        put_sprite(&mut vdp, 0, 0, 0, entry(SPRITE, 4, true));
+
+        vdp.render_line(0);
+        let plane_a = pixel_of((PLANE_A << 4) | COLOUR);
+        let sprite = pixel_of((SPRITE << 4) | COLOUR);
+        let line = row(&vdp, 0);
+        assert!(
+            line[..8].iter().all(|&p| p == sprite),
+            "before the blank is switched on, the sprite is what the column shows"
+        );
+
+        vdp.write_register(0, 1 << 5);
+        vdp.render_line(0);
+        let line = row(&vdp, 0);
+        let backdrop = pixel_of(BACKDROP);
+        assert!(
+            line[..8].iter().all(|&p| p == backdrop),
+            "the 8 pixels of R0 bit 5 are the backdrop, sprite included"
+        );
+        assert!(
+            line[8..].iter().all(|&p| p == plane_a),
+            "and pixel 8 on is the plane it always was"
+        );
+    }
+
+    /// A game that drops from H40 to H32 part way down the frame does not move
+    /// the frame: it stays 320 wide, the geometry of line 0, and the lines that
+    /// are only 256 pixels long get the backdrop where the display is not.
+    #[test]
+    fn a_line_narrower_than_the_frame_is_padded_with_the_backdrop() {
+        let mut vdp = compose_vdp();
+        plane_a_everywhere(&mut vdp);
+        vdp.write_register(12, 0x81);
+        vdp.render_line(0);
+        vdp.write_register(12, 0x00);
+        vdp.render_line(1);
+
+        let frame = vdp.frame();
+        assert_eq!(frame.width, 320, "the frame keeps the width of line 0");
+        let backdrop = pixel_of(BACKDROP);
+        let plane_a = pixel_of((PLANE_A << 4) | COLOUR);
+        let line0 = row(&vdp, 0);
+        assert!(
+            line0.iter().all(|&p| p == plane_a),
+            "the H40 line of line 0 is still plane A end to end"
+        );
+        let line1 = row(&vdp, 1);
+        assert!(
+            line1[..WIDTH_H32].iter().all(|&p| p == plane_a),
+            "the 256 pixels of the H32 line are plane A"
+        );
+        assert!(
+            line1[WIDTH_H32..].iter().all(|&p| p == backdrop),
+            "and the 64 the mode has no display for are the backdrop"
         );
     }
 
