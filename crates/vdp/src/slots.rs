@@ -62,6 +62,7 @@ pub(crate) const REFRESH_OFF_H40: usize = 6;
 /// This is not what the write FIFO waits on: with the display off nothing is
 /// being fetched and [`Vdp::fifo_clock`] gives a write the memories as it is
 /// made. The note under [`Vdp::free_slot_indices`] says what that costs.
+#[allow(dead_code)] // first caller is the display-off wait of #302
 pub(crate) const OFF_TRANSFERS_H40: usize = SLOTS_H40 - (2 * REFRESH_OFF_H40);
 
 /// Every slot of an H40 line but the [`REFRESH_BLANK_H40`] the DRAM refresh
@@ -151,7 +152,10 @@ const ACTIVE_H32: [u16; 16] = [
 /// Master clock the access slot `slot` of the line is taken at: slot `n` starts at
 /// pixel `2n`, both modes having two pixels to a slot.
 pub(crate) fn slot_mclk(slot: usize, h40: bool) -> u32 {
-    pixel_to_mclk(2 * u32::try_from(slot).expect("a line has at most 210 slots"), h40)
+    pixel_to_mclk(
+        2 * u32::try_from(slot).expect("a line has at most 210 slots"),
+        h40,
+    )
 }
 
 impl Vdp {

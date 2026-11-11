@@ -687,7 +687,10 @@ mod tests {
     #[test]
     fn an_idle_fifo_owes_itself_no_slots() {
         let mut fifo = Fifo::new();
-        assert!(fifo.take_slot().is_none(), "an empty queue has nothing to write");
+        assert!(
+            fifo.take_slot().is_none(),
+            "an empty queue has nothing to write"
+        );
 
         fifo.push(Entry::new(0x01, 0x0100, 0xBEEF));
         assert!(

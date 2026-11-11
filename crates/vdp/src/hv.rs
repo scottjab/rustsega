@@ -473,7 +473,11 @@ mod tests {
     fn mclk_to_pixel_covers_the_h40_line_from_end_to_end() {
         assert_eq!(mclk_to_pixel(0, true), 0);
         assert_eq!(mclk_to_pixel(7, true), 0, "the first pixel is a fast one");
-        assert_eq!(mclk_to_pixel(8, true), 1, "and the slow run starts after it");
+        assert_eq!(
+            mclk_to_pixel(8, true),
+            1,
+            "and the slow run starts after it"
+        );
         assert_eq!(mclk_to_pixel(3419, true), 419);
     }
 
@@ -535,7 +539,10 @@ mod tests {
         // left border 13 in front of the 320, right border 14 and right blanking
         // 9 behind it.
         let left = 34 + 30 + 13;
-        assert_eq!(pixel_to_mclk(left + 320, true) - pixel_to_mclk(left, true), 2560);
+        assert_eq!(
+            pixel_to_mclk(left + 320, true) - pixel_to_mclk(left, true),
+            2560
+        );
         assert_eq!(
             MCLKS_PER_LINE - (pixel_to_mclk(left + 320, true) - pixel_to_mclk(left, true)),
             860,
