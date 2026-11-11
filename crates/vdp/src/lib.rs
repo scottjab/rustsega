@@ -3,10 +3,9 @@
 //! What lives here today is the state layer: the three memories, the 24
 //! registers, the register writes, and the mode getters every later VDP ticket
 //! reads, the two ports the 68k reaches them with (`ports`: control port
-//! writes and data port writes), and the 68k to VDP DMA (`dma`). Data port
-//! reads are M4-03 (#81), the status register M4-04 (#82), the fill and copy
-//! DMA modes M4-08 (#86), rendering starts at M4-10 (#88), and timing after
-//! that.
+//! writes and data port writes and reads), and the 68k to VDP DMA (`dma`). The
+//! status register is M4-04 (#82), the fill and copy DMA modes M4-08 (#86),
+//! rendering starts at M4-10 (#88), and timing after that.
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address

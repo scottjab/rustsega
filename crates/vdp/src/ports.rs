@@ -263,9 +263,9 @@ const fn vsram_word_index(addr: u16) -> Option<usize> {
 /// `0xFF` is +255 and not -1.
 ///
 /// The full address register is kept here, unmasked, for the memory the code
-/// register names. TODO(M4-03 #81) reads it and masks the address it uses per
-/// memory (VRAM whole 64 KiB, CRAM and VSRAM bits 6-1); reads increment with
-/// this same function.
+/// register names. [`Vdp::read_data`] masks the address it uses per memory (VRAM
+/// whole 64 KiB, CRAM and VSRAM bits 6-1); reads increment with this same
+/// function, because the access happened either way.
 const fn increment(addr: u16, step: u8) -> u16 {
     addr.wrapping_add(step as u16)
 }
