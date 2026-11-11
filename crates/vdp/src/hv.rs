@@ -120,9 +120,9 @@ fn h_count(pixel: u32, h40: bool) -> u8 {
 
 /// The V counter byte on frame line `line`, before the interlace transform.
 ///
-/// One value per line of the frame, ending on 0xFF at the last line: see
-/// [`V_JUMP_NTSC_LINE`] for the NTSC table and [`V_JUMP_PAL_V28_LINE`] for the
-/// two PAL ones.
+/// One count per line of the frame, and the last line of the frame counts
+/// 0xFF: see [`V_JUMP_NTSC_LINE`] for the NTSC table and
+/// [`V_JUMP_PAL_V28_LINE`] for the two PAL ones.
 ///
 /// NTSC has no V30. R1 bit 3 "will select between a PAL (240) and NTSC (224
 /// lines) display" (genvdp.txt section 17 "$01"), and an NTSC frame is still
@@ -153,11 +153,11 @@ fn v_count(line: u16, pal: bool, v30: bool) -> u8 {
 ///
 /// genvdp.txt says one thing about this, and one thing only: "According to the
 /// manual, VC0 is replaced with VC8 when in interlace mode 2" (section 5). The
-/// mode 2 rule below is that sentence - the doubled value has bit 0 spare, and
-/// bit 8 of the internal counter goes into it. Mode 1's transform is the same
-/// replacement without the doubling, which is what the ticket specifies for it
-/// and is *not* something genvdp.txt says: nothing here does. Both are
-/// therefore inferred, TODO(M4-20 #98) to confirm them on hardware.
+/// mode 2 rule below is that sentence: the doubled value has bit 0 spare, and
+/// bit 8 of the internal counter goes into it. Mode 1 is the same replacement
+/// without the doubling, which is what the ticket says and is not something
+/// genvdp.txt says at all - it names mode 2 and nothing else. Both are therefore
+/// inferred, TODO(M4-20 #98) to confirm them on hardware.
 ///
 /// `field` is bit 8 of the internal counter, `VC8`: the second half of the
 /// frame, which is the half that the 8-bit V counter cannot name and which
