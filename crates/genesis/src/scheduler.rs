@@ -23,13 +23,20 @@
 //! 2^64 of them is 2^64 / 53_693_175 s, about ten thousand years of running
 //! (NTSC, and PAL is slower still).
 //!
+//! ## The VDP's position in it
+//!
+//! [`Bus::vdp`] is a third chip on the same master clock. [`Scheduler::sync_vdp`] walks
+//! it after every slice, to `min(m68k_clock, z80_clock)` - the time the two CPUs agree
+//! has passed - so the beam never runs ahead of the instructions the bus was answering,
+//! and [`Scheduler::update_interrupts`] takes what the walk produced: the VDP's
+//! VINT/HINT level onto the 68000's `ipl` pins and the VBlank pulse onto the Z80's
+//! `/INT`. Rendering is inside [`vdp::Vdp::advance`] and never called from here.
+//!
 //! ## What the line loop does not do yet
 //!
-//! The VDP is not in this ticket: no rendering, no HV counter, no VINT/HINT, and no
-//! Z80 interrupt line. `// TODO(M3-14 #75)` marks where each of those joins, which is
-//! M3-14 (#75), the VDP half of the scheduler. So is freezing the 68k on
-//! [`Bus::locked_up`], which has to move the 68k's clock rather than skip it, for
-//! exactly the reason the stopped Z80's clock moves.
+//! Freezing the 68k on [`Bus::locked_up`] is still M3-16's, and it has to move the
+//! 68k's clock rather than skip it, for exactly the reason the stopped Z80's clock
+//! moves.
 
 use crate::bus::Bus;
 use crate::config::Region;
@@ -69,6 +76,10 @@ pub struct Scheduler {
     pub master_clock: u64,
     m68k_clock: u64,
     z80_clock: u64,
+    /// How far [`Bus::vdp`] has been advanced, in the same master clocks as the two
+    /// CPU positions. It is never ahead of either of them, and it is never reset, so
+    /// the VDP sees every clock the machine runs and sees it once.
+    vdp_clock: u64,
     lines_per_frame: u16,
 }
 
@@ -90,6 +101,7 @@ impl Scheduler {
             master_clock: 0,
             m68k_clock: 0,
             z80_clock: 0,
+            vdp_clock: 0,
             lines_per_frame: if region.is_pal() {
                 LINES_PER_FRAME_PAL
             } else {
@@ -149,7 +161,7 @@ impl Scheduler {
                     self.z80_clock = line_end;
                 }
             } else {
-                // TODO(M3-14 #75): freeze the 68k while `bus.locked_up()` is set, by
+                // TODO(M3-16 #77): freeze the 68k while `bus.locked_up()` is set, by
                 // taking its clock to the end of the line rather than by skipping it.
                 let cycles = cpu.step(bus);
                 Self::charge(
@@ -160,13 +172,73 @@ impl Scheduler {
                 );
                 bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
             }
+
+            self.sync_vdp(bus);
+            Self::update_interrupts(cpu, z80, &bus.vdp);
         }
 
-        // TODO(M3-14 #75): the VDP joins here - `vdp.advance(MASTER_CLOCKS_PER_LINE)`,
-        // the HV counter from `self.line`, and VINT/HINT out to `M68k::set_ipl` and
-        // `Z80::set_int_line`.
         self.master_clock += MASTER_CLOCKS_PER_LINE;
         self.line = (self.line + 1) % self.lines_per_frame;
+    }
+
+    /// Run one whole frame: [`Scheduler::run_line`] until the VDP says the frame is
+    /// drawn, and then the rest of the raster too.
+    ///
+    /// [`vdp::Vdp::frame_done`] is raised at VBlank start, which on NTSC is line 224
+    /// of 262, and once per frame after that. Ending the frame there would make the
+    /// first call 224 lines long and every later one 262 - which is not a difference
+    /// the VDP can be blamed for, since it is simply answering a question about where
+    /// its own beam is. So the flag is what ends the waiting, and the line counter
+    /// wrapping is what ends the frame: one `run_frame` is one raster of
+    /// [`Scheduler::lines_per_frame`] lines, and it takes exactly one `frame_done`
+    /// with it (`run_frame_ends_at_vblank` holds the two together).
+    pub fn run_frame(&mut self, cpu: &mut M68k, z80: &mut Z80, bus: &mut Bus) {
+        let mut lines = 0_u32;
+        while !bus.vdp.frame_done() {
+            lines += 1;
+            // The line counter is what ends the frame below, so a VDP that never
+            // raises the flag would spin here forever: the same kind of guard
+            // [`Scheduler::slice_bound`] is, on the outer loop instead of the inner
+            // one, and a panic naming itself rather than a hung test.
+            assert!(
+                lines <= u32::from(self.lines_per_frame),
+                "{} lines and the VDP has not raised `frame_done`",
+                lines,
+            );
+            self.run_line(cpu, z80, bus);
+        }
+        while self.line != 0 {
+            self.run_line(cpu, z80, bus);
+        }
+    }
+
+    /// Walk the VDP to the time the two CPUs agree has passed, so that the beam and
+    /// the interrupts that fall out of it never run ahead of the instructions the bus
+    /// has been answering.
+    ///
+    /// Both CPU positions are only ever raised, so this is a monotone clock too and
+    /// the subtraction cannot underflow. The amount is bounded by one slice - the
+    /// call happens at every slice boundary - which is why it fits the `u32` of
+    /// [`vdp::Vdp::advance`] without a thought beyond the cast.
+    fn sync_vdp(&mut self, bus: &mut Bus) {
+        let now = self.m68k_clock.min(self.z80_clock);
+        bus.vdp.advance((now - self.vdp_clock) as u32);
+        self.vdp_clock = now;
+    }
+
+    /// The two wires from the VDP to the two CPUs, re-read after every slice.
+    ///
+    /// `ipl` is a pin, not a queue ([`m68k::M68k::ipl`]): the 68000 samples it between
+    /// instructions, so holding the VDP's current offer on it is the whole of the
+    /// delivery, and [`Bus::int_ack`] - which the CPU calls as it takes the level -
+    /// is what makes the next read of [`vdp::Vdp::pending_irq`] come back without it.
+    ///
+    /// The Z80's `/INT` is a level too ([`z80::Z80::set_int_line`]), and
+    /// [`vdp::Vdp::z80_int_line`] is the pulse it is driven with: one stretch of the
+    /// first line of VBlank, once per frame.
+    fn update_interrupts(cpu: &mut M68k, z80: &mut Z80, vdp: &vdp::Vdp) {
+        cpu.ipl = vdp.pending_irq().unwrap_or(0);
+        z80.set_int_line(vdp.z80_int_line());
     }
 
     /// Is the sound CPU the one that is behind, so that its slice comes next? The 68k
@@ -298,10 +370,91 @@ mod tests {
         }
     }
 
-    /// One frame of `s`'s region.
+    /// One frame of `s`'s region, by the scheduler's own rule rather than by a line
+    /// count, so that every test above is really testing [`Scheduler::run_frame`].
     fn run_frame(s: &mut Scheduler, cpu: &mut M68k, z80: &mut Z80, bus: &mut Bus) {
-        let lines = s.lines_per_frame;
-        run_lines(s, cpu, z80, bus, lines);
+        s.run_frame(cpu, z80, bus);
+    }
+
+    // ---- The VDP in the loop (M3-14, #75) ------------------------------------
+    //
+    // The 68k in these tests has one program - `BRA.B $` - and the VDP it talks to is
+    // set up through the bus's own VDP port arm, which is the same `write_word` the
+    // 68k would reach with a `move.w`. What is under test here is the scheduler and
+    // the chip, not the 68000's instruction decoding, which `crates/m68k` owns.
+
+    /// The VDP's two 68000 ports: `$C00000` data and `$C00004` control, both
+    /// mirrored across the whole `$C00000-$DFFFFF` area (plutiedev "Memory map").
+    const VDP_DATA: u32 = 0xC0_0000;
+    const VDP_CONTROL: u32 = 0xC0_0004;
+    /// The 68000's autovector slots for the two VDP levels: `AUTO_VECTOR_BASE + 6`
+    /// is vector 30 and `+ 4` is vector 28 (`crates/m68k/src/interrupts.rs`), so
+    /// the longs live at `4 * 30` and `4 * 28`.
+    const VINT_VECTOR: usize = 4 * 30;
+    const HINT_VECTOR: usize = 4 * 28;
+    /// Where the two handlers go, clear of the init code at [`CODE`].
+    const VINT_HANDLER: u32 = 0x0000_0100;
+    const HINT_HANDLER: u32 = 0x0000_0110;
+    /// `BRA.B $`, the loop the 68k waits in while the interrupts arrive.
+    const BRA_SELF: u16 = 0x60_FE;
+    /// Supervisor mode with the interrupt mask at 0. `M68k::reset` leaves the mask
+    /// at 7 (M68000UM section 5 "Reset"), which would mask every VINT and HINT
+    /// from the bus; these tests are about the delivery path from the VDP, which
+    /// `crates/m68k/src/interrupts.rs` already covers for the mask itself.
+    const MASKLESS: u16 = 0x2000;
+    /// Master clocks in a VDP line, the same 3420 [`MASTER_CLOCKS_PER_LINE`] is.
+    const VDP_LINE: u32 = MASTER_CLOCKS_PER_LINE as u32;
+
+    /// The console `rom` runs on. The sound CPU stays in the reset [`Bus::new`]
+    /// leaves it in, so these tests have the 68k and the VDP and nothing else.
+    fn console(rom: Vec<u8>) -> (M68k, Z80, Bus) {
+        let mut bus = Bus::new(rom, VERSION);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        let mut z80 = Z80::new();
+        z80.reset();
+        (cpu, z80, bus)
+    }
+
+    /// A cartridge image for the interrupt tests: the reset table with
+    /// [`VINT_HANDLER`] in the level 6 slot and [`HINT_HANDLER`] in the level 4 one,
+    /// and a program of `BRA.B $` to sit in while they fire.
+    ///
+    /// The handler bodies are `ADDQ.L #1,D0` / `ADDQ.L #1,D1` and `RTE`
+    /// (`$5280`/`$5281` and `$4E73`: the first is the encoding
+    /// `runs_expected_68k_cycles_per_frame` proves, the second `decode`'s
+    /// `0x4E73 => Op::Rte`). Each counts its own entries and neither saves the
+    /// register it bumps, which is enough for a counter and nothing else.
+    fn interrupt_rom() -> Vec<u8> {
+        let mut rom = vec![0_u8; 0x200];
+        rom[0..4].copy_from_slice(&0x00FF_0000_u32.to_be_bytes());
+        rom[4..8].copy_from_slice(&CODE.to_be_bytes());
+        rom[VINT_VECTOR..VINT_VECTOR + 4].copy_from_slice(&VINT_HANDLER.to_be_bytes());
+        rom[HINT_VECTOR..HINT_VECTOR + 4].copy_from_slice(&HINT_HANDLER.to_be_bytes());
+        rom[CODE as usize..CODE as usize + 2].copy_from_slice(&BRA_SELF.to_be_bytes());
+
+        for (handler, addq) in [(VINT_HANDLER, 0x5280_u16), (HINT_HANDLER, 0x5281)] {
+            let at = usize::try_from(handler).expect("a 24 bit address fits a usize");
+            rom[at..at + 2].copy_from_slice(&addq.to_be_bytes());
+            rom[at + 2..at + 4].copy_from_slice(&0x4E73_u16.to_be_bytes());
+        }
+        rom
+    }
+
+    /// [`console`] running the interrupt program, with the 68k's mask down - the
+    /// only way a VDP level 4 or level 6 reaches a handler at all - and the VDP
+    /// registers in `regs` written through the control port the way the 68k's own
+    /// [`m68k::Bus::write_word`] would write them.
+    fn interrupt_machine(regs: &[(u8, u8)]) -> (M68k, Z80, Bus) {
+        let (mut cpu, z80, mut bus) = console(interrupt_rom());
+        cpu.set_sr(MASKLESS);
+        for &(reg, value) in regs {
+            bus.write_word(
+                VDP_CONTROL,
+                0x8000 | (u16::from(reg) << 8) | u16::from(value),
+            );
+        }
+        (cpu, z80, bus)
     }
 
     /// One frame is 262 lines of 3420 master clocks, and the 68k must have been run
@@ -545,5 +698,146 @@ mod tests {
             "halted, and still clocked"
         );
         assert_eq!(z80_a(&z80), A_RESET, "neither ran anything");
+    }
+
+    /// genvdp.txt section 4 "Vertical interrupts": "a level 6 interrupt will occur
+    /// when the V counter is at line E0h", once per frame. With R1 bit 5 (IE0) set
+    /// by the program and vector 30 aimed at a handler that counts, three frames is
+    /// three counts.
+    #[test]
+    fn vint_reaches_68k() {
+        // Register 1 = $60: display on (bit 6) and IE0 (bit 5).
+        let (mut cpu, mut z80, mut bus) = interrupt_machine(&[(1, 0x60)]);
+        let mut s = Scheduler::new(Region::Usa);
+
+        for _ in 0..3 {
+            s.run_frame(&mut cpu, &mut z80, &mut bus);
+        }
+
+        assert_eq!(
+            cpu.d[0], 3,
+            "one level 6 per frame, taken through vector 30"
+        );
+        assert_eq!(cpu.d[1], 0, "and no HINT: R0 bit 4 is clear");
+    }
+
+    /// genvdp.txt section 4 "Line interrupts": the counter is loaded from R10 on
+    /// line 0 and decremented on every line that is not VBlank, so R10 = 15 is an
+    /// interrupt every 16 lines. `timing.rs` puts the first on line 15 and the last
+    /// on line 223 - the line VBlank starts on still decrements, and lines 225 to
+    /// 261 reload - which is the 224 / 16 = 14 a frame holds.
+    #[test]
+    fn hint_fires_every_n_lines() {
+        // R0 = $10 turns IE1 on and R10 = 15 is the line counter the ticket names.
+        let (mut cpu, mut z80, mut bus) = interrupt_machine(&[(0, 0x10), (10, 15)]);
+        let mut s = Scheduler::new(Region::Usa);
+
+        let mut counted = Vec::new();
+        for _ in 0..5 {
+            s.run_frame(&mut cpu, &mut z80, &mut bus);
+            counted.push(cpu.d[1]);
+        }
+
+        assert_eq!(
+            counted,
+            vec![14, 28, 42, 56, 70],
+            "one level 4 every 16 lines of active display, and none in VBlank"
+        );
+        assert_eq!(cpu.d[0], 0, "and no VINT: R1 bit 5 is clear");
+    }
+
+    /// The acknowledge is the only thing that clears a VDP interrupt - "Reading the
+    /// control port does not clear this bit" (genvdp.txt section 6) - so
+    /// [`Bus::int_ack`] hands the level to [`vdp::Vdp::ack_irq`] and, taking both
+    /// halves of it: the VDP stops offering the level, and the answer stays `None`
+    /// so the 68k keeps autovectoring.
+    #[test]
+    fn int_ack_clears_vdp_pending() {
+        let mut bus = Bus::new(Vec::new(), VERSION);
+        bus.vdp.write_register(1, 0x60);
+        bus.vdp.advance(225 * VDP_LINE);
+        assert_eq!(
+            bus.vdp.pending_irq(),
+            Some(6),
+            "a frame's worth of clocks, and the VINT is being offered"
+        );
+
+        assert_eq!(bus.int_ack(6), None, "autovector, as a Genesis always does");
+        assert_eq!(
+            bus.vdp.pending_irq(),
+            None,
+            "and the VDP stopped offering it"
+        );
+
+        // And the same thing through the loop: a frame in which the handler ran
+        // leaves nothing pending, because the CPU acknowledged on entry.
+        let (mut cpu, mut z80, mut bus) = interrupt_machine(&[(1, 0x60)]);
+        let mut s = Scheduler::new(Region::Usa);
+        s.run_frame(&mut cpu, &mut z80, &mut bus);
+        assert_eq!(cpu.d[0], 1, "the level 6 handler ran");
+        assert_eq!(
+            bus.vdp.pending_irq(),
+            None,
+            "and entry to it cleared the VDP's flag"
+        );
+    }
+
+    /// One [`Scheduler::run_frame`] is one whole raster.
+    ///
+    /// The VDP raises `frame_done` at VBlank start, 224 lines into a 262 line NTSC
+    /// frame, and stops raising it until the next one: ending the frame there would
+    /// make the first call 224 lines and every later one 262. So the flag is what
+    /// ends the waiting and the rest of the raster is paid for as well, which keeps
+    /// consecutive returns exactly `262 * 3420` master clocks apart and takes
+    /// exactly one flag each time.
+    #[test]
+    fn run_frame_ends_at_vblank() {
+        let (mut cpu, mut z80, mut bus) = machine();
+        let mut s = Scheduler::new(Region::Usa);
+
+        for frame in 1..=5_u64 {
+            let before = s.master_clock;
+            s.run_frame(&mut cpu, &mut z80, &mut bus);
+            assert_eq!(
+                s.master_clock - before,
+                262 * MASTER_CLOCKS_PER_LINE,
+                "frame {frame} is a whole raster of lines"
+            );
+            assert_eq!(s.line, 0, "and the line counter wraps with it");
+            assert!(
+                !bus.vdp.frame_done(),
+                "frame {frame} took the VDP's flag with it rather than leaving it up"
+            );
+        }
+    }
+
+    /// R7's backdrop colour, set by a program writing a CRAM command and one data
+    /// word, reaches the frame buffer through [`vdp::Vdp::advance`] alone - the
+    /// scheduler never calls `render_line`.
+    #[test]
+    fn frame_buffer_updates() {
+        let (mut cpu, mut z80, mut bus) = console(interrupt_rom());
+        // $C000 is the first half of a command word whose CD1-CD0 make it a CRAM
+        // write (genvdp.txt section 7) and $000E is CRAM entry 0 as `0000 BBB0 GGG0
+        // RRR0` with R = 7: full red, which the frame buffer's `0xAABBGGRR` packing
+        // is 0xFF00_00FF. Both go in over the ports, as a `move.w` would.
+        bus.write_word(VDP_CONTROL, 0xC000);
+        bus.write_word(VDP_DATA, 0x000E);
+        let mut s = Scheduler::new(Region::Usa);
+        s.run_frame(&mut cpu, &mut z80, &mut bus);
+
+        let frame = bus.vdp.frame();
+        let row_is_red = |y: usize| {
+            (0..frame.width).all(|x| frame.pixels[frame.pixel_index(x, y)] == 0xFF00_00FF)
+        };
+        assert_eq!(frame.height, 224, "the active display, and no more");
+        assert!(
+            row_is_red(0) && row_is_red(100) && row_is_red(223),
+            "the backdrop colour reaches every active line"
+        );
+        assert!(
+            !row_is_red(224),
+            "and no line past the active display was painted"
+        );
     }
 }
