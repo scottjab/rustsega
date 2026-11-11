@@ -1,23 +1,27 @@
-//! 68k to VDP DMA: the transfer a command word starts and the 68k bus feeds.
+//! The three DMA modes: the 68k transfer, the fill and the copy.
 //!
-//! A command word with CD5 set asks for the transfer (`ports`, genvdp.txt
+//! A command word with CD5 set asks for one of them (`ports`, genvdp.txt
 //! section 7 "VDP ports": "Setting CD5 will trigger a DMA operation"), and it
-//! also sets up the destination, so every word arrives at the address register
-//! through the data port rules of M4-02 (#80). The source and the word count
-//! come from R19 to R23 (genvdp.txt section 11 "DMA"; plutiedev "$93xx" to
-//! "$97xx").
+//! also sets up the destination, so what each mode writes arrives at the
+//! address register through the data port rules of M4-02 (#80). Which mode it
+//! asked for is R23 bits 7-6 ([`DmaMode`]), and the length and the source come
+//! from R19 to R23 (genvdp.txt section 11 "DMA"; plutiedev "$93xx" to "$97xx").
 //!
-//! Only the 68k transfer mode is here. R23 bit 7 set is a fill or a copy
-//! ([`DmaMode::Fill`], [`DmaMode::Copy`]), which is M4-08 (#86); a request for
-//! one is dropped unrun, as a request is whenever the transfer is not allowed.
+//! [`Vdp::run_dma`] is the turn the bus glue gives the request after every
+//! control port write, and it is where the 68k transfer ([`DmaMode::Mc68kTransfer`],
+//! M4-07 #85) and the copy ([`DmaMode::Copy`], M4-08 #86) run. The fill
+//! ([`DmaMode::Fill`], also #86) is the odd one out: the command word only arms
+//! it, and the next word to the data port is what runs it, so [`Vdp::run_fill`]
+//! is called from the data port instead.
 //!
-//! Not modelled: when the transfer runs and how long it takes, the 68k bus
-//! stall that goes with it, and the read FIFO quirk that makes the first word
-//! of a 68k-to-VRAM transfer wrong on real hardware. All three are M4-22 (#101).
+//! Not modelled: when any of the three runs and how long it takes, the 68k bus
+//! stall that goes with the transfer, and the read FIFO quirk that makes the
+//! first word of a 68k-to-VRAM transfer wrong on real hardware. All three are
+//! M4-22 (#101).
 
-use crate::ports::{data_target, increment, DataTarget};
 use crate::DmaMode;
 use crate::Vdp;
+use crate::ports::{DataTarget, data_target, increment};
 use crate::regs;
 
 /// The 68k-side memory a 68k to VDP DMA reads its source from.
@@ -109,7 +113,9 @@ const fn source_fields(src: u32) -> (u8, u8) {
 }
 
 impl Vdp {
-    /// Run the 68k to VDP DMA that the last control port write asked for.
+    /// Run the DMA that the last control port write asked for, whatever mode
+    /// R23 says it was: the 68k transfer and the copy run here, and the fill is
+    /// armed for [`Vdp::run_fill`] to run at the next data port write.
     ///
     /// Called by the bus glue after every control port write, which only
     /// records the request ([`Vdp::dma_requested`]) because it has no bus to
@@ -117,14 +123,10 @@ impl Vdp {
     /// asked for no DMA.
     ///
     /// The request is consumed either way. A DMA that is not allowed, because
-    /// R1 M1 went clear or R23 bit 7 went set between the command word and
-    /// here, stops at the consuming: no bus read, no write, no register
-    /// write-back. Leaving the request standing would let a later, permitted
-    /// command carry out a transfer the game never asked for.
-    ///
-    /// The words arrive through [`Vdp::write_data`], so the destination
-    /// memory, its masking and the move of the address register are the data
-    /// port rules of M4-02 (#80) and are not restated here.
+    /// R1 M1 went clear between the command word and here, stops at the
+    /// consuming: no bus read, no write, no register write-back. Leaving the
+    /// request standing would let a later, permitted command carry out a
+    /// transfer the game never asked for.
     pub fn run_dma(&mut self, bus: &mut impl DmaBus) {
         if !self.dma_requested {
             return;
@@ -186,6 +188,14 @@ impl Vdp {
     /// `vdp_dma_fill` is called the same way, after the port write has moved
     /// the register on, and its loop is `WRITE_BYTE(vram, addr ^ 1, data)` then
     /// `addr += reg[15]`.
+    ///
+    /// The first line of that pseudocode is the one place the doc contradicts
+    /// itself: it puts the LSB at `address`, where genvdp.txt section 8 has the
+    /// MSB at the even address ("When writing 16-bit data to VRAM, having
+    /// address bit 0 set will swap the upper and lower bytes of the data
+    /// written") and where the port rules of #80 were settled. A fill does not
+    /// reverse a data port write, so the word goes in the ordinary way and only
+    /// the repeated byte is the fill's own.
     ///
     /// The MSB is also what makes an 8-bit write to the data port a byte fill:
     /// "a distinction between 8-bit and 16-bit VRAM fills do not exist. There
@@ -276,6 +286,13 @@ impl Vdp {
     /// transfer or DMA copy, the operation will start immediately after writing
     /// this value" (plutiedev "Start DMA") - unlike the fill, which waits for
     /// the data port.
+    ///
+    /// Only R19/R20 are written back. Whether the source registers move during a
+    /// DMA is one of genvdp.txt's own open questions - "Source and length
+    /// registers being updated during DMA" is on its to-do list - and Genesis
+    /// Plus GX adds the whole length to R21/R22 for every mode without
+    /// convincing anybody. A game that chained copies without reloading them
+    /// would want that; if one turns up, that is the follow-up.
     fn run_copy(&mut self) {
         let steps = bytes_to_move(self.dma_length());
         let mut src = self.dma_copy_source();
@@ -291,7 +308,12 @@ impl Vdp {
         self.dma_busy = false;
     }
 
-    /// The 68k to VDP transfer itself.
+    /// The 68k to VDP transfer itself: [`Vdp::dma_source`] to the address
+    /// register, [`words_to_transfer`] of them.
+    ///
+    /// The words arrive through [`Vdp::write_data`], so the destination memory,
+    /// its masking and the move of the address register are the data port rules
+    /// of M4-02 (#80) and are not restated here.
     fn run_transfer(&mut self, bus: &mut impl DmaBus) {
         let words = words_to_transfer(self.dma_length());
         let mut src = self.dma_source();
@@ -311,6 +333,7 @@ impl Vdp {
         // the same CD5 command read with a different R23, so a game can ask
         // for one and then the other without a write in between.
         let fill_pending = self.dma_fill_pending;
+        self.dma_fill_pending = false;
         for _ in 0..words {
             let value = bus.read_word(src);
             // TODO(M4-22 #101): the first word of a 68k-to-VRAM transfer is
@@ -705,7 +728,41 @@ mod tests {
         start_dma(vdp, cmd);
         let mut bus = FakeBus::default();
         vdp.run_dma(&mut bus);
-        assert!(bus.reads.is_empty(), "neither a fill nor a copy is on the 68k bus");
+        assert!(
+            bus.reads.is_empty(),
+            "neither a fill nor a copy is on the 68k bus"
+        );
+    }
+
+    /// A 68k transfer writes the memories, not the data port, so it does not
+    /// run a fill that is already waiting for a port write: "Any write to the
+    /// data port will then start a VRAM fill" (genvdp.txt section 11 "VRAM
+    /// fill"). Genesis Plus GX agrees: its transfer path goes to `vdp_bus_w`
+    /// and leaves its `dmafill` flag standing.
+    #[test]
+    fn a_transfer_does_not_run_a_fill_that_is_already_waiting() {
+        let mut vdp = Vdp::new(false);
+        dma_set_up(&mut vdp, FILL, 4, 1);
+        start_and_run(&mut vdp, vram_write_cmd(0x2000));
+        assert!(
+            vdp.dma_fill_pending,
+            "the fill is waiting for the data port"
+        );
+
+        // A 68k transfer set up over the top of it, with the fill never given
+        // its write: two words to VRAM 0x3000, and the fill still waiting after
+        // them.
+        dma_from(&mut vdp, 0x000100, 2);
+        start_dma(&mut vdp, vram_write_cmd(0x3000));
+        let mut bus = FakeBus::laid_at(0x000100, &[0x1111, 0x2222]);
+        vdp.run_dma(&mut bus);
+
+        assert_eq!(
+            &vdp.vram[0x3000..0x3004],
+            [0x11, 0x11, 0x22, 0x22],
+            "the transfer lands clean: a fill run part-way through it would leave its byte at 0x3003"
+        );
+        assert!(vdp.dma_fill_pending, "and the fill is still waiting");
     }
 
     #[test]

@@ -5,9 +5,9 @@
 //! reads, the two ports the 68k reaches them with (`ports`: control port
 //! writes and data port writes and reads), the status register the control port
 //! reads answer (`status`), the beam position and the HV counter port (`hv`),
-//! and the 68k to VDP DMA (`dma`), and the beam timing that drives the status
-//! flags and raises the interrupts (`timing`). The fill and copy DMA modes are
-//! M4-08 (#86); rendering is M4-10 (#88) onwards, so the line renderer that
+//! and the three DMA modes, the 68k transfer, the fill and the copy (`dma`),
+//! and the beam timing that drives the status flags and raises the interrupts
+//! (`timing`). Rendering is M4-10 (#88) onwards, so the line renderer that
 //! `timing` calls is the backdrop stub of M4-17 (#95).
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
