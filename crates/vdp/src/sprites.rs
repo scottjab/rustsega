@@ -14,11 +14,12 @@
 //! plane fetch, but they do share its two operations: the word read and
 //! [`crate::pattern::tile_row`].
 //!
-//! Not here, and all of it M4-16 (#94): the per-line sprite and pixel limits and
-//! the SOVR status bit they set, collision, and the masking a sprite at X = 0
-//! does to the sprites behind it. Neither is the priority resolution against the
-//! planes, which is M4-17 (#95), nor the 11-bit y coordinate and 8x16 cells of
-//! interlace mode 2, which are M4-20 (#98).
+//! The per-line sprite and pixel limits, the SOVR status bit they set, collision
+//! and the masking a sprite at X = 0 does to the sprites behind it are all here as
+//! of M4-16 (#94). Not here is the priority resolution against the planes, which is
+//! M4-17 (#95), nor the 11-bit y coordinate and 8x16 cells of interlace mode 2,
+//! which are M4-20 (#98), nor the X = 1 masking mode 2 of genvdp.txt section 15,
+//! which is #292.
 
 use crate::pattern::{NameEntry, read_word, tile_row};
 use crate::planes::{CELL_ROWS, PRIORITY_SHIFT};
@@ -219,6 +220,20 @@ impl Vdp {
     /// the display - "Sprites that are outside of the physical display area are still
     /// taken into account".
     ///
+    /// Masking is genvdp.txt section 15 "Sprite masking, mode 1": "If a sprite has an
+    /// X coordinate of zero, and has a Y coordinate that is within range of the
+    /// display, then all sprites of lower priority will not be displayed on the lines
+    /// which the sprite takes up", with the height of those lines from the vertical
+    /// size bits and nothing else. A mask is a sprite of the line and spends its slot
+    /// and its dots, and the sprites in front of it are unaffected: "sprites #0
+    /// through #3 could still be displayed in this area".
+    ///
+    /// That the mask only bites once a sprite of a non-zero X has been found on the
+    /// line before it, or once the line before has run out of dots, is INFERRED from
+    /// Nemesis's masking test - genvdp.txt does not cover it, and there is no test
+    /// ROM for it until M6-06. Masking mode 2, the X = 1 of genvdp.txt, is not
+    /// implemented either: it has its own issue, #292.
+    ///
     /// Collision is d5 of the status register, "Set when any sprites have
     /// non-transparent pixels overlapping one another" (section 6), and it is
     /// detected here as the second sprite of a pair finding a pixel already taken:
@@ -239,6 +254,7 @@ impl Vdp {
         } else {
             (MAX_SPRITES_LINE_H32, MAX_DOTS_LINE_H32)
         };
+        let prev_line_dot_overflow = self.prev_line_dot_overflow;
         let mut walk = LineWalk::default();
 
         for sprite in self.sprite_list() {
@@ -252,11 +268,19 @@ impl Vdp {
             let Some(pixels) = walk.admit(&sprite, max_sprites, max_dots) else {
                 break;
             };
-            walk.collision |= self.fill_sprite_line(&sprite, row as usize, pixels, out);
+            if sprite.x == 0 {
+                walk.mask(prev_line_dot_overflow);
+            } else {
+                walk.x_nonzero = true;
+            }
+            if !walk.masked {
+                walk.collision |= self.fill_sprite_line(&sprite, row as usize, pixels, out);
+            }
         }
 
         self.sprite_overflow |= walk.overflow;
         self.sprite_collision |= walk.collision;
+        self.prev_line_dot_overflow = walk.dot_overflow;
     }
 
     /// Draw `row` - the row of `sprite` counting down from its top, 0..the height
@@ -364,9 +388,17 @@ struct LineWalk {
     /// SOVR, from a sprite past either of the two limits of the line: see
     /// [`Vdp::sprite_overflow`].
     overflow: bool,
+    /// Whether the dot limit cut one of the sprites of this line, which is what
+    /// [`Vdp::prev_line_dot_overflow`] becomes: see [`Vdp::render_sprite_line`].
+    dot_overflow: bool,
     /// d5: two sprites of this line drew an opaque pixel in the same place, and
     /// [`Vdp::fill_sprite_line`] is what noticed.
     collision: bool,
+    /// A sprite of a non-zero X has been found on this line, which is what makes a
+    /// mask of a later x = 0 one: see [`Vdp::render_sprite_line`].
+    x_nonzero: bool,
+    /// The sprites after the first mask of this line draw nothing.
+    masked: bool,
 }
 
 impl LineWalk {
@@ -394,12 +426,25 @@ impl LineWalk {
         let dots = usize::from(sprite.width_cells) * CELL_ROWS;
         let allowed = if self.dots + dots > max_dots {
             self.overflow = true;
+            self.dot_overflow = true;
             max_dots - self.dots
         } else {
             dots
         };
         self.dots += allowed;
         Some(allowed)
+    }
+
+    /// A mask: the sprites after this one draw nothing on this line, and neither do
+    /// the ones after it on the lines the mask reaches, which is why [`LineWalk`]
+    /// ends at every line and this is asked again for the next one.
+    ///
+    /// Only once the line has something to mask: `previous_line_overflowed` is the
+    /// dot overflow of the line before, and `x_nonzero` a sprite of a non-zero X on
+    /// this one, either of them arming the mask and neither of them being the mask
+    /// itself. INFERRED, and see [`Vdp::render_sprite_line`].
+    fn mask(&mut self, previous_line_overflowed: bool) {
+        self.masked |= self.x_nonzero || previous_line_overflowed;
     }
 }
 
@@ -786,8 +831,10 @@ mod tests {
     /// off screen" (section 15). Even the largest sprite there is, 4x4 cells of 32
     /// pixels, ends 96 pixels before the display.
     ///
-    /// What an X of 0 means as well, the masking of every later sprite of those
-    /// lines, is TODO(M4-16 #94).
+    /// What an X of 0 means as well - the masking of every later sprite of those
+    /// lines - is [`Vdp::render_sprite_line`], and it changes nothing here: both
+    /// sprites are at x = 0, so the second is masked by the first and the line the
+    /// two of them leave is the same blank one either way.
     #[test]
     fn a_sprite_at_x_zero_is_off_screen() {
         let mut vdp = sprite_vdp();
@@ -1249,5 +1296,183 @@ mod tests {
         vdp.render_sprite_line(0, &mut line);
         assert_eq!(line, blank_line(), "the eleventh sprite is cut to nothing");
         assert!(!vdp.sprite_collision, "and so collides with nothing");
+    }
+
+    /// genvdp.txt section 15 "Sprite masking, mode 1": "If a sprite has an X
+    /// coordinate of zero, and has a Y coordinate that is within range of the
+    /// display, then all sprites of lower priority will not be displayed on the
+    /// lines which the sprite takes up", and the worked example of that section
+    /// keeps the earlier ones: "sprites #0 through #3 could still be displayed in
+    /// this area".
+    ///
+    /// That the mask only bites once a sprite with a non-zero X has been found on the
+    /// line before it is INFERRED, from Nemesis's masking test as the ticket cites
+    /// and not from genvdp.txt: that is what the first sprite of this list is for,
+    /// and [`a_mask_as_the_first_sprite_of_a_line_hides_nothing`] is the case without
+    /// it.
+    #[test]
+    fn a_sprite_at_x_zero_hides_the_sprites_after_it_on_its_lines() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 1);
+        solid_tile(&mut vdp, 2, 2);
+        put_sprite(&mut vdp, 0, 128, 200, (1, 1), 1, 1);
+        put_sprite(&mut vdp, 1, 128, 0, (1, 1), 2, 0);
+        put_sprite(&mut vdp, 2, 128, 128, (1, 1), 0, 2);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            &line[72..80],
+            &[1; 8],
+            "the sprite in front of the mask still draws"
+        );
+        assert_eq!(&line[0..8], &[0; 8], "and the sprite behind it does not");
+
+        put_sprite(&mut vdp, 1, 128, 208, (1, 1), 2, 0);
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            &line[0..8],
+            &[2; 8],
+            "the same list with a sprite where the mask was does draw it"
+        );
+    }
+
+    /// "The height of the sprite is determined by the vertical size bits in the
+    /// sprite attributes", so an 8 pixel tall mask masks 8 lines and no more: the
+    /// sprite of line 8 is behind the mask in the list and draws anyway.
+    #[test]
+    fn a_mask_covers_only_the_lines_of_its_own_sprite() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 1);
+        solid_tile(&mut vdp, 2, 2);
+        solid_tile(&mut vdp, 3, 3);
+        put_sprite(&mut vdp, 0, 128, 200, (1, 1), 1, 1);
+        put_sprite(&mut vdp, 1, 128, 0, (1, 1), 2, 0);
+        put_sprite(&mut vdp, 2, 128, 128, (1, 1), 3, 2);
+        put_sprite(&mut vdp, 3, 136, 128, (1, 1), 0, 3);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[72..80], &[1; 8], "the sprite before the mask");
+        assert_eq!(&line[0..8], &[0; 8], "line 0 is masked");
+
+        let mut below = blank_line();
+        vdp.render_sprite_line(8, &mut below);
+        assert_eq!(
+            &below[0..8],
+            &[3; 8],
+            "one cell of mask is eight lines, and line 8 is past them"
+        );
+    }
+
+    /// The masking rule of Nemesis's test, INFERRED and pinned for M6-06: a mask with
+    /// nothing but masks in front of it on the line has taken nothing to mask, so it
+    /// masks nothing. genvdp.txt says nothing about this case at all.
+    #[test]
+    fn a_mask_as_the_first_sprite_of_a_line_hides_nothing() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 1);
+        solid_tile(&mut vdp, 2, 2);
+        put_sprite(&mut vdp, 0, 128, 0, (1, 1), 1, 0);
+        put_sprite(&mut vdp, 1, 128, 128, (1, 1), 0, 2);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            &line[0..8],
+            &[2; 8],
+            "no sprite of a non-zero x came before the mask on this line"
+        );
+    }
+
+    /// The other half of the same rule: a line whose sprite dots ran out arms the
+    /// mask of the next line even when nothing precedes it there. The overflow is
+    /// taken from the line before, so this reads the lines in order: line 8, the one
+    /// of the mask, alone draws, and line 8 again after line 0 has overflowed does
+    /// not. The 11 wide sprites are 8 lines tall, so line 8 is the first line that
+    /// is not one of them.
+    #[test]
+    fn a_mask_after_a_dot_overflowing_line_hides_even_as_the_first_sprite() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        wide_sprites(&mut vdp, 11);
+        for index in 0..11usize {
+            wide_sprite(
+                &mut vdp,
+                index,
+                128,
+                128 + 32 * index as u16,
+                index as u8 + 1,
+            );
+        }
+        // Tile 45, clear of the 44 tiles `wide_sprites` fills with its own colours.
+        solid_tile(&mut vdp, 45, 2);
+        put_sprite(&mut vdp, 11, 136, 0, (1, 1), 12, 0);
+        put_sprite(&mut vdp, 12, 136, 128, (1, 1), 0, 45);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(8, &mut line);
+        assert_eq!(
+            &line[0..8],
+            &[2; 8],
+            "with nothing before it and no overflow behind it, no masking"
+        );
+
+        vdp.render_sprite_line(0, &mut line);
+        assert!(vdp.sprite_overflow, "line 0 is the 352 dot one");
+        vdp.render_sprite_line(8, &mut line);
+        assert_eq!(
+            &line[0..8],
+            &[0; 8],
+            "the same mask masks once the line before it ran out of dots"
+        );
+    }
+
+    /// A count overflow is not a dot overflow: the field of [`Vdp`] says dots, the
+    /// rule says dots, and the 21 sprites of line 0 here are 168 dots of a 320 dot
+    /// line, so the mask that follows them on line 1 is still an unarmed one.
+    #[test]
+    fn a_count_overflow_on_the_previous_line_is_not_a_dot_overflow() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        solid_tile(&mut vdp, 1, 1);
+        solid_tile(&mut vdp, 2, 2);
+        put_line(&mut vdp, 128, 21, |_| 460);
+        put_sprite(&mut vdp, 21, 136, 0, (1, 1), 22, 0);
+        put_sprite(&mut vdp, 22, 136, 128, (1, 1), 0, 2);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert!(vdp.sprite_overflow, "the 21st sprite of the line");
+
+        vdp.render_sprite_line(8, &mut line);
+        assert_eq!(
+            &line[0..8],
+            &[2; 8],
+            "an overflow of sprites is not an overflow of dots"
+        );
+    }
+
+    /// The mask is a sprite of the line, and spends a slot of it: "The height of the
+    /// sprite is determined by the vertical size bits in the sprite attributes; other
+    /// factors like horizontal size, pattern data used, priority bit, and color
+    /// palette have no effect" (genvdp.txt section 15), and the section's own rule
+    /// that off-display sprites count. Twenty sprites and a mask are therefore 21
+    /// sprites, which is an overflow.
+    #[test]
+    fn a_mask_counts_toward_the_sprite_limit_of_the_line() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        solid_tile(&mut vdp, 1, 7);
+        put_line(&mut vdp, 128, 20, |i| 128 + 8 * i as u16);
+        put_sprite(&mut vdp, 20, 128, 0, (1, 1), 0, 0);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert!(
+            vdp.sprite_overflow,
+            "the mask is the 21st sprite of the line, and is counted as one"
+        );
     }
 }
