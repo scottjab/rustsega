@@ -181,6 +181,30 @@ impl Scheduler {
         self.line = (self.line + 1) % self.lines_per_frame;
     }
 
+    /// Restart the raster the scheduler is counting, because something outside
+    /// it has restarted the beam: the console's reset button reaches
+    /// [`m68k::Bus::reset_devices`], which rebuilds [`Bus::vdp`] as a chip that
+    /// has never been advanced and so sits back at line 0 with its own clock
+    /// unwound to nothing (M3-15, #76).
+    ///
+    /// Two positions have to follow it. [`Scheduler::line`] goes to 0 with the
+    /// VDP's own line, because [`Scheduler::run_frame`] ends the frame on the
+    /// line counter wrapping and the VDP raises `frame_done` on its own line
+    /// 224: leaving the two out of step would make the first frame after a reset
+    /// up to a raster longer than every one after it.
+    ///
+    /// And `vdp_clock` goes to the time the two CPUs agree on, which is where
+    /// [`Scheduler::sync_vdp`] starts from: it is a position in the master clock
+    /// rather than a chip, so it is *not* reset with the VDP, and letting the new
+    /// chip be walked by everything the old one had already run would hand it
+    /// every clock since power on in one [`vdp::Vdp::advance`] call - a frame
+    /// counter tens of thousands of lines past the VBlank it is meant to be
+    /// waiting for, and a first frame after a reset that never ends.
+    pub fn restart_frame(&mut self) {
+        self.line = 0;
+        self.vdp_clock = self.m68k_clock.min(self.z80_clock);
+    }
+
     /// Run one whole frame: [`Scheduler::run_line`] until the VDP says the frame is
     /// drawn, and then the rest of the raster too.
     ///
