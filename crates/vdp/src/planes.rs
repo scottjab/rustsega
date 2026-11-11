@@ -40,6 +40,25 @@ const HSCROLL_MASK: u16 = 0x3FF;
 /// "Scroll values for planes A and B are stored in an interleaved fashion".
 const HSCROLL_ENTRY: usize = 4;
 
+/// Bits of a VSRAM word that the plane fetch reads: genvdp.txt section 10,
+/// "y = Vertical scroll factor (0-3FFh)". The 11th bit of the word belongs to
+/// interlace mode 2 alone (see the note on [`crate::Vdp::vsram`]), so it is not
+/// part of the scroll value here.
+///
+/// TODO(M4-20 #98): what the 11th bit does once interlace mode 2 is modelled.
+const VSCROLL_MASK: u16 = 0x3FF;
+
+/// Width in pixels of the column one VSRAM word scrolls in 2-cell column mode:
+/// genvdp.txt section 17 "$0B" bit 2 "selects between full screen vertical
+/// scrolling when clear, and 2-cell column based vertical scrolling when set",
+/// and a cell is [`CELL_ROWS`] pixels wide.
+const CELL_COLUMN: usize = 2 * CELL_ROWS;
+
+/// The two VSRAM words the partial 2-cell column at the left edge of an H40 line
+/// is fetched with: see [`Vdp::left_column_vscroll`], which is as uncertain as
+/// this list of numbers is.
+const LEFT_COLUMN_WORDS: [usize; 2] = [19, 39];
+
 /// Which of the two scroll planes to render (genvdp.txt section 13 "Background
 /// Layers": "The VDP manages two background layers, called plane A and plane B").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +96,21 @@ impl Plane {
             Plane::B => 2,
         }
     }
+
+    /// Which of the two VSRAM words of a column this plane reads: A the first,
+    /// B the second, which is also `vsram[0]` and `vsram[1]` in full screen mode.
+    ///
+    /// INFERRED, not documented. genvdp.txt section 10 counts the 40 words and
+    /// section 17 "$0B" names the mode bit, but nothing says which word belongs
+    /// to which plane; this follows the only interleave the doc does give, the
+    /// horizontal one of section 13 quoted by [`Plane::scroll_word`].
+    #[inline]
+    fn scroll_vsram_word(self) -> usize {
+        match self {
+            Plane::A => 0,
+            Plane::B => 1,
+        }
+    }
 }
 
 impl Vdp {
@@ -109,6 +143,60 @@ impl Vdp {
         usize::from(read_word(&self.vram, addr) & HSCROLL_MASK)
     }
 
+    /// The vertical scroll value of `plane` for the 16 pixel column `column`.
+    ///
+    /// genvdp.txt section 17 "$0B" bit 2 gives the two modes, "full screen
+    /// vertical scrolling" and "2-cell column based vertical scrolling", and
+    /// section 10 gives each value as 10 bits of VSRAM:
+    ///
+    /// - full screen: `vsram[0]` for plane A and `vsram[1]` for plane B, so
+    ///   `column` is not read and one value moves the whole plane;
+    /// - 2-cell: `vsram[2 * column]` for plane A and `vsram[2 * column + 1]` for
+    ///   plane B, which is what makes the 40 words of section 10 exactly the 20
+    ///   [`CELL_COLUMN`] columns of an H40 line times the two planes. Nothing
+    ///   clamps `column` because the line of [`WIDTH_H40`] pixels is 20 columns
+    ///   wide, so the largest index is `2 * 19 + 1` = 39.
+    ///
+    /// Both the walk and the A/B choice are INFERRED: the doc describes the
+    /// hardware as "Vertical Scroll RAM ... used to store vertical scroll values
+    /// for the playfield" (section 10) and leaves the addressing to the reader.
+    /// They are pinned by the tests of #91 rather than by prose.
+    #[inline]
+    fn column_vscroll(&self, plane: Plane, column: usize) -> usize {
+        let index = if self.vscroll_per_cell_column() {
+            column * 2
+        } else {
+            0
+        } + plane.scroll_vsram_word();
+        usize::from(self.vsram[index] & VSCROLL_MASK)
+    }
+
+    /// The vertical scroll value of the partially visible 2-cell column at the
+    /// left edge of the line: the `hscroll & (CELL_COLUMN - 1)` pixels before the
+    /// first whole column, which hardware is said to fetch with a broken value.
+    ///
+    /// UNCERTAIN, and NOT hardware fact. genvdp.txt does not mention a partial
+    /// column at all - it says only that the lower bits of a scroll value are a
+    /// pixel offset (section 13) - and says nothing about what VSRAM word that
+    /// half-fetched column is read with. The model #91 works to, and which
+    /// [`tests::h40_fetches_the_partial_left_column_with_vsram_19_and_39`] pins
+    /// so that a change here cannot be quiet:
+    ///
+    /// - H40: both planes use `vsram[19] & vsram[39]`, the two words of
+    ///   [`LEFT_COLUMN_WORDS`];
+    /// - H32: 0.
+    ///
+    /// TODO(M6-06): verify both halves of that with the Nemesis test ROMs, and
+    /// correct this function and its tests if hardware says otherwise.
+    #[inline]
+    fn left_column_vscroll(&self) -> usize {
+        if !self.h40() {
+            return 0;
+        }
+        let [first, second] = LEFT_COLUMN_WORDS;
+        usize::from(self.vsram[first] & self.vsram[second] & VSCROLL_MASK)
+    }
+
     /// Fill `out` with one line of `plane`: one [`u8`] per pixel, bits 5-0 the
     /// CRAM index (`palette * 16 + colour`, the 6-bit index of CRAM's 64 words,
     /// genvdp.txt section 9) and bit 6 the cell's priority flag.
@@ -121,8 +209,7 @@ impl Vdp {
     /// cannot leak into the layer above.
     ///
     /// Horizontal scroll: a pixel of the line comes from plane x
-    /// `(x - hscroll) & (width * 8 - 1)` of this plane, and plane y is still
-    /// `line` until M4-13 (#91) adds vertical scroll. `hscroll` is
+    /// `(x - hscroll) & (width * 8 - 1)` of this plane. `hscroll` is
     /// [`Vdp::line_hscroll`] of this very plane and line, and only its low three
     /// bits are a sub-cell offset, so a scroll of 8 moves the plane exactly one
     /// cell and a scroll of 3 starts the fetch three pixels into the first
@@ -134,9 +221,20 @@ impl Vdp {
     /// so that a larger one moves the plane right, is what #90 works to and what
     /// the tests here fix in. It is INFERRED, not documented.
     ///
+    /// Vertical scroll: plane y is `(line + vscroll) & (height * 8 - 1)`, where
+    /// `vscroll` is [`Vdp::column_vscroll`] of the 16 pixel column the pixel is
+    /// in - or of the partial column at the left edge, which is where
+    /// [`Vdp::left_column_vscroll`] takes over. Adding the value, so that a larger
+    /// one moves the plane up, is what #91 works to; like the horizontal case the
+    /// direction is INFERRED, and unlike it the value is not 8 pixels wide but 10.
+    /// Because a 2-cell column can name any plane row, the fetch of a line may
+    /// change plane row four times, so `row_base` and `cell_row` belong to the run
+    /// being fetched and not to the line.
+    ///
     /// A cell is still 8 pixels by 8 pixels and both axes wrap at the plane size
     /// of R16. The fetch runs one cell of the plane at a time - eight pixels, or
-    /// the remainder of one at the left edge of the line - and allocates nothing.
+    /// the remainder of one at the left edge of a line or of a 2-cell column - and
+    /// allocates nothing.
     ///
     /// Invalid plane sizes, which genvdp.txt section 13 calls the combinations
     /// over its 8192-byte table (128x128 and 64x128), have no documented
@@ -161,18 +259,45 @@ impl Vdp {
         let width = usize::from(self.plane_width_cells());
         let height = usize::from(self.plane_height_cells());
         let line = usize::from(line);
-        let row_base = ((line / CELL_ROWS) % height) * width;
-        let cell_row = line % CELL_ROWS;
-        let scroll = self.line_hscroll(plane, line);
-        // The plane is `width * 8` pixels wide, and every valid width of R16 is a
-        // power of two, so masking is wrapping the plane x.
-        let plane_mask = width * CELL_ROWS - 1;
+        let hscroll = self.line_hscroll(plane, line);
+        let columns = self.vscroll_per_cell_column();
+        // The plane is `width * 8` pixels wide and `height * 8` lines tall, and
+        // every valid size of R16 is a power of two, so masking is wrapping.
+        let plane_x_mask = width * CELL_ROWS - 1;
+        let plane_y_mask = height * CELL_ROWS - 1;
+        // Width of the partial column at the left edge: 0 when there are no 2-cell
+        // columns, or when the horizontal scroll lands on a column boundary and
+        // the whole of the first column is visible.
+        let left_partial = if columns {
+            hscroll & (CELL_COLUMN - 1)
+        } else {
+            0
+        };
 
         let mut x = 0;
         while x < out.len() {
-            let plane_x = x.wrapping_sub(scroll) & plane_mask;
+            let partial = x < left_partial;
+            let vscroll = if partial {
+                self.left_column_vscroll()
+            } else {
+                self.column_vscroll(plane, x / CELL_COLUMN)
+            };
+            // The first x where `vscroll` no longer applies: a fetch must not run
+            // into the next column, which may name another plane row.
+            let ends_at = if partial {
+                left_partial
+            } else if columns {
+                x + CELL_COLUMN - x % CELL_COLUMN
+            } else {
+                out.len()
+            };
+            let plane_y = line.wrapping_add(vscroll) & plane_y_mask;
+            let row_base = (plane_y / CELL_ROWS) * width;
+            let cell_row = plane_y % CELL_ROWS;
+
+            let plane_x = x.wrapping_sub(hscroll) & plane_x_mask;
             let offset = plane_x % CELL_ROWS;
-            let run = (CELL_ROWS - offset).min(out.len() - x);
+            let run = (CELL_ROWS - offset).min(ends_at - x).min(out.len() - x);
             let entry_index = (row_base + plane_x / CELL_ROWS) & (MAX_ENTRIES - 1);
             let entry = read_word(&self.vram, base + entry_index * 2);
             let cell = NameEntry::decode(entry);
@@ -272,6 +397,34 @@ pub(crate) mod testutil {
     /// too (`column_colour(31)` is 2, `column_colour(0)` is 1).
     pub(crate) fn column_colour(column: usize) -> u8 {
         (column % 15 + 1) as u8
+    }
+
+    /// The whole 32x32 plane of the table at `base` as one distinct colour per
+    /// cell row: every cell of row `row` names tile `row + 1`, and that tile is
+    /// solid [`row_colour`] in all 8 of its rows. Filled over all 32 cell
+    /// columns, so any display line of the plane reads a cell and the colour of a
+    /// pixel says which cell row of the plane it came from - which is what a
+    /// vertical scroll test needs to see.
+    ///
+    /// This uses the same 32 pattern tiles as [`fill_columns`], so one VDP is
+    /// filled with one of the two and never both.
+    pub(crate) fn fill_rows(vdp: &mut Vdp, base: usize) {
+        for row in 0..PLANE_ROWS {
+            let tile = (row + 1) as u16;
+            for column in 0..PLANE_COLUMNS {
+                put_entry(vdp, base, row * PLANE_COLUMNS + column, tile);
+            }
+            for tile_row in 0..CELL_TILE_ROWS {
+                fill_tile_row(vdp, tile, tile_row, row_colour(row));
+            }
+        }
+    }
+
+    /// The colour [`fill_rows`] gives cell row `row`: 1..=15, so no row is
+    /// transparent. 15 does not divide 32, so neighbouring rows never match and
+    /// the wrap at cell row 32/0 differs too.
+    pub(crate) fn row_colour(row: usize) -> u8 {
+        (row % 15 + 1) as u8
     }
 
     /// One row of `tile`, filled with the colour index `colour`.
@@ -792,6 +945,307 @@ mod tests {
             scroll_of(&out),
             8,
             "plane B reads the second word of the entry, which is 8"
+        );
+    }
+
+    /// A [`plane_vdp`] with the horizontal scroll table at [`HSCROLL_BASE`] and
+    /// `r11` in R11, and plane A filled by [`fill_rows`] so that the colour of a
+    /// pixel says which cell row of the plane it came from.
+    fn vscrolled_plane(r11: u8) -> Vdp {
+        let mut vdp = scroll_vdp(r11);
+        fill_rows(&mut vdp, PLANE_A_BASE);
+        vdp
+    }
+
+    /// Plane A with cell (0,0) naming tile 1 (all 8 rows colour 1) and cell
+    /// (0,1) naming tile 2 (row 0 colour 2, every other row colour 3): the top
+    /// row of the second cell has a colour of its own, so a line that shows it
+    /// cannot be confused with the cell row above, the cell row below, or the
+    /// same cell read at the wrong tile row.
+    fn plane_a_two_cell_rows() -> Vdp {
+        let mut vdp = plane_vdp();
+        put_entry(&mut vdp, PLANE_A_BASE, 0, 1);
+        for row in 0..CELL_TILE_ROWS {
+            fill_tile_row(&mut vdp, 1, row, 1);
+        }
+        put_entry(&mut vdp, PLANE_A_BASE, PLANE_COLUMNS, 2);
+        for row in 0..CELL_TILE_ROWS {
+            fill_tile_row(&mut vdp, 2, row, if row == 0 { 2 } else { 3 });
+        }
+        vdp
+    }
+
+    /// The 32 cell columns of cell row 0 naming tile 1, whose 8 rows are the 8
+    /// different colours 1..=8: the colour of a pixel then says which row of the
+    /// tile it was fetched from, so a vscroll of 3 shows colour 4 and a vscroll
+    /// of 0 colour 1. Every other cell row is the empty entry, drawing nothing,
+    /// so a vscroll that lands on another cell row shows colour 0.
+    fn plane_a_row_gradient() -> Vdp {
+        let mut vdp = plane_vdp();
+        for column in 0..PLANE_COLUMNS {
+            put_entry(&mut vdp, PLANE_A_BASE, column, 1);
+        }
+        for row in 0..CELL_TILE_ROWS {
+            fill_tile_row(&mut vdp, 1, row, (row + 1) as u8);
+        }
+        vdp
+    }
+
+    /// R11 bit 2 clear is "full screen vertical scrolling" (genvdp.txt section
+    /// 17 "$0B") and section 10 gives the value as "y = Vertical scroll factor
+    /// (0-3FFh)": one value for the whole plane, `vsram[0]` for plane A. A value
+    /// of 8 is one whole cell row, so line 0 shows what was on line 8 - plane y
+    /// `line + vscroll`, the direction #91 works to and INFERRED like the
+    /// opposite one of [`Vdp::render_plane_line`].
+    #[test]
+    fn full_vscroll_of_8_shows_plane_row_8_on_line_0() {
+        let mut vdp = plane_a_two_cell_rows();
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[1; 8],
+            "with no vertical scroll line 0 still shows the top cell row"
+        );
+
+        vdp.vsram[0] = 8;
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[2; 8],
+            "vscroll 8: line 0 shows plane y 8, which is tile row 0 of cell row 1"
+        );
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 1, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[3; 8],
+            "line 1 is the row below it, so the scroll moved plane y and not the tile row"
+        );
+    }
+
+    /// A 32-cell plane is 256 lines tall, so the 10-bit vscroll of 0x3FF is -1
+    /// and line 0 shows plane y 255: the plane wraps at its own height, exactly
+    /// as it wraps at its own width (genvdp.txt section 13 says the wrap for the
+    /// horizontal case; the vertical one is INFERRED from it and from R16).
+    #[test]
+    fn vscroll_of_0x3ff_wraps_a_32_cell_plane_to_plane_y_255() {
+        let mut vdp = plane_vdp();
+        put_entry(&mut vdp, PLANE_A_BASE, 31 * PLANE_COLUMNS, 1);
+        for row in 0..CELL_TILE_ROWS {
+            fill_tile_row(&mut vdp, 1, row, if row == 7 { 4 } else { 5 });
+        }
+
+        vdp.vsram[0] = 0x3FF;
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[4; 8],
+            "plane y 255 of a 256-line plane: cell row 31, tile row 7"
+        );
+
+        // The 11th bit of a VSRAM word belongs to interlace mode 2 alone (see
+        // the note on [`crate::Vdp::vsram`), so it is not part of the scroll.
+        vdp.vsram[0] = 0x400 | 0x3FF;
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[4; 8],
+            "only the 10 scroll bits of genvdp.txt section 10 are read outside interlace mode 2"
+        );
+    }
+
+    /// Full mode reads `vsram[0]` for plane A and `vsram[1]` for plane B: the
+    /// same A/B interleave genvdp.txt section 13 records for the horizontal
+    /// table ("Entry #0 of the table is for plane A, entry #1 is for plane B"),
+    /// which is INFERRED for VSRAM as section 10 gives the words but not who
+    /// reads them.
+    #[test]
+    fn plane_b_takes_its_vertical_scroll_from_vsram_1() {
+        let mut vdp = plane_vdp();
+        put_entry(&mut vdp, PLANE_A_BASE, 0, 1);
+        put_entry(&mut vdp, PLANE_A_BASE, PLANE_COLUMNS, 2);
+        fill_tile_row(&mut vdp, 1, 0, 1);
+        fill_tile_row(&mut vdp, 2, 0, 2);
+        put_entry(&mut vdp, PLANE_B_BASE, 0, 3);
+        put_entry(&mut vdp, PLANE_B_BASE, PLANE_COLUMNS, 4);
+        fill_tile_row(&mut vdp, 3, 0, 5);
+        fill_tile_row(&mut vdp, 4, 0, 6);
+
+        vdp.vsram[1] = 8;
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[1; 8],
+            "plane A reads vsram[0], which is still 0, so it has not moved"
+        );
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::B, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[6; 8],
+            "plane B reads vsram[1] = 8, so its line 0 is the second cell row"
+        );
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::B, 8, &mut out);
+        assert_eq!(
+            out[0], 0,
+            "line 8 is then the third cell row, which is empty: the scroll is added once, not instead of the line"
+        );
+    }
+
+    /// R11 bit 2 set is "2-cell column based vertical scrolling" (genvdp.txt
+    /// section 17 "$0B"): one VSRAM word per 16 pixel column of the line, plane A
+    /// at `vsram[2 * column]` and plane B at `vsram[2 * column + 1]`.
+    ///
+    /// genvdp.txt says none of that - section 10 counts 40 words, section 17
+    /// names the bit, and nothing between them describes how the words are laid
+    /// out. The `2 * column` walk and the A/B interleave are INFERRED from the
+    /// two facts and from the horizontal table's "Scroll values for planes A and
+    /// B are stored in an interleaved fashion"; 40 words is exactly the 20
+    /// columns of an H40 line times the two planes.
+    #[test]
+    fn two_cell_mode_gives_each_16_pixel_column_its_own_vscroll() {
+        let mut vdp = vscrolled_plane(0x04);
+        vdp.vsram[0] = 0;
+        vdp.vsram[2] = 8;
+        vdp.vsram[4] = 16;
+        // The words of plane B, none of which may move plane A.
+        vdp.vsram[1] = 24;
+        vdp.vsram[3] = 40;
+        vdp.vsram[5] = 56;
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..16],
+            &[row_colour(0); 16],
+            "column 0 reads vsram[0] = 0, and 8 pixels is not a column"
+        );
+        assert_eq!(
+            &out[16..32],
+            &[row_colour(1); 16],
+            "column 1 reads vsram[2] = 8: a whole cell row down, from pixel 16"
+        );
+        assert_eq!(
+            &out[32..48],
+            &[row_colour(2); 16],
+            "column 2 reads vsram[4] = 16, neither plane B's vsram[3] nor the column before it"
+        );
+        assert_eq!(
+            &out[48..],
+            &[row_colour(0); 272],
+            "every column past vsram[4] still has a scroll of 0"
+        );
+    }
+
+    /// The 16 pixel column is the *screen* column and hscroll only moves the
+    /// fetch: with an hscroll of 16 the split between `vsram[0]` and `vsram[2]`
+    /// is still at pixel 16, where the screen column changes, not at pixel 32
+    /// where the plane's own 16 pixel column changes. INFERRED - genvdp.txt never
+    /// says which x picks the VSRAM word - and pinned here so that a change of
+    /// model is loud.
+    ///
+    /// TODO(M6-06): verify against the Nemesis scroll tests, together with the
+    /// direction of the scroll itself.
+    #[test]
+    fn two_cell_columns_are_screen_columns_under_hscroll() {
+        let mut vdp = vscrolled_plane(0x04);
+        put_scroll(&mut vdp, 0, 16, 0);
+        vdp.vsram[0] = 0;
+        vdp.vsram[2] = 8;
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..16],
+            &[row_colour(0); 16],
+            "pixels 0..16 are screen column 0, which is vsram[0], even though the fetch of pixel 0 is 16 pixels into the plane"
+        );
+        assert_eq!(
+            &out[16..32],
+            &[row_colour(1); 16],
+            "and the vscroll changes at pixel 16, not where plane x crosses a 16 pixel boundary"
+        );
+    }
+
+    /// The left column quirk of the ticket, which is a model of undocumented
+    /// hardware and not a fact: see [`Vdp::left_column_vscroll`]. H40, 2-cell
+    /// mode, an hscroll of 4 so that only 4 pixels of the first column are
+    /// visible, and `vsram[19] = 0x0F` and `vsram[39] = 0xF3`.
+    #[test]
+    fn h40_fetches_the_partial_left_column_with_vsram_19_and_39() {
+        let mut vdp = plane_a_row_gradient();
+        vdp.write_register(12, 0x81);
+        vdp.write_register(13, 0x3F);
+        vdp.write_register(11, 0x04);
+        put_scroll(&mut vdp, 0, 4, 0);
+        vdp.vsram[19] = 0x0F;
+        vdp.vsram[39] = 0xF3;
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..4],
+            &[4; 4],
+            "the first 4 pixels - 4 and 15 is 4 - are at plane y 0x0F & 0xF3 = 3, which is tile row 3"
+        );
+        assert_eq!(
+            &out[4..16],
+            &[1; 12],
+            "from pixel 4 the column's own value, vsram[0] = 0, applies again"
+        );
+        assert_eq!(
+            &out[16..],
+            &[1; 304],
+            "and no other column of plane A is affected: the odd VSRAM words belong to plane B"
+        );
+
+        put_scroll(&mut vdp, 0, 16, 0);
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[1; 8],
+            "an hscroll that is a multiple of 16 has no partial column, so vsram[19] and vsram[39] are not read"
+        );
+    }
+
+    /// The other half of that model: an H32 display fetches its partial left
+    /// column with a vscroll of 0 rather than with the two words, and full screen
+    /// mode has no 2-cell column to fetch wrong at all.
+    #[test]
+    fn h32_and_full_mode_fetch_the_partial_left_column_with_a_scroll_of_0() {
+        let mut vdp = plane_a_row_gradient();
+        vdp.write_register(13, 0x3F);
+        vdp.write_register(11, 0x04);
+        put_scroll(&mut vdp, 0, 4, 0);
+        vdp.vsram[19] = 0x0F;
+        vdp.vsram[39] = 0xF3;
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..4],
+            &[1; 4],
+            "H32: the partial column is at plane y 0, not at the H40 value of 3"
+        );
+
+        vdp.write_register(11, 0x00);
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..4],
+            &[1; 4],
+            "full screen mode has no 2-cell column, so the two words are not read there either"
         );
     }
 }
