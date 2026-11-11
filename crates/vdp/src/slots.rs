@@ -54,6 +54,7 @@ pub(crate) const BLANK_SLOTS_H32: usize = SLOTS_H32 - REFRESH_BLANK_H32;
 /// blank line, and each of them costs a 68k read *two* slots rather than the one
 /// a write pays. "There are 6 refresh slots when the display is off ... a refresh
 /// costs one write slot but two 68k read slots" (SpritesMind thread 1291 page 3).
+#[allow(dead_code)] // first caller is the display-off wait of #302
 pub(crate) const REFRESH_OFF_H40: usize = 6;
 /// Transfers an H40 line with the display off carries: 198, which is
 /// [`SLOTS_H40`] less two slots for each of the 6 refresh slots.
@@ -63,22 +64,47 @@ pub(crate) const REFRESH_OFF_H40: usize = 6;
 /// made. The note under [`Vdp::free_slot_indices`] says what that costs.
 pub(crate) const OFF_TRANSFERS_H40: usize = SLOTS_H40 - (2 * REFRESH_OFF_H40);
 
-/// Every slot of an H40 line, which is what a blank line offers apart from its
-/// [`REFRESH_BLANK_H40`] refresh slots.
-const GRID_H40: [u16; SLOTS_H40] = slot_grid();
-/// [`GRID_H40`]'s H32 twin, for [`BLANK_SLOTS_H32`].
-const GRID_H32: [u16; SLOTS_H32] = slot_grid();
+/// Every slot of an H40 line but the [`REFRESH_BLANK_H40`] the DRAM refresh
+/// takes: the 205 of [`BLANK_SLOTS_H40`], which is the schedule of a blank line.
+const BLANK_H40: [u16; BLANK_SLOTS_H40] = blank_line(SLOTS_H40, REFRESH_BLANK_H40);
+/// [`BLANK_H40`]'s H32 twin, the 167 of [`BLANK_SLOTS_H32`].
+const BLANK_H32: [u16; BLANK_SLOTS_H32] = blank_line(SLOTS_H32, REFRESH_BLANK_H32);
 
-/// `0, 1, 2 .. N - 1`: the slot grid, every slot of a line. `N` is a slot count
-/// of 171 or 210, both of which fit the `u16` the tables hold.
-const fn slot_grid<const N: usize>() -> [u16; N] {
-    let mut grid = [0u16; N];
+/// The slots of a line that are not DRAM refresh: `0 .. total` without `count` of
+/// them, those being spread evenly over it.
+///
+/// How many refresh slots a line has is [`REFRESH_BLANK_H40`] and
+/// [`REFRESH_BLANK_H32`]; where they are is in nothing this ticket could reach,
+/// so they go every `total / count` slots - and refresh is a property of the
+/// whole frame rather than of the beam, so any regular spread is as good an
+/// answer as another. What that buys and costs is measured against the counts,
+/// which do not depend on it: [`BLANK_SLOTS_H40`] and [`BLANK_SLOTS_H32`] come
+/// out of the length of this. INFERRED, TODO(#301).
+const fn blank_line<const N: usize>(total: usize, count: usize) -> [u16; N] {
+    let mut slots = [0u16; N];
+    let mut out = 0;
     let mut slot = 0;
-    while slot < N {
-        grid[slot] = slot as u16;
+    while slot < total {
+        if !is_refresh(slot, total, count) {
+            slots[out] = slot as u16;
+            out += 1;
+        }
         slot += 1;
     }
-    grid
+    slots
+}
+
+/// Whether slot `slot` of a line of `total` is one of the `count` DRAM refresh
+/// slots, spread from slot 0 at `total / count` apart.
+const fn is_refresh(slot: usize, total: usize, count: usize) -> bool {
+    let mut n = 0;
+    while n < count {
+        if n * total / count == slot {
+            return true;
+        }
+        n += 1;
+    }
+    false
 }
 
 /// The free access slots of an active H40 line, as slot indices: the 18 that the
@@ -136,26 +162,21 @@ impl Vdp {
     ///
     /// * the active display: [`ACTIVE_H40`] or [`ACTIVE_H32`], the 18 and 16 slots
     ///   the plane and sprite fetches leave over;
-    /// * blanking, horizontal or vertical: the whole grid, every slot of the line.
-    ///
-    /// The grid keeps the [`REFRESH_BLANK_H40`] refresh slots of a blank line in
-    /// it rather than cutting them out, so it offers 210 where the documentation
-    /// says [`BLANK_SLOTS_H40`] is 205. Nothing retrieved says where the refresh
-    /// slots fall, they are spread over the line, and five of two hundred cannot
-    /// move the moment a four-entry FIFO empties by more than one slot; the count
-    /// to use for anything about bandwidth - the 68k to VDP transfer of M4-22
-    /// (#101) - is [`BLANK_SLOTS_H40`], and the grid is for the schedule, which is
-    /// a fiftieth of a line optimistic about how long a write waits. TODO(#301).
+    /// * blanking, horizontal or vertical: [`BLANK_H40`] / [`BLANK_H32`], every
+    ///   slot of the line but the [`REFRESH_BLANK_H40`] and
+    ///   [`REFRESH_BLANK_H32`] that DRAM refresh takes - the 205 and 167 of
+    ///   [`BLANK_SLOTS_H40`] and [`BLANK_SLOTS_H32`]. Where the refresh slots
+    ///   fall is INFERRED (see [`blank_line`]); that they are 5 and 4 is not.
     ///
     /// With the display off this is not consulted at all: nothing is being
     /// fetched, so the memories are free for the port the moment a write is made,
     /// which is what [`Vdp::fifo_clock`] does with them and what #99 pins in
     /// `a_write_with_the_display_off_drains_at_once`. Hardware charges for it
     /// anyway - [`OFF_TRANSFERS_H40`] transfers a line in H40, 17.3 clocks apiece
-    /// - and TODO(#302) is whether to start modelling that wait.
+    /// - and #302 is whether to start modelling that wait.
     fn free_slot_indices(&self) -> &'static [u16] {
         if self.in_hblank || self.in_vblank {
-            return if self.h40() { &GRID_H40 } else { &GRID_H32 };
+            return if self.h40() { &BLANK_H40 } else { &BLANK_H32 };
         }
         if self.h40() { &ACTIVE_H40 } else { &ACTIVE_H32 }
     }
@@ -288,8 +309,8 @@ mod tests {
         for (slots, slots_per_line, name) in [
             (&ACTIVE_H40 as &[u16], SLOTS_H40, "active H40"),
             (&ACTIVE_H32 as &[u16], SLOTS_H32, "active H32"),
-            (&GRID_H40 as &[u16], SLOTS_H40, "grid H40"),
-            (&GRID_H32 as &[u16], SLOTS_H32, "grid H32"),
+            (&BLANK_H40 as &[u16], SLOTS_H40, "blank H40"),
+            (&BLANK_H32 as &[u16], SLOTS_H32, "blank H32"),
         ] {
             let mut previous: Option<u16> = None;
             for &slot in slots {
@@ -303,13 +324,26 @@ mod tests {
         }
     }
 
-    /// A blank line is 205 external slots in H40 and 167 in H32: the grid less the
-    /// 5 and 4 refresh slots of "VDP Internals" (SpritesMind thread 1291), which
-    /// are also what the Sega DMA bandwidth table quotes.
+    /// A blank line is 205 external slots in H40 and 167 in H32: the line less
+    /// the 5 and 4 refresh slots of "VDP Internals" (SpritesMind thread 1291),
+    /// which are also what the Sega DMA bandwidth table quotes. The tables are
+    /// that long because the counts are those, and no refresh slot is missing
+    /// from or repeated in them.
     #[test]
     fn a_blank_line_is_205_slots_in_h40_and_167_in_h32() {
         assert_eq!(BLANK_SLOTS_H40, 205);
         assert_eq!(BLANK_SLOTS_H32, 167);
+        assert_eq!(BLANK_H40.len(), BLANK_SLOTS_H40);
+        assert_eq!(BLANK_H32.len(), BLANK_SLOTS_H32);
+        assert_eq!(
+            BLANK_H40
+                .iter()
+                .map(|&slot| usize::from(slot))
+                .collect::<std::collections::HashSet<usize>>()
+                .len(),
+            BLANK_SLOTS_H40,
+            "every slot of a blank line once and no more"
+        );
     }
 
     /// With the display off an H40 line carries 198 transfers: the 6 refresh slots
@@ -386,8 +420,16 @@ mod tests {
             "and one clock short of that is three"
         );
 
-        assert_eq!(blank(false).slots_ahead(MCLKS_PER_LINE), u32::try_from(SLOTS_H32).unwrap());
-        assert_eq!(blank(true).slots_ahead(MCLKS_PER_LINE), u32::try_from(SLOTS_H40).unwrap());
+        assert_eq!(
+            blank(false).slots_ahead(MCLKS_PER_LINE),
+            u32::try_from(BLANK_SLOTS_H32).unwrap(),
+            "a blank H32 line of the grid less its 4 refresh slots"
+        );
+        assert_eq!(
+            blank(true).slots_ahead(MCLKS_PER_LINE),
+            u32::try_from(BLANK_SLOTS_H40).unwrap(),
+            "and 205 for a blank H40 one"
+        );
     }
 
     /// An active H40 line's first free slot is the 14th of the line, and on the
