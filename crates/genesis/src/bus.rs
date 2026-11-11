@@ -51,7 +51,7 @@
 //! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`] and the Z80's control
 //! lines; the VDP joins them with M3-09 (#69).
 
-use crate::cart::{Mapper, Sram, mapper, sram};
+use crate::cart::{Eeprom, Mapper, Sram, eeprom, mapper, sram};
 use crate::io::Io;
 use crate::z80_bus::{self, YM_STATUS_IDLE, Z80Side};
 use m68k::ADDR_MASK;
@@ -268,6 +268,18 @@ pub struct Bus {
     /// Private behind [`Bus::sram`], [`Bus::load_sram`] and [`Bus::take_dirty`]:
     /// the only writes that may reach a save are ones that can say so.
     sram: Option<Sram>,
+    /// The cart's serial EEPROM, from [`crate::cart::eeprom::detect`] on
+    /// [`Bus::rom`], or `None` for a cart that has no chip on its bus.
+    ///
+    /// The other save shape the cartridge slot answers, and never both at once:
+    /// [`crate::cart::sram`] and [`crate::cart::eeprom`] decode one header field,
+    /// and a cart that declares save RAM has had the chip of the serial EEPROM
+    /// game it was replaced for. What the two have in common is that they live
+    /// *inside* the cartridge area, so like the save RAM this is a field the slot
+    /// consults rather than a region of its own - see [`Bus::read_rom_byte`] for
+    /// the order, and [`Bus::sram`] for the one view of either that a front end
+    /// is handed.
+    eeprom: Option<Eeprom>,
     /// The cart's bank registers, from [`crate::cart::mapper::detect`] on
     /// [`Bus::rom`]: the Sega mapper for a cart too big for the cartridge area,
     /// and [`Mapper::None`] for one that is not.
@@ -409,6 +421,10 @@ impl Bus {
         // The save RAM of a cart is declared in its header, which is 0x200 bytes
         // into the image and may not be there at all.
         let sram = sram::detect(&rom).map(|info| Sram::new(info, rom.len()));
+        // The EEPROM is asked after the save RAM and is told by it to stop: the
+        // two are the two shapes a cart's one save takes, and
+        // [`crate::cart::eeprom::detect`] is what keeps them apart.
+        let eeprom = eeprom::detect(&rom).map(Eeprom::new);
         // The mapper is read out of the image the same way, and for the same
         // reason: it is either the size of the cart or the cart's own request for
         // it in the system type, and both are in front of the code that turns a
@@ -417,6 +433,7 @@ impl Bus {
         Self {
             rom,
             sram,
+            eeprom,
             mapper,
             ram: Box::new([0; 0x10000]),
             version,
@@ -436,24 +453,35 @@ impl Bus {
         }
     }
 
-    /// The cart's save RAM, or `None` when it declares none: the bytes a front end
+    /// The cart's battery-backed save, whatever chip it is: the bytes a front end
     /// persists, packed as [`crate::cart::sram`] describes them (the usual
-    /// 0x200001-0x20FFFF odd-only window is 32 KiB here, not 64 KiB with a gap).
+    /// 0x200001-0x20FFFF odd-only window is 32 KiB here, not 64 KiB with a gap),
+    /// or as the array of the cart's serial EEPROM when that is what the cart has
+    /// ([`crate::cart::eeprom`], and 128 bytes for the X24C01 that most of those
+    /// carts have). `None` for a cart with neither.
+    ///
+    /// One view of the two because a front end's half of the job - keep these
+    /// bytes, write them back, and know when they changed - is the same for both,
+    /// and the name has to answer to the cart slot's one save rather than to the
+    /// chip behind it.
     ///
     /// Read-only, because the only writes that may reach a save are the 68k's -
     /// they are what [`Bus::take_dirty`] reports - and [`Bus::load_sram`] for the
     /// one thing a front end does with the bytes back.
     pub fn sram(&self) -> Option<&[u8]> {
-        self.sram.as_ref().map(|save| save.contents())
+        self.sram
+            .as_ref()
+            .map(|save| save.contents())
+            .or_else(|| self.eeprom.as_ref().map(|chip| chip.contents()))
     }
 
-    /// Put `data` back as the cart's save RAM, where `data` is what [`Bus::sram`]
+    /// Put `data` back as the cart's save, where `data` is what [`Bus::sram`]
     /// gave for this cart.
     ///
     /// A blob of any other length is another cart's save, so it is refused whole:
     /// nothing is loaded, nothing is panicked on, and the contents stay exactly as
-    /// they were. A cart with no save RAM has nowhere for one to land and ignores
-    /// it too. Both are why this reports nothing: see
+    /// they were. A cart with no save has nowhere for one to land and ignores it
+    /// too. Both are why this reports nothing: see
     /// [`crate::cart::sram::Sram::load`] for the choice.
     ///
     /// Restoring is not a change to persist, so [`Bus::take_dirty`] is `false`
@@ -461,17 +489,25 @@ impl Bus {
     pub fn load_sram(&mut self, data: &[u8]) {
         if let Some(save) = self.sram.as_mut() {
             save.load(data);
+            return;
+        }
+        if let Some(chip) = self.eeprom.as_mut() {
+            chip.load(data);
         }
     }
 
-    /// Has the save RAM changed since this was last asked, clearing it?
+    /// Has the cart's save changed since this was last asked, clearing it?
     ///
     /// The front end's reason to write anything, and true for exactly one call
     /// after any write the 68k has stored: never for a read, a
     /// [`Bus::load_sram`], or a write the cart refused with the `0xA130F1` write
-    /// protect or by hitting the dead half of a half-width window.
+    /// protect or by hitting the dead half of a half-width window. A serial
+    /// EEPROM has no way to refuse a byte, so every byte the chip takes sets it.
     pub fn take_dirty(&mut self) -> bool {
-        self.sram.as_mut().is_some_and(|save| save.take_dirty())
+        if let Some(save) = self.sram.as_mut() {
+            return save.take_dirty();
+        }
+        self.eeprom.as_mut().is_some_and(|chip| chip.take_dirty())
     }
 
     /// Does this console have a TMSS at all?
@@ -640,6 +676,15 @@ impl Bus {
 
     /// Cartridge slot byte read, in the order the slot decides:
     ///
+    /// 0. **the serial EEPROM**, over the byte the rest of this order has
+    ///    answered: [`crate::cart::eeprom::Eeprom::read`] replaces the one bit of
+    ///    it that the cart board's data line is on, and answers `None` for every
+    ///    other address of the cart. First, and over the two below it, because the
+    ///    chip is not another claimant on the address but a wire across the slot:
+    ///    the acknowledge it held low a moment ago has to reach the 68k whether the
+    ///    address is save RAM the same cart cannot also have, a bank the mapper has
+    ///    switched in, or the image past its end - which is where every cart with a
+    ///    `$E8` in its header puts it.
     /// 1. **the save RAM**, for a cart that has one and a window that is mapped:
     ///    [`crate::cart::sram::Sram::read`] answers `None` for every address the
     ///    save has no claim on, so the one call is the whole overlay and never a
@@ -668,7 +713,14 @@ impl Bus {
         // mapper is consulted on the way to a byte: the overlay above has already
         // had its say and keeps its priority.
         let offset = self.mapper.map(addr).unwrap_or((addr - ROM_START) as usize);
-        self.rom.get(offset).copied().unwrap_or(OPEN_BUS)
+        let byte = self.rom.get(offset).copied().unwrap_or(OPEN_BUS);
+        // Step 0 of the order above, and the last thing done to the byte: the one
+        // bit of it that is the cart's data line, replaced with what the chip is
+        // holding it at.
+        match self.eeprom.as_ref().and_then(|chip| chip.read(addr, byte)) {
+            Some(value) => value,
+            None => byte,
+        }
     }
 
     /// Cartridge slot word read: the two bytes, high byte first (M68000UM, "Data
@@ -695,6 +747,13 @@ impl Bus {
     /// `addr` is inside it, and otherwise nothing at all - the image, like the
     /// mapper that will sit where [`Bus::read_rom_byte`] says, is read-only.
     fn write_rom_byte(&mut self, addr: u32, value: u8) {
+        // The serial EEPROM first: what the 68k wrote here is two lines of the
+        // cart's board, and the chip has to see it whether or not the address is
+        // one its save RAM overlay claims. The two are decoded from one header
+        // field and never both exist, so nothing else about this order changes.
+        if let Some(chip) = self.eeprom.as_mut() {
+            chip.write(addr, value);
+        }
         // `Sram::write` answers true for the whole of a mapped window, so a save
         // under the `0xA130F1` write protect and the dead half of a half-width
         // window are both refused here rather than falling through to the image.
@@ -1310,6 +1369,12 @@ impl m68k::Bus for Bus {
         // [`crate::cart::sram::Sram::reset`].
         if let Some(save) = self.sram.as_mut() {
             save.reset();
+        }
+        // And the serial EEPROM's transfer in hand is abandoned with it: a reset
+        // is the 68k stopping in the middle of walking the two lines, and a chip
+        // that kept a half-taken byte would answer the next cart access with it.
+        if let Some(chip) = self.eeprom.as_mut() {
+            chip.reset();
         }
         // The mapper's bank registers go back to slot `n` on page `n` with them:
         // a cart boots from a reset assuming nothing is switched out from under
@@ -2947,5 +3012,286 @@ mod tests {
             8,
             "and the bank is back, where the mapper put it"
         );
+    }
+    // The serial EEPROM: the other save shape the cartridge slot answers, with
+    // its two lines on bits of the cart data bus. The chip's own protocol is
+    // `cart::eeprom`'s tests; these are about what the bus does with it.
+
+    /// A cart whose save is a serial EEPROM: an `$E8` and the single address
+    /// 0x200001, which is what a cart that means it declares, on an image `len`
+    /// bytes long with `serial` for its name.
+    fn eeprom_rom(len: usize, serial: &str) -> Vec<u8> {
+        let mut rom = vec![0u8; len];
+        rom[0x180..0x180 + serial.len()].copy_from_slice(serial.as_bytes());
+        rom[0x1B0..0x1B4].copy_from_slice(&[b'R', b'A', 0xE8, 0x20]);
+        rom[0x1B4..0x1B8].copy_from_slice(&0x20_0001u32.to_be_bytes());
+        rom[0x1B8..0x1BC].copy_from_slice(&0x20_0001u32.to_be_bytes());
+        rom
+    }
+
+    /// A cart board's two lines, walked through the cart slot one access at a
+    /// time: which address carries which line, at which bit, and which bit of the
+    /// answer the chip drives. Every cart that declares a window declares the odd
+    /// byte 0x200001, and only Acclaim's 32 Mbit board puts the clock somewhere
+    /// else.
+    struct EepromLines {
+        scl_addr: u32,
+        scl: u8,
+        sda_addr: u32,
+        sda: u8,
+        out: u8,
+        /// The byte last written to each half of the cart's pair, so that moving
+        /// one line leaves the other where it was.
+        written: [u8; 2],
+    }
+
+    impl EepromLines {
+        fn new(scl_addr: u32, scl: u8, sda_addr: u32, sda: u8, out: u8) -> Self {
+            Self {
+                scl_addr,
+                scl,
+                sda_addr,
+                sda,
+                out,
+                written: [0xFF; 2],
+            }
+        }
+
+        /// Sega's boards: D1 is the clock and D0 the data, on the odd byte of the
+        /// pair, and the answer comes back on D0.
+        fn sega() -> Self {
+            Self::new(0x20_0001, 2, 0x20_0001, 1, 1)
+        }
+
+        /// The Acclaim 16 Mbit board, which is the same until the answer, on D1.
+        fn acclaim_16m() -> Self {
+            Self::new(0x20_0001, 2, 0x20_0001, 1, 2)
+        }
+
+        /// The Acclaim 32 Mbit board: D0 of the even byte is the clock and D0 of
+        /// the odd byte is the data.
+        fn acclaim_32m() -> Self {
+            Self::new(0x20_0000, 1, 0x20_0001, 1, 1)
+        }
+
+        fn scl(&mut self, bus: &mut Bus, level: bool) {
+            let (addr, mask) = (self.scl_addr, self.scl);
+            self.drive(bus, addr, mask, level);
+        }
+
+        fn sda(&mut self, bus: &mut Bus, level: bool) {
+            let (addr, mask) = (self.sda_addr, self.sda);
+            self.drive(bus, addr, mask, level);
+        }
+
+        fn drive(&mut self, bus: &mut Bus, addr: u32, mask: u8, level: bool) {
+            let byte = &mut self.written[(addr & 1) as usize];
+            *byte = if level { *byte | mask } else { *byte & !mask };
+            bus.write_byte(addr, *byte);
+        }
+
+        fn start(&mut self, bus: &mut Bus) {
+            self.scl(bus, true);
+            self.sda(bus, true);
+            self.sda(bus, false);
+            self.scl(bus, false);
+        }
+
+        fn stop(&mut self, bus: &mut Bus) {
+            self.sda(bus, false);
+            self.scl(bus, true);
+            self.sda(bus, true);
+        }
+
+        fn clock(&mut self, bus: &mut Bus, level: bool) -> bool {
+            self.sda(bus, level);
+            self.scl(bus, true);
+            let answer = bus.read_byte(self.sda_addr) & self.out != 0;
+            self.scl(bus, false);
+            answer
+        }
+
+        fn send(&mut self, bus: &mut Bus, byte: u8) -> bool {
+            for bit in (0..8).rev() {
+                self.clock(bus, byte & (1 << bit) != 0);
+            }
+            !self.clock(bus, true)
+        }
+
+        fn recv(&mut self, bus: &mut Bus, ack: bool) -> u8 {
+            let mut byte = 0u8;
+            for bit in (0..8).rev() {
+                if self.clock(bus, true) {
+                    byte |= 1 << bit;
+                }
+            }
+            self.clock(bus, !ack);
+            byte
+        }
+    }
+
+    /// The save of a cart with a serial EEPROM is the chip's array, through the
+    /// one view of a cart's save that [`Bus::sram`] is: [`Bus::load_sram`] puts
+    /// one back and [`Bus::take_dirty`] says when the game has changed it.
+    #[test]
+    fn eeprom_contents_exposed_via_sram_api() {
+        let mut bus = Bus::new(eeprom_rom(0x20_0000, "GM T-123456-00"), TEST_VERSION);
+        // 128 bytes, because a cart that declares `$E8` and nothing else has the
+        // X24C01, and the array is the size of the chip.
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(128));
+        assert!(bus.sram().unwrap().iter().all(|&byte| byte == 0xFF));
+
+        let mut lines = EepromLines::sega();
+        // 0x5A at word 1: the word address and the write bit in the first byte,
+        // which is the whole of what the X24C01 takes as addressing.
+        lines.start(&mut bus);
+        assert!(lines.send(&mut bus, 0x02), "the chip acknowledges");
+        assert!(lines.send(&mut bus, 0x5A));
+        lines.stop(&mut bus);
+        assert_eq!(bus.sram().unwrap()[1], 0x5A, "and it is the save");
+        assert!(bus.take_dirty(), "which the front end is told about");
+        assert!(!bus.take_dirty(), "once, and once only");
+
+        // And what it stored reads back through the bus as well as through the
+        // view: word 1 again, this time with the read bit.
+        lines.start(&mut bus);
+        assert!(lines.send(&mut bus, 0x03));
+        assert_eq!(lines.recv(&mut bus, false), 0x5A);
+        lines.stop(&mut bus);
+
+        bus.load_sram(&[0x11; 128]);
+        assert!(bus.sram().unwrap().iter().all(|&byte| byte == 0x11));
+        assert!(!bus.take_dirty(), "and restoring is not a change");
+    }
+
+    /// The chip's line is what the window answers, in front of the bank the mapper
+    /// has switched in and of the image under it - which is the one thing a cart
+    /// that is too big for the cartridge area *and* has a save on two bits of its
+    /// bus can get wrong.
+    #[test]
+    fn eeprom_keeps_priority_over_the_sram_and_mapper() {
+        // A 5 MB cart, its pages filled with their own numbers, declaring an
+        // EEPROM at 0x200001.
+        let mut rom = vec![0u8; 0x50_0000];
+        for page in 0..10u8 {
+            let start = usize::from(page) * 0x8_0000;
+            rom[start..start + 0x8_0000].fill(page);
+        }
+        rom[0x180..0x18E].copy_from_slice(b"GM T-123456-00");
+        rom[0x1B0..0x1B4].copy_from_slice(&[b'R', b'A', 0xE8, 0x20]);
+        rom[0x1B4..0x1B8].copy_from_slice(&0x20_0001u32.to_be_bytes());
+        rom[0x1B8..0x1BC].copy_from_slice(&0x20_0001u32.to_be_bytes());
+        let mut bus = Bus::new(rom, TEST_VERSION);
+        // One save and not two: `$E8` is not save RAM, so `0xA130F1` has nothing
+        // to map and the chip's 128 bytes are what `sram()` reports.
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(128));
+
+        // Slot 4 is 0x200000-0x27FFFF, so the window lies over a bank of the
+        // mapper: the image answers 4 there, and 8 once the bank is switched.
+        assert_eq!(bus.read_byte(0x20_0000), 4);
+        bus.write_byte(0xA130F9, 8);
+        assert_eq!(bus.read_byte(0x20_0000), 8, "and the mapper moved");
+
+        // The chip owns the one bit it drives, over the bank's own 8, and it owns
+        // nothing else: the byte below the window is the mapper's alone.
+        let mut lines = EepromLines::sega();
+        lines.sda(&mut bus, false);
+        assert_eq!(bus.read_byte(0x20_0001) & 1, 0, "the line is held low");
+        assert_eq!(bus.read_byte(0x20_0001) & !1, 8, "over the bank under it");
+        assert_eq!(
+            bus.read_byte(0x20_0000),
+            8,
+            "and no other cart address is touched by it"
+        );
+    }
+
+    /// A cart's word accesses are its two byte accesses, which is what lets a
+    /// board that puts its two lines on two halves of the bus work at all, and
+    /// what makes the low half of a word write the half that counts on a board
+    /// that looks at neither.
+    #[test]
+    fn eeprom_word_accesses_are_two_byte_accesses() {
+        let mut rom = eeprom_rom(0x20_0004, "GM T-081326 00");
+        rom[0x20_0000] = 0x4E;
+        let mut bus = Bus::new(rom, TEST_VERSION);
+        // NBA Jam is on Acclaim's 16 Mbit board: the X24C02, and the answer on D1.
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(256));
+        let mut lines = EepromLines::acclaim_16m();
+
+        // A word write to the pair drives both halves, and the same byte in both
+        // of them leaves the lines where the board would have put them with the
+        // one access it is.
+        bus.write_word(0x20_0000, 0x0303);
+        bus.write_word(0x20_0000, 0x0302);
+        lines.scl(&mut bus, false);
+        // Which is a start condition - D0 fell while D1 was up - so the chip is
+        // listening, and the bytes that follow a byte at a time are a write. The
+        // X24C02 takes mode 2 addressing: the device address, then the word.
+        assert!(lines.send(&mut bus, 0xA0), "the device address");
+        assert!(lines.send(&mut bus, 0x02), "and word 2");
+        assert!(lines.send(&mut bus, 0xC3));
+        lines.stop(&mut bus);
+        assert_eq!(bus.sram().unwrap()[2], 0xC3);
+
+        // And the word read of the pair is its two byte reads: the even half is
+        // the image's own byte, and the chip's line is the one bit of the odd
+        // half its board reads back on.
+        let word = bus.read_word(0x20_0000);
+        assert_eq!(word >> 8, 0x4E, "the even half is the image's, untouched");
+        assert_eq!(
+            (word as u8) & 2,
+            2,
+            "and the line, high since the stop, is in the odd half's D1"
+        );
+    }
+
+    /// The 32 Mbit board's split, the one mapping that puts the two lines on two
+    /// different addresses: D0 of the even byte is the clock, D0 of the odd byte
+    /// is the data, and a whole transfer walks the split.
+    #[test]
+    fn acclaim_32m_board_splits_the_two_lines_over_the_bus() {
+        let mut bus = Bus::new(eeprom_rom(0x20_0000, "GM T-081276 00"), TEST_VERSION);
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(256), "the 24C02");
+
+        let mut lines = EepromLines::acclaim_32m();
+        lines.start(&mut bus);
+        assert!(lines.send(&mut bus, 0xA0), "the device address");
+        assert!(lines.send(&mut bus, 0x05), "and word 5");
+        assert!(lines.send(&mut bus, 0x5C));
+        lines.stop(&mut bus);
+        assert_eq!(bus.sram().unwrap()[5], 0x5C);
+
+        lines.start(&mut bus);
+        assert!(lines.send(&mut bus, 0xA0));
+        assert!(lines.send(&mut bus, 0x05));
+        lines.stop(&mut bus);
+        lines.start(&mut bus);
+        assert!(lines.send(&mut bus, 0xA1), "and the same word, reading");
+        assert_eq!(lines.recv(&mut bus, false), 0x5C);
+        lines.stop(&mut bus);
+    }
+
+    /// A cart that declares neither save has neither, and a cart that declares an
+    /// EEPROM has no `0xA130F1` switch for anything to answer with: the window
+    /// keeps answering as the image, and `sram()` says nothing.
+    #[test]
+    fn no_eeprom_means_the_window_is_the_image() {
+        let mut rom = rom_image(0x20_0004);
+        rom[0x1B0..0x1B4].copy_from_slice(b"    ");
+        // Set so that a chip holding the line low for an acknowledge, which is
+        // what a cart that had one would do here, would be noticed.
+        rom[0x20_0001] = 0xFF;
+        let (image, above) = (rom[0x20_0001], rom[0x20_0003]);
+        let mut bus = Bus::new(rom, TEST_VERSION);
+        assert_eq!(bus.sram(), None);
+        assert_eq!(bus.read_byte(0x20_0001), image);
+
+        let mut lines = EepromLines::sega();
+        lines.start(&mut bus);
+        lines.send(&mut bus, 0x02);
+        lines.stop(&mut bus);
+        assert_eq!(bus.read_byte(0x20_0001), image, "the image answers");
+        assert_eq!(bus.read_byte(0x20_0003), above);
+        assert!(!bus.take_dirty());
     }
 }
