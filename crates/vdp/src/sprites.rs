@@ -55,6 +55,17 @@ const LINK_MASK: u16 = 0x7F;
 const MAX_SPRITES_H40: usize = 80;
 const MAX_SPRITES_H32: usize = 64;
 
+/// The most sprites one line may draw, by display width: "Twenty sprites on the
+/// same scanline have been drawn in 40 cell mode. Sixteen sprites on the same
+/// scanline have been drawn in 32 cell mode" (genvdp.txt section 15 "Sprite
+/// Drawing Limitations"). Parsing the one past the limit is what sets the status
+/// bit - "Set when too many sprites are on the current scan line, meaning when the
+/// VDP parses the 21st sprite in 40-cell mode or the 17th sprite in 32-cell mode
+/// from the sprite list" (section 6) - so the sprite over the limit is read and
+/// not drawn, and neither it nor anything later in the list is drawn either.
+const MAX_SPRITES_LINE_H40: usize = 20;
+const MAX_SPRITES_LINE_H32: usize = 16;
+
 /// The origin of the display inside the sprite space: "Sprites are positioned in
 /// a virtual 512x512 space. The display starts at coordinate 128, 128" (section
 /// 15), so the screen coordinate of a sprite is its raw one less this.
@@ -192,14 +203,23 @@ impl Vdp {
     /// per sprite at most, and no allocation. Which cell a sprite's pattern index
     /// names is the column-major rule of [`Vdp::fill_sprite_line`].
     ///
-    /// TODO(M4-16 #94): the 20-sprite (40-cell) and 16-sprite (32-cell) per-line
-    /// limits, the 320/256 pixels of sprite data per line, the SOVR status bit and
-    /// collision. Sprites wholly off the line are skipped here, which changes
-    /// nothing until those limits exist, since genvdp.txt only counts them "Sprites
-    /// that are outside of the physical display area are still taken into account"
-    /// for the limits themselves.
-    pub fn render_sprite_line(&self, line: u16, out: &mut [u8; WIDTH_H40]) {
+    /// Of the limits of section 15 "Sprite Drawing Limitations" the two that count
+    /// sprites are here: a sprite whose y does not reach `line` is not on the line
+    /// and spends nothing, and one whose y does spends a slot of it whether or not
+    /// any of its pixels land on the display - "Sprites that are outside of the
+    /// physical display area are still taken into account".
+    ///
+    /// TODO(M4-16 #94): the 320/256 pixels of sprite data per line, collision and
+    /// the masking of a sprite at x = 0.
+    pub fn render_sprite_line(&mut self, line: u16, out: &mut [u8; WIDTH_H40]) {
         out.fill(0);
+        let max_sprites = if self.h40() {
+            MAX_SPRITES_LINE_H40
+        } else {
+            MAX_SPRITES_LINE_H32
+        };
+        let mut walk = LineWalk::default();
+
         for sprite in self.sprite_list() {
             // The sprite occupies the lines `y - ORIGIN` to `y - ORIGIN` plus its
             // own height, and `row` is which row of that it is drawing.
@@ -208,8 +228,13 @@ impl Vdp {
             if row < 0 || row >= height {
                 continue;
             }
+            if !walk.admit(max_sprites) {
+                break;
+            }
             self.fill_sprite_line(&sprite, row as usize, out);
         }
+
+        self.sprite_overflow |= walk.overflow;
     }
 
     /// Draw `row` - the row of `sprite` counting down from its top, 0..the height
@@ -280,6 +305,37 @@ impl Vdp {
                 }
             }
         }
+    }
+}
+
+/// The counters of genvdp.txt section 15 "Sprite Drawing Limitations" that one line
+/// of [`Vdp::render_sprite_line`] keeps, and the two status flags its walk ends in.
+///
+/// They live here rather than in the VDP because they are about one line and are
+/// rebuilt every time one is drawn; only [`Vdp::sprite_overflow`] and
+/// [`Vdp::sprite_collision`] outlive a line, and `render_sprite_line` copies those
+/// over once the list has been walked.
+#[derive(Debug, Default)]
+struct LineWalk {
+    /// Sprites of this line reached so far.
+    sprites: usize,
+    /// SOVR, from a sprite past [`MAX_SPRITES_LINE_H40`] /
+    /// [`MAX_SPRITES_LINE_H32`]: see [`Vdp::sprite_overflow`].
+    overflow: bool,
+}
+
+impl LineWalk {
+    /// Take one more sprite of the line and say whether it may draw: `false` for
+    /// the sprite past the limit of `max_sprites`, which the VDP parses but does not
+    /// draw and stops the whole line at - genvdp.txt lists its limits as things the
+    /// VDP "will stop drawing sprites under".
+    fn admit(&mut self, max_sprites: usize) -> bool {
+        self.sprites += 1;
+        if self.sprites > max_sprites {
+            self.overflow = true;
+            return false;
+        }
+        true
     }
 }
 
@@ -785,6 +841,100 @@ mod tests {
             &line[8..16],
             &[3; 8],
             "the entry at 0xF200 is entry 0 of the new base, and the one at 0xF000 is no longer read"
+        );
+    }
+
+    // ---- The per-line limits, SOVR, collision and masking (M4-16 #94) ----
+
+    /// The 40-cell display, because both per-line limits of genvdp.txt section 15
+    /// "Sprite Drawing Limitations" are given per display width.
+    fn in_h40(vdp: &mut Vdp) {
+        vdp.write_register(12, 0x81);
+    }
+
+    /// `count` opaque 1x1 sprites on the lines of `y`, at `x(index)`, each linking
+    /// to the next and the last to entry `count`: the shape the per-line limit
+    /// tests need, one sprite per 8 pixels of the line. Entry `count` is left
+    /// alone, so it ends the list (a zero link) unless a test goes on to fill it.
+    fn put_line(vdp: &mut Vdp, y: u16, count: usize, x: impl Fn(usize) -> u16) {
+        for index in 0..count {
+            put_sprite(vdp, index, y, x(index), (1, 1), index as u8 + 1, 1);
+        }
+    }
+
+    /// genvdp.txt section 15 "Sprite Drawing Limitations": "Twenty sprites on the
+    /// same scanline have been drawn in 40 cell mode", and section 6 says of the
+    /// flag that it is set "when the VDP parses the 21st sprite in 40-cell mode".
+    /// The 21st is parsed and not drawn, so the line ends with the 20th.
+    #[test]
+    fn a_twenty_first_sprite_of_a_line_is_dropped_and_sets_overflow() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        solid_tile(&mut vdp, 1, 7);
+        put_line(&mut vdp, 128, 21, |i| 128 + 8 * i as u16);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            &line[0..160],
+            &[7; 160],
+            "the twenty sprites of the line, 8 pixels each"
+        );
+        assert_eq!(&line[160..168], &[0; 8], "and nothing of the 21st");
+        assert!(
+            vdp.sprite_overflow,
+            "d6 SOVR, set when the 21st sprite of the line is parsed"
+        );
+    }
+
+    /// The same limit of a 32-cell line is sixteen sprites, which is the default
+    /// display of [`Vdp::new`] and so needs no R12 write.
+    #[test]
+    fn a_seventeenth_sprite_of_a_thirty_two_cell_line_is_dropped_and_sets_overflow() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 7);
+        put_line(&mut vdp, 128, 17, |i| 128 + 8 * i as u16);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[0..128], &[7; 128], "sixteen sprites of 8 pixels");
+        assert_eq!(&line[128..136], &[0; 8], "and nothing of the 17th");
+        assert!(vdp.sprite_overflow, "the 17th sprite of a 32-cell line");
+    }
+
+    /// The limit is inclusive: twenty sprites are what a 40-cell line may draw, so
+    /// the flag stays clear until there is a 21st to parse.
+    #[test]
+    fn twenty_sprites_on_a_line_do_not_overflow() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        solid_tile(&mut vdp, 1, 7);
+        put_line(&mut vdp, 128, 20, |i| 128 + 8 * i as u16);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[0..160], &[7; 160], "all twenty are drawn");
+        assert!(!vdp.sprite_overflow, "reaching the limit is not passing it");
+    }
+
+    /// The 20 slots are spent by the sprites of the line, not by the sprites the
+    /// viewer can see: "Sprites that are outside of the physical display area are
+    /// still taken into account" (section 15). x = 460 is screen x 332, so all 20
+    /// of these are past the right hand edge of the display.
+    #[test]
+    fn a_sprite_outside_the_display_uses_a_slot_of_the_line() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        solid_tile(&mut vdp, 1, 7);
+        put_line(&mut vdp, 128, 20, |_| 460);
+        put_sprite(&mut vdp, 20, 128, 128, (1, 1), 0, 1);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(line, blank_line(), "the visible sprite is the 21st");
+        assert!(
+            vdp.sprite_overflow,
+            "and the twenty off-screen ones used up the line to get there"
         );
     }
 }
