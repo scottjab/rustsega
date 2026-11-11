@@ -7,5 +7,11 @@ publish.workspace = true
 
 [dependencies]
 
+[features]
+# Debug views of VDP internals (`debug`): pattern, plane, sprite and palette
+# dumps to RGBA buffers. Default off so that neither the emulator nor the WASM
+# build carries the renderer.
+debug-views = []
+
 [lints]
 workspace = true

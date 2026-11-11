@@ -14,7 +14,9 @@
 //! (`sprites`), and the priority compositor that turns the three layer buffers of
 //! a line into the pixels of a frame-buffer row (`compose`), shadow and highlight
 //! and the mode sizes and edges of M4-19 (#97) and the interlaced fields of
-//! M4-20 (#98) included.
+//! M4-20 (#98) included. Under the `debug-views` cargo feature, off by default,
+//! there is also the tile, plane, sprite and palette dumping of M4-24 (#104),
+//! which no release build of the emulator carries.
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
@@ -22,6 +24,8 @@
 
 pub mod color;
 mod compose;
+#[cfg(feature = "debug-views")]
+pub mod debug;
 mod dma;
 mod fifo;
 mod framebuffer;

@@ -35,7 +35,7 @@ pub(crate) const CELL_ROWS_MODE2: usize = 16;
 /// name table size cannot exceed 8192 bytes, so while a 64x64 or 128x32 name
 /// table is allowed, a size of 128x128 or 64x128 is invalid" - 8192 bytes is
 /// 4096 of the 16-bit words a table is a matrix of.
-const MAX_ENTRIES: usize = 4096;
+pub(crate) const MAX_ENTRIES: usize = 4096;
 
 /// Bit 6 of a layer pixel: the priority of the cell it came from, as M4-17
 /// (#95) wants it. genvdp.txt section 14 moves a plane's pixels from `B`/`C`

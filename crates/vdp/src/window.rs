@@ -35,7 +35,7 @@ const TABLE_CELLS_H40: usize = 64;
 
 /// Rows of the window name table, in both widths and in both V30 modes: the
 /// `x32` of the sentence quoted on [`TABLE_CELLS_H32`].
-const TABLE_ROWS: usize = 32;
+pub(crate) const TABLE_ROWS: usize = 32;
 
 impl Vdp {
     /// Cells in a row of the window name table: the fixed width of genvdp.txt
@@ -43,7 +43,7 @@ impl Vdp {
     /// has - unlike plane A and plane B it has no size register, and R16 does not
     /// reach it.
     #[inline]
-    fn window_table_cells(&self) -> usize {
+    pub(crate) fn window_table_cells(&self) -> usize {
         if self.h40() {
             TABLE_CELLS_H40
         } else {
