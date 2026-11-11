@@ -26,6 +26,7 @@ mod dma;
 mod fifo;
 mod framebuffer;
 mod hv;
+mod latch;
 pub mod pattern;
 mod planes;
 mod ports;
@@ -236,6 +237,28 @@ pub struct Vdp {
     /// [`Vdp::line`]: false for the line 0 of a VDP that has never been
     /// advanced, and cleared each time the beam moves to a new line (M4-06 #84).
     line_started: bool,
+    /// The scroll and mode state of [`Vdp::line`], read at the start of that
+    /// line's active display (`latch`, M4-23 #102).
+    ///
+    /// `Some` from the moment [`Vdp::advance`] walks the beam through that point
+    /// to the moment the line is drawn, and what the renderer answers register
+    /// and VSRAM reads from in between - see [`latch::LineState`].
+    ///
+    /// Boxed to keep a `Vdp` inside the 512 bytes
+    /// [`Vdp::new`] holds itself to (`vdp_values_stay_off_the_stack`), and
+    /// written in place by [`Vdp::latch_line_state`] so that it is one allocation
+    /// per chip rather than one per line - docs/ARCHITECTURE.md: "Core crates
+    /// must not allocate per frame in hot paths. Allocate buffers once."
+    line_latch: Option<Box<latch::LineState>>,
+    /// Set while [`Vdp::render_line`] is drawing the line [`Vdp::line_latch`]
+    /// belongs to, which is when [`Vdp::line_reg`] and [`Vdp::latched_vsram`] mean
+    /// that latch rather than the live chip.
+    ///
+    /// One bit rather than a per-reader view because the renderer reaches the
+    /// registers through the same getters everything else does, and nothing else
+    /// runs while a line is being drawn: no port write and no DMA start inside
+    /// `planes`, `sprites`, `window` and `compose`.
+    line_drawing: bool,
     /// The HV counter frozen by R0 bit 1 (M3), `None` while the bit is clear.
     ///
     /// `Some` from the moment M3 goes up to the moment it comes down, which is
@@ -294,6 +317,8 @@ impl Vdp {
             line: 0,
             line_mclk: 0,
             line_started: false,
+            line_latch: None,
+            line_drawing: false,
             hv_latch: None,
             color_lut: Box::new(ColorLut::new()),
             frame_buffer: FrameBuffer::new(),
@@ -348,7 +373,7 @@ impl Vdp {
     /// is true of the next line drawn (M4-19, #97).
     #[inline]
     pub fn left_column_blank(&self) -> bool {
-        self.regs[regs::R0] & (1 << 5) != 0
+        self.line_reg(regs::R0) & (1 << 5) != 0
     }
 
     /// R0 bit 4 (IE1): enable the HINT horizontal-blank interrupt
@@ -358,7 +383,7 @@ impl Vdp {
     /// pending HINT reaches the 68k.
     #[inline]
     pub fn hint_enabled(&self) -> bool {
-        self.regs[regs::R0] & (1 << 4) != 0
+        self.line_reg(regs::R0) & (1 << 4) != 0
     }
 
     /// R0 bit 1 (M3): latch and freeze the HV counter instead of letting it
@@ -369,7 +394,7 @@ impl Vdp {
     /// by nothing else: it is not a display mode.
     #[inline]
     pub fn hv_counter_latch(&self) -> bool {
-        self.regs[regs::R0] & (1 << 1) != 0
+        self.line_reg(regs::R0) & (1 << 1) != 0
     }
 
     /// R0 bit 2: palette select, which of the two CRAM halves a shadow or
@@ -377,7 +402,7 @@ impl Vdp {
     /// "$80xx"; genvdp.txt section 16 "Shadow / Hilight mode").
     #[inline]
     pub fn palette_select(&self) -> bool {
-        self.regs[regs::R0] & (1 << 2) != 0
+        self.line_reg(regs::R0) & (1 << 2) != 0
     }
 
     /// R1 bit 7: the 128 KiB VRAM select.
@@ -388,7 +413,7 @@ impl Vdp {
     /// (genvdp.txt section 17 "$01"; plutiedev lists the bit as always 0).
     #[inline]
     pub fn vram_128k_enabled(&self) -> bool {
-        self.regs[regs::R1] & (1 << 7) != 0
+        self.line_reg(regs::R1) & (1 << 7) != 0
     }
 
     /// R1 bit 6 (DISP): the display is drawn. When clear every line shows the
@@ -396,7 +421,7 @@ impl Vdp {
     /// section 17 "$01"; plutiedev "$81xx").
     #[inline]
     pub fn display_enabled(&self) -> bool {
-        self.regs[regs::R1] & (1 << 6) != 0
+        self.line_reg(regs::R1) & (1 << 6) != 0
     }
 
     /// R1 bit 5 (IE0): enable the VINT vertical-blank interrupt (genvdp.txt
@@ -406,14 +431,14 @@ impl Vdp {
     /// is delivered as soon as this goes up.
     #[inline]
     pub fn vint_enabled(&self) -> bool {
-        self.regs[regs::R1] & (1 << 5) != 0
+        self.line_reg(regs::R1) & (1 << 5) != 0
     }
 
     /// R1 bit 4 (M1): DMA is enabled. A DMA command word does nothing while
     /// this is clear (genvdp.txt section 11 "DMA"; plutiedev "$81xx").
     #[inline]
     pub fn dma_enabled(&self) -> bool {
-        self.regs[regs::R1] & (1 << 4) != 0
+        self.line_reg(regs::R1) & (1 << 4) != 0
     }
 
     /// R1 bit 3 (M2): V30 mode, a 30-cell (240-line) vertical resolution.
@@ -423,7 +448,7 @@ impl Vdp {
     /// systems").
     #[inline]
     pub fn v30_mode(&self) -> bool {
-        self.regs[regs::R1] & (1 << 3) != 0
+        self.line_reg(regs::R1) & (1 << 3) != 0
     }
 
     /// R1 bit 2 (M5): set for the Genesis's own mode 5, clear for the Master
@@ -433,14 +458,14 @@ impl Vdp {
     /// yet; it is exposed so a ROM that clears it can be recognised.
     #[inline]
     pub fn mode5_selected(&self) -> bool {
-        self.regs[regs::R1] & (1 << 2) != 0
+        self.line_reg(regs::R1) & (1 << 2) != 0
     }
 
     /// Plane A name table base, from R2 bits 5-3 (16 KiB steps; genvdp.txt
     /// section 17 "$02", plutiedev "$82xx").
     #[inline]
     pub fn plane_a_base(&self) -> u16 {
-        regs::table_base(self.regs[regs::R2], 0x38, 10)
+        regs::table_base(self.line_reg(regs::R2), 0x38, 10)
     }
 
     /// Window name table base, from R3 bits 5-1 (2 KiB steps; genvdp.txt
@@ -454,14 +479,14 @@ impl Vdp {
     #[inline]
     pub fn window_base(&self) -> u16 {
         let mask = if self.h40() { 0x3C } else { 0x3E };
-        regs::table_base(self.regs[regs::R3], mask, 10)
+        regs::table_base(self.line_reg(regs::R3), mask, 10)
     }
 
     /// Plane B name table base, from R4 bits 2-0 (16 KiB steps; genvdp.txt
     /// section 17 "$04", plutiedev "$84xx").
     #[inline]
     pub fn plane_b_base(&self) -> u16 {
-        regs::table_base(self.regs[regs::R4], 0x07, 13)
+        regs::table_base(self.line_reg(regs::R4), 0x07, 13)
     }
 
     /// Sprite attribute table base, from R5 bits 6-0 (512 byte steps; genvdp.txt
@@ -473,14 +498,14 @@ impl Vdp {
     #[inline]
     pub fn sprite_base(&self) -> u16 {
         let mask = if self.h40() { 0x7E } else { 0x7F };
-        regs::table_base(self.regs[regs::R5], mask, 9)
+        regs::table_base(self.line_reg(regs::R5), mask, 9)
     }
 
     /// R7 bits 5-4: palette the backdrop colour is read from (genvdp.txt
     /// section 17 "$07"; plutiedev "$87xx", "CPT1-0").
     #[inline]
     pub fn backdrop_palette(&self) -> u8 {
-        (self.regs[regs::R7] >> 4) & 0x03
+        (self.line_reg(regs::R7) >> 4) & 0x03
     }
 
     /// R7 bits 3-0 combined with the palette bits: the CRAM index of the
@@ -489,7 +514,7 @@ impl Vdp {
     /// palette entry to be used as the backdrop color").
     #[inline]
     pub fn backdrop_index(&self) -> u8 {
-        self.regs[regs::R7] & 0x3F
+        self.line_reg(regs::R7) & 0x3F
     }
 
     /// R10: value reloaded into the HINT counter after every HINT
@@ -497,7 +522,7 @@ impl Vdp {
     /// "$8Axx"). The counter it is loaded into is `timing`'s.
     #[inline]
     pub fn hint_reload(&self) -> u8 {
-        self.regs[regs::R10]
+        self.line_reg(regs::R10)
     }
 
     /// R11 bit 3 (IE2): enable the external interrupt driven by the TH pin.
@@ -505,7 +530,7 @@ impl Vdp {
     /// here uses it yet (genvdp.txt section 17 "$0B"; plutiedev "$8Bxx").
     #[inline]
     pub fn ext_int_enabled(&self) -> bool {
-        self.regs[regs::R11] & (1 << 3) != 0
+        self.line_reg(regs::R11) & (1 << 3) != 0
     }
 
     /// R11 bit 2 (VSCR): vertical scrolling is per 2-cell column instead of
@@ -513,7 +538,7 @@ impl Vdp {
     /// "$8Bxx").
     #[inline]
     pub fn vscroll_per_cell_column(&self) -> bool {
-        self.regs[regs::R11] & (1 << 2) != 0
+        self.line_reg(regs::R11) & (1 << 2) != 0
     }
 
     /// R11 bits 1-0 (HSCR/LSCR): how the horizontal scroll table is walked
@@ -521,7 +546,7 @@ impl Vdp {
     /// settings under the two bit names).
     #[inline]
     pub fn hscroll_mode(&self) -> HScrollMode {
-        regs::decode_hscroll_mode(self.regs[regs::R11])
+        regs::decode_hscroll_mode(self.line_reg(regs::R11))
     }
 
     /// H40 mode: the display is 40 cells wide.
@@ -533,7 +558,7 @@ impl Vdp {
     /// "$8Cxx").
     #[inline]
     pub fn h40(&self) -> bool {
-        self.regs[regs::R12] & regs::R12_RES_MASK != 0
+        self.line_reg(regs::R12) & regs::R12_RES_MASK != 0
     }
 
     /// R12 bit 3 (S/TE): shadow/highlight mode enabled, which is what makes the
@@ -541,7 +566,7 @@ impl Vdp {
     /// section 16 "Shadow / Hilight mode"; plutiedev "$8Cxx").
     #[inline]
     pub fn shadow_highlight_enabled(&self) -> bool {
-        self.regs[regs::R12] & (1 << 3) != 0
+        self.line_reg(regs::R12) & (1 << 3) != 0
     }
 
     /// R12 bits 2-1 (LSM): the interlace mode (genvdp.txt section 17 "$0C";
@@ -552,14 +577,14 @@ impl Vdp {
     /// lines of [`InterlaceMode::Mode2`].
     #[inline]
     pub fn interlace_mode(&self) -> InterlaceMode {
-        regs::decode_interlace_mode(self.regs[regs::R12])
+        regs::decode_interlace_mode(self.line_reg(regs::R12))
     }
 
     /// Horizontal scroll table base, from R13 bits 5-0 (1 KiB steps; genvdp.txt
     /// section 17 "$0D", plutiedev "$8Dxx").
     #[inline]
     pub fn hscroll_base(&self) -> u16 {
-        regs::table_base(self.regs[regs::R13], 0x3F, 10)
+        regs::table_base(self.line_reg(regs::R13), 0x3F, 10)
     }
 
     /// R15: value added to the VDP address register after every data port
@@ -570,7 +595,7 @@ impl Vdp {
     /// and the wrap of the address register are settled.
     #[inline]
     pub fn auto_increment(&self) -> u8 {
-        self.regs[regs::R15]
+        self.line_reg(regs::R15)
     }
 
     /// True when a control port command word asked for a DMA and nobody has
@@ -586,42 +611,42 @@ impl Vdp {
     /// [`regs::plane_extent`] for the invalid `10`.
     #[inline]
     pub fn plane_width_cells(&self) -> u8 {
-        regs::plane_extent(self.regs[regs::R16] & 0x03)
+        regs::plane_extent(self.line_reg(regs::R16) & 0x03)
     }
 
     /// Plane A and B name table height in cells, from R16 bits 5-4 (VSZ;
     /// genvdp.txt section 17 "$10", plutiedev "$90xx").
     #[inline]
     pub fn plane_height_cells(&self) -> u8 {
-        regs::plane_extent(self.regs[regs::R16] >> 4)
+        regs::plane_extent(self.line_reg(regs::R16) >> 4)
     }
 
     /// R17 bit 7 (RIGT): the window is drawn to the right of the split when set,
     /// to the left when clear (genvdp.txt section 17 "$11"; plutiedev "$91xx").
     #[inline]
     pub fn window_right(&self) -> bool {
-        self.regs[regs::R17] & (1 << 7) != 0
+        self.line_reg(regs::R17) & (1 << 7) != 0
     }
 
     /// R17 bits 4-0 (WHP): how wide the window is, in 2-cell (16 pixel) units;
     /// zero means no window (genvdp.txt section 17 "$11"; plutiedev "$91xx").
     #[inline]
     pub fn window_h_position(&self) -> u8 {
-        self.regs[regs::R17] & 0x1F
+        self.line_reg(regs::R17) & 0x1F
     }
 
     /// R18 bit 7 (DOWN): the window is drawn below the split when set, above it
     /// when clear (genvdp.txt section 17 "$12"; plutiedev "$92xx").
     #[inline]
     pub fn window_down(&self) -> bool {
-        self.regs[regs::R18] & (1 << 7) != 0
+        self.line_reg(regs::R18) & (1 << 7) != 0
     }
 
     /// R18 bits 4-0 (WVP): how high the window is, in cells (genvdp.txt
     /// section 17 "$12"; plutiedev "$92xx").
     #[inline]
     pub fn window_v_position(&self) -> u8 {
-        self.regs[regs::R18] & 0x1F
+        self.line_reg(regs::R18) & 0x1F
     }
 
     /// DMA length, R19 low and R20 high (genvdp.txt section 11
@@ -635,7 +660,7 @@ impl Vdp {
     /// a field of 0 means 0x10000 of them, live.
     #[inline]
     pub fn dma_length(&self) -> u16 {
-        u16::from(self.regs[regs::R19]) | (u16::from(self.regs[regs::R20]) << 8)
+        u16::from(self.line_reg(regs::R19)) | (u16::from(self.line_reg(regs::R20)) << 8)
     }
 
     /// DMA source address, from R21 (source bits 8-1), R22 (bits 16-9) and R23
@@ -648,9 +673,9 @@ impl Vdp {
     /// "DMD0 becomes SA23").
     #[inline]
     pub fn dma_source(&self) -> u32 {
-        (u32::from(self.regs[regs::R21]) << 1)
-            | (u32::from(self.regs[regs::R22]) << 9)
-            | ((u32::from(self.regs[regs::R23]) & 0x7F) << 17)
+        (u32::from(self.line_reg(regs::R21)) << 1)
+            | (u32::from(self.line_reg(regs::R22)) << 9)
+            | ((u32::from(self.line_reg(regs::R23)) & 0x7F) << 17)
     }
 
     /// The VRAM source address of a copy: R21 bits 7-0 and R22 bits 15-8
@@ -662,7 +687,7 @@ impl Vdp {
     /// 8-1, while a copy reads bytes.
     #[inline]
     pub fn dma_copy_source(&self) -> u16 {
-        u16::from(self.regs[regs::R21]) | (u16::from(self.regs[regs::R22]) << 8)
+        u16::from(self.line_reg(regs::R21)) | (u16::from(self.line_reg(regs::R22)) << 8)
     }
 
     /// R23 bits 7-6 (DMD1-0): which DMA the command asked for (genvdp.txt
@@ -673,7 +698,7 @@ impl Vdp {
     /// the next data port write.
     #[inline]
     pub fn dma_mode(&self) -> DmaMode {
-        regs::decode_dma_mode(self.regs[regs::R23])
+        regs::decode_dma_mode(self.line_reg(regs::R23))
     }
 
     /// Width of the active display in pixels: 320 in H40, 256 in H32

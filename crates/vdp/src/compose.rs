@@ -318,12 +318,23 @@ impl Vdp {
     /// [`compose_row`], and a line wider than it - the switch the other way, which
     /// shows nothing of the extra 64 columns - is cut short.
     ///
-    /// Everything else of the line is read at the moment it is drawn, R12
-    /// included, as [`Vdp::window_base`] and [`Vdp::sprite_base`] do too.
+    /// Everything else of the line is read from the latch of [`crate::latch`],
+    /// taken at the start of this line's active display: R12, the window base and
+    /// the sprite base included, so that a register written halfway across a line
+    /// is what the next line is drawn with rather than the rest of this one
+    /// (M4-23, #102).
     pub fn render_line(&mut self, line: u16) {
         if usize::from(line) >= self.active_height() {
             return;
         }
+        self.begin_line(line);
+        self.draw_line(line);
+        self.end_line();
+    }
+
+    /// The body of [`Vdp::render_line`], with [`Vdp::begin_line`] already run and
+    /// [`Vdp::end_line`] owed after it.
+    fn draw_line(&mut self, line: u16) {
         // The line of the picture this beam line of this field draws: `line` itself
         // uninterlaced, `line * 2 + field` in interlace mode 2, where the two fields
         // of a frame share one frame buffer and each writes the lines of its own
