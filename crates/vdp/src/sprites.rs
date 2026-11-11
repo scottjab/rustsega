@@ -22,7 +22,7 @@
 
 use crate::pattern::{NameEntry, read_word, tile_row};
 use crate::planes::{CELL_ROWS, PRIORITY_SHIFT};
-use crate::{Vdp, WIDTH_H40};
+use crate::{Vdp, WIDTH_H32, WIDTH_H40};
 
 /// Bytes of one SAT entry: genvdp.txt section 15, "The table is 640 bytes in
 /// size. Each 8-byte entry has the following format".
@@ -65,6 +65,14 @@ const MAX_SPRITES_H32: usize = 64;
 /// not drawn, and neither it nor anything later in the list is drawn either.
 const MAX_SPRITES_LINE_H40: usize = 20;
 const MAX_SPRITES_LINE_H32: usize = 16;
+
+/// The most sprite pixels one line may fetch, by display width: "320 pixels worth
+/// of sprite data has been drawn on the same scanline in 40 cell mode. 256 pixels
+/// worth of sprite data has been drawn on the same scanline in 32 cell mode"
+/// (genvdp.txt section 15 "Sprite Drawing Limitations"). Both are the width of the
+/// display they belong to, so they are the width and not another number next to it.
+const MAX_DOTS_LINE_H40: usize = WIDTH_H40;
+const MAX_DOTS_LINE_H32: usize = WIDTH_H32;
 
 /// The origin of the display inside the sprite space: "Sprites are positioned in
 /// a virtual 512x512 space. The display starts at coordinate 128, 128" (section
@@ -203,20 +211,21 @@ impl Vdp {
     /// per sprite at most, and no allocation. Which cell a sprite's pattern index
     /// names is the column-major rule of [`Vdp::fill_sprite_line`].
     ///
-    /// Of the limits of section 15 "Sprite Drawing Limitations" the two that count
-    /// sprites are here: a sprite whose y does not reach `line` is not on the line
-    /// and spends nothing, and one whose y does spends a slot of it whether or not
-    /// any of its pixels land on the display - "Sprites that are outside of the
-    /// physical display area are still taken into account".
+    /// Both limits of section 15 "Sprite Drawing Limitations" that a line spends are
+    /// counted by [`LineWalk`] as the list is walked, and both are spent by the
+    /// sprites of the line rather than by the pixels the viewer sees: a sprite whose
+    /// y does not reach `line` is not on the line and spends nothing, and one whose y
+    /// does spends its own slot and its own dots whether or not any of them land on
+    /// the display - "Sprites that are outside of the physical display area are still
+    /// taken into account".
     ///
-    /// TODO(M4-16 #94): the 320/256 pixels of sprite data per line, collision and
-    /// the masking of a sprite at x = 0.
+    /// TODO(M4-16 #94): collision and the masking of a sprite at x = 0.
     pub fn render_sprite_line(&mut self, line: u16, out: &mut [u8; WIDTH_H40]) {
         out.fill(0);
-        let max_sprites = if self.h40() {
-            MAX_SPRITES_LINE_H40
+        let (max_sprites, max_dots) = if self.h40() {
+            (MAX_SPRITES_LINE_H40, MAX_DOTS_LINE_H40)
         } else {
-            MAX_SPRITES_LINE_H32
+            (MAX_SPRITES_LINE_H32, MAX_DOTS_LINE_H32)
         };
         let mut walk = LineWalk::default();
 
@@ -228,10 +237,10 @@ impl Vdp {
             if row < 0 || row >= height {
                 continue;
             }
-            if !walk.admit(max_sprites) {
+            let Some(pixels) = walk.admit(&sprite, max_sprites, max_dots) else {
                 break;
-            }
-            self.fill_sprite_line(&sprite, row as usize, out);
+            };
+            self.fill_sprite_line(&sprite, row as usize, pixels, out);
         }
 
         self.sprite_overflow |= walk.overflow;
@@ -240,6 +249,16 @@ impl Vdp {
     /// Draw `row` - the row of `sprite` counting down from its top, 0..the height
     /// of the sprite in pixels - over `out`, writing only the pixels that are
     /// still transparent; see [`Vdp::render_sprite_line`] for who that leaves.
+    ///
+    /// `pixels` is how much of the sprite the dot limit left it, and cells of
+    /// [`CELL_ROWS`] is the step it is cut in: INFERRED, and the rule the tests of
+    /// this ticket fix in. genvdp.txt gives only the 320 and 256 of the limit and
+    /// never says what a line that runs out of them does to the sprite it runs out
+    /// on, and a sprite is fetched a cell at a time in the cell order of its own
+    /// pattern, so what is left of one is its first `pixels / CELL_ROWS` cells and
+    /// not its first `pixels` pixels of pattern read any which way. The cells kept
+    /// are the ones the loop reaches first, which are the leftmost ones on screen -
+    /// the cut is at the right of the sprite, where a line runs out.
     ///
     /// The cells of a sprite are numbered down the columns, so the cell at
     /// `column` and `row` is `pattern + column * height_cells + row_cell`. That is
@@ -257,7 +276,7 @@ impl Vdp {
     /// [`tile_row`] does with the same flag. Mirroring the cell index and passing
     /// `row` to [`tile_row`] unmirrored is the same thing as mirroring the row and
     /// dropping the flag, so each axis is mirrored once here and nowhere else.
-    fn fill_sprite_line(&self, sprite: &Sprite, row: usize, out: &mut [u8]) {
+    fn fill_sprite_line(&self, sprite: &Sprite, row: usize, pixels: usize, out: &mut [u8]) {
         let NameEntry {
             priority,
             palette,
@@ -278,7 +297,7 @@ impl Vdp {
         let layer_base = (u16::from(palette) << 4) | (u16::from(priority) << PRIORITY_SHIFT);
         let left = i32::from(sprite.x) - ORIGIN;
 
-        for cell in 0..usize::from(sprite.width_cells) {
+        for cell in 0..pixels / CELL_ROWS {
             let column = if hflip {
                 usize::from(sprite.width_cells) - 1 - cell
             } else {
@@ -319,23 +338,45 @@ impl Vdp {
 struct LineWalk {
     /// Sprites of this line reached so far.
     sprites: usize,
-    /// SOVR, from a sprite past [`MAX_SPRITES_LINE_H40`] /
-    /// [`MAX_SPRITES_LINE_H32`]: see [`Vdp::sprite_overflow`].
+    /// Sprite pixels of this line fetched so far, of the [`MAX_DOTS_LINE_H40`] /
+    /// [`MAX_DOTS_LINE_H32`] the display width allows.
+    dots: usize,
+    /// SOVR, from a sprite past either of the two limits of the line: see
+    /// [`Vdp::sprite_overflow`].
     overflow: bool,
 }
 
 impl LineWalk {
-    /// Take one more sprite of the line and say whether it may draw: `false` for
-    /// the sprite past the limit of `max_sprites`, which the VDP parses but does not
-    /// draw and stops the whole line at - genvdp.txt lists its limits as things the
-    /// VDP "will stop drawing sprites under".
-    fn admit(&mut self, max_sprites: usize) -> bool {
+    /// Take one more sprite of the line and say how much of it may draw:
+    ///
+    /// * `None` for the sprite past the limit of `max_sprites`, which the VDP parses
+    ///   but does not draw and stops the whole line at - genvdp.txt lists its limits
+    ///   as things the VDP "will stop drawing sprites under".
+    /// * the number of pixels of the sprite that the dot limit still leaves it,
+    ///   `MAX_DOTS_LINE_H40` / [`MAX_DOTS_LINE_H32`] of them in all, with the whole
+    ///   of the sprite counted against the limit whether or not any of it lands on
+    ///   the display: "Sprites that are outside of the physical display area are
+    ///   still taken into account".
+    ///
+    /// A sprite is the last thing the limit cuts in one step, so a sprite that does
+    /// not fit takes the rest of the line and leaves nothing for the sprites after
+    /// it, which are then cut to 0 pixels each. Every case of the two limits sets
+    /// SOVR, which is what genvdp.txt section 15 has them all do.
+    fn admit(&mut self, sprite: &Sprite, max_sprites: usize, max_dots: usize) -> Option<usize> {
         self.sprites += 1;
         if self.sprites > max_sprites {
             self.overflow = true;
-            return false;
+            return None;
         }
-        true
+        let dots = usize::from(sprite.width_cells) * CELL_ROWS;
+        let allowed = if self.dots + dots > max_dots {
+            self.overflow = true;
+            max_dots - self.dots
+        } else {
+            dots
+        };
+        self.dots += allowed;
+        Some(allowed)
     }
 }
 
@@ -936,5 +977,154 @@ mod tests {
             vdp.sprite_overflow,
             "and the twenty off-screen ones used up the line to get there"
         );
+    }
+
+    /// `count` solid tiles from `first`, all of `colour`: a sprite of any width
+    /// whose pattern starts at `first` then draws `colour` in every cell of it,
+    /// which the column-major numbering of [`Vdp::fill_sprite_line`] otherwise
+    /// undoes because a wide sprite is several tiles and not one.
+    fn solid_span(vdp: &mut Vdp, first: u16, count: usize, colour: u8) {
+        for tile in 0..count {
+            for row in 0..CELL_ROWS {
+                fill_tile_row(vdp, first + tile as u16, row, colour);
+            }
+        }
+    }
+
+    /// The patterns of the 4-cell sprites of the dot tests: sprite `index` names the
+    /// four tiles at `4 * index + 1` and is colour `index + 1` in all four of them,
+    /// so the colour of a pixel says which sprite of the line drew it. Up to 15
+    /// sprites, since a pattern pixel has 4 bits and colour 0 is transparency.
+    fn wide_sprites(vdp: &mut Vdp, count: usize) {
+        for index in 0..count {
+            solid_span(vdp, 4 * index as u16 + 1, 4, index as u8 + 1);
+        }
+    }
+
+    /// The 4-cell sprite of a dot test: `index` picks its pattern out of
+    /// [`wide_sprites`], so it is solid `index + 1` for all 32 of its pixels.
+    fn wide_sprite(vdp: &mut Vdp, index: usize, y: u16, x: u16, link: u8) {
+        put_sprite(vdp, index, y, x, (4, 1), link, 4 * index as u16 + 1);
+    }
+
+    /// genvdp.txt section 15: "320 pixels worth of sprite data has been drawn on
+    /// the same scanline in 40 cell mode", which eleven 4-cell sprites of 32 pixels
+    /// overrun. The tenth ends the line at exactly 320, the eleventh has no dots
+    /// left, and SOVR is set: every pixel of the display here belongs to one of the
+    /// first ten, each of which drew all 32 pixels of itself.
+    #[test]
+    fn a_line_of_eleven_wide_sprites_is_cut_at_the_dot_limit() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        wide_sprites(&mut vdp, 11);
+        for index in 0..11usize {
+            wide_sprite(
+                &mut vdp,
+                index,
+                128,
+                128 + 32 * index as u16,
+                index as u8 + 1,
+            );
+        }
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        for index in 0..10usize {
+            let from = index * 32;
+            assert_eq!(
+                &line[from..from + 32],
+                &[index as u8 + 1; 32],
+                "sprite {index}, the last of them ending at the 320th dot"
+            );
+        }
+        assert!(
+            vdp.sprite_overflow,
+            "352 pixels of sprite data on a line that holds 320"
+        );
+    }
+
+    /// The dot limit is spent by the sprite data of the line, not by the pixels of it
+    /// the viewer sees: "Sprites that are outside of the physical display area are
+    /// still taken into account" (section 15). Ten 4-cell sprites off the right hand
+    /// edge therefore leave nothing for the eleventh, which is cut to 0 pixels - the
+    /// exact-zero case of a cut, and what makes the limit a `>` and not a `>=`.
+    #[test]
+    fn a_full_dot_line_cuts_a_later_sprite_to_nothing() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        wide_sprites(&mut vdp, 11);
+        for index in 0..10usize {
+            wide_sprite(&mut vdp, index, 128, 460, index as u8 + 1);
+        }
+        wide_sprite(&mut vdp, 10, 128, 128, 0);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            line,
+            blank_line(),
+            "the eleventh sprite draws nothing at all, not even its first cell"
+        );
+        assert!(vdp.sprite_overflow, "and the line overflowed to get there");
+    }
+
+    /// The other side of the same boundary: a line that uses exactly 320 dots of
+    /// sprite data is a full line and not an overflowed one, so the sprite that
+    /// fills it to its last dot still draws all 32 pixels of itself.
+    #[test]
+    fn a_line_that_uses_exactly_the_dot_limit_does_not_overflow() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        wide_sprites(&mut vdp, 10);
+        for index in 0..9usize {
+            wide_sprite(&mut vdp, index, 128, 460, index as u8 + 1);
+        }
+        wide_sprite(&mut vdp, 9, 128, 128, 0);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            &line[0..32],
+            &[10; 32],
+            "the tenth sprite of the line is the one that filled it"
+        );
+        assert!(
+            !vdp.sprite_overflow,
+            "320 dots is the limit, and reaching it is not passing it"
+        );
+    }
+
+    /// A sprite the dot limit cuts in mid-sprite draws the whole cells it has dots
+    /// left for and no more: 320 - 288 - 24 = 8 of them, so the 4-cell sprite at the
+    /// end of this line draws its first 8 pixels and loses its other three cells.
+    /// INFERRED, see [`Vdp::fill_sprite_line`]: the fetch step of a sprite is one 8
+    /// pixel cell, so a cut lands on a cell boundary and cuts the sprite from its
+    /// right, the end the pixels of a line are fetched in.
+    ///
+    /// The 288 and the 24 are spent outside the display, as in
+    /// [`a_full_dot_line_cuts_a_later_sprite_to_nothing`].
+    #[test]
+    fn a_sprite_cut_by_the_dot_limit_draws_whole_cells() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        wide_sprites(&mut vdp, 13);
+        solid_tile(&mut vdp, 1, 1);
+        for index in 0..9usize {
+            wide_sprite(&mut vdp, index, 128, 460, index as u8 + 1);
+        }
+        for index in 9..12 {
+            put_sprite(&mut vdp, index, 128, 460, (1, 1), index as u8 + 1, 1);
+        }
+        put_sprite(&mut vdp, 12, 128, 128, (4, 1), 0, 1);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[0..8], &[1; 8], "the first cell of the cut sprite");
+        assert_eq!(
+            &line[8..32],
+            &[0; 24],
+            "and nothing of its other three cells, which had no dots left"
+        );
+        assert!(vdp.sprite_overflow, "344 dots on a 320 dot line");
     }
 }
