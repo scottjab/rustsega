@@ -192,6 +192,7 @@ impl Vdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::color;
     use crate::planes::testutil::{
         CELL_TILE_ROWS, PLANE_A_BASE, PLANE_B_BASE, PLANE_COLUMNS, PLANE_ROWS, fill_tile_row,
         plane_vdp, put_entry, put_word,
@@ -528,5 +529,268 @@ mod tests {
             line[128..].iter().all(|&p| p == window),
             "x >= 128 is the window"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Shadow / highlight: genvdp.txt section 16, R12 bit 3 (M4-18, #96).
+    // ---------------------------------------------------------------------
+
+    /// The pattern colour of the highlight operator: palette 3 colour 14, the
+    /// `3E` of genvdp.txt section 16.
+    const HIGHLIGHT: u8 = 14;
+    /// [`HIGHLIGHT`]'s partner: palette 3 colour 15, the `3F` of that section.
+    const SHADOW: u8 = 15;
+    /// What [`compose_vdp`] writes to the two operator entries of CRAM for
+    /// [`operators_are_ordinary_colours_when_shadow_highlight_is_off`], one word
+    /// apiece so the two cannot be confused for each other.
+    const OPERATOR_WORDS: [(u8, u16); 2] = [
+        ((SPRITE << 4) | HIGHLIGHT, 0x00C0),
+        ((SPRITE << 4) | SHADOW, 0x0C00),
+    ];
+
+    /// The frame pixel of a CRAM entry of [`COLOURS`] at `level`.
+    ///
+    /// [`crate::color::ColorLut`] is [`color`] for every colour at every
+    /// intensity, which is what lets a shadow or highlight expectation be
+    /// written from the CRAM word rather than from another table.
+    fn pixel_at(cram_index: u8, level: Intensity) -> u32 {
+        let (_, word, _) = COLOURS
+            .into_iter()
+            .find(|(index, _, _)| *index == cram_index)
+            .unwrap_or_else(|| panic!("no test colour for CRAM entry {cram_index}"));
+        color(word, level)
+    }
+
+    /// [`compose_vdp`] with R12 bit 3 (S/TE) set: shadow/highlight mode
+    /// (genvdp.txt section 16, plutiedev "$8Cxx").
+    fn shadow_vdp() -> Vdp {
+        let mut vdp = compose_vdp();
+        vdp.write_register(12, 1 << 3);
+        vdp
+    }
+
+    /// Plane B at low priority over the whole display and plane A over the first
+    /// cell at `plane_a_priority`: the background every shadow/highlight test
+    /// below has a sprite pass over.
+    fn shadow_background(vdp: &mut Vdp, plane_a_priority: bool) {
+        solid(vdp, 1, COLOUR);
+        solid(vdp, 2, COLOUR);
+        for cell in 0..PLANE_COLUMNS * PLANE_ROWS {
+            put_entry(vdp, PLANE_B_BASE, cell, entry(PLANE_B, 1, false));
+        }
+        put_entry(vdp, PLANE_A_BASE, 0, entry(PLANE_A, 2, plane_a_priority));
+    }
+
+    /// The pattern [`sprite_over`] draws its 1x1 cell from: its own, so that
+    /// plane A keeps drawing [`COLOUR`] under it and an operator left in no doubt
+    /// about what it is raising or darkening.
+    const SPRITE_TILE: u16 = 5;
+
+    /// A 1x1 cell sprite at (0, 0) drawing `colour` from the [`SPRITE`] palette
+    /// at `priority`, over the plane A cell of [`shadow_background`].
+    fn sprite_over(vdp: &mut Vdp, colour: u8, priority: bool) {
+        solid(vdp, SPRITE_TILE, colour);
+        put_sprite(vdp, 0, 0, 0, entry(SPRITE, SPRITE_TILE, priority));
+    }
+
+    /// Both planes low: everything is shadowed, plane B as much as plane A.
+    #[test]
+    fn a_low_priority_background_shows_at_shadow_intensity() {
+        let mut vdp = shadow_vdp();
+        shadow_background(&mut vdp, false);
+
+        vdp.render_line(0);
+
+        let line = row(&vdp, 0);
+        let plane_a = pixel_at((PLANE_A << 4) | COLOUR, Intensity::Shadow);
+        let plane_b = pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow);
+        assert!(
+            line[..8].iter().all(|&p| p == plane_a),
+            "the plane A cell is shadowed, not the normal colour of its CRAM entry"
+        );
+        assert!(
+            line[8..].iter().all(|&p| p == plane_b),
+            "plane B is shadowed too, and it is the only layer from pixel 8 on"
+        );
+    }
+
+    /// Plane A high: its own pixels are normal, and so is everything else in
+    /// their 8x8 block - while the rest of the line, plane B alone and low, is
+    /// still shadowed (genvdp.txt section 16: "Background tiles are shown at half
+    /// intensity, or at normal intensity if their priority bit is set").
+    #[test]
+    fn a_high_priority_plane_shows_at_normal_intensity() {
+        let mut vdp = shadow_vdp();
+        shadow_background(&mut vdp, true);
+
+        vdp.render_line(0);
+
+        let line = row(&vdp, 0);
+        let plane_a = pixel_at((PLANE_A << 4) | COLOUR, Intensity::Normal);
+        let plane_b = pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow);
+        assert!(line[..8].iter().all(|&p| p == plane_a), "plane A is high");
+        assert!(
+            line[8..].iter().all(|&p| p == plane_b),
+            "and plane B, low and on its own, is not"
+        );
+    }
+
+    /// The shadow of nothing is the shadow of the backdrop: "The backdrop is
+    /// shown at half intensity" (genvdp.txt section 16), which is the R7 colour
+    /// at [`Intensity::Shadow`] with no plane opaque anywhere to argue with it.
+    #[test]
+    fn the_backdrop_is_shadowed_too() {
+        let mut vdp = shadow_vdp();
+
+        vdp.render_line(0);
+
+        assert_eq!(
+            row(&vdp, 0),
+            vec![pixel_at(BACKDROP, Intensity::Shadow); 256],
+            "nothing but R7 is opaque on this line"
+        );
+    }
+
+    /// A shadow operator over a shadowed background is that background still
+    /// shadowed, and a highlight operator lifts it one step: "shadow + shadow =
+    /// shadow" and "shadow + highlight = normal" (SpritesMind "Shadow/Highlight"
+    /// thread 2692, which is also what settles genvdp.txt section 16 the other
+    /// way round on which of the two colours is which).
+    #[test]
+    fn a_highlight_operator_raises_a_shadowed_background_one_step() {
+        let mut vdp = shadow_vdp();
+        shadow_background(&mut vdp, false);
+        sprite_over(&mut vdp, HIGHLIGHT, false);
+
+        vdp.render_line(0);
+
+        let line = row(&vdp, 0);
+        let normal = pixel_at((PLANE_A << 4) | COLOUR, Intensity::Normal);
+        assert!(
+            line[..8].iter().all(|&p| p == normal),
+            "the operator draws nothing and the plane under it shows at normal"
+        );
+
+        let mut vdp = shadow_vdp();
+        shadow_background(&mut vdp, false);
+        sprite_over(&mut vdp, SHADOW, false);
+
+        vdp.render_line(0);
+
+        let line = row(&vdp, 0);
+        let shadowed = pixel_at((PLANE_A << 4) | COLOUR, Intensity::Shadow);
+        assert!(
+            line[..8].iter().all(|&p| p == shadowed),
+            "a shadow over a shadow is still the shadow of the same colour"
+        );
+    }
+
+    /// A normal background - a high priority plane - under a highlight operator
+    /// goes to highlight, which is the top step of the ladder; and the operator
+    /// is one even on a high priority sprite, whose own priority is what puts it
+    /// in front of that plane in the first place.
+    #[test]
+    fn a_highlight_operator_raises_a_normal_background_to_highlight() {
+        let mut vdp = shadow_vdp();
+        shadow_background(&mut vdp, true);
+        sprite_over(&mut vdp, HIGHLIGHT, true);
+
+        vdp.render_line(0);
+
+        let line = row(&vdp, 0);
+        let highlight = pixel_at((PLANE_A << 4) | COLOUR, Intensity::Highlight);
+        assert!(
+            line[..8].iter().all(|&p| p == highlight),
+            "the sprite pixel of palette 3 colour 14 is not drawn, and the plane under it is highlighted"
+        );
+    }
+
+    /// A shadow operator over a normal background: the plane colour, shadowed.
+    #[test]
+    fn a_shadow_operator_shadows_the_background_under_it() {
+        let mut vdp = shadow_vdp();
+        shadow_background(&mut vdp, true);
+        sprite_over(&mut vdp, SHADOW, true);
+
+        vdp.render_line(0);
+
+        let line = row(&vdp, 0);
+        let shadowed = pixel_at((PLANE_A << 4) | COLOUR, Intensity::Shadow);
+        assert!(
+            line[..8].iter().all(|&p| p == shadowed),
+            "the plane colour, one step down from the normal it was drawn at"
+        );
+    }
+
+    /// A low priority sprite over a shadowed background is shadowed with it, and
+    /// a high priority sprite over the same background is not: "sprites are shown
+    /// at normal or half intensity just like background tiles" (genvdp.txt
+    /// section 16).
+    #[test]
+    fn a_sprite_takes_its_intensity_from_its_own_priority() {
+        let cases = [(false, Intensity::Shadow), (true, Intensity::Normal)];
+        for (priority, level) in cases {
+            let mut vdp = shadow_vdp();
+            shadow_background(&mut vdp, false);
+            sprite_over(&mut vdp, COLOUR, priority);
+
+            vdp.render_line(0);
+
+            let line = row(&vdp, 0);
+            let want = pixel_at((SPRITE << 4) | COLOUR, level);
+            assert!(
+                line[..8].iter().all(|&p| p == want),
+                "sprite priority {priority} is {level:?}"
+            );
+            assert!(
+                line[8..].iter().all(|&p| p == pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow)),
+                "the plane B behind is shadowed either way"
+            );
+        }
+    }
+
+    /// An operator only commands the pixel under it when it is the sprite the
+    /// display shows there: "this only works if the sprite in question is at the
+    /// top of the display - meaning there are no planes set to higher priority
+    /// than the sprite" (Raster Scroll, "Shadow and Highlight"), which is also
+    /// the shape of the hardware-verified implementation of the SpritesMind
+    /// thread the mode was settled on.
+    #[test]
+    fn an_operator_under_a_high_priority_plane_does_nothing() {
+        for colour in [HIGHLIGHT, SHADOW] {
+            let mut vdp = shadow_vdp();
+            shadow_background(&mut vdp, true);
+            sprite_over(&mut vdp, colour, false);
+
+            vdp.render_line(0);
+
+            let line = row(&vdp, 0);
+            let plane_a = pixel_at((PLANE_A << 4) | COLOUR, Intensity::Normal);
+            assert!(
+                line[..8].iter().all(|&p| p == plane_a),
+                "palette 3 colour {colour} is behind a high priority plane A, which shows as itself"
+            );
+        }
+    }
+
+    /// R12 bit 3 clear: the two operator entries of the sprite palette are
+    /// colours like any other, drawn where the sprite draws them.
+    #[test]
+    fn operators_are_ordinary_colours_when_shadow_highlight_is_off() {
+        for (index, word) in OPERATOR_WORDS {
+            let mut vdp = compose_vdp();
+            shadow_background(&mut vdp, false);
+            vdp.cram[usize::from(index)] = word;
+            sprite_over(&mut vdp, index & 0x0F, false);
+
+            vdp.render_line(0);
+
+            let line = row(&vdp, 0);
+            let want = color(word, Intensity::Normal);
+            assert!(
+                line[..8].iter().all(|&p| p == want),
+                "CRAM entry {index:#04x} of a display with no shadow/highlight is its own colour"
+            );
+        }
     }
 }
