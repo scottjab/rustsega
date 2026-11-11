@@ -48,13 +48,15 @@
 //!
 //! [`m68k::Bus::int_ack`] is deliberately left at the trait default: returning
 //! `None` *is* what a Genesis does, always autovectoring.
-//! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`] and the Z80's control
-//! lines; the VDP joins them with M3-09 (#69).
+//! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`], the Z80's control
+//! lines and - since M3-09 (#69) put one here - [`Bus::vdp`].
 
 use crate::cart::{Eeprom, Mapper, Sram, eeprom, mapper, sram};
+use crate::config::version_is_pal;
 use crate::io::Io;
 use crate::z80_bus::{self, YM_STATUS_IDLE, Z80Side};
 use m68k::ADDR_MASK;
+use vdp::Vdp;
 
 /// What an undriven data bus reads as: the placeholder for every area that
 /// nothing drives yet. See the module docs, and M3-16 (#77) for the real thing.
@@ -178,8 +180,10 @@ enum Region {
     /// on a TMSS console nothing here is reachable at all until the security string
     /// arrives (see [`Bus::vdp_access_denied`]).
     ///
-    /// TODO(M3-09 #69): the data/control/HV-counter/PSG ports at
-    /// 0xC00000-0xC0001C, mirrored every 0x40 (plutiedev "Memory map").
+    /// The area is the VDP's ports and their mirrors: the whole 0x20 block of
+    /// plutiedev "Memory map", every other word, mirrored every 0x40 up to
+    /// `$DFFFFF`. [`vdp_port`] is the decode, and the corner that decodes to
+    /// nothing - `$C00020-$C0003F` of the same page - is [`VDP_HANG_BIT`]'s.
     Vdp,
     /// 0xA00000-0xA0FFFF, the Z80 bus seen from the 68k: the sound RAM, the YM2612,
     /// the bank register and the PSG, reached only while the 68k holds the Z80's bus.
@@ -237,6 +241,170 @@ impl Region {
             TMSS_START..=TMSS_END => Self::Tmss,
             _ => Self::Unmapped,
         }
+    }
+}
+
+/// One of the VDP's own ports, the sub-decode of [`Region::Vdp`] that
+/// [`Bus::read_vdp_byte`] and its three siblings answer.
+///
+/// The table is plutiedev "Memory map", "List of VDP ports", read together with
+/// the two mirrors the same page states:
+///
+/// | `addr & 0x1F` | port |
+/// | ------------- | ---- |
+/// | `$00`, `$02`  | data port, and its every-other-word mirror |
+/// | `$04`, `$06`  | control port: write a command, read the status register |
+/// | `$08`-`$0F`   | HV counter, read-only |
+/// | `$10`-`$17`   | PSG, on the odd lane of the pair |
+/// | `$18`-`$1F`   | the debug address (`$18`) and data (`$1C`) ports |
+///
+/// Genesis Plus GX's `vdp_read_byte`/`vdp_write_word` (`core/mem68k.c`) is the
+/// same table, reached with `case 0x00:` for the data port, `case 0x04:` for the
+/// control one and `case 0x10: case 0x14:` for the PSG.
+enum VdpPort {
+    /// The data port: the memories, at the address and memory the code register
+    /// points at, and their read side (genvdp.txt section 7).
+    Data,
+    /// The control port: register writes and command words going in, the status
+    /// register coming out (genvdp.txt section 7).
+    Control,
+    /// The HV counter, which reads the counter and takes no writes (genvdp.txt
+    /// section 5 "HV Counter").
+    HvCounter,
+    /// The PSG port: the 68k's own way to the sound chip, one byte wide
+    /// (plutiedev "Memory map": "PSG is normally accessed by byte, so you'll
+    /// generally see $C00011 instead").
+    Psg,
+    /// The debug pair at `$18` and `$1C`. Nothing models it: writes are dropped
+    /// and reads float. Genesis Plus GX sends `$1C` to a `vdp_test_w` whose ticket
+    /// has not been written, and MAME's map gives the pair no function.
+    Debug,
+}
+
+/// The one address line that separates the VDP's port block from the corner of
+/// the area that hangs up: A5.
+///
+/// plutiedev "Memory map" gives the ports to `$C0001F` and then says "Accessing
+/// address range `$C00020` to `$C0003F` hangs up", and one line later "VDP
+/// mirrors every `$40` up to `$DFFFFF`". Both sentences are the same decoder: the
+/// block the VDP decodes is 0x20 bytes - A4-A1 select the ports and A0 is the byte
+/// lane - A5 has to be low for the chip to answer at all, and nothing above A5
+/// reaches the decode, which is what "mirrors every $40" is.
+///
+/// Modelling the hang itself - no DTACK, so the 68k stops - is M3-16 (#77); until
+/// then an address with this bit set answers what the rest of the undecoded area
+/// answers.
+const VDP_HANG_BIT: u32 = 1 << 5;
+
+/// The port that `addr` names inside [`Region::Vdp`], or `None` for the corner of
+/// the area that is not a port at all.
+///
+/// `addr` is masked and already decoded as [`Region::Vdp`], and that region is
+/// half the answer on its own: the VDP is selected for all of
+/// `$C00000-$DFFFFF`, so nothing above A5 of the address takes part in the port
+/// decode and only [`VDP_HANG_BIT`] and the five bits of the [`VdpPort`] table are
+/// left.
+///
+/// ## The mask #69 suggested, checked
+///
+/// The ticket put `(addr & 0xE700E0) == 0xC00000` forward and asked for it to be
+/// verified against plutiedev "Memory map" and genvdp.txt. It is not the decode,
+/// in both directions, and it is not used:
+///
+/// - It tests A6 and A7 along with A5, so it says `$C00040` and `$C00080` are not
+///   the VDP. plutiedev says the opposite one sentence after naming the hang-up
+///   corner: "VDP mirrors every $40 up to $DFFFFF". A6 is above the 0x20 the VDP
+///   decodes and takes no part in the hang.
+/// - It tests A16-A18, so it says `$C10000`-`$CFFFFF` are not the VDP either,
+///   while the range that same page's overview table gives, and which
+///   [`Region::Vdp`] decodes, runs to `$DFFFFF`. It also leaves A19-A20 alone,
+///   which accepts `$D00000`-`$D0FFFF` while its test on A16-A18 rejects
+///   `$D10000`-`$DFFFFF`: a shape no address decoder has ever had.
+///
+/// What checking leaves behind is one bit, [`VDP_HANG_BIT`], inside a region that
+/// is already the mirror. The other mirror, the every-other-word one of plutiedev
+/// "all VDP ports are mirrored every other word, e.g. control port is at both
+/// $C00004 and $C00006", is A1 - which the port table below simply does not look
+/// at, and which is what lets a `move.l` reach a port as two word accesses.
+///
+/// The three sources this file quotes from do not agree with each other on the
+/// upper mirror, which is why the difference is recorded rather than settled:
+/// MAME's `megadriv_68k_base_map` maps `$C00000-$C0001F` and nothing else (plus
+/// `$D00000-$D0001F`, commented "the earth defend"), and Genesis Plus GX's
+/// `vdp_read_byte`/`vdp_write_word` mask `& 0xFD` and `& 0xFC`, so A1 and A8-A23
+/// are don't-care but A6 and A7 are not and `$C00040` reaches its lockup handler.
+/// plutiedev is the map this bus is built from throughout this file, and its rule
+/// accepts everything those two accept near `$C00000` and nothing that hangs up.
+fn vdp_port(addr: u32) -> Option<VdpPort> {
+    if addr & VDP_HANG_BIT != 0 {
+        return None;
+    }
+    Some(match addr & z80_bus::VDP_PORT_MASK {
+        0x00..=0x03 => VdpPort::Data,
+        0x04..=0x07 => VdpPort::Control,
+        0x08..=0x0F => VdpPort::HvCounter,
+        0x10..=0x17 => VdpPort::Psg,
+        _ => VdpPort::Debug,
+    })
+}
+
+/// The 68k memory a 68k to VDP DMA reads its source through: the cart and work
+/// RAM, which is where every DMA source is.
+///
+/// This is what [`Vdp::run_dma`] is handed after each control port write, and it
+/// is a separate type rather than a call into [`Bus`] because of a borrow: the
+/// transfer holds `&mut self.vdp` for its whole length, and the source cannot
+/// also borrow `self`. [`Bus::vdp_control_write`] is where the two borrows are
+/// taken apart.
+///
+/// [`Vdp::run_dma`]: vdp::Vdp::run_dma
+struct VdpDmaSource<'a> {
+    rom: &'a [u8],
+    ram: &'a [u8; 0x10000],
+    mapper: &'a Mapper,
+}
+
+impl vdp::DmaBus for VdpDmaSource<'_> {
+    /// The word the 68k would read at `addr`.
+    ///
+    /// Not [`Bus::read_rom_word`], and that is a choice rather than an
+    /// inconvenience: the save RAM overlay and the cart's EEPROM are what make
+    /// that one `&mut self`, and this runs with the VDP borrowed. So a DMA whose
+    /// source is a save window reads the ROM underneath it, and the cart's data
+    /// line is always read as the image. No cart has ever put its save where its
+    /// DMA sources point.
+    ///
+    /// The mapper *is* consulted, because a DMA out of a banked cart is ordinary
+    /// and `Mapper::map` takes `&self`: a DMA reads what the 68k would read at
+    /// that address today, which is the bank the cart last switched in.
+    ///
+    /// Nothing else answers a DMA at all. A source inside [`Region::Vdp`] is not
+    /// modelled, which is a transfer reading the memory it is writing to - the
+    /// VDP asking itself a question through the bus - and what hardware does
+    /// about it is not settled: Genesis Plus GX splits the 68k transfer into
+    /// `vdp_dma_68k_ext`, `vdp_dma_68k_ram` and `vdp_dma_68k_io`, and the middle
+    /// one comments "access Work-RAM by default" for every internal address from
+    /// `$800000` up. No game has pointed a DMA at the VDP ports.
+    fn read_word(&mut self, addr: u32) -> u16 {
+        let addr = addr & ADDR_MASK;
+        let (high, low) = match Region::decode(addr) {
+            Region::Rom => {
+                let offset = self.mapper.map(addr).unwrap_or((addr - ROM_START) as usize);
+                (
+                    self.rom.get(offset).copied(),
+                    self.rom.get(offset + 1).copied(),
+                )
+            }
+            Region::Ram => {
+                let index = Bus::ram_index(addr);
+                (Some(self.ram[index]), Some(self.ram[index + 1]))
+            }
+            _ => return OPEN_BUS_WORD,
+        };
+        // Two bytes rather than a slice, so that a word straddling the end of the
+        // image still returns the byte that is there - the same reason
+        // [`Bus::read_rom_word`] looks its halves up separately.
+        u16::from_be_bytes([high.unwrap_or(OPEN_BUS), low.unwrap_or(OPEN_BUS)])
     }
 }
 
@@ -325,6 +493,19 @@ pub struct Bus {
     /// the module docs of [`crate::z80_bus`]. The Z80 runs on the same board as
     /// this bus, and stepping it is `Z80View::new(&mut bus)`.
     pub z80: Z80Side,
+    /// The VDP: the chip behind [`Region::Vdp`], and the one the ports of M3-09
+    /// (#69) reach.
+    ///
+    /// Public because the bus has nothing else to hand a front end that wants to
+    /// know what the VDP was told, and because the tests of those ports have to
+    /// see the memory a port write landed in. Nothing outside the port decode of
+    /// `read_vdp_*`/`write_vdp_*` writes it, and the scheduler (M3-14 #75) is the
+    /// thing that will advance it.
+    ///
+    /// The `pal` it is built with comes from [`Bus::version`], the one byte this
+    /// bus knows about the console (see [`crate::config`] and
+    /// [`Vdp::new`]).
+    pub vdp: Vdp,
     /// The Z80's bus request line, as the 68k last set it at [`Z80_BUSREQ`].
     ///
     /// `true` means the 68k has asked for the bus and therefore owns the sound side
@@ -439,6 +620,10 @@ impl Bus {
             version,
             io: Io::new(),
             z80: Z80Side::new(),
+            // The VDP's `PAL` pin is wired to the same console that reports VMOD
+            // in [`Bus::version`], so a PAL machine gives the chip the 240-line
+            // crystal that [`Vdp::v30_mode`] is allowed to use.
+            vdp: Vdp::new(version_is_pal(version)),
             z80_busreq: false,
             z80_reset: true,
             z80_reset_pulse: false,
@@ -804,29 +989,141 @@ impl Bus {
         self.ram[index..index + 2].copy_from_slice(&value.to_be_bytes());
     }
 
-    /// VDP port byte read. Placeholder for [`Region::Vdp`]: returns open bus,
-    /// where a real console reads the VDP data port, the status register, the HV
-    /// counter or nothing, and 0xC00020-0xC0003F hangs the bus (plutiedev
-    /// "Memory map").
+    /// VDP port byte read: the lane of [`Bus::read_vdp_word`] that `addr` sits on.
+    ///
+    /// The even byte of a port is the high byte of its word and the odd byte the
+    /// low one (genvdp.txt section 7 "8-bit port access"; Genesis Plus GX's
+    /// `vdp_read_byte` answers `case 0x00:` with `vdp_68k_data_r() >> 8` and
+    /// `case 0x01:` with `& 0xFF`).
     ///
     /// The TMSS gate is not here: it is in the dispatch, in front of every
-    /// `Region::Vdp` arm, so that filling these four functions in cannot lose it. See
-    /// [`Bus::vdp_access_denied`].
-    fn read_vdp_byte(&mut self, _addr: u32) -> u8 {
-        OPEN_BUS
+    /// `Region::Vdp` arm, so that filling these four functions in cannot lose it.
+    /// See [`Bus::vdp_access_denied`].
+    fn read_vdp_byte(&mut self, addr: u32) -> u8 {
+        let word = self.read_vdp_word(addr & EVEN_LANE);
+        if addr & 1 == 0 {
+            (word >> 8) as u8
+        } else {
+            word as u8
+        }
     }
 
-    /// VDP port word read. Placeholder for [`Region::Vdp`].
-    fn read_vdp_word(&mut self, _addr: u32) -> u16 {
-        OPEN_BUS_WORD
+    /// VDP port word read: the data port, the status register behind a control
+    /// port read, and the HV counter are the three ports with a read, and none of
+    /// them has one yet.
+    ///
+    /// Every read of the area answers [`OPEN_BUS_WORD`], the value the rest of the
+    /// undecoded map answers, because nothing can produce anything else: the data
+    /// port read and the read buffer behind it is M4-03 (#81), the status register
+    /// M4-04 (#82) and the HV counter M4-05 (#83). The port decode is done anyway,
+    /// and is the reason this is not one `OPEN_BUS_WORD` - it is where each of
+    /// those three tickets arrives, and it is what the tests of these reads
+    /// (`status_read_word_and_bytes`, [`Self::hv_counter_read`]) hold still.
+    ///
+    /// The PSG and the debug pair have no read in any case: plutiedev "Memory map"
+    /// gives the PSG as write-only and the debug ports no function, and Genesis
+    /// Plus GX's `vdp_read_word` answers `$18` and `$1C` with `m68k_read_bus_16`,
+    /// which is its open bus.
+    fn read_vdp_word(&mut self, addr: u32) -> u16 {
+        match vdp_port(addr) {
+            // TODO(M4-03 #81): `self.vdp.read_data()`, with the read buffer of
+            //   that ticket in front of it.
+            // TODO(M4-04 #82): `self.vdp.read_status()`, which also clears the
+            //   write-pending flag (genvdp.txt section 7).
+            // TODO(M4-05 #83): `self.vdp.hv_counter()`.
+            Some(VdpPort::Data) | Some(VdpPort::Control) | Some(VdpPort::HvCounter) => {
+                OPEN_BUS_WORD
+            }
+            Some(VdpPort::Psg) | Some(VdpPort::Debug) => OPEN_BUS_WORD,
+            // The corner of the area that decodes to nothing: see
+            // [`VDP_HANG_BIT`] for what it does on real hardware, and M3-16 (#77)
+            // for when that gets modelled.
+            None => OPEN_BUS_WORD,
+        }
     }
 
-    /// VDP port byte write. Placeholder for [`Region::Vdp`]: dropped, where a
-    /// real console would push a byte to the PSG at 0xC00011.
-    fn write_vdp_byte(&mut self, _addr: u32, _value: u8) {}
+    /// VDP port byte write: the byte reaches the port as the same byte in both
+    /// halves of the word (genvdp.txt section 7 "8-bit port access"; Genesis Plus
+    /// GX's `vdp_write_byte` is `vdp_68k_data_w(data << 8 | data)` for the data
+    /// port and `vdp_68k_ctrl_w(data << 8 | data)` for the control one).
+    ///
+    /// That duplication is the whole story on the chip's side: [`Vdp::write_data`]
+    /// and [`Vdp::write_control`] are word functions and the VDP never learns that
+    /// the 68k only sent eight of the sixteen bits.
+    fn write_vdp_byte(&mut self, addr: u32, value: u8) {
+        match vdp_port(addr) {
+            Some(VdpPort::Data) => self.vdp.write_data(u16::from_be_bytes([value, value])),
+            Some(VdpPort::Control) => self.vdp_control_write(u16::from_be_bytes([value, value])),
+            // The PSG is one byte wide and it is the odd lane of the pair, so an
+            // even-lane byte is not the PSG at all (plutiedev "Memory map": "PSG
+            // is normally accessed by byte, so you'll generally see $C00011
+            // instead"; Genesis Plus GX's `vdp_write_byte` takes the `$10`/`$14`
+            // case and writes `if (address & 1)`).
+            Some(VdpPort::Psg) => {
+                if addr & 1 != 0 {
+                    self.psg_write(value);
+                }
+            }
+            // The counter takes no writes, and nothing models the debug pair.
+            Some(VdpPort::HvCounter) | Some(VdpPort::Debug) => {}
+            None => {}
+        }
+    }
 
-    /// VDP port word write. Placeholder for [`Region::Vdp`].
-    fn write_vdp_word(&mut self, _addr: u32, _value: u16) {}
+    /// VDP port word write: the chip's two ports, and the PSG, which lives in the
+    /// same block and is one byte wide.
+    fn write_vdp_word(&mut self, addr: u32, value: u16) {
+        match vdp_port(addr) {
+            Some(VdpPort::Data) => self.vdp.write_data(value),
+            Some(VdpPort::Control) => self.vdp_control_write(value),
+            // A word write to the PSG pair feeds the PSG the low byte of the word.
+            // That byte is the one at `$C00011`, the lane the port lives on, so a
+            // `move.w` sends the same byte to the chip as the `move.b` of the same
+            // command would (Genesis Plus GX's `vdp_write_word` is
+            // `psg_write(cycles, data & 0xFF)`).
+            Some(VdpPort::Psg) => self.psg_write(value as u8),
+            Some(VdpPort::HvCounter) | Some(VdpPort::Debug) => {}
+            None => {}
+        }
+    }
+
+    /// One word to the control port, and then the DMA that write asked for.
+    ///
+    /// [`Vdp::write_control`] records the request and cannot run it, because the
+    /// chip has no bus to read a source through; the glue that has one is what
+    /// calls [`Vdp::run_dma`] (#85 says so on the method), and that call is a
+    /// no-op touching nothing whenever the write asked for no DMA. So it follows
+    /// every control port write, and nothing else.
+    ///
+    /// Taking the fields apart rather than calling through `self` is the point of
+    /// this function being a function: `run_dma` holds `&mut self.vdp` for the
+    /// whole transfer, and [`VdpDmaSource`] holds `rom`, `ram` and `mapper` across
+    /// it, which only separate field borrows allow at the same time.
+    fn vdp_control_write(&mut self, value: u16) {
+        let Bus {
+            vdp,
+            rom,
+            ram,
+            mapper,
+            ..
+        } = self;
+        let mut source = VdpDmaSource { rom, ram, mapper };
+        vdp.write_control(value);
+        vdp.run_dma(&mut source);
+    }
+
+    /// One byte to the PSG, from the VDP's PSG port at `$C00011`.
+    ///
+    /// Into [`Z80Side::psg_log`], the one log the chip has: the Z80's own `0x7F11`
+    /// and the 68k's `0xA07F11` window have been writing it since M3-07 (#67) and
+    /// M3-08 (#68), and this port is a third spelling of the same wire rather than
+    /// a second PSG.
+    ///
+    /// TODO(M5-13 #118): the `sn76489::Sn76489` that replaces the log, per
+    /// docs/ARCHITECTURE.md "Audio chips".
+    fn psg_write(&mut self, value: u8) {
+        self.z80.psg_log.push(value);
+    }
 
     /// Z80 bus byte read: one of the sound side's devices, or open bus if the 68k does
     /// not hold the Z80's bus. See [`Bus::z80_bus_granted`] for the gate and
@@ -1343,6 +1640,21 @@ impl m68k::Bus for Bus {
     /// [`Bus::set_z80_reset`].
     fn reset_devices(&mut self) {
         self.io.reset();
+        // The VDP goes back to the state a chip that has never been talked to is
+        // in: its registers, its code and address registers, its write-pending
+        // flag, and its memories. `RESET` is the console's own reset and both
+        // references that model one reset the VDP with it: Genesis Plus GX's
+        // `gen_reset` reaches `VDP_reset`, which zeroes VRAM, CRAM and VSRAM, and
+        // MAME's `machine_reset` resets the VDP device with the rest of the
+        // machine. Work RAM is the opposite case and stays: what a reset clears is
+        // the chip's own state, not everything this bus holds.
+        //
+        // Rebuilding the chip is what stands in for a reset of the VDP's own,
+        // which `crates/vdp` does not have yet: [`Vdp::new`] is exactly the state
+        // its docs call "a VDP that has never been talked to". The `pal` it is
+        // rebuilt with is the one this bus was built with, because `RESET` does not
+        // change the crystal.
+        self.vdp = Vdp::new(version_is_pal(self.version));
         self.z80_busreq = false;
         self.z80_reset = true;
         self.z80_reset_pulse = false;
@@ -1526,8 +1838,10 @@ mod tests {
         // One address per stub region, including every register the map names.
         // The I/O entry is past the version register, which #64 implements and
         // the tests below cover. The Z80 area and its two control registers left
-        // this list with #68 and are covered by the arbitration tests below.
-        for addr in [0xA10020, 0xA130F1, 0xA14000, 0xA14101, 0xC00000] {
+        // this list with #68 and are covered by the arbitration tests below, and
+        // the VDP data port left it with #69 for the same reason: the VDP is what
+        // answers it now, and the port tests at the end of this module cover it.
+        for addr in [0xA10020, 0xA130F1, 0xA14000, 0xA14101] {
             assert_eq!(bus.read_byte(addr), OPEN_BUS, "byte at {addr:#08x}");
             assert_eq!(
                 bus.read_word(addr + 2),
@@ -3293,5 +3607,323 @@ mod tests {
         assert_eq!(bus.read_byte(0x20_0001), image, "the image answers");
         assert_eq!(bus.read_byte(0x20_0003), above);
         assert!(!bus.take_dirty());
+    }
+
+    // ---- The VDP ports on the bus (M3-09 #69) ----
+    //
+    // The port addresses, their mirrors and the byte rules are plutiedev "Memory
+    // map" and genvdp.txt section 7 "VDP ports"; the chip behind them is
+    // `crates/vdp`, reached through [`Bus::vdp`].
+    //
+    // Two helpers set the chip up the way a game does, through the ports rather
+    // than through `Vdp::write_register`, because that is what the tests are
+    // about: they only ever assert on what a port access did.
+
+    /// One VDP register write: `100r rrrr dddd dddd` to the control port
+    /// (genvdp.txt section 7 "Programming VDP registers").
+    fn set_reg(bus: &mut Bus, reg: u8, value: u8) {
+        let word = 0x8000 | ((u16::from(reg) & 0x1F) << 8) | u16::from(value);
+        bus.write_word(0xC00004, word);
+    }
+
+    /// The two control port words that point the data port at `addr` for a VRAM
+    /// write (genvdp.txt section 7: the first word is CD1-CD0 = `01` and A13-A0,
+    /// the second CD5-CD2 and A15-A14).
+    fn vram_write_cmd(addr: u16) -> (u16, u16) {
+        (0x4000 | (addr & 0x3FFF), (addr >> 14) & 0x0003)
+    }
+
+    /// The same command with CD5 set, which is what "Setting CD5 will trigger a
+    /// DMA operation" means (genvdp.txt section 7): the trigger is bit 7 of the
+    /// second word.
+    fn dma_cmd(addr: u16) -> (u16, u16) {
+        (0x4000 | (addr & 0x3FFF), 0x0080 | ((addr >> 14) & 0x0003))
+    }
+
+    /// Point the data port at `addr` for a VRAM write, both halves through the
+    /// control port at 0xC00004.
+    fn vram_write_at(bus: &mut Bus, addr: u16) {
+        let (first, second) = vram_write_cmd(addr);
+        bus.write_word(0xC00004, first);
+        bus.write_word(0xC00004, second);
+    }
+
+    /// A word write to the data port reaches the VRAM the code register points
+    /// at, and R15 steps the address register on for the next one.
+    #[test]
+    fn word_write_data_port_reaches_vdp() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        set_reg(&mut bus, 15, 2);
+        vram_write_at(&mut bus, 0x0000);
+
+        bus.write_word(0xC00000, 0xDEAD);
+        // Big endian into the two bytes of the word, which is what makes a
+        // `move.w` of a sprite entry land in the order genvdp.txt section 15
+        // documents (see `ports::vram_word_bytes`).
+        assert_eq!(&bus.vdp.vram[0..2], &[0xDE, 0xAD]);
+
+        bus.write_word(0xC00000, 0xBEEF);
+        assert_eq!(
+            &bus.vdp.vram[2..4],
+            &[0xBE, 0xEF],
+            "the write incremented the address register"
+        );
+    }
+
+    /// An 8-bit write to the control port reaches the VDP as the byte in both
+    /// halves of the word (genvdp.txt section 7 "8-bit port access"; Genesis Plus
+    /// GX's `vdp_write_byte` calls `vdp_68k_ctrl_w(data << 8 | data)`).
+    ///
+    /// `0x8F` is the test value because it is only a register write once it has
+    /// been duplicated: `0x8F8F` is `100r rrrr dddd dddd` for R15, while `0x008F`
+    /// and `0x8F00` are half of a command word and write nothing.
+    #[test]
+    fn byte_write_control_duplicates_byte() {
+        // Either lane of the word, and either of the two words the control port
+        // is at (plutiedev "Memory map": "all VDP ports are mirrored every other
+        // word, e.g. control port is at both $C00004 and $C00006").
+        for addr in [0xC00004u32, 0xC00005, 0xC00006, 0xC00007] {
+            let mut bus = Bus::new(Vec::new(), NO_TMSS);
+            bus.write_byte(addr, 0x8F);
+            assert_eq!(bus.vdp.reg(15), 0x8F, "{addr:#08x} is the control port");
+        }
+    }
+
+    /// A read of the control port is the status read, not a control port write:
+    /// the half-written command word in the latch has to survive it, or the data
+    /// port write that finishes it lands in the wrong memory.
+    ///
+    /// The value the port answers is the placeholder [`Bus::read_vdp_word`]
+    /// documents, because the VDP has no status register until M4-04 (#82); what
+    /// this pins down is the decode, the two byte lanes of the word, and that
+    /// reading leaves the chip alone.
+    #[test]
+    fn status_read_word_and_bytes() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+
+        let word = bus.read_word(0xC00004);
+        assert_eq!(
+            bus.read_byte(0xC00004),
+            (word >> 8) as u8,
+            "the even lane is the high byte of the port's word"
+        );
+        assert_eq!(
+            bus.read_byte(0xC00005),
+            (word & 0xFF) as u8,
+            "the odd lane is the low byte of the same word"
+        );
+
+        // Half a command word down, then the status read every VBL handler does
+        // somewhere, then the second half. A read that fed the control port
+        // anything at all would consume the pending half here and the write
+        // below would be ignored.
+        set_reg(&mut bus, 15, 2);
+        let (first, second) = vram_write_cmd(0x0004);
+        bus.write_word(0xC00004, first);
+        let _ = bus.read_word(0xC00004);
+        let _ = bus.read_byte(0xC00005);
+        bus.write_word(0xC00004, second);
+        bus.write_word(0xC00000, 0x1234);
+        assert_eq!(
+            &bus.vdp.vram[4..6],
+            &[0x12, 0x34],
+            "a status read left the command latch alone"
+        );
+    }
+
+    /// The HV counter block is read-only, reads as the counter on either lane,
+    /// and is not any other port of the area.
+    ///
+    /// Like the status register the value waits for M4-05 (#83), so this is a
+    /// decode test and a write-does-nothing test; see [`Bus::read_vdp_word`] for
+    /// what the placeholder is and why.
+    #[test]
+    fn hv_counter_read() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+
+        // The block is 0xC00008-0xC0000F: four words of counter, all of them the
+        // same one (plutiedev "Memory map" lists $C00008 and $C0000C, and every
+        // port mirrors every other word).
+        for addr in [0xC00008u32, 0xC0000A, 0xC0000C, 0xC0000E] {
+            let word = bus.read_word(addr);
+            assert_eq!(bus.read_byte(addr), (word >> 8) as u8, "{addr:#08x}");
+            assert_eq!(bus.read_byte(addr + 1), (word & 0xFF) as u8, "{addr:#08x}");
+        }
+
+        for addr in [0xC00008u32, 0xC0000C] {
+            bus.write_word(addr, 0xDEAD);
+            bus.write_byte(addr + 1, 0x5A);
+        }
+        assert!(
+            bus.vdp.vram.iter().all(|&b| b == 0),
+            "the counter block is not the data port"
+        );
+        assert_eq!(bus.vdp.reg(15), 0, "and not the control port");
+        assert!(bus.z80.psg_log.is_empty(), "and not the PSG");
+    }
+
+    /// Which addresses of [`Region::Vdp`] are the data port.
+    ///
+    /// Every mirror of plutiedev "Memory map" has to reach the chip - the every
+    /// other word one that lets a longword be two word accesses, and "VDP mirrors
+    /// every $40 up to $DFFFFF" - and the one address that page says is not a
+    /// port at all must not reach it: `$C00020-$C0003F` hangs up, which this bus
+    /// answers as nothing-there until M3-16 (#77) models the hang. The mask that
+    /// decides it, and why the one #69 suggested is not it, is on [`vdp_port`].
+    #[test]
+    fn mirror_address_hits_vdp() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        set_reg(&mut bus, 15, 2);
+        vram_write_at(&mut bus, 0x0000);
+
+        // Each write is one word at the address R15 has stepped to, so each
+        // address below has to have been taken for the data port in turn.
+        let ports: [u32; 8] = [
+            0xC0_0000, // the port itself
+            0xC0_0002, // its every-other-word mirror
+            0xC0_0040, // the three $40 mirrors of the port and of its mirror
+            0xC0_0042, 0xC0_0080, 0xC0_0100, // A8 is not part of the decode either
+            0xC1_0000, // nor are A16-A18
+            0xDF_FF80, // the top of the area is still the VDP: $80 of any 0x100
+        ];
+        for (index, addr) in ports.iter().enumerate() {
+            let value = 0x0101 * (index as u16 + 1);
+            bus.write_word(*addr, value);
+        }
+        let expected: Vec<u8> = (1..=8).flat_map(|i| [i, i]).collect();
+        assert_eq!(&bus.vdp.vram[0..16], expected.as_slice(),);
+
+        // And the hang-up corner of the same page: no device answers it, so no
+        // word is the data port. The address register has stopped moving, so the
+        // next two bytes of VRAM are still nothing.
+        for addr in [0xC0_0020u32, 0xC0_0022, 0xC0_003E, 0xC0_0060, 0xC0_00A0] {
+            bus.write_word(addr, 0xFF00);
+            bus.write_byte(addr + 1, 0xFF);
+        }
+        assert_eq!(
+            &bus.vdp.vram[16..18],
+            &[0, 0],
+            "0xC00020-0xC0003F is not a port of the VDP"
+        );
+    }
+
+    /// The PSG port of the 68k side is the odd lane of `$C00010` and its
+    /// `$C00014` mirror, and one byte of it is one write to the sound chip
+    /// (plutiedev "Memory map": "PSG is normally accessed by byte, so you'll
+    /// generally see $C00011 instead").
+    ///
+    /// The sound chip is [`crate::z80_bus::Z80Side::psg_log`] until M5-13 (#118)
+    /// puts an `sn76489::Sn76489` on the bus, which is the placeholder M3-07
+    /// (#67) left on the Z80's route to it; both CPUs share that one log.
+    #[test]
+    fn psg_write_logged() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        for addr in [0xC00011u32, 0xC00013, 0xC00015, 0xC00017] {
+            bus.write_byte(addr, 0x8F);
+        }
+        assert_eq!(bus.z80.psg_log, vec![0x8F; 4], "one byte, one write");
+
+        // A word write to the pair is the PSG too, and the byte it sends is the
+        // low one: the same byte a `move.b` at $C00011 leaves there (Genesis Plus
+        // GX's `vdp_write_word` does `psg_write(cycles, data & 0xFF)`).
+        bus.write_word(0xC00010, 0x002A);
+        assert_eq!(bus.z80.psg_log, vec![0x8F, 0x8F, 0x8F, 0x8F, 0x2A]);
+
+        // The even lane of the pair, on its own, is nothing: the PSG only has the
+        // odd byte of it (`is_psg_port`, and Genesis Plus GX's
+        // `vdp_write_byte` writing its $10/$14 case `if (address & 1)`).
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        bus.write_byte(0xC00010, 0x8F);
+        assert!(bus.z80.psg_log.is_empty(), "the even lane is not the PSG");
+
+        // None of this is the VDP: the PSG lives in the VDP's port pair but the
+        // PSG is not the VDP.
+        assert!(bus.vdp.vram.iter().all(|&b| b == 0), "not the data port");
+        assert_eq!(bus.vdp.reg(15), 0, "not the control port");
+    }
+
+    /// A DMA command word through the control port moves the block.
+    ///
+    /// This is the test that proves the bus calls `Vdp::run_dma`: a control port
+    /// write on its own only sets the request flag ([`Vdp::dma_requested`]), so
+    /// VRAM only holds the transferred words if the glue ran the transfer after
+    /// the write. #85 says this on the method, and that the call is a no-op
+    /// whenever the write asked for no DMA.
+    ///
+    /// The registers are genvdp.txt section 11 and plutiedev "$93xx" to "$97xx":
+    /// R1 M1 (bit 4) allows DMA, R19/R20 the word count, R21/R22/R23 the source
+    /// address, and R15 is the destination's own step, set to 2 like every DMA
+    /// set-up does.
+    #[test]
+    fn dma_68k_to_vram_via_control_write() {
+        /// R19, R20, R21, R22 and R23 in the five writes they take.
+        fn regs(bus: &mut Bus, from: u8, values: &[u8]) {
+            for (offset, value) in values.iter().enumerate() {
+                set_reg(bus, from + offset as u8, *value);
+            }
+        }
+
+        // Work RAM as the source: four words at 0xE00000.
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        for (index, word) in [0x1234u16, 0x5678, 0x9ABC, 0xDEF0].iter().enumerate() {
+            bus.write_word(RAM_START + 2 * index as u32, *word);
+        }
+        set_reg(&mut bus, 1, 0x10);
+        set_reg(&mut bus, 15, 2);
+        // R19-R20 = 4 words, R21-R23 = 0x000000 of the 0xE00000 block.
+        regs(&mut bus, 19, &[4, 0, 0, 0, 0x70]);
+
+        let (first, second) = dma_cmd(0x0000);
+        bus.write_word(0xC00004, first);
+        bus.write_word(0xC00004, second);
+        assert_eq!(
+            &bus.vdp.vram[0..8],
+            &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0],
+            "the four words of work RAM are in VRAM"
+        );
+        assert!(
+            !bus.vdp.dma_requested(),
+            "the request was run rather than left standing"
+        );
+
+        // The cartridge as the source, which is the other memory a DMA reads and
+        // the reason the DMA's view of the bus is not just work RAM.
+        let mut rom = vec![0; 0x200];
+        rom[0x100..0x108].copy_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE, 0x11, 0x22, 0x33, 0x44]);
+        let mut bus = Bus::new(rom, NO_TMSS);
+        set_reg(&mut bus, 1, 0x10);
+        set_reg(&mut bus, 15, 2);
+        // R19-R20 = 4 words, R21-R23 = 0x00100: 0x80 of the block's first 512
+        // bytes, so R21 (source bits 8-1) is 0x80 and the other two are 0.
+        regs(&mut bus, 19, &[4, 0, 0x80, 0, 0]);
+
+        let (first, second) = dma_cmd(0x0000);
+        bus.write_word(0xC00004, first);
+        bus.write_word(0xC00004, second);
+        assert_eq!(
+            &bus.vdp.vram[0..8],
+            &[0xCA, 0xFE, 0xBA, 0xBE, 0x11, 0x22, 0x33, 0x44],
+            "the four words of the cart are in VRAM"
+        );
+    }
+
+    /// `RESET` resets the VDP with the rest of the console, memories and all: see
+    /// [`m68k::Bus::reset_devices`] for the references that reset the chip on a
+    /// `RESET` and for the work RAM that deliberately survives one.
+    #[test]
+    fn reset_devices_resets_the_vdp() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        set_reg(&mut bus, 15, 2);
+        vram_write_at(&mut bus, 0x0000);
+        bus.write_word(0xC00000, 0xDEAD);
+        assert_eq!(&bus.vdp.vram[0..2], &[0xDE, 0xAD], "and not before");
+
+        bus.reset_devices();
+
+        assert_eq!(bus.vdp.reg(15), 0, "the registers go back to zero");
+        assert!(
+            bus.vdp.vram.iter().all(|&b| b == 0),
+            "and so does the memory they point at"
+        );
     }
 }

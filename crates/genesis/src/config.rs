@@ -31,6 +31,18 @@ const DISK_NONE: u8 = 0x20;
 /// (#70), which keeps the number at 0 or 1.
 const VERSION_TMSS: u8 = 1;
 
+/// Does the version register byte `version` report the PAL machine?
+///
+/// VMOD is bit 6 of the register [`Region::version_register`] builds, so a
+/// [`crate::Bus`] built from `region.version_register(config.tmss)` can tell its
+/// VDP which crystal it is clocked by ([`Vdp::new`](vdp::Vdp::new), the `PAL` pin
+/// of the chip) from the one byte the bus is handed. It is a question about the
+/// register rather than about a [`Region`], because the register is all the bus
+/// is given - and the bit lives here, with the rest of the layout.
+pub(crate) const fn version_is_pal(version: u8) -> bool {
+    version & VMOD_PAL != 0
+}
+
 /// A console region: one of the three the Mega Drive / Genesis shipped in.
 ///
 /// This is the single region the emulator runs as, which is why it is its type
