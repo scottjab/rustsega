@@ -8,7 +8,9 @@
 //! and the three DMA modes, the 68k transfer, the fill and the copy (`dma`),
 //! and the beam timing that drives the status flags and raises the interrupts
 //! (`timing`), and the CRAM to pixel conversion with its colour LUT (`color`),
-//! and the name table entries and the pattern rows they point at (`pattern`).
+//! and the name table entries and the pattern rows they point at (`pattern`),
+//! and the plane A and plane B layer buffers read from those tables
+//! (`planes`).
 //! Rendering is M4-10 (#88) onwards, so the line renderer that `timing` calls
 //! is the backdrop stub of M4-17 (#95).
 //!
@@ -21,6 +23,7 @@ mod dma;
 mod framebuffer;
 mod hv;
 pub mod pattern;
+mod planes;
 mod ports;
 mod regs;
 mod status;
@@ -29,6 +32,7 @@ mod timing;
 pub use color::{ColorLut, Intensity};
 pub use dma::DmaBus;
 pub use framebuffer::FrameBuffer;
+pub use planes::Plane;
 pub use regs::{DmaMode, HScrollMode, InterlaceMode};
 
 /// VRAM: 64 KiB of 8-bit RAM (genvdp.txt section 8).
