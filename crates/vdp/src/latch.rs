@@ -45,7 +45,7 @@
 //! change.
 
 use crate::planes::Plane;
-use crate::{Vdp, regs, VSRAM_WORDS};
+use crate::{VSRAM_WORDS, Vdp, regs};
 
 /// The state one line of the picture is drawn from: what [`Vdp::latch_line_state`]
 /// reads at the latch point and [`Vdp::render_line`] works from.
@@ -175,13 +175,13 @@ impl Vdp {
 
 #[cfg(test)]
 mod tests {
+    use crate::Vdp;
     use crate::color::{Intensity, color};
     use crate::hv::MCLKS_PER_LINE;
     use crate::planes::testutil::{
         PLANE_A_BASE, column_colour, fill_columns, fill_rows, put_scroll, row_colour, scroll_vdp,
     };
     use crate::timing::HBLANK_CLEAR_MCLK_H32;
-    use crate::Vdp;
 
     /// Every CRAM entry as its own entry number: the 9 bits of a CRAM word are
     /// `----bbb-ggg-rrr-`, the low bit of the word unused (genvdp.txt section 9 and
@@ -307,7 +307,11 @@ mod tests {
         assert_eq!(row(&vdp, 5), vec![pixel_of(0); 256], "R7 of line 5 is 0");
 
         vdp.advance(MCLKS_PER_LINE);
-        assert_eq!(row(&vdp, 6), vec![pixel_of(1); 256], "and R7 of line 6 is 1");
+        assert_eq!(
+            row(&vdp, 6),
+            vec![pixel_of(1); 256],
+            "and R7 of line 6 is 1"
+        );
     }
 
     /// The vertical half of the scroll latch: VSRAM is read for a line at the
