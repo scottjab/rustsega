@@ -1009,16 +1009,19 @@ impl Bus {
     }
 
     /// VDP port word read: the data port, the status register behind a control
-    /// port read, and the HV counter are the three ports with a read, and none of
-    /// them has one yet.
+    /// port read, and the HV counter are the three ports with a read, and the data
+    /// port is the only one of the three that has an answer yet.
     ///
-    /// Every read of the area answers [`OPEN_BUS_WORD`], the value the rest of the
-    /// undecoded map answers, because nothing can produce anything else: the data
-    /// port read and the read buffer behind it is M4-03 (#81), the status register
-    /// M4-04 (#82) and the HV counter M4-05 (#83). The port decode is done anyway,
-    /// and is the reason this is not one `OPEN_BUS_WORD` - it is where each of
-    /// those three tickets arrives, and it is what the tests of these reads
-    /// (`status_read_word_and_bytes`, [`Self::hv_counter_read`]) hold still.
+    /// The data port is the chip's own [`Vdp::read_data`], which decides which
+    /// memory the code register points at, what the read is masked by, and how the
+    /// address register moves on (M4-03, #81).
+    ///
+    /// The rest of the area answers [`OPEN_BUS_WORD`], the value the rest of the
+    /// undecoded map answers, because nothing can produce anything else: the
+    /// status register is M4-04 (#82) and the HV counter M4-05 (#83). The port
+    /// decode is done anyway, and is the reason this is not one `OPEN_BUS_WORD` -
+    /// it is where each of those tickets arrives, and it is what the tests of these
+    /// reads (`status_read_word_and_bytes`, [`Self::hv_counter_read`]) hold still.
     ///
     /// The PSG and the debug pair have no read in any case: plutiedev "Memory map"
     /// gives the PSG as write-only and the debug ports no function, and Genesis
@@ -1026,14 +1029,11 @@ impl Bus {
     /// which is its open bus.
     fn read_vdp_word(&mut self, addr: u32) -> u16 {
         match vdp_port(addr) {
-            // TODO(M4-03 #81): `self.vdp.read_data()`, with the read buffer of
-            //   that ticket in front of it.
+            Some(VdpPort::Data) => self.vdp.read_data(),
             // TODO(M4-04 #82): `self.vdp.read_status()`, which also clears the
             //   write-pending flag (genvdp.txt section 7).
             // TODO(M4-05 #83): `self.vdp.hv_counter()`.
-            Some(VdpPort::Data) | Some(VdpPort::Control) | Some(VdpPort::HvCounter) => {
-                OPEN_BUS_WORD
-            }
+            Some(VdpPort::Control) | Some(VdpPort::HvCounter) => OPEN_BUS_WORD,
             Some(VdpPort::Psg) | Some(VdpPort::Debug) => OPEN_BUS_WORD,
             // The corner of the area that decodes to nothing: see
             // [`VDP_HANG_BIT`] for what it does on real hardware, and M3-16 (#77)
@@ -3646,6 +3646,32 @@ mod tests {
         let (first, second) = vram_write_cmd(addr);
         bus.write_word(0xC00004, first);
         bus.write_word(0xC00004, second);
+    }
+
+    /// A word read of the data port is the VDP's data port read: the VRAM word
+    /// the address register points at, big endian, and R15 steps the address on
+    /// for the next read (M4-03, #81).
+    ///
+    /// This is the read half of `word_write_data_port_reaches_vdp`, seen from
+    /// 68k side: `move.w $C00000, d0` after a command word with CD1-CD0 = `00`.
+    #[test]
+    fn word_read_data_port_reads_vdp() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        set_reg(&mut bus, 15, 2);
+        vram_write_at(&mut bus, 0x0000);
+        bus.write_word(0xC00000, 0xDEAD);
+        bus.write_word(0xC00000, 0xBEEF);
+
+        // The VRAM read command for address $0000: CD1-CD0 and CD5-CD2 are all
+        // zero, so both halves are the address alone.
+        bus.write_word(0xC00004, 0x0000);
+        bus.write_word(0xC00004, 0x0000);
+        assert_eq!(bus.read_word(0xC00000), 0xDEAD);
+        assert_eq!(
+            bus.read_word(0xC00002),
+            0xBEEF,
+            "the read of a port is a data port access, so R15 moved the address on"
+        );
     }
 
     /// A word write to the data port reaches the VRAM the code register points
