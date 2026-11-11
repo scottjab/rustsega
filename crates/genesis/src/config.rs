@@ -53,7 +53,9 @@ impl Region {
     /// and docs/ARCHITECTURE.md "Clocks and timing" gives 313 lines for PAL
     /// against the 262 of NTSC.
     ///
-    /// Nothing here switches the master clock on it yet: PAL timing is M3-14 (#75).
+    /// What it decides in the emulator today is the scanline count of a frame, in
+    /// [`crate::Scheduler::new`]; the master clock frequency itself is only what turns
+    /// those counts into seconds.
     pub fn is_pal(self) -> bool {
         matches!(self, Self::Europe)
     }
