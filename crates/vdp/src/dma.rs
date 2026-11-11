@@ -699,7 +699,7 @@ mod tests {
 
     /// Set up a fill or a copy: `length` in bytes (R19 low, R20 high), the
     /// address register stepping by `step` (R15), R1 M1 set so the DMA is
-    /// allowed, and R23 holding `mode` ( [`FILL`] or [`COPY`]).
+    /// allowed, and R23 holding `mode` ([`FILL`] or [`COPY`]).
     ///
     /// All of this has to happen before the command word, because a register
     /// write clears the code register ([`Vdp::write_control`]).
