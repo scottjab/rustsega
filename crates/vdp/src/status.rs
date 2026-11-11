@@ -9,9 +9,10 @@
 //!
 //! Every flag here is plain state that the timing tickets set: M4-05 (#83) the
 //! blanking and frame bits, M4-06 (#84) the interrupt pending bit, M4-16 (#93)
-//! the sprite flags, M4-21a (#99) the FIFO the empty/full pair reports, M4-22
-//! (#101) the DMA busy bit. Nothing in this file drives them: the read packs
-//! what it is given and clears the two bits reading clears on real hardware.
+//! the sprite flags, M4-21a (#99) the write FIFO whose empty/full pair reports,
+//! M4-22 (#101) the DMA busy bit. Nothing in this file drives them: the read
+//! packs what it is given and clears the two bits reading clears on real
+//! hardware.
 
 use crate::Vdp;
 
@@ -24,29 +25,20 @@ use crate::Vdp;
 /// NTSC VDP with an empty FIFO is `$3600`, not the `$FFFF` of the undecoded bus.
 const STATUS_FIXED: u16 = 0x3400;
 
-/// d9, FIFO empty.
-///
-/// The empty/full pair reports the four-entry FIFO (genvdp.txt section 6 quotes
-/// Flavio Morsoletto: "EMPTY only goes 1 when there is nothing on the stack. The
-/// intermediate state is signaled by both of them showing 0"), and there is no
-/// FIFO yet, so there is no intermediate state to report and d8 is never set.
-/// Reporting empty always is what genvdp.txt recommends on its own reading of
-/// the field: "I've noticed most emulators keep the EMPTY flag set, so it
-/// appears as if the FIFO was always empty instead of being in the neutral
-/// state. This is probably for games that would normally check and find the FIFO
-/// in a neutral state, then write data and expect to poll the FULL flag
-/// afterwards." TODO(M4-21a #99): the FIFO that decides both bits.
-const STATUS_FIFO_EMPTY: u16 = 1 << 9;
-
 /// Bit numbers of genvdp.txt section 6, for [`flag`].
-const BIT_PAL: u8 = 0;
-const BIT_DMA_BUSY: u8 = 1;
-const BIT_HBLANK: u8 = 2;
-const BIT_VBLANK: u8 = 3;
-const BIT_ODD_FRAME: u8 = 4;
-const BIT_SPRITE_COLLISION: u8 = 5;
-const BIT_SPRITE_OVERFLOW: u8 = 6;
+///
+/// d9 and d8 are the write FIFO's, which `fifo` reports; the rest are state the
+/// tickets named at the top of this file drive.
+const BIT_FIFO_EMPTY: u8 = 9;
+const BIT_FIFO_FULL: u8 = 8;
 const BIT_VINT: u8 = 7;
+const BIT_SPRITE_OVERFLOW: u8 = 6;
+const BIT_SPRITE_COLLISION: u8 = 5;
+const BIT_ODD_FRAME: u8 = 4;
+const BIT_VBLANK: u8 = 3;
+const BIT_HBLANK: u8 = 2;
+const BIT_DMA_BUSY: u8 = 1;
+const BIT_PAL: u8 = 0;
 
 /// `bit` when `set`, nothing when it is not, for OR-ing the flag bits together.
 const fn flag(bit: u8, set: bool) -> u16 {
@@ -80,7 +72,11 @@ impl Vdp {
         self.pending = false;
 
         let word = STATUS_FIXED
-            | STATUS_FIFO_EMPTY
+            // d9 and d8 are the write FIFO's pair, and `fifo` is what decides
+            // them: empty is nothing on the queue, full is all four entries
+            // taken, and a queue holding one to three of them reports neither.
+            | flag(BIT_FIFO_EMPTY, self.fifo_empty())
+            | flag(BIT_FIFO_FULL, self.fifo_full())
             | flag(BIT_VINT, self.vint_pending)
             | flag(BIT_SPRITE_OVERFLOW, self.sprite_overflow)
             | flag(BIT_SPRITE_COLLISION, self.sprite_collision)

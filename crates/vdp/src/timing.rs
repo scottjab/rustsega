@@ -11,8 +11,10 @@
 //! hardware changes state, the back porch and the H-blank release, so the cost
 //! of `advance` is a few events a line rather than one iteration a clock.
 //!
-//! The exact clock of the HINT and VINT pulses is out of scope here (M4-23),
-//! and so is the FIFO that delays everything else (M4-21a, #99).
+//! The exact clock of the HINT and VINT pulses is out of scope here (M4-23).
+//! The write FIFO is not: every clock the beam moves is a clock the FIFO counts
+//! too, so `advance` hands its clocks to `fifo::Vdp::fifo_clock` before it looks
+//! at line events (M4-21a, #99).
 
 use crate::hv::MCLKS_PER_LINE;
 use crate::{InterlaceMode, Vdp};
@@ -84,6 +86,10 @@ impl Vdp {
     /// that work, and is for the scheduler and tests that start a frame rather
     /// than move within one.
     pub fn advance(&mut self, mclk: u32) {
+        // The FIFO's slots come round on the beam too, and a slot is the only
+        // thing that empties it: `fifo` says what the schedule costs today.
+        self.fifo_clock(mclk);
+
         let mut left = mclk;
         while left > 0 {
             if !self.line_started {

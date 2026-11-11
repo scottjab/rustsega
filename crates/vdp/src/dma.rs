@@ -311,9 +311,13 @@ impl Vdp {
     /// The 68k to VDP transfer itself: [`Vdp::dma_source`] to the address
     /// register, [`words_to_transfer`] of them.
     ///
-    /// The words arrive through [`Vdp::write_data`], so the destination memory,
-    /// its masking and the move of the address register are the data port rules
-    /// of M4-02 (#80) and are not restated here.
+    /// The words arrive through [`Vdp::write_data_now`], so the destination
+    /// memory, its masking and the move of the address register are the data
+    /// port rules of M4-02 (#80) and are not restated here. It is the data port
+    /// write that skips the write FIFO of M4-21a (#99), and skips it because a
+    /// transfer is thousands of words run in one call and the FIFO is four
+    /// entries deep: what a transfer costs the bus, and what the first word of
+    /// one really reads, is M4-22 (#101).
     fn run_transfer(&mut self, bus: &mut impl DmaBus) {
         let words = words_to_transfer(self.dma_length());
         let mut src = self.dma_source();
@@ -339,7 +343,7 @@ impl Vdp {
             // TODO(M4-22 #101): the first word of a 68k-to-VRAM transfer is
             // often wrong on real hardware, because of the read FIFO, and the
             // transfer is not instant either. Neither is modelled here.
-            self.write_data(value);
+            self.write_data_now(value);
             src = next_source(src);
         }
         self.pending = pending;

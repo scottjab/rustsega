@@ -10,14 +10,19 @@
 //! The 68k-side window that calls these two functions is `genesis`'s job
 //! (M3-09, #69); this file is the chip.
 //!
+//! A data port write is queued rather than performed: it goes through the
+//! four-entry write FIFO of `fifo` (M4-21a, #99) and reaches its memory at the
+//! next access slot, two for a VRAM word and one for a CRAM or VSRAM word.
+//!
 //! Data port reads ([`Vdp::read_data`]) are the other half of the same pair of
 //! ports: the code register says which memory to read and the last word written
 //! to the port fills the bits that memory does not drive. Not here either: the
-//! control port read of the status register, which is `status`, and the FIFO
-//! with the read prefetch that real hardware runs behind the read side
-//! (M4-21a, #99).
+//! control port read of the status register, which is `status`, and the read
+//! prefetch that real hardware runs behind the read side, which is M4-21b
+//! (#100).
 
 use crate::Vdp;
+use crate::fifo;
 
 /// Bit 5 of the code register: the DMA trigger. genvdp.txt section 7 "VDP
 /// ports": "Setting CD5 will trigger a DMA operation."
@@ -320,8 +325,9 @@ const fn vsram_read_index(addr: u16) -> usize {
 /// The CRAM word a read answers: the colour from CRAM, the rest from the port.
 ///
 /// "Unused bits are set using data from next available FIFO entry" (Genesis Plus
-/// GX's `vdp_68k_data_r_m5` case `0x08`), where the FIFO entry is what
-/// `Vdp::fifo_last` stands in for until M4-21a (#99).
+/// GX's `vdp_68k_data_r_m5` case `0x08`). The read side has no FIFO of its own
+/// yet - that is the read prefetch of M4-21b (#100) - so `Vdp::fifo_last`, the
+/// word the port was last driven with, stands where that entry does.
 const fn cram_read_word(stored: u16, port: u16) -> u16 {
     (stored & CRAM_COLOR_BITS) | (port & CRAM_UNUSED_BITS)
 }
@@ -379,9 +385,16 @@ impl Vdp {
 
     /// Write the data port (`$C00000`, and its mirror at `$C00002`).
     ///
-    /// What happens is decided by the code register, which of the three
-    /// memories is being written and how the word is masked; the address
-    /// register then moves on by R15 whatever happened, because the access
+    /// The write is queued, not performed: it goes onto the four-entry FIFO
+    /// (`fifo`, M4-21a #99) with the code and address it is made with, and
+    /// reaches VRAM, CRAM or VSRAM at the next external access slot - two slots
+    /// for a VRAM word, which is byte wide, one for a CRAM or VSRAM word.
+    /// [`Vdp::data_port_stall_mclk`] is how long a write made to a full FIFO
+    /// holds the 68k, and a read of the port drains the queue first.
+    ///
+    /// What the write does when it lands is decided by the code register, which
+    /// of the three memories is being written and how the word is masked; the
+    /// address register moves on by R15 whatever happened, because the access
     /// itself did happen (genvdp.txt section 17 "$0F": the increment follows
     /// "every read or write to the data port").
     pub fn write_data(&mut self, value: u16) {
@@ -391,14 +404,28 @@ impl Vdp {
         // for the read side of the chip ([`Vdp::read_data`]).
         self.pending = false;
         self.fifo_last = value;
-        self.write_target_word(value);
+
+        // What is queued is the access the 68k made, at the address the address
+        // register had when it made it: the register moves on now, not when the
+        // word reaches memory, because "[R15] specify the value to be added to
+        // the VDP's address register after every read or write to the data
+        // port" (genvdp.txt section 17 "$0F").
+        let addr = self.addr;
+        self.addr = increment(addr, self.auto_increment());
+        self.fifo.push(fifo::Entry::new(self.code, addr, value));
+
+        // And with that done there may already be an access slot to write it
+        // out in: while the display is off the VDP fetches nothing, so every
+        // write is written the moment it is made and the FIFO stays empty.
+        self.fifo_clock(0);
 
         // The data port write is also what starts a DMA fill that a command
         // word has armed: "Any write to the data port will then start a VRAM
         // fill" (genvdp.txt section 11 "VRAM fill"). `dma::Vdp::run_fill` is
         // where that lives, and it does nothing at all whenever no fill is
-        // waiting - which is every other write to the port, the words a 68k to
-        // VDP transfer writes included.
+        // waiting, which is every other write to the port. The words a 68k to
+        // VDP transfer writes are not writes to this port and never reach here
+        // (`dma::Vdp::run_transfer`).
         self.run_fill(value);
     }
 
@@ -408,9 +435,23 @@ impl Vdp {
     /// Split out of [`Vdp::write_data`] because a DMA fill to CRAM or VSRAM
     /// repeats this whole-word write on every step of its own (`dma`, #86).
     pub(crate) fn write_target_word(&mut self, value: u16) {
-        match data_target(self.code) {
+        self.write_code_word(self.code, self.addr, value);
+        self.addr = increment(self.addr, self.auto_increment());
+    }
+
+    /// The word `value` to `addr` in the memory `code` names, with that memory's
+    /// masking, and nothing else: the address register does not move, because
+    /// the access this describes is not the 68k's own.
+    ///
+    /// [`Vdp::write_target_word`] is the same write with the live code and
+    /// address registers and R15 applied afterwards, and this is the form the
+    /// FIFO drain uses: its entries carry the code and address their write was
+    /// made with, which is not what the registers hold by the time the entry is
+    /// written out (`fifo`).
+    pub(crate) fn write_code_word(&mut self, code: u8, addr: u16, value: u16) {
+        match data_target(code) {
             DataTarget::Vram => {
-                let (even, bytes) = vram_word_bytes(self.addr, value);
+                let (even, bytes) = vram_word_bytes(addr, value);
                 let base = usize::from(even);
                 self.vram[base] = bytes[0];
                 // `even` is `addr & !1`, so at worst it is 0xFFFE and the pair
@@ -418,17 +459,29 @@ impl Vdp {
                 self.vram[base + 1] = bytes[1];
             }
             DataTarget::Cram => {
-                self.cram[cram_word_index(self.addr)] = value & CRAM_COLOR_BITS;
+                self.cram[cram_word_index(addr)] = value & CRAM_COLOR_BITS;
             }
             DataTarget::Vsram => {
-                if let Some(word) = vsram_word_index(self.addr) {
+                if let Some(word) = vsram_word_index(addr) {
                     self.vsram[word] = value & VSRAM_WORD_BITS;
                 }
             }
             DataTarget::Ignored => {}
         }
+    }
 
-        self.addr = increment(self.addr, self.auto_increment());
+    /// A data port write that goes to the memory in the call rather than onto
+    /// the write FIFO.
+    ///
+    /// Only the 68k-to-VDP transfer of `dma` (#85) uses it: a transfer is
+    /// thousands of port writes run in one call, and the FIFO is four entries
+    /// deep, so queueing them would hold or lose all but the first four. The
+    /// transfer's own timing, and with it the slots its writes really do cost,
+    /// is M4-22 (#101).
+    pub(crate) fn write_data_now(&mut self, value: u16) {
+        self.pending = false;
+        self.fifo_last = value;
+        self.write_target_word(value);
     }
 
     /// Read the data port (`$C00000`, and its mirror at `$C00002`).
@@ -449,17 +502,24 @@ impl Vdp {
     /// not what the port answers; Genesis Plus GX leaves its read switch with
     /// `data = 0`, which would be all-zero. This returns the last word the bus
     /// was driven with instead, the same value a read of a partial word falls
-    /// back on. TODO(M4-21a #99): the FIFO decides this properly.
+    /// back on: the write FIFO of `fifo` has no word to answer with here, since
+    /// nothing was written to any memory.
     ///
     /// Like a write, the access happened whatever the code made of it, so the
     /// address register moves on by R15 and `pending` clears.
     ///
-    /// TODO(M4-21a #99): real hardware prefetches the word when the read command
+    /// TODO(M4-21b #100): real hardware prefetches the word when the read command
     /// is set up, which is what makes reading the port right after a command
     /// word return the old word and the VDP lock up if the command was a write.
     /// There is no prefetch here, so no delay and no lock.
     pub fn read_data(&mut self) -> u16 {
         self.pending = false;
+
+        // Whatever the port has been told to write is written first. A read of
+        // a location a queued write is on its way to reads the old value
+        // otherwise, and the FIFO is not consulted about ordering: the 68k may
+        // only have a word waiting for its access slot.
+        self.fifo_drain();
 
         let value = match read_target(self.code) {
             ReadTarget::Vram => {
@@ -898,6 +958,10 @@ mod tests {
         assert!(!vdp.pending);
     }
 
+    /// A read waits for the write FIFO: [`Vdp::fifo_drain`] runs at the top of
+    /// this, because a read of a location that a queued write is on its way to
+    /// otherwise reads the value from before that write.
+    ///
     /// Reading with a write code in the code register reads nothing.
     ///
     /// "You cannot write data after setting up a read operation, or read data
