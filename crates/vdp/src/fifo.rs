@@ -175,11 +175,14 @@ impl Fifo {
         }
         self.slot_clock -= slot_mclk;
 
-        // `len` says there is an entry at the head, and its slots are what
-        // stands between that entry and memory.
-        if let Some(head) = self.queue[self.head].as_mut() && head.slots > 1 {
+        // `len` says there is an entry at the head, and the slots it has left
+        // are what stands between it and memory: this one is spent, and only a
+        // VRAM word still has another to wait for.
+        if let Some(head) = self.queue[self.head].as_mut() {
             head.slots -= 1;
-            return None;
+            if head.slots > 0 {
+                return None;
+            }
         }
         self.pop()
     }
