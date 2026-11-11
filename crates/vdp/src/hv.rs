@@ -61,9 +61,10 @@ const H_JUMP_H32: u8 = 0xE9;
 ///
 /// Not in genvdp.txt: section 5 says only "This is not the case for the 40-cell
 /// display, where I would assume the H counter jumps back farther at a later
-/// point in the count-up", so this is the H32 rule applied to a 420-pixel line
-/// - the counter still ends the line on 0xFF. 0xFF-0xE4+1 = 28 values over 56
-/// pixels, so the jump is at pixel 364 and the count before it runs to 0xB5.
+/// point in the count-up", so this is the H32 rule applied to a 420-pixel line,
+/// the counter still ending the line on 0xFF: 0xFF less 0xE4 plus 1 is 28 values
+/// over 56 pixels, so the jump is at pixel 364 and the count before it runs to
+/// 0xB5.
 const H_JUMP_H40: u8 = 0xE4;
 
 /// First line whose V counter has jumped, NTSC.
@@ -109,7 +110,7 @@ fn h_count(pixel: u32, h40: bool) -> u8 {
     } else {
         (PIXELS_H32, H_JUMP_H32)
     };
-    let after_jump = pixels - u32::from(0x100 - u32::from(jump)) * 2;
+    let after_jump = pixels - (0x100 - u32::from(jump)) * 2;
     if pixel < after_jump {
         (pixel >> 1) as u8
     } else {
@@ -257,9 +258,7 @@ mod tests {
     /// from pixel 0 to the last one the counter still covers.
     fn h_sequence(h40: bool) -> Vec<u8> {
         let pixels = if h40 { PIXELS_H40 } else { PIXELS_H32 };
-        (0..pixels / 2)
-            .map(|step| h_count(step * 2, h40))
-            .collect()
+        (0..pixels / 2).map(|step| h_count(step * 2, h40)).collect()
     }
 
     /// The V counter reads of a whole frame, line 0 to the last one.
@@ -382,7 +381,11 @@ mod tests {
     fn pal_v30_v_counter_wraps_at_line_267() {
         assert_eq!(v_count(0, true, true), 0x00);
         assert_eq!(v_count(256, true, true), 0x00);
-        assert_eq!(v_count(266, true, true), 0x0A, "the last line of the repeat");
+        assert_eq!(
+            v_count(266, true, true),
+            0x0A,
+            "the last line of the repeat"
+        );
         assert_eq!(v_count(267, true, true), 0xD2, "the jump");
         assert_eq!(v_count(312, true, true), 0xFF);
     }
@@ -484,7 +487,11 @@ mod tests {
             "0xEA doubled is 0x1D4 and the port has 8 bits for it"
         );
         vdp.set_position(256, 0);
-        assert_eq!(vdp.hv_counter() >> 8, 0xF5, "0xFA doubled, and VC8 in bit 0");
+        assert_eq!(
+            vdp.hv_counter() >> 8,
+            0xF5,
+            "0xFA doubled, and VC8 in bit 0"
+        );
     }
 
     #[test]
@@ -519,7 +526,11 @@ mod tests {
         vdp.write_register(0, 0x02 | 0x20);
         assert_eq!(vdp.hv_counter(), 0x1000, "M3 was already set, no new latch");
         vdp.write_register(1, 0x40);
-        assert_eq!(vdp.hv_counter(), 0x1000, "and a different register is not M3");
+        assert_eq!(
+            vdp.hv_counter(),
+            0x1000,
+            "and a different register is not M3"
+        );
     }
 
     #[test]
@@ -533,6 +544,10 @@ mod tests {
         vdp.set_position(0x20, 0);
         vdp.write_register(0, R0_M3);
         vdp.set_position(0x30, 0);
-        assert_eq!(vdp.hv_counter(), 0x2000, "the 0-to-1 transition is the latch point");
+        assert_eq!(
+            vdp.hv_counter(),
+            0x2000,
+            "the 0-to-1 transition is the latch point"
+        );
     }
 }
