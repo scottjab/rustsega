@@ -174,8 +174,11 @@ impl Fifo {
             return None;
         }
         self.slot_clock -= slot_mclk;
-        if self.queue[self.head]?.slots > 1 {
-            self.queue[self.head].as_mut()?.slots -= 1;
+
+        // `len` says there is an entry at the head, and its slots are what
+        // stands between that entry and memory.
+        if let Some(head) = self.queue[self.head].as_mut() && head.slots > 1 {
+            head.slots -= 1;
             return None;
         }
         self.pop()

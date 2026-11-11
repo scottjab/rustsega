@@ -423,8 +423,9 @@ impl Vdp {
         // word has armed: "Any write to the data port will then start a VRAM
         // fill" (genvdp.txt section 11 "VRAM fill"). `dma::Vdp::run_fill` is
         // where that lives, and it does nothing at all whenever no fill is
-        // waiting - which is every other write to the port, the words a 68k to
-        // VDP transfer writes included.
+        // waiting, which is every other write to the port. The words a 68k to
+        // VDP transfer writes are not writes to this port and never reach here
+        // (`dma::Vdp::run_transfer`).
         self.run_fill(value);
     }
 

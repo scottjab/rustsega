@@ -72,10 +72,9 @@ impl Vdp {
         self.pending = false;
 
         let word = STATUS_FIXED
-            // d9 and d8 are the write FIFO's pair, the only two bits of this
-            // word that another part of the chip drives: `fifo` says how full
-            // the four entries between the data port and the memories are,
-            // and both read 0 together while it holds one to three entries.
+            // d9 and d8 are the write FIFO's pair, and `fifo` is what decides
+            // them: empty is nothing on the queue, full is all four entries
+            // taken, and a queue holding one to three of them reports neither.
             | flag(BIT_FIFO_EMPTY, self.fifo_empty())
             | flag(BIT_FIFO_FULL, self.fifo_full())
             | flag(BIT_VINT, self.vint_pending)
