@@ -188,6 +188,17 @@ impl Vdp {
         }
     }
 
+    /// The line the beam is on after [`Vdp::line`], wrapping at the end of the
+    /// frame: the line the sprite search of this one leaves its list for (#311).
+    #[inline]
+    pub(crate) fn next_line(&self) -> u16 {
+        if self.line + 1 >= self.frame_lines() {
+            0
+        } else {
+            self.line + 1
+        }
+    }
+
     /// The line the beam has just finished: draw it, then move along.
     fn finish_line(&mut self) {
         if usize::from(self.line) < self.active_height() {
@@ -195,11 +206,7 @@ impl Vdp {
         }
 
         self.line_mclk = 0;
-        self.line = if self.line + 1 >= self.frame_lines() {
-            0
-        } else {
-            self.line + 1
-        };
+        self.line = self.next_line();
         self.start_line();
     }
 

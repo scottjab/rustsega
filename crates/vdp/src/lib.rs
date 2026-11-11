@@ -100,6 +100,18 @@ pub struct Vdp {
     /// of the 512 that [`Vdp::new`] holds itself to, and
     /// `vdp_values_stay_off_the_stack` is what keeps that true of `Vdp` values.
     sprite_cache: Box<sprites::SpriteCache>,
+    /// The sprite list of the line being drawn and of the line after it: the two
+    /// slots of [`crate::sprites::Vdp::search_sprites`], one per line parity
+    /// (M4-23, #311).
+    ///
+    /// The search of a line runs at the latch point of the line before it and is read
+    /// when the beam finishes the line it belongs to, which is after the next latch
+    /// point, so one slot would be overwritten before it was read - see
+    /// [`crate::sprites::Vdp::searched_line`].
+    ///
+    /// Boxed like [`Vdp::sprite_cache`]: two lists of up to 80 entries are more than
+    /// [`Vdp::new`] holds itself to, and they are filled in place by the search.
+    sprite_lines: Box<[sprites::SpriteLine; 2]>,
     /// R0 to R23, in the order the control port numbers them
     /// (genvdp.txt section 17).
     regs: [u8; regs::NUM_REGISTERS],
@@ -306,6 +318,7 @@ impl Vdp {
             cram: [0; CRAM_WORDS],
             vsram: [0; VSRAM_WORDS],
             sprite_cache: Box::new(sprites::SpriteCache::new()),
+            sprite_lines: Box::new([sprites::SpriteLine::empty(), sprites::SpriteLine::empty()]),
             regs: [0; regs::NUM_REGISTERS],
             code: 0,
             addr: 0,
