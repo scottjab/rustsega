@@ -13,6 +13,13 @@
 //! [`Vdp::fill_cell_run`] the two scroll planes end with, so the entry decode, the
 //! flip, the palette and the colour-0 transparency of genvdp.txt section 13 are
 //! written once for the three name tables.
+//!
+//! TODO(#289): four readings here go beyond what genvdp.txt settles - that R17 and
+//! R18 are an intersection ([`Vdp::window_line`]), that the window has to be shown
+//! for its bug to bite ([`Vdp::window_edge_bug`]), that the bug moves the name
+//! table fetch of a column and not its VSRAM word ([`Vdp::render_window_run`]'s
+//! caller), and what a window fetch reads past the end of its own table - and each
+//! is pinned by a test here so that a correction cannot be quiet.
 
 use crate::Vdp;
 use crate::WIDTH_H40;
