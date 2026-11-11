@@ -141,7 +141,15 @@ pub(crate) struct Sprite {
 /// size/link word, and the two it never holds are the pattern and the x.
 pub(crate) fn sprite_at(vram: &[u8], cache: &SpriteCache, base: usize, index: usize) -> Sprite {
     let entry = base + index * ENTRY_BYTES;
-    let [y, size] = match cache.line(index) {
+    let [y, size] = entry_words(vram, cache, entry, index);
+    sprite_of(vram, entry, y, size)
+}
+
+/// The two words the VDP keeps of the entry at byte `entry` of the table: the y and
+/// the size/link, from `cache` where it holds a line for `index` and out of `vram`
+/// where it does not - see [`SpriteCache::line`] for the links that miss.
+fn entry_words(vram: &[u8], cache: &SpriteCache, entry: usize, index: usize) -> [u16; 2] {
+    match cache.line(index) {
         // `Y_WORD` is 0 and `SIZE_WORD` 1, so a cache line holds the two words in
         // the same order VRAM holds them.
         Some(line) => [
@@ -152,7 +160,16 @@ pub(crate) fn sprite_at(vram: &[u8], cache: &SpriteCache, base: usize, index: us
             read_word(vram, entry + Y_WORD * 2),
             read_word(vram, entry + SIZE_WORD * 2),
         ],
-    };
+    }
+}
+
+/// The entry at byte `entry` of `vram` as a [`Sprite`], from the two words of
+/// [`entry_words`] and the two the VDP does not keep: the pattern and the x, which
+/// every fetch of the entry reads again (#103).
+///
+/// [`Vdp::line_sprites`] is what calls this for an entry of a [`SpriteLine`], whose
+/// y and size came from the search of the line before (#311).
+fn sprite_of(vram: &[u8], entry: usize, y: u16, size: u16) -> Sprite {
     Sprite {
         y: y & 0x3FF,
         x: read_word(vram, entry + X_WORD * 2) & 0x1FF,
@@ -244,6 +261,103 @@ impl SpriteCache {
     }
 }
 
+/// One entry of [`SpriteLine`]: what the sprite search of the line before read out
+/// of the SAT for it (M4-23, #311).
+///
+/// The y and the size/link are the two words of [`entry_words`], kept as the search
+/// read them. The pattern and the x are not kept, because the search is not what
+/// fetches them: [`crate::latch`] and #103's split of the entry both leave those two
+/// to the line that draws the sprite, which is why this holds the SAT `index`.
+#[derive(Debug, Clone, Copy)]
+struct SpriteLineEntry {
+    /// The entry of the table this, 0..=127 as the 7-bit link field numbers them.
+    index: u8,
+    /// Word 0 as the search read it: the y coordinate, unmasked for [`sprite_of`].
+    y: u16,
+    /// Word 1 as the search read it: the two size fields and the link.
+    size: u16,
+}
+
+impl SpriteLineEntry {
+    /// The entry of a list that has never been walked.
+    const EMPTY: Self = Self {
+        index: 0,
+        y: 0,
+        size: 0,
+    };
+}
+
+/// [`SpriteLine::line`] of a slot that has never held a search: no beam line is ever
+/// this, so an empty slot is never taken for the line being drawn.
+const NO_LINE: u16 = u16::MAX;
+
+/// The sprite list of one line: what the walk of the SAT had left when the line
+/// before was latched, in the order the line draws it (M4-23, #311).
+///
+/// [`Vdp::search_sprites`] fills one of these at the latch point of [`crate::latch`]
+/// and [`Vdp::line_sprites`] draws from it, which is the model of "sprites for line
+/// N are evaluated during line N-1" that #311 asks for: an entry written halfway
+/// across a line is in the list of the line after the one it reached too late for.
+///
+/// The y of an entry is latched with it - it is what the search reads - but it is
+/// not *used* by the search: which entries belong to the line is still worked out by
+/// [`Vdp::render_sprite_line`] of the line that draws them. Two reasons: the walk
+/// stops at the 80 and 64 entries of [`MAX_SPRITES_H40`] / [`MAX_SPRITES_H32`],
+/// which count the entries *visited* and not the ones on the line, so cutting the
+/// list by y first would move that limit; and the line number of a search is the
+/// line after the one the beam is on, which in interlace mode 2 is a line of a field
+/// [`Vdp::display_line`] has not moved to yet (#98). The answer is the same either
+/// way, because the y here and the line there both belong to the same line.
+#[derive(Debug)]
+pub(crate) struct SpriteLine {
+    /// The beam line this list belongs to: the one that draws it, and [`NO_LINE`]
+    /// of a slot that has never been searched. [`Vdp::line_sprites`] is what reads
+    /// it, and it is the same rule [`crate::latch::LineState`] gives the registers.
+    line: u16,
+    /// The list, in draw order: the first [`count`] entries of it.
+    entries: [SpriteLineEntry; MAX_SPRITES_H40],
+    /// How many entries the walk filled, `..=` [`MAX_SPRITES_H40`].
+    count: usize,
+}
+
+impl SpriteLine {
+    /// The empty list of beam line `line`.
+    pub(crate) const fn new(line: u16) -> Self {
+        Self {
+            line,
+            entries: [SpriteLineEntry::EMPTY; MAX_SPRITES_H40],
+            count: 0,
+        }
+    }
+
+    /// A list that has never been walked, for the two slots of a chip that has never
+    /// latched a line: [`NO_LINE`] is no beam line, so neither slot is taken for the
+    /// line being drawn until a search has filled it in.
+    pub(crate) const fn empty() -> Self {
+        Self::new(NO_LINE)
+    }
+
+    /// The entries of the list, in the order the line draws them.
+    fn sprites(&self) -> &[SpriteLineEntry] {
+        &self.entries[..self.count]
+    }
+
+    /// One more entry on the end of the list.
+    ///
+    /// Infallible because the walk that calls it cannot visit more than
+    /// [`MAX_SPRITES_H40`] entries, which is how many there is room for.
+    fn push(&mut self, entry: SpriteLineEntry) {
+        debug_assert!(
+            self.count < self.entries.len(),
+            "a walk of the SAT visits no more entries than the list holds"
+        );
+        if self.count < self.entries.len() {
+            self.entries[self.count] = entry;
+            self.count += 1;
+        }
+    }
+}
+
 /// The sprites of one SAT list, in the order the VDP draws them.
 ///
 /// genvdp.txt section 15 "Linking": "The VDP draws sprites in a front-to-back
@@ -296,6 +410,49 @@ impl Iterator for SpriteList<'_> {
     }
 }
 
+/// The sprites of the line [`Vdp::render_sprite_line`] is drawing, in the order it
+/// draws them: either of the two walks of [`Vdp::line_sprites`], which is what
+/// builds one (#311).
+///
+/// The two walks are one type because the drawing of a line is the same either way:
+/// every entry arrives as a whole [`Sprite`], the searched one bringing its y, its
+/// size and its link from [`SpriteLine`] and fetching its pattern and its x from
+/// VRAM now, exactly as the [`SpriteList`] walk fetches all six of its fields now
+/// (#103).
+pub(crate) struct LineSprites<'a> {
+    /// The memory the pattern and the x of a searched entry are read from.
+    vram: &'a [u8],
+    /// The table they are in: [`Vdp::sprite_base`] of the line being drawn.
+    base: usize,
+    /// Which of the two walks this is.
+    from: LineSpritesFrom<'a>,
+}
+
+/// The two walks a [`LineSprites`] can be.
+enum LineSpritesFrom<'a> {
+    /// The chain of the SAT as it is now, from [`Vdp::sprite_list`].
+    Chain(SpriteList<'a>),
+    /// The [`SpriteLine`] the search of the line before left, in list order.
+    Searched(core::slice::Iter<'a, SpriteLineEntry>),
+}
+
+impl Iterator for LineSprites<'_> {
+    type Item = Sprite;
+
+    fn next(&mut self) -> Option<Sprite> {
+        // The fields apart, because `from` is borrowed mutably and `vram` and `base`
+        // are read by the arm that needs them.
+        let Self { vram, base, from } = self;
+        match from {
+            LineSpritesFrom::Chain(list) => list.next(),
+            LineSpritesFrom::Searched(entries) => entries.next().map(|entry| {
+                let address = *base + usize::from(entry.index) * ENTRY_BYTES;
+                sprite_of(*vram, address, entry.y, entry.size)
+            }),
+        }
+    }
+}
+
 impl Vdp {
     /// The sprite list of the SAT at [`Vdp::sprite_base`], starting at entry 0 and
     /// ending at the first zero link or at the sprite limit of the display width.
@@ -315,6 +472,105 @@ impl Vdp {
                 MAX_SPRITES_H32
             },
         }
+    }
+
+    /// The sprite search of [`Vdp::line`]: walk the link chain of the SAT as it
+    /// stands at the latch point of [`crate::latch`] and leave what it read in
+    /// [`Vdp::sprite_lines`] for the line after this one to draw (M4-23, #311).
+    ///
+    /// "Sprites for line N are evaluated during line N-1 (sprite list for a line is
+    /// built one line early)" (ticket #311, after the same plutiedev VDP timing notes
+    /// whose per-line access pattern `crate::latch` quotes: its `a` and `b` steps,
+    /// the sprite fetches, are in the active part of every line and cannot be the
+    /// sprites of that line, since they are laid out before the plane B and A fetches
+    /// of it). The sprite work of the line before is also what makes the VDP render
+    /// 225 lines rather than 224 - SpritesMind t=1291 page 3, quoted on #100 - which
+    /// is one line of sprite evaluation past the last line of the picture: a walk of
+    /// every line, this one included, is the same count.
+    ///
+    /// Only the two cached words of an entry are read here, because that is all the
+    /// search has and all [`SpriteCache`] holds (#103). The pattern and the x of an
+    /// entry are fetched by the line that draws it, by [`sprite_of`] and
+    /// [`LineSprites`], and that is why a pattern written halfway across a line is
+    /// on the next one while a whole entry written at the same moment is not.
+    ///
+    /// The chain is followed from entry 0 and stopped at the first zero link or at
+    /// the 80 and 64 entries of [`MAX_SPRITES_H40`] / [`MAX_SPRITES_H32`], exactly as
+    /// [`SpriteList`] walks and stops, and for the same reasons: a link that loops is
+    /// broken by the count, and a link past the table is read rather than stopped at.
+    pub(crate) fn search_sprites(&mut self) {
+        let base = usize::from(self.sprite_base());
+        let limit = if self.h40() {
+            MAX_SPRITES_H40
+        } else {
+            MAX_SPRITES_H32
+        };
+        let mut searched = SpriteLine::new(self.next_line());
+        // The chain of `SpriteList` in a loop rather than an iterator, because what
+        // the walk keeps is the two words it read and not a `Sprite`: the pattern
+        // and the x of an entry are nobody's business until the entry is drawn.
+        let mut index = 0u8;
+        loop {
+            let entry = base + usize::from(index) * ENTRY_BYTES;
+            let [y, size] = entry_words(&self.vram, &self.sprite_cache, entry, usize::from(index));
+            let link = (size & LINK_MASK) as u8;
+            // `index` is 0 or a 7-bit link, so it is always one of the 128 values a
+            // `u8` holds, and `SpriteLine::push` is bounded by `limit`.
+            searched.push(SpriteLineEntry { index, y, size });
+            if link == 0 || searched.count >= limit {
+                break;
+            }
+            index = link;
+        }
+
+        let line = searched.line;
+        self.sprite_lines[usize::from(line) & 1] = searched;
+    }
+
+    /// The sprites of the line [`Vdp::begin_line`] has started, in the order the
+    /// renderer draws them (#311).
+    ///
+    /// While a latched line is being drawn this is the [`SpriteLine`] the search of
+    /// the line before left for it: the y, the size and the link of every entry as
+    /// they stood at the latch point one line early, and the pattern and the x read
+    /// now. [`Vdp::searched_line`] is the rule that picks it, and it is the rule
+    /// [`crate::latch`] gives the registers, the VSRAM and the scroll: a line the
+    /// beam never latched - [`Vdp::render_line`] called directly, the beam moved by
+    /// [`Vdp::set_position`] - walks the chain of the moment instead.
+    pub(crate) fn line_sprites(&self) -> LineSprites<'_> {
+        let from = match self.searched_line() {
+            Some(searched) => LineSpritesFrom::Searched(searched.sprites().iter()),
+            None => LineSpritesFrom::Chain(self.sprite_list()),
+        };
+        LineSprites {
+            vram: &self.vram,
+            base: usize::from(self.sprite_base()),
+            from,
+        }
+    }
+
+    /// The [`SpriteLine`] the line being drawn was searched with, and `None` when it
+    /// was not searched at all.
+    ///
+    /// [`Vdp::sprite_lines`] is two slots because a search is not read by the line it
+    /// runs on: the search of line N runs at the latch point of line N - 1 and is
+    /// read when the beam has *finished* line N, which is a whole latch point later,
+    /// and one slot would be overwritten by the search of line N + 1 before line N is
+    /// ever drawn. So the list of a line lives in the slot of its own parity, and
+    /// [`SpriteLine::line`] says which line a slot holds: the slot of `line` is
+    /// written at the latch point before it and read once, by the draw of the line,
+    /// and the next write to it is two lines after that.
+    ///
+    /// `line_drawing` is what says a latched line is being drawn at all, and that the
+    /// line being drawn is [`Vdp::line`] and no other - see [`Vdp::begin_line`],
+    /// which is the only thing that sets it, and which is false for a
+    /// [`Vdp::render_line`] call from outside the beam.
+    fn searched_line(&self) -> Option<&SpriteLine> {
+        if !self.line_drawing {
+            return None;
+        }
+        let searched = &self.sprite_lines[usize::from(self.line) & 1];
+        (searched.line == self.line).then_some(searched)
     }
 
     /// Fill `out` with the sprite layer of `line`: one [`u8`] per pixel, bits 5-0
@@ -392,7 +648,7 @@ impl Vdp {
         let cell_rows = self.cell_height();
         let mut walk = LineWalk::default();
 
-        for sprite in self.sprite_list() {
+        for sprite in self.line_sprites() {
             // The sprite occupies the lines `y - origin_y` to `y - origin_y` plus
             // its own height, and `row` is which row of that it is drawing. `line`
             // is a line of the picture, so in interlace mode 2 a sprite is twice
@@ -603,7 +859,8 @@ impl LineWalk {
 mod tests {
     use super::*;
     use crate::planes::testutil::{
-        CELL_TILE_ROWS, fill_tile_row, fill_tile_row_of_height, put_sprite_at, put_tile_row, put_word,
+        CELL_TILE_ROWS, fill_tile_row, fill_tile_row_of_height, put_sprite_at, put_tile_row,
+        put_word,
     };
 
     /// SAT base of these tests: R5 = `0x78` is 0xF000 both under the H32 mask of
@@ -645,7 +902,6 @@ mod tests {
     ) {
         put_sprite_at(vdp, SPRITE_BASE, index, y, x, cells, link, pattern);
     }
-
 
     /// The word 2 naming `tile` in `palette`, priority and flips clear.
     fn palette_tile(palette: u8, tile: u16) -> u16 {

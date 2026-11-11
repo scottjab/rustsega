@@ -35,11 +35,18 @@
 //! porch of the line before. The two differ only for a write in the first 81
 //! clocks of an H40 line, or the first 100 of an H32 one.
 //!
-//! Sprites are not latched here: the sprite list is still a walk of the VRAM of
-//! the moment, which is #311, and the cache of the table's first four bytes per
-//! entry, `crate::sprites::SpriteCache` (#103), is chip state rather than line
-//! state - the chip takes no VRAM write while a line is being drawn, so there is
-//! nothing for a latch to keep it away from.
+//! Sprites are latched here too, but one line earlier and in another place: the
+//! sprite list of a line is evaluated during the line before, so
+//! [`Vdp::search_sprites`] walks the table at this same point and leaves what it
+//! read in [`Vdp::sprite_lines`] for the line after this one to draw (#311). It is
+//! not part of [`LineState`] because a `LineState` is read by the line it was
+//! latched for, at the end of that line, and a sprite search is not read until the
+//! end of the line *after* the one it ran on - one box would be refilled by the next
+//! line's search before the line the first one belongs to was ever drawn. The cache
+//! of the table's first four bytes per entry, `crate::sprites::SpriteCache` (#103),
+//! stays chip state and keeps its semantics: the search reads it, keeps what it
+//! read, and still leaves the pattern and the x of an entry to the fetch of the line
+//! that draws them.
 //!
 //! TODO(#102): pin the latch point with a scroll test ROM (M6-06), including
 //! whether a write inside that first-blanking window reaches the line it is
@@ -96,6 +103,11 @@ impl Vdp {
     /// from VRAM during HBlank before line N" puts the scroll read in. Live state
     /// is read here, not the latch: this is what fills it.
     pub(crate) fn latch_line_state(&mut self) {
+        // The sprite walk of the line after this one, at the same moment and for the
+        // same reason as the three reads below: the sprite list of a line is
+        // evaluated during the line before (#311).
+        self.search_sprites();
+
         let display_line = usize::from(self.display_line(self.line));
         let latch = LineState {
             line: self.line,
