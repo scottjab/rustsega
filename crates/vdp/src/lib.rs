@@ -2,14 +2,17 @@
 //!
 //! What lives here today is the state layer: the three memories, the 24
 //! registers, the register writes, and the mode getters every later VDP ticket
-//! reads. The port that reaches this state is M4-02 (#80), DMA is M4-07 (#85)
-//! and M4-08 (#86), rendering starts at M4-10 (#88), and timing after that.
+//! reads, and the two ports the 68k reaches them with (`ports`: control port
+//! writes and data port writes). Data port reads are M4-03 (#81), the status
+//! register M4-04 (#82), DMA execution M4-07 (#85) and M4-08 (#86), rendering
+//! starts at M4-10 (#88), and timing after that.
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
 //! of the register (`$83xx` is R3), which is how each is usually quoted.
 
 mod framebuffer;
+mod ports;
 mod regs;
 
 pub use framebuffer::FrameBuffer;
@@ -40,8 +43,9 @@ pub struct Vdp {
     /// `Vdp` never puts 64 KiB on the caller's stack; the length is fixed at
     /// `VRAM_SIZE` by [`Vdp::new`] and nothing resizes it.
     ///
-    /// TODO(M4-02 #80): the data port reads and writes this, through the
-    /// address register that ticket adds.
+    /// The data port writes it (M4-02, #80, in `ports`).
+    ///
+    /// TODO(M4-03 #81): the data port reads it, with the same byte order.
     pub vram: Box<[u8]>,
     /// CRAM: 64 words of 9-bit colour in `0000 BBB0 GGG0 RRR0` form
     /// (genvdp.txt section 9: `----bbb-ggg-rrr-`).
@@ -51,13 +55,33 @@ pub struct Vdp {
     pub cram: [u16; CRAM_WORDS],
     /// VSRAM: 40 words of vertical scroll values (genvdp.txt section 10).
     ///
-    /// Only the low 10 bits of each word are used, and 11 in interlace mode 2
-    /// (R12 LSM, [`InterlaceMode::Mode2`]). Neither is masked here: masking a
-    /// write is a property of the data port, which is M4-02 (#80).
+    /// The scroll value is 10 bits (`------yyyyyyyyyy`, genvdp.txt section 10)
+    /// but the word is 11 bits wide, which is what interlace mode 2 uses, so
+    /// the data port masks a write to 11 bits rather than 10 (`ports`, and
+    /// SpritesMind "Interlace mode (LSMx=3)": "VSRAM width is 11-bit but bit0
+    /// is ignored in interlaced mode 2").
     pub vsram: [u16; VSRAM_WORDS],
     /// R0 to R23, in the order the control port numbers them
     /// (genvdp.txt section 17).
     regs: [u8; regs::NUM_REGISTERS],
+    /// The VDP code register, CD5-CD0: which memory a data port access is for
+    /// and whether it reads or writes (genvdp.txt section 7 "VDP ports").
+    /// Written by [`Vdp::write_control`], read by [`Vdp::write_data`]; the
+    /// per-memory rules are in `ports`.
+    code: u8,
+    /// The VDP address register, A15-A0: where the data port points
+    /// (genvdp.txt section 7). R15 moves it along after every data port access,
+    /// see `ports::increment`.
+    addr: u16,
+    /// Set between the two halves of a control port command word: the VDP
+    /// "maintains an internal write-pending flag", which the first half sets
+    /// and the second half, a data port access, and a control port read clear
+    /// (genvdp.txt section 7).
+    pending: bool,
+    /// Set by a command word with CD5 while R1 M1 allows DMA (genvdp.txt
+    /// section 7: "Setting CD5 will trigger a DMA operation"). The DMA tickets
+    /// run the transfer and clear it.
+    dma_requested: bool,
     /// The frame the renderer draws into. Read through [`Vdp::frame`].
     frame_buffer: FrameBuffer,
     /// Which crystal the chip is clocked by: `true` for PAL, which can drive a
@@ -81,6 +105,10 @@ impl Vdp {
             cram: [0; CRAM_WORDS],
             vsram: [0; VSRAM_WORDS],
             regs: [0; regs::NUM_REGISTERS],
+            code: 0,
+            addr: 0,
+            pending: false,
+            dma_requested: false,
             frame_buffer: FrameBuffer::new(),
             pal,
         }
@@ -99,9 +127,9 @@ impl Vdp {
     /// Write `value` into register `reg`.
     ///
     /// Registers 24 to 31 do not exist and writes to them are ignored rather
-    /// than panicking: the control port decode of M4-02 (#80) hands this
-    /// function the 5-bit field of a `100r rrrr` command word, which can name
-    /// them (genvdp.txt section 7 "VDP ports").
+    /// than panicking: the control port decode of `ports` hands this function
+    /// the 5-bit field of a `100r rrrr` command word, which can name them
+    /// (genvdp.txt section 7 "VDP ports").
     pub fn write_register(&mut self, reg: u8, value: u8) {
         if let Some(slot) = self.regs.get_mut(usize::from(reg)) {
             *slot = value;
@@ -337,11 +365,23 @@ impl Vdp {
     /// access (genvdp.txt section 17 "$0F", section 7 "VDP ports"; plutiedev
     /// "$8Fxx").
     ///
-    /// TODO(M4-02 #80): applying it, and the code that has to decide whether a
-    /// negative value wraps the address register the way the hardware does.
+    /// Applied by `ports::increment`, which is where the width of the field
+    /// and the wrap of the address register are settled.
     #[inline]
     pub fn auto_increment(&self) -> u8 {
         self.regs[regs::R15]
+    }
+
+    /// True when a control port command word asked for a DMA and nobody has
+    /// run it yet.
+    ///
+    /// TODO(M4-07 #85): the 68k transfer that clears it; TODO(M4-08 #86): the
+    /// fill and copy. Until then this is only the request a command word with
+    /// CD5 raises (genvdp.txt section 7: "Setting CD5 will trigger a DMA
+    /// operation").
+    #[inline]
+    pub fn dma_requested(&self) -> bool {
+        self.dma_requested
     }
 
     /// Plane A and B name table width in cells, from R16 bits 1-0 (HSZ;
