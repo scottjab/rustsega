@@ -201,15 +201,17 @@ impl Scheduler {
 
     /// Restart the raster the scheduler is counting, because something outside
     /// it has restarted the beam: the console's reset button reaches
-    /// [`m68k::Bus::reset_devices`], which rebuilds [`Bus::vdp`] as a chip that
-    /// has never been advanced and so sits back at line 0 with its own clock
-    /// unwound to nothing (M3-15, #76).
+    /// [`m68k::Bus::reset_devices`], which rebuilds [`Bus::vdp`] as a chip that has
+    /// never been advanced, its own clock unwound to nothing (M3-15, #76) and its
+    /// beam parked back into blanking by the same reset (#310).
     ///
-    /// Two positions have to follow it. [`Scheduler::line`] goes to 0 with the
-    /// VDP's own line, because [`Scheduler::run_frame`] ends the frame on the
-    /// line counter wrapping and the VDP raises `frame_done` on its own line
-    /// 224: leaving the two out of step would make the first frame after a reset
-    /// up to a raster longer than every one after it.
+    /// Two positions have to follow it. [`Scheduler::line`] goes back to 0, and it
+    /// is the scheduler's own count of lines since the frame boundary rather than
+    /// the VDP's line number: the two are only required to wrap together, and since
+    /// #310 they sit a fixed distance apart, because a console that is started puts
+    /// its beam on the VBlank line the VDP raises `frame_done` on rather than at
+    /// line 0. Leaving this counter where the reset left it would make the first
+    /// frame after one up to a raster longer than every one after it.
     ///
     /// And `vdp_clock` goes to the time the two CPUs agree on, which is where
     /// [`Scheduler::sync_vdp`] starts from: it is a position in the master clock
@@ -468,6 +470,11 @@ mod tests {
     const MASKLESS: u16 = 0x2000;
     /// Master clocks in a VDP line, the same 3420 [`MASTER_CLOCKS_PER_LINE`] is.
     const VDP_LINE: u32 = MASTER_CLOCKS_PER_LINE as u32;
+    /// The first line of VBlank: 224, the `E0h` of genvdp.txt section 4 "Vertical
+    /// interrupts", which is the line `timing` raises `frame_done` on and - the
+    /// NTSC V counter being one count a line up to 255 - its own V counter. This
+    /// is where the console parks a beam it has just started (#310).
+    const VBLANK_LINE: u16 = 224;
 
     /// The console `rom` runs on. The sound CPU stays in the reset [`Bus::new`]
     /// leaves it in, so these tests have the 68k and the VDP and nothing else.
@@ -933,6 +940,40 @@ mod tests {
             assert!(
                 !bus.vdp.frame_done(),
                 "frame {frame} took the VDP's flag with it rather than leaving it up"
+            );
+        }
+    }
+
+    /// The other start of frame: a console that parks the beam on the first line of
+    /// VBlank before it runs anything (#310, `Genesis::new`) begins its rasters in
+    /// blanking rather than at line 0, and a frame is still one whole raster.
+    ///
+    /// The VDP's line and [`Scheduler::line`] are a fixed distance apart in that
+    /// machine - the scheduler counts lines since the frame boundary, the chip since
+    /// VBlank - and all the two loops of [`Scheduler::run_frame`] have to keep is the
+    /// wrap. Because the parked chip is parked without its frame flag up, the wait is
+    /// what runs the whole raster, taking the flag the beam raises on arriving back at
+    /// VBlank; the drain after it has nothing left to pay for.
+    #[test]
+    fn a_frame_that_starts_in_vblank_is_a_whole_raster() {
+        let (mut cpu, mut z80, mut bus) = machine();
+        // What `Genesis::new` does to the chip it has just built.
+        bus.vdp.start_in_vblank();
+        let mut s = Scheduler::new(Region::Usa);
+
+        for frame in 1..=3_u64 {
+            let before = s.master_clock;
+            s.run_frame(&mut cpu, &mut z80, &mut bus);
+            assert_eq!(
+                s.master_clock - before,
+                262 * MASTER_CLOCKS_PER_LINE,
+                "frame {frame} of a machine started in VBlank is a whole raster"
+            );
+            assert_eq!(s.line, 0, "and its line counter wraps with it");
+            assert_eq!(
+                bus.vdp.hv_counter() >> 8,
+                VBLANK_LINE,
+                "and the beam is back at the line the frame started on"
             );
         }
     }

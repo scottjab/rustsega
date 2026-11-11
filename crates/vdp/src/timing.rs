@@ -121,6 +121,39 @@ impl Vdp {
         }
     }
 
+    /// Move the beam to the first line of VBlank: where a chip that is being
+    /// started, or restarted, is rather than where one that has been advanced got
+    /// to (#310).
+    ///
+    /// [`Vdp::new`] leaves a chip at line 0 clock 0, and a host that resets a
+    /// console into that state then runs the 68000's first instruction 40 master
+    /// clocks inside the active display of line 0 - past the point a line is drawn
+    /// from (the latch of [`crate::latch`], at [`HBLANK_CLEAR_MCLK_H32`] and
+    /// [`HBLANK_CLEAR_MCLK_H40`]) - so a ROM's start-up register writes miss line 0
+    /// and the first frame of the run is drawn in the mode the chip reset into.
+    /// Hardware resets into blanking, where a write is in time for the line that
+    /// follows; this is that position.
+    ///
+    /// The line's own blanking state is applied as [`Vdp::start_line`] would have
+    /// left it, and [`Vdp::line_started`] with it, so the first [`Vdp::advance`]
+    /// does not do it a second time. The two event flags of that line are not, and
+    /// that is the point: no vertical interrupt has occurred and no frame has been
+    /// drawn since this chip was reset, so `vint_pending` stays down and so does
+    /// [`Vdp::frame_ready`]. A scheduler waiting on the latter cannot tell a beam
+    /// parked with the flag already up from one that has drawn a frame, and hands
+    /// the first frame of the run to whoever asks first - after which the call that
+    /// should have drawn it finds the flag spent and returns having done nothing.
+    pub fn start_in_vblank(&mut self) {
+        self.line = self.vblank_line();
+        self.line_mclk = 0;
+        // The same three writes `start_line` makes on arriving here: a line begins
+        // in the horizontal blanking it lets go of at [`Vdp::hblank_clear_mclk`],
+        // and this line is the first of VBlank.
+        self.line_started = true;
+        self.in_hblank = true;
+        self.in_vblank = true;
+    }
+
     /// The first point in [`Vdp::line`] after the beam's current clock.
     ///
     /// The release always precedes the back porch in a line (100 clocks, 2940
@@ -500,6 +533,43 @@ mod tests {
         assert_eq!(vdp.pending_irq(), Some(4), "the HINT is still waiting");
         vdp.ack_irq(4);
         assert_eq!(vdp.pending_irq(), None, "and both are gone");
+    }
+
+    /// [`Vdp::start_in_vblank`] parks the beam on the first line of VBlank with that
+    /// line's blanking applied and its two event flags down: the chip is in
+    /// blanking, and it has drawn nothing yet (#310).
+    #[test]
+    fn start_in_vblank_is_blank_and_has_drawn_nothing() {
+        let mut vdp = Vdp::new(false);
+        vdp.start_in_vblank();
+
+        assert_eq!(
+            (vdp.line, vdp.line_mclk),
+            (224, 0),
+            "the E0h of genvdp.txt section 4, at the start of it"
+        );
+        assert!(
+            vdp.in_vblank && vdp.in_hblank,
+            "and the blanking of that line is what a status read sees"
+        );
+        assert!(
+            vdp.line_started,
+            "the once-a-line work of the line is applied, not still owed to it"
+        );
+        assert!(
+            !vdp.frame_done() && !vdp.vint_pending,
+            "and neither of the line's two events comes up with the parking"
+        );
+
+        // Which is what a host waiting on the flag needs: from a parked beam to the
+        // flag is a whole raster, not nothing at all.
+        let mut lines = 0;
+        while !vdp.frame_done() {
+            vdp.advance(MCLKS_PER_LINE);
+            lines += 1;
+            assert!(lines <= 262, "one frame, however the wait is written");
+        }
+        assert_eq!(lines, 262, "one whole raster from the beam to the flag");
     }
 
     #[test]

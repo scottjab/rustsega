@@ -22,6 +22,17 @@ const VDP_CONTROL: u32 = 0xC0_0004;
 /// area is read-only, so it has to be work RAM; 0xFF0000 is the last mirror of
 /// the 64 KiB at 0xE00000 (plutiedev "Memory map").
 const PAD_COPY: u32 = 0xFF_0000;
+/// The V counter of the first line of VBlank: line 224, the `E0h` of genvdp.txt
+/// section 4 "Vertical interrupts" ("a level 6 interrupt will occur when the V
+/// counter is at line E0h"), counting as itself because the NTSC counter counts
+/// one per line up to 255 (`crates/vdp/src/hv.rs`, `v_count`).
+const VBLANK_V_COUNTER: u16 = 0xE0;
+
+/// The V counter of the beam right now, as a program reads it: `(V << 8) | H`
+/// from `$C00008` (genvdp.txt section 5), and the V half is the line.
+fn v_counter(machine: &Genesis) -> u16 {
+    machine.bus().vdp.hv_counter() >> 8
+}
 
 /// A cartridge image with the reset table for [`STACK`] / [`CODE`] and `program`
 /// at [`CODE`].
@@ -123,12 +134,65 @@ fn new_sets_pc_from_vector() {
     assert_eq!(machine.cpu().ssp, STACK, "and SSP from the one at $000000");
 }
 
+/// The beam of a machine that has just been built is on the first line of VBlank,
+/// so the first thing a ROM does - write a full set of VDP registers, at the top
+/// of its start-up code - happens during blanking and is in time for line 0 of the
+/// first frame (#310).
+///
+/// `Vdp::new` leaves a chip at line 0, and a line is drawn from the state latched
+/// at the start of its active display - master clock 100 in H32 and 81 in H40
+/// (#102) - so a beam that starts there puts the whole of a ROM's init code 40
+/// clocks inside line 0 and one frame behind. [`run_frame_returns_frame_of_expected_size`]
+/// is the mode change this is noticed in.
+#[test]
+fn new_starts_the_beam_in_vblank() {
+    let machine =
+        Genesis::new(&fake_rom(&[0x4E71]), Config::default()).expect("a ROM with a header loads");
+
+    assert_eq!(
+        v_counter(&machine),
+        VBLANK_V_COUNTER,
+        "the V counter of a machine before its first frame is the first line of VBlank"
+    );
+}
+
+/// The reset button restarts the beam in VBlank with the 68000 and the VDP, so the
+/// frame after a reset is drawn in the mode the program asks for at the top of it
+/// rather than in the mode the freshly-reset VDP sits in (#310).
+#[test]
+fn reset_restarts_the_beam_in_vblank() {
+    // R1 = $40 turns the display on and R12 = $81 is H40, so there is a mode for
+    // the reset to lose and the program's re-run to win back (genvdp.txt section
+    // 17 "$01" and "$0C").
+    let mut program = vdp_command(0x8000 | (0x01 << 8) | 0x40);
+    program.extend(vdp_command(0x8000 | (0x0C << 8) | 0x81));
+    program.push(0x60FE); // `bra.b $`
+
+    let mut machine =
+        Genesis::new(&fake_rom(&program), Config::default()).expect("a ROM with a header loads");
+    // Two frames, so this starts from the H40 the program asks for either way and
+    // only the reset that follows is under test.
+    machine.run_frame();
+    machine.run_frame();
+    assert_eq!(machine.frame().width, 320, "H40 before the reset");
+
+    machine.reset();
+    machine.run_frame();
+
+    assert_eq!(
+        machine.frame().width,
+        320,
+        "the re-run program writes R12 during blanking, so the first frame after a reset is the H40 it asked for and not the H32 the VDP reset into"
+    );
+}
+
 /// One `run_frame` is one frame of the picture, and `frame` reports the geometry
 /// the VDP's mode asks for: 320x224 in H40 and 256x224 in H32, so a front end
 /// never draws a 320 wide row into a 256 wide frame. The geometry is the mode of
-/// the frame's first line, and the line is latched before this program gets as
-/// far as its mode write (#102), so the test runs two frames: the first proves
-/// the latch, the second the geometry.
+/// the frame's first line, and the console starts that first line in blanking
+/// (#310), so a mode asked for at boot is in the very first frame; the test walks
+/// a second frame anyway, because a mode a game holds has to survive a whole
+/// raster of it.
 #[test]
 fn run_frame_returns_frame_of_expected_size() {
     // R1 = $40 turns the display on, R12 = $81 is H40 (RS0 and RS1) and R12 =
@@ -142,17 +206,24 @@ fn run_frame_returns_frame_of_expected_size() {
             .expect("a ROM with a header loads");
         machine.run_frame();
 
-        // The frame a mode is asked for in is not the frame that shows it. This
-        // program's write to R12 lands on line 0 at master clock 140, and a line
-        // is drawn from the state latched at the start of its active display -
-        // master clock 100 in H32 and 81 in H40 (M4-23, #102) - so a write 40
-        // clocks into the active display of line 0 is too late for line 0 and too
-        // late for the frame whose geometry line 0 fixes. Frame 0 is the 256 pixels
-        // of the mode the VDP reset into; the frame after is the one asked for.
+        // The frame a mode is asked for in is the frame that shows it, because the
+        // beam is in blanking while it is asked: `Genesis::new` parks it on the
+        // first line of VBlank (#310), so this program's write to R12 lands well
+        // before the latch of line 0 - the state a line is drawn from is taken at
+        // the start of its active display, master clock 100 in H32 and 81 in H40
+        // (M4-23, #102) - and line 0, which fixes the geometry of the frame, is
+        // drawn in the mode asked for.
+        //
+        // This assertion read `(256, 224)` until #310: with a beam that started at
+        // line 0 the same write landed at master clock 140 of line 0, 40 clocks
+        // past that latch, and the first frame of every run came up in the mode the
+        // VDP reset into. The second frame below no longer tells the two apart; it
+        // is kept because a mode has to survive a whole raster of it to be the
+        // display a front end draws.
         assert_eq!(
             (machine.frame().width, machine.frame().height),
-            (256, 224),
-            "R12 = {reg12:#04x} is written after the latch of line 0, so frame 0 is the mode it reset into"
+            (width, 224),
+            "R12 = {reg12:#04x} is written during blanking, so frame 0 is already {width} wide"
         );
 
         machine.run_frame();
@@ -161,7 +232,7 @@ fn run_frame_returns_frame_of_expected_size() {
         assert_eq!(
             (frame.width, frame.height),
             (width, 224),
-            "R12 = {reg12:#04x} is a {width} x 224 display from the frame after"
+            "R12 = {reg12:#04x} is still a {width} x 224 display a whole frame later"
         );
 
         // The frame buffer keeps room for the biggest picture the VDP can make,
