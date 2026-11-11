@@ -508,7 +508,7 @@ impl Vdp {
     /// Like a write, the access happened whatever the code made of it, so the
     /// address register moves on by R15 and `pending` clears.
     ///
-    /// TODO(M4-21b #100): real hardware prefetches the word when the read command
+    /// TODO(#303): real hardware prefetches the word when the read command
     /// is set up, which is what makes reading the port right after a command
     /// word return the old word and the VDP lock up if the command was a write.
     /// There is no prefetch here, so no delay and no lock.

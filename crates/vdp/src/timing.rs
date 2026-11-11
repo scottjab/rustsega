@@ -12,9 +12,9 @@
 //! of `advance` is a few events a line rather than one iteration a clock.
 //!
 //! The exact clock of the HINT and VINT pulses is out of scope here (M4-23).
-//! The write FIFO is not: every clock the beam moves is a clock the FIFO counts
-//! too, so `advance` hands its clocks to `fifo::Vdp::fifo_clock` before it looks
-//! at line events (M4-21a, #99).
+//! The write FIFO is not: every clock the beam moves takes the FIFO's external
+//! access slots with it, so `advance` hands its clocks to `fifo::Vdp::fifo_clock`
+//! before it looks at line events (M4-21a, #99, timed by `slots` for M4-21b #100).
 
 use crate::hv::MCLKS_PER_LINE;
 use crate::{InterlaceMode, Vdp};
@@ -87,7 +87,8 @@ impl Vdp {
     /// than move within one.
     pub fn advance(&mut self, mclk: u32) {
         // The FIFO's slots come round on the beam too, and a slot is the only
-        // thing that empties it: `fifo` says what the schedule costs today.
+        // thing that empties it: `slots` is what says how many of them fit in
+        // these clocks and `fifo` is what writes them out.
         self.fifo_clock(mclk);
 
         let mut left = mclk;

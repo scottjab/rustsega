@@ -14,11 +14,11 @@
 //! So a VRAM word costs two slots and a CRAM or VSRAM word one, an entry
 //! carrying the code and address its write was made with because the 68k has
 //! moved both on by the time the entry lands. What a slot costs in master
-//! clocks depends on where the beam is, and the schedule here is the
-//! placeholder the ticket asks for: one slot every [`SLOT_MCLK_ACTIVE`] clocks
-//! over the active display, one every [`SLOT_MCLK_BLANK`] while blanking, and
-//! no wait at all while the display is off. M4-21b (#100) replaces it with the
-//! real per-mode tables.
+//! clocks is the slot schedule's business, and the schedule is `slots`: the
+//! positions in the line the memories are free at, per mode and per part of the
+//! line. [`Vdp::slots_ahead`] says how many of them a run of clocks covers and
+//! [`Vdp::mclk_to_slots`] how long `mclk` of waiting is in clocks, and this
+//! module is the queue that runs behind them.
 //!
 //! The bus-facing half of this is [`Vdp::data_port_stall_mclk`]: a write that
 //! finds the queue full cannot be performed, and the master clocks it is held
@@ -35,19 +35,6 @@ use crate::ports::{DataTarget, data_target};
 /// the `VDPFIFOTesting` ROMs push against), and it is what lets a game lay down
 /// a burst of palette writes and carry on without waiting for any of them.
 pub(crate) const FIFO_DEPTH: usize = 4;
-
-/// Master clocks between access slots over the active display.
-///
-/// A placeholder rather than a measurement: an active line is a line of pixel
-/// fetches, so slots are the exception on it. M4-21b (#100) puts the real
-/// per-mode figures here.
-pub(crate) const SLOT_MCLK_ACTIVE: u32 = 32;
-
-/// Master clocks between access slots while blanking.
-///
-/// "About one every 2 pixels" (ticket #99), a pixel of the 420-pixel H40 line
-/// being 3420 / 420 master clocks, so two of them is 16.
-pub(crate) const SLOT_MCLK_BLANK: u32 = 16;
 
 /// One data port write, waiting its turn at the memories.
 ///
@@ -90,6 +77,11 @@ impl Entry {
 }
 
 /// The four entries between the data port and the memories.
+///
+/// The queue keeps no clock of its own: the slots it waits for are positions in
+/// the line (`slots`), so the beam is the only clock there is and
+/// [`Vdp::fifo_clock`] tells this how many of them a run of master clocks
+/// covered.
 #[derive(Debug)]
 pub(crate) struct Fifo {
     /// The queue, `queue[head]` being the entry next in line. `len` is kept
@@ -108,8 +100,6 @@ pub(crate) struct Fifo {
     /// real hardware is one of the bus locks Nemesis's FIFO tests circle, and
     /// which no ticket has taken on yet.
     waiting: Option<Entry>,
-    /// Master clocks counted since the last access slot was taken.
-    slot_clock: u32,
 }
 
 impl Fifo {
@@ -120,7 +110,6 @@ impl Fifo {
             head: 0,
             len: 0,
             waiting: None,
-            slot_clock: 0,
         }
     }
 
@@ -141,39 +130,18 @@ impl Fifo {
         } else {
             self.waiting = Some(entry);
         }
-        // The first entry of an idle FIFO starts its own wait: the FIFO banks
-        // no slots for a write that had not arrived yet, so a write made just
-        // before a slot boundary is not written at once for free.
-        if self.len == 1 {
-            self.slot_clock = 0;
-        }
     }
 
-    /// `mclk` master clocks of beam time pass. An idle FIFO banks nothing, so
-    /// the clock does not run while there is nothing to write.
-    pub(crate) fn count(&mut self, mclk: u32) {
+    /// One access slot has come round: `None` when the entry at the head still
+    /// has slots to go, and that entry when this one was its last.
+    ///
+    /// A slot is a position in the line, not a width of time, so whether one has
+    /// come round is `slots`' question rather than this module's - see
+    /// [`Vdp::fifo_clock`], which is what calls this once for each of them.
+    pub(crate) fn take_slot(&mut self) -> Option<Entry> {
         if self.len == 0 {
-            self.slot_clock = 0;
-            return;
-        }
-        self.slot_clock += mclk;
-    }
-
-    /// Whether an access slot of `slot_mclk` master clocks has come round. Zero
-    /// is always ready, which is how the display-off VDP of
-    /// [`Vdp::fifo_slot_mclk`] writes a word the moment it is written.
-    pub(crate) fn slot_ready(&self, slot_mclk: u32) -> bool {
-        self.slot_clock >= slot_mclk
-    }
-
-    /// One access slot: `None` when none has come round or when the entry at
-    /// the head still has slots to go, and the head entry when this slot is the
-    /// one that writes it.
-    pub(crate) fn take_slot(&mut self, slot_mclk: u32) -> Option<Entry> {
-        if self.len == 0 || !self.slot_ready(slot_mclk) {
             return None;
         }
-        self.slot_clock -= slot_mclk;
 
         // `len` says there is an entry at the head, and the slots it has left
         // are what stands between it and memory: this one is spent, and only a
@@ -203,9 +171,6 @@ impl Fifo {
             self.queue[(self.head + self.len) % FIFO_DEPTH] = Some(waiting);
             self.len += 1;
         }
-        if self.len == 0 {
-            self.slot_clock = 0;
-        }
         entry
     }
 
@@ -220,69 +185,59 @@ impl Fifo {
         self.len == FIFO_DEPTH
     }
 
-    /// The master clocks the port has to wait for room to put a write in,
-    /// counting the slots the entry at the head still needs. See
-    /// [`Vdp::data_port_stall_mclk`], which is the bus-facing version.
-    pub(crate) fn stall_mclk(&self, slot_mclk: u32) -> u32 {
+    /// The access slots the entry at the head is still waiting for, and `0`
+    /// whenever the port is not being held.
+    ///
+    /// Only a full queue holds the port, and only the entry at the head has to
+    /// clear first: see [`Vdp::data_port_stall_mclk`], which turns this many
+    /// slots into the clocks the bus waits.
+    pub(crate) fn head_slots(&self) -> u32 {
         if !self.is_full() {
             return 0;
         }
-        // Counted from the slot that has just gone rather than the next one to
-        // arrive, so this can name a slot that is already spent: it is a floor
-        // on how long the 68k waits, never an overestimate of it. The exact
-        // clock is M4-21b (#100)'s.
-        let slots = self.queue[self.head].map_or(1, |entry| entry.slots);
-        u32::from(slots) * slot_mclk
+        u32::from(self.queue[self.head].map_or(1, |entry| entry.slots))
     }
 }
 
 impl Vdp {
-    /// Master clocks between the external access slots, for where the beam is.
-    ///
-    /// The VDP lets the 68k at the memories only when it is not fetching
-    /// pixels, so how long a write waits depends on what the chip is doing:
-    ///
-    /// * display off: nothing is being fetched, so a slot is available for
-    ///   every write the moment it is made - `0`, which every drain in this
-    ///   file reads as "no clock has to pass";
-    /// * blanking, horizontal or vertical: [`SLOT_MCLK_BLANK`], "about one
-    ///   every 2 pixels", which is why a palette load in VBlank runs at the
-    ///   speed of the 68k;
-    /// * the active display: [`SLOT_MCLK_ACTIVE`], the same idea with the busy
-    ///   line's number.
-    ///
-    /// The split is a placeholder. M4-21b (#100) replaces it with the per-mode
-    /// slot tables, which are positions in the line rather than one number
-    /// chosen by which flag happens to be up.
-    fn fifo_slot_mclk(&self) -> u32 {
-        if !self.display_enabled() {
-            0
-        } else if self.in_hblank || self.in_vblank {
-            SLOT_MCLK_BLANK
-        } else {
-            SLOT_MCLK_ACTIVE
-        }
-    }
-
     /// The FIFO's share of the beam moving on: `mclk` master clocks pass, and
-    /// every access slot inside them writes its entry to memory.
+    /// every external access slot inside them writes its entry to memory.
     ///
     /// Called from [`Vdp::advance`] and from [`Vdp::write_data`], the latter
-    /// with no clocks at all so that a VDP with the display off - where a slot
-    /// is always ready - writes the word it has just been given now.
+    /// with no clocks at all: a write never writes itself out on the way in,
+    /// because the slots are strictly in front of the beam
+    /// ([`Vdp::slots_ahead`] of 0 clocks is no slots) - except with the display
+    /// off, where nothing is being fetched and the memories are free for the
+    /// port the moment it asks. That last part is #99's and is what keeps every
+    /// data port test of #80 and #81 true without an `advance` in it; real
+    /// hardware still only lets the 68k have the memories
+    /// [`slots::OFF_TRANSFERS_H40`](crate::slots::OFF_TRANSFERS_H40) times an H40
+    /// line, 17.3 clocks apiece, and #302 is whether to start waiting for that.
+    ///
+    /// The schedule is read at the state the beam is in now, so a call that runs
+    /// across the end of the line counts its slots against the line it started
+    /// in. Nothing does that yet except a whole-frame `advance`, where it is
+    /// within a slot or two of right either way.
     pub(crate) fn fifo_clock(&mut self, mclk: u32) {
-        self.fifo.count(mclk);
-        let slot = self.fifo_slot_mclk();
-        while !self.fifo.is_empty() && self.fifo.slot_ready(slot) {
+        if self.fifo.is_empty() {
+            return;
+        }
+        if !self.display_enabled() {
+            self.fifo_drain();
+            return;
+        }
+        for _ in 0..self.slots_ahead(mclk) {
             self.service_slot();
+            if self.fifo.is_empty() {
+                break;
+            }
         }
     }
 
     /// One external access slot: the entry at the head of the FIFO moves a slot
     /// closer to memory, and is written out when this one was its last.
     fn service_slot(&mut self) {
-        let slot = self.fifo_slot_mclk();
-        if let Some(entry) = self.fifo.take_slot(slot) {
+        if let Some(entry) = self.fifo.take_slot() {
             self.write_code_word(entry.code, entry.addr, entry.value);
         }
     }
@@ -292,7 +247,9 @@ impl Vdp {
     /// This is what a read of the data port waits for: the 68k that wrote three
     /// words and then reads the port is reading the memory those words are on
     /// their way to, and it is the bus's own access rather than a clock, so the
-    /// slots are spent in one go rather than counted out.
+    /// slots are spent in one go rather than counted out. It is also what the
+    /// display-off case in [`Vdp::fifo_clock`] does, for the reason its comment
+    /// gives.
     pub(crate) fn fifo_drain(&mut self) {
         while let Some(entry) = self.fifo.pop() {
             self.write_code_word(entry.code, entry.addr, entry.value);
@@ -321,12 +278,24 @@ impl Vdp {
     /// [`Vdp::dma_68k_stall_mclk`], which is a stall on the other side of the
     /// same transfer.
     ///
-    /// The write is not lost meanwhile: [`Fifo::waiting`] holds it, and joins
-    /// the queue as each slot frees a place. A second write made while the
-    /// first is still held is the bus lock every FIFO document describes and
-    /// which nothing here models yet.
+    /// "How long" is the head entry's own slots counted along the slot schedule:
+    /// the entry cannot move until every slot it needs has come round, and a slot
+    /// at the beam's own clock does not count. Over the active display that is two
+    /// of the 18 free slots a line offers, so two of the gaps `slots` tabulates -
+    /// the largest of which is the documented 32-pixel FIFO-full stall; in
+    /// blanking it is under two pixels.
+    ///
+    /// The write is not lost meanwhile: [`Fifo::waiting`] holds it, and joins the
+    /// queue as each slot frees a place. A second write made while the first is
+    /// still held is the bus lock every FIFO document describes and which
+    /// nothing here models yet.
     pub fn data_port_stall_mclk(&self) -> u32 {
-        self.fifo.stall_mclk(self.fifo_slot_mclk())
+        let slots = self.fifo.head_slots();
+        if slots == 0 {
+            0
+        } else {
+            self.mclk_to_slots(slots)
+        }
     }
 }
 
@@ -334,6 +303,7 @@ impl Vdp {
 mod tests {
     use super::*;
     use crate::ports::testutil::{cram_write_cmd, vram_read_cmd, vram_write_cmd};
+    use crate::slots::slot_mclk;
 
     fn set_reg(vdp: &mut Vdp, reg: u8, value: u8) {
         vdp.write_control(0x8000 | ((u16::from(reg) & 0x1F) << 8) | u16::from(value));
@@ -352,11 +322,13 @@ mod tests {
     }
 
     /// The beam, in the middle of an active display line: the part of the
-    /// placeholder schedule where a write has to wait for its slots.
+    /// schedule where a write has to wait for its slots.
     ///
     /// 200 master clocks is past the front porch of the H32 line
     /// (`timing::HBLANK_CLEAR_MCLK_H32`, 100) and nowhere near the back porch or
-    /// the end of the line, so no event and no render falls in the setup.
+    /// the end of the line, so no event and no render falls in the setup. The
+    /// first free slot of the line is at 280, so eight of them - 1520 clocks -
+    /// still fit inside the line.
     fn active_display() -> Vdp {
         let mut vdp = Vdp::new(false);
         set_reg(&mut vdp, 1, 0x40);
@@ -386,19 +358,23 @@ mod tests {
 
         cram_write_at(&mut vdp, 0x0000);
         vdp.write_data(0x0EEE);
+        let first_slot = vdp.mclk_to_slots(1);
         assert_eq!(vdp.cram[0], 0, "no slot has come round yet");
-        vdp.advance(SLOT_MCLK_ACTIVE);
+        vdp.advance(first_slot - 1);
+        assert_eq!(vdp.cram[0], 0, "one clock short of the first slot");
+        vdp.advance(1);
         assert_eq!(vdp.cram[0], 0x0EEE, "CRAM is word wide: one slot");
 
         vram_write_at(&mut vdp, 0x0100);
         vdp.write_data(0xBEEF);
-        vdp.advance(SLOT_MCLK_ACTIVE);
+        let two_slots = vdp.mclk_to_slots(2);
+        vdp.advance(two_slots - 1);
         assert_eq!(
             &vdp.vram[0x0100..0x0102],
             [0, 0],
             "one slot of a VRAM word is not a written word"
         );
-        vdp.advance(SLOT_MCLK_ACTIVE);
+        vdp.advance(1);
         assert_eq!(&vdp.vram[0x0100..0x0102], [0xBE, 0xEF]);
     }
 
@@ -426,6 +402,52 @@ mod tests {
         assert_eq!(status & (1 << 9), 0, "d9 FIFO empty is not set");
     }
 
+    /// The ticket's drain test: four VRAM words written at the start of an active
+    /// H40 line reach memory at the slots the table says, to the master clock.
+    ///
+    /// Eight slots of the 18 an active H40 line offers, from the head of the
+    /// line: 272, 412, 540, 796, 924, 1052, 1308, 1436 - the last of them the
+    /// eighth slot and the clock the fourth word is written at. Note that the
+    /// first is at 272 rather than the 280 of H32: the line's slow HSYNC head is
+    /// 332 clocks over 34 pixels, so the first 34 pixels cost 12 clocks more than
+    /// the 8 a pixel of the active display costs.
+    #[test]
+    fn four_words_at_the_start_of_an_active_h40_line_arrive_at_their_slots() {
+        let mut vdp = Vdp::new(false);
+        set_reg(&mut vdp, 1, 0x40);
+        set_reg(&mut vdp, 12, 0x81);
+        set_reg(&mut vdp, 15, 2);
+        vdp.in_hblank = false;
+        vdp.in_vblank = false;
+        assert!(vdp.h40(), "the beam is in H40");
+        assert_eq!(vdp.line_mclk, 0, "and at the head of the line");
+
+        vram_write_at(&mut vdp, 0x0000);
+        for word in [0x1111u16, 0x2222, 0x3333, 0x4444] {
+            vdp.write_data(word);
+        }
+
+        let eighth = vdp.mclk_to_slots(8);
+        assert_eq!(
+            eighth, 1436,
+            "the eighth free slot of the line, from the table"
+        );
+        assert_eq!(eighth, slot_mclk(86, true), "slot 86 of the H40 line");
+
+        vdp.advance(eighth - 1);
+        assert_eq!(
+            &vdp.vram[0..8],
+            [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0, 0],
+            "three of the four words, one clock before the last slot"
+        );
+        vdp.advance(1);
+        assert_eq!(
+            &vdp.vram[0..8],
+            [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44],
+            "and all four on the clock of the eighth slot"
+        );
+    }
+
     /// Empty it by advancing, and the words arrive in the order they were
     /// written: the queue is a queue.
     #[test]
@@ -437,8 +459,9 @@ mod tests {
         for word in [0x1111u16, 0x2222, 0x3333, 0x4444] {
             vdp.write_data(word);
         }
-        // Four VRAM words, two slots each, of the active-display schedule.
-        vdp.advance(8 * SLOT_MCLK_ACTIVE);
+        // Four VRAM words, two of the active line's 18 slots each.
+        let to = vdp.mclk_to_slots(8);
+        vdp.advance(to);
 
         assert_eq!(
             &vdp.vram[0..8],
@@ -487,10 +510,16 @@ mod tests {
             stall, 0,
             "the port is full: the 68k waits for an access slot"
         );
+        assert_eq!(
+            stall,
+            vdp.mclk_to_slots(2),
+            "to the clock of the second free slot: the VRAM word at the head needs both"
+        );
 
         // And the wait ends when the slots arrive: after eight of them the FIFO
         // is empty and the bus is on its way again.
-        vdp.advance(8 * SLOT_MCLK_ACTIVE);
+        let to = vdp.mclk_to_slots(8);
+        vdp.advance(to);
         assert_eq!(vdp.data_port_stall_mclk(), 0);
     }
 
@@ -505,15 +534,18 @@ mod tests {
             vdp.write_data(word);
         }
 
-        vdp.advance(10 * SLOT_MCLK_ACTIVE);
+        // Five VRAM words, so ten of the line's free slots.
+        let to = vdp.mclk_to_slots(10);
+        vdp.advance(to);
         assert_eq!(
             &vdp.vram[0..10],
             [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55]
         );
     }
 
-    /// In VBlank the slots come round in a sixteenth of a line, which is the
-    /// "almost at once" of the ticket: one VRAM word, two slots of blanking.
+    /// In VBlank the schedule is the whole grid, one slot every two pixels, which
+    /// is the "almost at once" of the ticket: one VRAM word, two slots of
+    /// blanking and a twentieth of a line.
     #[test]
     fn a_write_in_vblank_is_visible_after_a_tiny_advance() {
         let mut vdp = in_vblank();
@@ -521,13 +553,15 @@ mod tests {
         vram_write_at(&mut vdp, 0x0100);
         vdp.write_data(0xABCD);
 
-        vdp.advance(SLOT_MCLK_BLANK);
+        let slot = vdp.mclk_to_slots(1);
+        assert_eq!(slot, 20, "two pixels of H32, the grid of a blank line");
+        vdp.advance(slot);
         assert_eq!(
             &vdp.vram[0x0100..0x0102],
             [0, 0],
             "one of the two slots, so not yet"
         );
-        vdp.advance(SLOT_MCLK_BLANK);
+        vdp.advance(slot);
         assert_eq!(&vdp.vram[0x0100..0x0102], [0xAB, 0xCD]);
     }
 
@@ -645,25 +679,53 @@ mod tests {
         assert!(fifo.is_empty());
     }
 
-    /// A slot is only taken when one has come round: a FIFO that has been
-    /// counting nothing is not owed a write.
+    /// A slot is only taken when one has come round, which the queue is now the
+    /// only judge of on its own terms: `take_slot` moves one slot, a VRAM word
+    /// needs two of them, and nothing at all happens to a queue that has been
+    /// handed no slot. The clock's half of that - the slots a run of master
+    /// clocks covers - is `slots`', and is tested there.
     #[test]
     fn an_idle_fifo_owes_itself_no_slots() {
         let mut fifo = Fifo::new();
-        fifo.push(Entry::new(0x01, 0x0100, 0xBEEF));
         assert!(
-            fifo.take_slot(SLOT_MCLK_ACTIVE).is_none(),
-            "the wait starts with the write, not with the slot before it"
+            fifo.take_slot().is_none(),
+            "an empty queue has nothing to write"
         );
 
-        fifo.count(SLOT_MCLK_ACTIVE);
+        fifo.push(Entry::new(0x01, 0x0100, 0xBEEF));
         assert!(
-            fifo.take_slot(SLOT_MCLK_ACTIVE).is_none(),
+            fifo.take_slot().is_none(),
             "a VRAM word is two slots, so this one writes nothing yet"
         );
-        fifo.count(SLOT_MCLK_ACTIVE);
-        let entry = fifo.take_slot(SLOT_MCLK_ACTIVE).expect("second slot");
+        let entry = fifo.take_slot().expect("second slot");
         assert_eq!((entry.addr, entry.value), (0x0100, 0xBEEF));
         assert!(fifo.is_empty());
+    }
+
+    /// The stall is the head entry's slots along the schedule, so a CRAM word at
+    /// the head - one slot, not two - holds the port for one slot's wait.
+    #[test]
+    fn the_stall_is_the_head_entry_s_own_wait() {
+        let mut vdp = active_display();
+        set_reg(&mut vdp, 15, 3);
+        cram_write_at(&mut vdp, 0x0000);
+        for _ in 0..4 {
+            vdp.write_data(0x0EEE);
+        }
+        assert!(vdp.fifo_full());
+        let stall = vdp.data_port_stall_mclk();
+        assert!(stall > 0, "the port is full");
+
+        let mut vram = active_display();
+        set_reg(&mut vram, 15, 2);
+        vram_write_at(&mut vram, 0x0000);
+        for _ in 0..4 {
+            vram.write_data(0xBEEF);
+        }
+        assert!(vram.fifo_full());
+        assert!(
+            stall < vram.data_port_stall_mclk(),
+            "a CRAM word at the head waits one slot, a VRAM word two"
+        );
     }
 }

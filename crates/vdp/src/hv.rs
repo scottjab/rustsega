@@ -32,16 +32,119 @@ pub(crate) const MCLKS_PER_LINE: u32 = 3420;
 
 /// Master clocks per pixel in H32: one seventh of the 68k's clock, ten of the
 /// master (`docs/ARCHITECTURE.md`, "Clocks and timing").
+///
+/// H32 is even and stays so: 342 of them make [`MCLKS_PER_LINE`], and the slow
+/// pixel clock of [`H40_CLOCK_RUNS`] is an H40 thing.
 const MCLKS_PER_PIXEL_H32: u32 = 10;
 
 /// Pixel positions per line in H32, blanking and retrace included.
-const PIXELS_H32: u32 = 342;
-/// Pixel positions per line in H40, likewise included. The 420 and the 3420
-/// together are where M4-21b (#99) will put the exact clock: the real line is
-/// 320 active pixels of 8 clocks plus a blanking period some of which runs at
-/// 10, so a pixel is 8 clocks for most of the line rather than 3420/420 of one
-/// throughout.
-const PIXELS_H40: u32 = 420;
+pub(crate) const PIXELS_H32: u32 = 342;
+/// Pixel positions per line in H40, likewise included: 420, of which 320 are the
+/// active picture.
+///
+/// A pixel is not [`MCLKS_PER_LINE`] / 420 of a clock. The line is 388 pixels of
+/// 8 master clocks, 4 of 9 and 28 of 10, laid out as [`H40_CLOCK_RUNS`].
+pub(crate) const PIXELS_H40: u32 = 420;
+
+/// The H40 line as runs of `(pixels, master clocks each)`.
+///
+/// The 420 pixels of an H40 line are not all the same width in time. "Two
+/// internal pixel clocks: MCLK/10 (slow) and MCLK/8 (fast)", and across the
+/// HSYNC region "HSYNC uses the pattern 1 fast, 7 slow, 2 medium, 7 slow", the
+/// medium being MCLK/9 ("Megadrive VDP H40 timing", nesdev forum thread 20410).
+/// One pass of that pattern is 17 pixels of 8 + 70 + 18 + 70 = 166 master
+/// clocks, so two of them are the 332-clock HSYNC block of
+/// "((30+13+320+14+9)*8)+332=3420" ("VDP FIFO and DMA questions", SpritesMind
+/// gendev thread 3221), and the remaining 386 pixels of the line run on 8.
+///
+/// Read as a per-line total that is 2 + 386 = 388 pixels at 8 clocks, 4 at 9 and
+/// 28 at 10, for 3104 + 36 + 280 = 3420 clocks over 420 pixels: nesdev 20410's
+/// own table ("H320: slow 28, medium 4, fast 388"). The ticket this clock was
+/// written from says "most pixels 8 mclk, the HSYNC region uses 10 mclk pixels"
+/// and so misses the MCLK/9 step; without those four pixels of nine the line is
+/// 3416 clocks and does not close on [`MCLKS_PER_LINE`] at all.
+///
+/// # Phase
+///
+/// That the slow block *starts* the line is INFERRED. t=3221 gives the line
+/// composition as "HSYNC 34, left blanking 30, left border 13, active 320, right
+/// border 14, right blanking 9", listing HSYNC first, and the scope measurement
+/// agrees: "in H40 mode the VDP slows down its clock for a number of cycles
+/// during HBlank (32 pixel clocks according to my oscilloscope tests) - starting
+/// 24 pixels after the right edge" (plutiedev, "SEGA Mega Drive / Genesis
+/// hardware notes", kabuto mirror). The right edge of the 320-pixel window is
+/// pixel 397 of this line, and 397 + 24 is 421 - one past the end of the line,
+/// which is pixel 1: the first of the slow runs, straight after the single fast
+/// pixel that opens the pattern.
+///
+/// TODO(#300): confirm on hardware where in the line the slow block sits, and
+/// where its four MCLK/9 pixels fall. The counts are firm, being what makes the
+/// line 3420 clocks; the phase is what is inferred.
+const H40_CLOCK_RUNS: [(u32, u32); 9] = [
+    (1, 8),
+    (7, 10),
+    (2, 9),
+    (7, 10),
+    (1, 8),
+    (7, 10),
+    (2, 9),
+    (7, 10),
+    (PIXELS_H40 - 34, 8),
+];
+
+/// Master clock each H40 pixel starts at, `H40_PIXEL_START[420]` being the end of
+/// the line: [`H40_CLOCK_RUNS`] accumulated, so that a clock finds its pixel by
+/// lookup and neither direction of the conversion has to round anything.
+const H40_PIXEL_START: [u32; (PIXELS_H40 + 1) as usize] = h40_pixel_start();
+
+/// [`H40_PIXEL_START`] itself, walked out of [`H40_CLOCK_RUNS`].
+const fn h40_pixel_start() -> [u32; (PIXELS_H40 + 1) as usize] {
+    let mut start = [0u32; (PIXELS_H40 + 1) as usize];
+    let mut pixel = 0usize;
+    let mut clock = 0u32;
+    let mut run = 0;
+    while run < H40_CLOCK_RUNS.len() {
+        let (pixels, mclk) = H40_CLOCK_RUNS[run];
+        let mut n = 0;
+        while n < pixels {
+            start[pixel] = clock;
+            clock += mclk;
+            pixel += 1;
+            n += 1;
+        }
+        run += 1;
+    }
+    start[PIXELS_H40 as usize] = clock;
+    start
+}
+
+/// Master clock the pixel `pixel` of the line starts at: ten of them in H32, and
+/// [`H40_PIXEL_START`] in H40.
+///
+/// The inverse of [`mclk_to_pixel`], and exact in both directions - which is what
+/// lets `slots` name an access slot by pixel and still have the FIFO wait on
+/// clocks.
+pub(crate) fn pixel_to_mclk(pixel: u32, h40: bool) -> u32 {
+    if h40 {
+        H40_PIXEL_START[pixel as usize]
+    } else {
+        pixel * MCLKS_PER_PIXEL_H32
+    }
+}
+
+/// Pixel of the line the master clock `mclk` falls in.
+///
+/// Ten clocks a pixel in H32; in H40 the last pixel whose start clock in
+/// [`H40_PIXEL_START`] is not past `mclk`. Every clock of a line is inside
+/// exactly one pixel, and clock 0 is pixel 0.
+pub(crate) fn mclk_to_pixel(mclk: u32, h40: bool) -> u32 {
+    if !h40 {
+        return mclk / MCLKS_PER_PIXEL_H32;
+    }
+    // `partition_point` is the first index whose pixel starts past `mclk`, and
+    // pixel 0 starts at clock 0, so this is never empty and `- 1` is safe.
+    H40_PIXEL_START.partition_point(|&start| start <= mclk) as u32 - 1
+}
 
 /// Where the H counter lands after its jump, in H32.
 ///
@@ -200,17 +303,11 @@ impl Vdp {
     /// now: R12 can be rewritten mid-line, and the counter answers for the mode
     /// of the moment rather than for the mode the line started in.
     ///
-    /// TODO(M4-21b #100): the exact H40 pixel clock. H32 is 10 master clocks a
-    /// pixel; H40 is 8 for the active part of the line and 10 across the HSYNC
-    /// the ticket this counter came from calls "some during HSYNC", so the
-    /// division by 3420 that spreads 420 pixels over the line is the
-    /// approximation.
+    /// The clock is the exact one in both modes: [`mclk_to_pixel`], with the
+    /// 8/9/10-clock run of [`H40_CLOCK_RUNS`] behind it (M4-21b, #100, which is
+    /// where the 3420 / 420 approximation this replaces had its TODO).
     fn pixel_in_line(&self) -> u32 {
-        if self.h40() {
-            self.line_mclk * PIXELS_H40 / MCLKS_PER_LINE
-        } else {
-            self.line_mclk / MCLKS_PER_PIXEL_H32
-        }
+        mclk_to_pixel(self.line_mclk, self.h40())
     }
 
     /// Move the beam: `line` counts from the first line of the frame, and
@@ -343,19 +440,114 @@ mod tests {
         assert_eq!(vdp.hv_counter() & 0xFF, 0xFF, "pixel 341 is the end of it");
     }
 
+    /// The same measurement in H40, on the exact clock of [`H40_CLOCK_RUNS`].
+    ///
+    /// This test asked for mclk 2964 before #100, which is 364 of the 3420 / 420
+    /// clocks the line was spread over then. The slow HSYNC block is 12 clocks
+    /// longer than a run of 8-clock pixels that wide, so pixel 364 really starts
+    /// at 2972 and 2964 is still pixel 363, one counter value short of the jump.
     #[test]
     fn h40_counter_ends_the_line_on_ff_from_the_clock_too() {
         let mut vdp = vdp_modes(false, true);
         vdp.set_position(0, 0);
         assert_eq!(vdp.hv_counter() & 0xFF, 0x00);
-        vdp.set_position(0, 2964);
+        vdp.set_position(0, 2972);
         assert_eq!(
             vdp.hv_counter() & 0xFF,
             0xE4,
-            "mclk 2964 is pixel 364, where H40 jumps"
+            "mclk 2972 is pixel 364, where H40 jumps"
+        );
+        vdp.set_position(0, 2971);
+        assert_eq!(
+            vdp.hv_counter() & 0xFF,
+            0xB5,
+            "and one clock earlier is still the last value before it"
         );
         vdp.set_position(0, MCLKS_PER_LINE - 1);
         assert_eq!(vdp.hv_counter() & 0xFF, 0xFF, "the last clock of the line");
+    }
+
+    /// The two ends of the H40 line the ticket names: clock 0 is pixel 0, and the
+    /// last clock of the line is still inside the last pixel of it.
+    #[test]
+    fn mclk_to_pixel_covers_the_h40_line_from_end_to_end() {
+        assert_eq!(mclk_to_pixel(0, true), 0);
+        assert_eq!(mclk_to_pixel(7, true), 0, "the first pixel is a fast one");
+        assert_eq!(
+            mclk_to_pixel(8, true),
+            1,
+            "and the slow run starts after it"
+        );
+        assert_eq!(mclk_to_pixel(3419, true), 419);
+    }
+
+    /// The clock and its inverse agree on every clock and every pixel of both
+    /// lines, which is the property the FIFO's slot tables depend on: a slot
+    /// named by pixel waits by exactly that many clocks.
+    #[test]
+    fn the_pixel_clock_round_trips_every_pixel_of_both_lines() {
+        for h40 in [false, true] {
+            let pixels = if h40 { PIXELS_H40 } else { PIXELS_H32 };
+            for pixel in 0..pixels {
+                assert_eq!(
+                    mclk_to_pixel(pixel_to_mclk(pixel, h40), h40),
+                    pixel,
+                    "the first clock of pixel {pixel} is in pixel {pixel}, h40={h40}"
+                );
+            }
+            for mclk in 0..MCLKS_PER_LINE {
+                let pixel = mclk_to_pixel(mclk, h40);
+                assert!(
+                    pixel_to_mclk(pixel, h40) <= mclk && mclk < pixel_to_mclk(pixel + 1, h40),
+                    "mclk {mclk} is inside pixel {pixel} and no other, h40={h40}"
+                );
+            }
+        }
+    }
+
+    /// The mix of pixel widths #100 asks for: "most pixels 8 mclk, the HSYNC
+    /// region uses 10 mclk pixels". The 10 is right and the ticket is short a
+    /// bucket - nesdev 20410 measures 388 of 8, 4 of 9 and 28 of 10, and the line
+    /// does not reach [`MCLKS_PER_LINE`] without the four of nine.
+    #[test]
+    fn the_h40_line_is_388_pixels_of_eight_four_of_nine_and_twenty_eight_of_ten() {
+        let mut widths = [0u32; 11];
+        for pixel in 0..PIXELS_H40 {
+            let width = pixel_to_mclk(pixel + 1, true) - pixel_to_mclk(pixel, true);
+            widths[usize::try_from(width).expect("a pixel is at most ten clocks")] += 1;
+        }
+        assert_eq!(widths[8], 388, "fast pixels");
+        assert_eq!(widths[9], 4, "medium pixels");
+        assert_eq!(widths[10], 28, "slow pixels");
+        assert_eq!(
+            widths[8] + widths[9] + widths[10],
+            PIXELS_H40,
+            "and nothing else in the line"
+        );
+    }
+
+    /// Both lines close on 3420 clocks, and both spend 2560 of them on the active
+    /// picture: 320 H40 pixels of 8, 256 H32 pixels of 10 (Eke, "VDP registers
+    /// timings", SpritesMind gendev thread 291: "2560 mclk active display and 860
+    /// mclk blanking, in both H32 and H40").
+    #[test]
+    fn both_modes_spend_2560_clocks_of_3420_on_the_active_picture() {
+        assert_eq!(pixel_to_mclk(PIXELS_H32, false), MCLKS_PER_LINE);
+        assert_eq!(pixel_to_mclk(PIXELS_H40, true), MCLKS_PER_LINE);
+
+        // The H40 window of the t=3221 composition: HSYNC 34, left blanking 30,
+        // left border 13 in front of the 320, right border 14 and right blanking
+        // 9 behind it.
+        let left = 34 + 30 + 13;
+        assert_eq!(
+            pixel_to_mclk(left + 320, true) - pixel_to_mclk(left, true),
+            2560
+        );
+        assert_eq!(
+            MCLKS_PER_LINE - (pixel_to_mclk(left + 320, true) - pixel_to_mclk(left, true)),
+            860,
+            "the blanking half of the same figure"
+        );
     }
 
     #[test]
@@ -448,7 +640,7 @@ mod tests {
         assert_eq!(pal.hv_counter(), 0xCA00, "the PAL V28 jump, on the bus");
 
         let mut h40 = vdp_modes(false, true);
-        h40.set_position(1, 2964);
+        h40.set_position(1, 2972);
         assert_eq!(h40.hv_counter(), 0x01E4, "the H40 jump, on the bus");
     }
 

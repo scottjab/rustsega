@@ -30,6 +30,7 @@ pub mod pattern;
 mod planes;
 mod ports;
 mod regs;
+mod slots;
 mod sprites;
 mod status;
 mod timing;
@@ -114,7 +115,7 @@ pub struct Vdp {
     /// from. Not the FIFO: `fifo` holds the writes on their way to the memories,
     /// and this is the word the port itself is holding.
     ///
-    /// TODO(M4-21b #100): the read prefetch, which on real hardware is a second,
+    /// TODO(#303): the read prefetch, which on real hardware is a second,
     /// read-side FIFO and is what makes a read straight after a command word
     /// answer with the old word.
     fifo_last: u16,
