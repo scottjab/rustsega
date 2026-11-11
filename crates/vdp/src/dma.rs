@@ -462,7 +462,7 @@ impl Vdp {
         match data_target(self.code) {
             DataTarget::Vram => {
                 let byte = (value >> 8) as u8;
-                self.vram[usize::from(self.addr ^ 1)] = byte;
+                self.write_vram_byte(usize::from(self.addr ^ 1), byte);
                 self.addr = increment(self.addr, self.auto_increment());
             }
             DataTarget::Cram | DataTarget::Vsram => self.write_target_word(value),
@@ -526,7 +526,7 @@ impl Vdp {
             Running::Fill { value, .. } => self.fill_step(*value),
             Running::Copy { source, .. } => {
                 let byte = self.vram[usize::from(*source ^ 1)];
-                self.vram[usize::from(self.addr ^ 1)] = byte;
+                self.write_vram_byte(usize::from(self.addr ^ 1), byte);
                 *source = source.wrapping_add(1);
                 self.addr = increment(self.addr, self.auto_increment());
             }
@@ -1483,6 +1483,89 @@ mod tests {
             slots_per_unit(DmaMode::Copy, DataTarget::Vram),
             2,
             "read and write: the table's 9 bytes an active H40 line out of 18 slots"
+        );
+    }
+
+    // A DMA writes VRAM the way the data port does, so a write that lands in the
+    // sprite attribute table updates the VDP's internal cache of it (#103) as
+    // well. The three modes reach memory by three different routes, so each is
+    // tried: the transfer through `Vdp::write_code_word`, the fill and the copy
+    // through their own byte writes.
+
+    /// The SAT base of the three tests below: R5 = `0x78` is 0xF000 (genvdp.txt
+    /// section 17 "$05"), away from the source data they copy from.
+    const SPRITE_REG: u8 = 0x78;
+
+    /// A 68k transfer is how a game loads a sprite table, and it writes the
+    /// memory through the port rules of M4-02 rather than the port itself.
+    #[test]
+    fn a_68k_transfer_into_the_sprite_table_updates_the_sprite_cache() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(5, SPRITE_REG);
+        dma_from(&mut vdp, 0x000100, 4);
+        start_dma(&mut vdp, vram_write_cmd(0xF000));
+
+        let mut bus = FakeBus::laid_at(0x000100, &[0x0080, 0x0102, 0x1234, 0x0ABC]);
+        vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
+
+        assert_eq!(
+            &vdp.vram[0xF000..0xF008],
+            [0x00, 0x80, 0x01, 0x02, 0x12, 0x34, 0x0A, 0xBC],
+            "the four words of the source, big endian"
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0x00, 0x80, 0x01, 0x02]),
+            "the y word and the size/link word of entry 0, which is what the cache holds"
+        );
+    }
+
+    /// A fill writes its repeated byte with `Vdp::fill_step`, which is no part of
+    /// `Vdp::write_code_word`, and still has to reach the cache.
+    #[test]
+    fn a_fill_of_the_sprite_table_updates_the_sprite_cache() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(5, SPRITE_REG);
+        dma_set_up(&mut vdp, FILL, 4, 1);
+        start_and_run(&mut vdp, vram_write_cmd(0xF000));
+
+        vdp.write_data(0xABCD);
+        run_dma_to_end(&mut vdp);
+
+        assert_eq!(
+            &vdp.vram[0xF000..0xF006],
+            [0xAB, 0xCD, 0xAB, 0xAB, 0x00, 0xAB],
+            "the word of the port write that starts the fill, then four steps of 0xAB at R15 = 1"
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0xAB, 0xCD, 0xAB, 0xAB]),
+            "every one of entry 0's four cached bytes was written here or by the port"
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(1).copied(),
+            Some([0; 4]),
+            "0xF005 is byte 5 of entry 1, and the last four bytes of an entry are not cached"
+        );
+    }
+
+    /// And a copy, which writes one byte at a time out of `Vdp::dma_move_unit`.
+    #[test]
+    fn a_copy_into_the_sprite_table_updates_the_sprite_cache() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(5, SPRITE_REG);
+        vdp.vram[0x0100..0x0104].copy_from_slice(&[0x00, 0x8A, 0x01, 0x02]);
+        copy_source(&mut vdp, 0x0100);
+        dma_set_up(&mut vdp, COPY, 4, 1);
+        start_and_run(&mut vdp, vram_write_cmd(0xF000));
+        run_dma_to_end(&mut vdp);
+
+        assert_eq!(&vdp.vram[0xF000..0xF004], [0x00, 0x8A, 0x01, 0x02]);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0x00, 0x8A, 0x01, 0x02]),
+            "the four bytes the copy landed on top of, cached as they went in"
         );
     }
 }

@@ -37,7 +37,9 @@
 //!
 //! Sprites are not latched here: the sprite list is still a walk of the VRAM of
 //! the moment, which is #311, and the cache of the table's first four bytes per
-//! entry is #103.
+//! entry, `crate::sprites::SpriteCache` (#103), is chip state rather than line
+//! state - the chip takes no VRAM write while a line is being drawn, so there is
+//! nothing for a latch to keep it away from.
 //!
 //! TODO(#102): pin the latch point with a scroll test ROM (M6-06), including
 //! whether a write inside that first-blanking window reaches the line it is

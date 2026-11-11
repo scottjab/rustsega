@@ -475,10 +475,14 @@ pub(crate) mod testutil {
 
     /// Big-endian `word` at byte `addr` of VRAM, which is how
     /// [`crate::pattern::read_word`] reads a table back.
+    ///
+    /// Through [`Vdp::write_vram_byte`] rather than the memory itself, so that a
+    /// table a test assembles by hand leaves the sprite attribute cache of #103
+    /// the way the same table written through the data port would have left it.
     pub(crate) fn put_word(vdp: &mut Vdp, addr: usize, word: u16) {
         let mask = VRAM_SIZE - 1;
-        vdp.vram[addr & mask] = (word >> 8) as u8;
-        vdp.vram[(addr + 1) & mask] = word as u8;
+        vdp.write_vram_byte(addr & mask, (word >> 8) as u8);
+        vdp.write_vram_byte((addr + 1) & mask, word as u8);
     }
 
     /// Entry `cell` of the name table at `base`: `base + cell * 2`.
@@ -594,7 +598,7 @@ pub(crate) mod testutil {
         let mask = VRAM_SIZE - 1;
         let start = tile_addr(tile, height) + row * 4;
         for (byte, pair) in pixels.chunks(2).enumerate() {
-            vdp.vram[(start + byte) & mask] = (pair[0] << 4) | pair[1];
+            vdp.write_vram_byte((start + byte) & mask, (pair[0] << 4) | pair[1]);
         }
     }
 }

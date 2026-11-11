@@ -453,10 +453,10 @@ impl Vdp {
             DataTarget::Vram => {
                 let (even, bytes) = vram_word_bytes(addr, value);
                 let base = usize::from(even);
-                self.vram[base] = bytes[0];
+                self.write_vram_byte(base, bytes[0]);
                 // `even` is `addr & !1`, so at worst it is 0xFFFE and the pair
                 // stays inside VRAM rather than wrapping.
-                self.vram[base + 1] = bytes[1];
+                self.write_vram_byte(base + 1, bytes[1]);
             }
             DataTarget::Cram => {
                 self.cram[cram_word_index(addr)] = value & CRAM_COLOR_BITS;

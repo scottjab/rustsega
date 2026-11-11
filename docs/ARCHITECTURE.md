@@ -240,8 +240,27 @@ not from the chip as it stands when the line is drawn:
   beam never latched work as they always did.
 * The exact clock of the latch is INFERRED, with a TODO on `latch.rs` for the
   scroll ROM of M6-06. Sprites are not in the snapshot at all: genvdp.txt's
-  sprite list is a VRAM walk of the moment, and the cache of its first four bytes
-  per entry is #103.
+  sprite list is a VRAM walk of the moment, and the sprite attribute cache below
+  is chip state rather than line state.
+
+### VDP sprite attribute cache
+
+`crates/vdp/src/sprites.rs` (M4-23b, #103) keeps the VDP's own copy of the sprite
+attribute table, because a sprite fetch cannot wait on the bus for all eight bytes
+of every entry:
+
+* 80 lines of four bytes, the `y` word and the `size`/`link` word of one entry
+  each. The pattern and the `x` are not cached and are read from VRAM on every
+  fetch of the entry.
+* Every VRAM write of the chip goes through `Vdp::write_vram_byte`, and that is
+  what feeds the cache: a write inside `[sat_base, sat_base + 640)` that lands on
+  one of the first four bytes of an entry updates that entry's line. The three DMA
+  modes of `dma.rs` reach it the way the data port of `ports.rs` does.
+* Moving the SAT with R5 refills nothing. A table moved to under one that was
+  never written is therefore drawn with the y, the size and the link of the old
+  one and the pattern and x of the new one, until the game rewrites the entries.
+* It is chip state, not part of the line snapshot above: the chip takes no VRAM
+  write while a line is being drawn.
 
 ### Audio chips
 

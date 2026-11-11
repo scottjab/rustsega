@@ -89,6 +89,17 @@ pub struct Vdp {
     /// SpritesMind "Interlace mode (LSMx=3)": "VSRAM width is 11-bit but bit0
     /// is ignored in interlaced mode 2").
     pub vsram: [u16; VSRAM_WORDS],
+    /// The VDP's internal copy of the first four bytes of every entry of the
+    /// sprite attribute table (`sprites::SpriteCache`, M4-23b #103).
+    ///
+    /// [`Vdp::write_vram_byte`] keeps it in step with every write the chip makes
+    /// to that area of VRAM, and [`crate::sprites::sprite_at`] answers the y, the
+    /// size and the link of an entry from it rather than from [`Vdp::vram`].
+    ///
+    /// Boxed for the same reason [`Vdp::vram`] is: 80 lines of four bytes are 320
+    /// of the 512 that [`Vdp::new`] holds itself to, and
+    /// `vdp_values_stay_off_the_stack` is what keeps that true of `Vdp` values.
+    sprite_cache: Box<sprites::SpriteCache>,
     /// R0 to R23, in the order the control port numbers them
     /// (genvdp.txt section 17).
     regs: [u8; regs::NUM_REGISTERS],
@@ -294,6 +305,7 @@ impl Vdp {
             vram: vec![0; VRAM_SIZE].into_boxed_slice(),
             cram: [0; CRAM_WORDS],
             vsram: [0; VSRAM_WORDS],
+            sprite_cache: Box::new(sprites::SpriteCache::new()),
             regs: [0; regs::NUM_REGISTERS],
             code: 0,
             addr: 0,
@@ -334,6 +346,25 @@ impl Vdp {
     #[inline]
     pub fn frame(&self) -> &FrameBuffer {
         &self.frame_buffer
+    }
+
+    /// Write one byte of VRAM at byte address `addr`: the one place every write to
+    /// VRAM that the chip makes ends up, which is what lets the sprite attribute
+    /// cache of [`Vdp::sprite_cache`] hear about all of them (M4-23b, #103).
+    ///
+    /// The four callers of it are the data port word write of `ports` and the
+    /// three DMA modes of `dma`, and each of those had a byte write of its own
+    /// before this gathered them: the port because a VRAM word is two byte writes
+    /// (`vram_word_bytes`), the transfer because it writes a whole word, the fill
+    /// and the copy because they write `addr ^ 1` rather than `addr`.
+    ///
+    /// `addr` is already the address to write: no masking, because the port write
+    /// is a `u16` ANDed down to an even address and a DMA is a `u16` too, so none
+    /// of them can land outside the 64 KiB.
+    pub(crate) fn write_vram_byte(&mut self, addr: usize, byte: u8) {
+        self.vram[addr] = byte;
+        self.sprite_cache
+            .write(addr, byte, usize::from(self.sprite_base()));
     }
 
     /// Write `value` into register `reg`.
