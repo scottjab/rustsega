@@ -155,7 +155,8 @@ pub struct Vdp {
     /// mode from the sprite list" (genvdp.txt section 6). Cleared by the status
     /// read that reports it, see [`Vdp::read_status`].
     ///
-    /// TODO(M4-16 #93): the sprite limit that sets it.
+    /// Set by [`Vdp::render_sprite_line`] for either limit of one line, the 20 and
+    /// 16 sprites and the 320 and 256 pixels of sprite data they share the line with.
     sprite_overflow: bool,
     /// Status bit 5 (C): two sprites with non-transparent pixels overlapped.
     ///
@@ -163,8 +164,19 @@ pub struct Vdp {
     /// another. This may hold true for sprites outside of the display area too"
     /// (genvdp.txt section 6). Cleared by the status read, as bit 6 is.
     ///
-    /// TODO(M4-16 #93): the collision detection that sets it.
+    /// Set by [`Vdp::render_sprite_line`] as it paints a line and finds a pixel of
+    /// one sprite already taken by another; see it for what counts as a pixel.
     sprite_collision: bool,
+    /// The sprite pixel limit of the line before the one now being drawn cut
+    /// something, which is what arms the masking of a sprite at x = 0 even when that
+    /// sprite is the first of its line.
+    ///
+    /// INFERRED, from Nemesis's sprite masking test as ticket #94 cites it; genvdp.txt
+    /// section 15 "Sprite masking, mode 1" describes the mask and never mentions the
+    /// previous line. [`Vdp::render_sprite_line`] writes the real answer of the line
+    /// it has just drawn on every call, so the field only ever describes the line
+    /// the beam was on last.
+    prev_line_dot_overflow: bool,
     /// Status bit 4 (ODD): this frame is the odd one of an interlace pair.
     ///
     /// "Set when the display is interlaced, and in the odd frame, otherwise it
@@ -252,6 +264,7 @@ impl Vdp {
             vint_pending: false,
             sprite_overflow: false,
             sprite_collision: false,
+            prev_line_dot_overflow: false,
             odd_frame: false,
             in_vblank: false,
             in_hblank: false,
