@@ -68,13 +68,12 @@ impl Vdp {
     /// 9-bit `0000 BBB0 GGG0 RRR0` of section 9 becomes a pixel at the DAC
     /// levels of [`crate::color::color`] (M4-09, #87).
     ///
-    /// At [`Intensity::Normal`]: genvdp.txt section 16 does show the backdrop at
-    /// half intensity, "while the overscan region outside of the display area is
-    /// always shown at normal intensity" and "if a background tile has high
-    /// priority, then the corresponding 8x8 block of the backdrop color will be
-    /// shown at normal intensity". Picking between the two per pixel needs the
-    /// plane priority data, which is the compositor's; M4-18 (#96) picks between
-    /// the two.
+    /// At [`Intensity::Normal`], which is what a display switched off by R1 bit 6
+    /// paints with and what the overscan of a live one does too: genvdp.txt
+    /// section 16 shows the backdrop at half intensity "while the overscan region
+    /// outside of the display area is always shown at normal intensity", and the
+    /// pick between the two per pixel needs the plane priority data, so it is
+    /// [`Vdp::render_line`] and its compositor that make it (M4-18, #96).
     pub(crate) fn backdrop_pixel(&self) -> u32 {
         let colour = self.cram[usize::from(self.backdrop_index())];
         self.color_lut.pixel(colour, Intensity::Normal)

@@ -16,9 +16,19 @@
 //! between the two by the time a pixel is composed.
 //!
 //! A line is therefore three layer buffers, resolved per pixel against that chain
-//! and painted at [`Intensity::Normal`]: the shadow and highlight intensities of
-//! genvdp.txt section 16 are M4-18 (#96), the left column and the rest of the mode
-//! detail M4-19 (#97), and the interlaced fields M4-20 (#98).
+//! and painted at one of the three intensities of [`Intensity`]: shadow where no
+//! plane has its priority bit, normal where one does, and highlight where a sprite
+//! operator raised what was already normal (genvdp.txt section 16, M4-18 #96). The
+//! left column and the rest of the mode detail are M4-19 (#97) and the interlaced
+//! fields M4-20 (#98).
+//!
+//! Two oddities of that section are outside the ticket and are not modelled: a
+//! sprite pixel of colour 14 of any palette line shows at normal intensity
+//! whatever its priority is (genvdp.txt's "bug rather than a feature", confirmed
+//! in the SpritesMind thread), and a high priority tile is said to lift the shadow
+//! of the whole 8x8 block it covers even where it is transparent - which the layer
+//! buffers of [`crate::planes`] cannot say, as a pixel they draw nothing at is a
+//! whole zero byte, priority and all. Both are for the M6 test-ROM triage.
 
 use crate::color::Intensity;
 use crate::planes::{self, Plane};
@@ -29,6 +39,23 @@ use crate::{CRAM_WORDS, Vdp, WIDTH_H40};
 /// [`planes::PRIORITY_SHIFT`], so a layer pixel becomes a CRAM index by masking
 /// this off.
 const CRAM_INDEX_MASK: u8 = CRAM_WORDS as u8 - 1;
+
+/// The sprite pixel that is not a colour but a word about the pixel under it:
+/// palette 3 colour 14, which raises that pixel one step - the shadow of a plane
+/// to normal, a normal plane to highlight.
+///
+/// genvdp.txt section 16 has the two operators the other way round ("Pixels with
+/// color 3Eh are not drawn. Instead, the underlying pixel ... will be shown at
+/// half intensity"), which the research that settled the mode has as wrong: "I
+/// noticed that Charles MacDonald got the purpose of sprite color 0x3e and 0x3f
+/// backward" (SpritesMind "Shadow/Highlight" thread 2692), and the two agree with
+/// the games Raster Scroll's "Shadow and Highlight" works from - the spotlight of
+/// Mega Turrican is palette 3 colour 14 and it is a highlight.
+const HIGHLIGHT_OPERATOR: u8 = 0x3E;
+
+/// [`HIGHLIGHT_OPERATOR`] going down instead of up: palette 3 colour 15, and down
+/// is all the way - "shadow + shadow = shadow" (SpritesMind thread 2692).
+const SHADOW_OPERATOR: u8 = 0x3F;
 
 /// Which layer of genvdp.txt section 14 shows at one screen position.
 ///
@@ -89,52 +116,132 @@ fn top_layer(plane_b: u8, plane_a: u8, sprite: u8) -> Layer {
     }
 }
 
+/// The intensity of the background of one position, which is the whole of the
+/// plane half of genvdp.txt section 16: "Background tiles are shown at half
+/// intensity, or at normal intensity if their priority bit is set", which the
+/// SpritesMind thread that settled the mode has as "if any layer is high priority,
+/// default to normal, otherwise default to shadowed".
+///
+/// A [`Layer::Backdrop`] is under this too, and shadowed with the planes: "The
+/// backdrop is shown at half intensity". Only the planes speak: a sprite's own
+/// priority makes its own pixel normal in [`compose_pixel`] and nothing else,
+/// which is what the same thread found on hardware ("the docs had the 'if either
+/// plane A or plane B priority is set, everything becomes normal' part wrong ...
+/// If sprite has priority set, that doesn't happen").
+fn background_level(shadow_highlight: bool, plane_b: u8, plane_a: u8) -> Intensity {
+    let high_priority = high(plane_a) || high(plane_b);
+    match (shadow_highlight, high_priority) {
+        (true, false) => Intensity::Shadow,
+        _ => Intensity::Normal,
+    }
+}
+
+/// One step up the ladder of genvdp.txt section 16, the "brighten" of the
+/// SpritesMind thread's list: "shadow + highlight = normal" and "normal +
+/// highlight = highlight". Highlight is the top of the ladder, so nothing steps
+/// above it.
+fn raise(level: Intensity) -> Intensity {
+    match level {
+        Intensity::Shadow => Intensity::Normal,
+        Intensity::Normal => Intensity::Highlight,
+        Intensity::Highlight => Intensity::Highlight,
+    }
+}
+
+/// What one screen position shows: the layer whose CRAM index to paint, at what
+/// intensity.
+///
+/// The planes set the intensity of everything under them; a sprite pixel either
+/// takes that of a low priority one, escapes it with its own priority bit, or -
+/// for the two operator colours of genvdp.txt section 16 - steps it by one and
+/// stands aside to let the background through.
+///
+/// An operator steps the background only where it is the sprite pixel that shows,
+/// and that means the whole chain of [`top_layer`]: a low priority operator under
+/// a high priority plane "is behind" it and commands nothing ("This only works if
+/// the sprite in question is at the 'top' of the display - meaning there are no
+/// planes set to higher priority than the sprite", Raster Scroll's "Shadow and
+/// Highlight").
+fn compose_pixel(
+    shadow_highlight: bool,
+    plane_b: u8,
+    plane_a: u8,
+    sprite: u8,
+) -> (Layer, Intensity) {
+    let level = background_level(shadow_highlight, plane_b, plane_a);
+    let winner = top_layer(plane_b, plane_a, sprite);
+    if winner != Layer::Sprite {
+        // Whatever won is a plane or the backdrop, and it wins the same way with
+        // the sprite taken out of the chain: that is the background of this pixel.
+        return (winner, level);
+    }
+    match (shadow_highlight, sprite & CRAM_INDEX_MASK) {
+        (true, HIGHLIGHT_OPERATOR) => (top_layer(plane_b, plane_a, 0), raise(level)),
+        (true, SHADOW_OPERATOR) => (top_layer(plane_b, plane_a, 0), Intensity::Shadow),
+        _ => (
+            Layer::Sprite,
+            if high(sprite) {
+                Intensity::Normal
+            } else {
+                level
+            },
+        ),
+    }
+}
+
 /// Paint `row`, the active pixels of one line, from the three layer buffers of
-/// that line.
+/// that line and the shadow/highlight mode of R12 bit 3.
 ///
 /// `cram` is [`Vdp::cram_pixels`], so a pixel costs one index into a table of
-/// 64 instead of a CRAM read and a LUT read. `row` is as wide as the mode says,
-/// which is how an H32 line drops the 64 overscan columns that
+/// 64 instead of a CRAM read and a LUT read, and `backdrop` is
+/// [`Vdp::backdrop_index`]: the entry of that table the backdrop shows from, at
+/// whatever intensity [`compose_pixel`] settled on. `row` is as wide as the mode
+/// says, which is how an H32 line drops the 64 overscan columns that
 /// [`Vdp::render_plane_line`] fills in every mode.
 fn compose_row(
     row: &mut [u32],
     plane_b: &[u8; WIDTH_H40],
     plane_a: &[u8; WIDTH_H40],
     sprites: &[u8; WIDTH_H40],
-    cram: &[u32; CRAM_WORDS],
-    backdrop: u32,
+    cram: &[[u32; Intensity::ALL.len()]; CRAM_WORDS],
+    backdrop: u8,
+    shadow_highlight: bool,
 ) {
     let layers = plane_b.iter().zip(plane_a).zip(sprites);
     for (pixel, ((&b, &a), &s)) in row.iter_mut().zip(layers) {
-        let winner = top_layer(b, a, s);
-        *pixel = match winner {
+        let (layer, level) = compose_pixel(shadow_highlight, b, a, s);
+        let index = match layer {
             Layer::Backdrop => backdrop,
-            Layer::PlaneB => cram[usize::from(b & CRAM_INDEX_MASK)],
-            Layer::PlaneA => cram[usize::from(a & CRAM_INDEX_MASK)],
-            Layer::Sprite => cram[usize::from(s & CRAM_INDEX_MASK)],
+            Layer::PlaneB => b & CRAM_INDEX_MASK,
+            Layer::PlaneA => a & CRAM_INDEX_MASK,
+            Layer::Sprite => s & CRAM_INDEX_MASK,
         };
+        *pixel = cram[usize::from(index)][level.index()];
     }
 }
 
 impl Vdp {
-    /// Every CRAM word as a frame-buffer pixel at [`Intensity::Normal`], the 64
-    /// lookups a line composites with read once for that line.
+    /// Every CRAM word as a frame-buffer pixel at every [`Intensity`]: the 64 x 3
+    /// lookups a line composites with, read once for that line and indexed
+    /// `[cram_index][Intensity::index]`.
     ///
-    /// [`Vdp::backdrop_pixel`] is this at [`Vdp::backdrop_index`]. Reading CRAM
-    /// once a line rather than once a pixel is also what lets [`compose_row`] be
-    /// a free function, so the row write borrows [`Vdp::frame_buffer`] alone and
-    /// not the whole `Vdp`.
-    fn cram_pixels(&self) -> [u32; CRAM_WORDS] {
-        let mut pixels = [0; CRAM_WORDS];
-        for (pixel, colour) in pixels.iter_mut().zip(self.cram) {
-            *pixel = self.color_lut.pixel(colour, Intensity::Normal);
+    /// [`Vdp::backdrop_pixel`] is this at [`Vdp::backdrop_index`] and
+    /// [`Intensity::Normal`]. Reading CRAM once a line rather than once a pixel is
+    /// also what lets [`compose_row`] be a free function, so the row write borrows
+    /// [`Vdp::frame_buffer`] alone and not the whole `Vdp`.
+    fn cram_pixels(&self) -> [[u32; Intensity::ALL.len()]; CRAM_WORDS] {
+        let mut pixels = [[0; Intensity::ALL.len()]; CRAM_WORDS];
+        for (entry, colour) in pixels.iter_mut().zip(self.cram) {
+            for (pixel, level) in entry.iter_mut().zip(Intensity::ALL) {
+                *pixel = self.color_lut.pixel(colour, level);
+            }
         }
         pixels
     }
 
     /// Draw one line of the picture: genvdp.txt section 14 over the plane B, the
-    /// plane A / window and the sprite layer buffers of `line`, into row `line`
-    /// of [`Vdp::frame`].
+    /// plane A / window and the sprite layer buffers of `line`, at the intensity
+    /// section 16 gives each pixel of them, into row `line` of [`Vdp::frame`].
     ///
     /// Public and callable on its own, as `docs/ARCHITECTURE.md` puts it
     /// ("Render one line directly. Public for tests; the scheduler uses
@@ -159,7 +266,6 @@ impl Vdp {
             return;
         }
         let width = self.active_width();
-        let backdrop = self.backdrop_pixel();
         {
             let frame = &mut self.frame_buffer;
             frame.width = width;
@@ -168,6 +274,11 @@ impl Vdp {
 
         let start = y * width;
         if !self.display_enabled() {
+            // The backdrop of a switched-off display is the whole line, at the
+            // normal intensity of [`Vdp::backdrop_pixel`]: the half of section 16
+            // belongs to the display, and "the overscan region outside of the
+            // display area is always shown at normal intensity".
+            let backdrop = self.backdrop_pixel();
             self.frame_buffer.pixels[start..start + width].fill(backdrop);
             return;
         }
@@ -184,8 +295,18 @@ impl Vdp {
         self.render_sprite_line(line, &mut sprites);
 
         let cram = self.cram_pixels();
+        let backdrop = self.backdrop_index();
+        let shadow_highlight = self.shadow_highlight_enabled();
         let row = &mut self.frame_buffer.pixels[start..start + width];
-        compose_row(row, &plane_b, &plane_a, &sprites, &cram, backdrop);
+        compose_row(
+            row,
+            &plane_b,
+            &plane_a,
+            &sprites,
+            &cram,
+            backdrop,
+            shadow_highlight,
+        );
     }
 }
 
@@ -743,7 +864,9 @@ mod tests {
                 "sprite priority {priority} is {level:?}"
             );
             assert!(
-                line[8..].iter().all(|&p| p == pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow)),
+                line[8..]
+                    .iter()
+                    .all(|&p| p == pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow)),
                 "the plane B behind is shadowed either way"
             );
         }
