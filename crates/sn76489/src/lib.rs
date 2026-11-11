@@ -254,7 +254,8 @@ pub struct Sn76489 {
     /// channel 3's tone period is indistinguishable from one that intends the
     /// noise control, and this model picks the noise generator for both. The
     /// chip has one register and two consumers, so the alternative reading is
-    /// that both are mixed. TODO(#106): pin on hardware or on a PSG test ROM.
+    /// that both are mixed. TODO(#106): pin on hardware or on a PSG test ROM,
+    /// filed as #323.
     noise_connected: bool,
 }
 
@@ -377,7 +378,7 @@ impl Sn76489 {
     /// INFERRED: neither the ticket nor the retrieved facts say whether a write
     /// also restarts the shift divider, so the divider keeps running and only
     /// the register is reloaded. TODO(#106): pin on hardware or on a PSG test
-    /// ROM; follow-up filed.
+    /// ROM, filed as #323.
     fn write_noise(&mut self, control: u8) {
         self.noise.control = control & NOISE_CONTROL_BITS;
         self.noise.lfsr = NOISE_RESET;
@@ -602,6 +603,16 @@ mod tests {
         }
     }
 
+    /// `clock` is the sum of the four channels, with every channel pinned: the
+    /// three tone channels at full scale and channel 3 on the noise generator.
+    ///
+    /// This test of #105 used to expect plus or minus four times
+    /// `VOLUME_TABLE[0]` on every tick, which asked channel 3 to keep being a
+    /// tone channel. It cannot: the noise control register is channel 3's tone
+    /// register, so the `set_tone(_, 3, _)` below is a write to the noise
+    /// register, and that connects the noise generator to channel 3's output for
+    /// the life of the chip (#106). Measured before the change: 16382 where
+    /// 32764 was expected.
     #[test]
     fn clock_returns_the_sum_of_the_channels() {
         let mut psg = Sn76489::new();
@@ -610,13 +621,30 @@ mod tests {
             set_tone(&mut psg, ch, 1);
         }
 
-        let mut previous = psg.clock();
-        assert_eq!(previous.abs(), 4 * VOLUME_TABLE[0]);
-        for _ in 0..7 {
+        // Power-on output bit low for every channel, and channel 3 is the noise
+        // bit 0 of the shift register the last write left at 0x8000.
+        let mut tone = -VOLUME_TABLE[0];
+        let noise = -VOLUME_TABLE[0];
+
+        for _ in 0..8 {
             let sample = psg.clock();
-            assert_eq!(sample.abs(), 4 * VOLUME_TABLE[0]);
-            assert_eq!(sample, -previous);
-            previous = sample;
+
+            assert_eq!(
+                sample,
+                (0..CHANNELS).map(|ch| psg.channel_output(ch)).sum::<i16>(),
+                "clock is not the sum of the channels"
+            );
+
+            tone = -tone;
+            for ch in 0..3 {
+                assert_eq!(psg.channel_output(ch), tone, "tone channel {ch}");
+            }
+
+            assert_eq!(
+                psg.channel_output(3),
+                noise,
+                "channel 3 is on the noise generator, not on the tone period it was written as"
+            );
         }
     }
 
