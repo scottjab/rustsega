@@ -23,6 +23,7 @@
 pub mod color;
 mod compose;
 mod dma;
+mod fifo;
 mod framebuffer;
 mod hv;
 pub mod pattern;
@@ -109,10 +110,18 @@ pub struct Vdp {
     /// this, and the whole word when the code register holds a write code
     /// ([`Vdp::read_data`], M4-03 #81).
     ///
-    /// A stand-in for the VDP's four-entry FIFO, which is what supplies those
-    /// bits on real hardware: unlike the FIFO this has no depth and no timing.
-    /// TODO(M4-21a #99): the FIFO itself, with the read prefetch that feeds it.
+    /// The word the data port was last driven with, which the read side answers
+    /// from. Not the FIFO: `fifo` holds the writes on their way to the memories,
+    /// and this is the word the port itself is holding.
+    ///
+    /// TODO(M4-21b #100): the read prefetch, which on real hardware is a second,
+    /// read-side FIFO and is what makes a read straight after a command word
+    /// answer with the old word.
     fifo_last: u16,
+    /// The four-entry write FIFO between the data port and the memories
+    /// (`fifo`, M4-21a #99): a data port write goes onto it, and an external
+    /// access slot takes it off again.
+    fifo: fifo::Fifo,
     /// Set by a command word with CD5 while R1 M1 allows DMA (genvdp.txt
     /// section 7: "Setting CD5 will trigger a DMA operation"). [`Vdp::run_dma`]
     /// consumes it, and each mode of genvdp.txt section 11 takes its turn there:
@@ -261,6 +270,7 @@ impl Vdp {
             addr: 0,
             pending: false,
             fifo_last: 0,
+            fifo: fifo::Fifo::new(),
             dma_requested: false,
             dma_fill_pending: false,
             vint_pending: false,
