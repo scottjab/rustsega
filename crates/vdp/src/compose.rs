@@ -322,7 +322,8 @@ impl Vdp {
     /// taken at the start of this line's active display: R12, the window base and
     /// the sprite base included, so that a register written halfway across a line
     /// is what the next line is drawn with rather than the rest of this one
-    /// (M4-23, #102).
+    /// (M4-23, #102). The sprite list of the line is one latch older than any of it,
+    /// being searched during the line before (#311).
     pub fn render_line(&mut self, line: u16) {
         if usize::from(line) >= self.active_height() {
             return;

@@ -96,12 +96,17 @@ impl LineState {
 
 impl Vdp {
     /// The beam has reached the latch point of [`Vdp::line`]: read the scroll
-    /// tables and the register file that line will be drawn from.
+    /// tables and the register file that line will be drawn from, and walk the
+    /// sprite table for the line after it.
     ///
     /// Called by `timing` at [`Vdp::hblank_clear_mclk`] of every line, the last
     /// moment of the HBlank that #102's "Horizontal scroll for line N is read
     /// from VRAM during HBlank before line N" puts the scroll read in. Live state
     /// is read here, not the latch: this is what fills it.
+    ///
+    /// The three reads below are of this line and go into [`LineState`];
+    /// [`Vdp::search_sprites`] is of the line after this one and does not, for the
+    /// reason on [`Vdp::searched_line`] (#311).
     pub(crate) fn latch_line_state(&mut self) {
         // The sprite walk of the line after this one, at the same moment and for the
         // same reason as the three reads below: the sprite list of a line is
@@ -426,7 +431,7 @@ mod tests {
             vdp,
             SPRITE_BASE,
             0,
-            u16::from(line) + 128,
+            line + 128,
             128 + 20,
             (1, 1),
             0,
