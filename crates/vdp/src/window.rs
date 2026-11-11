@@ -10,17 +10,18 @@
 //! whichever source each pixel came from.
 //!
 //! The two fetches of a cell are [`crate::pattern`]'s, through the same
-//! [`Vdp::fill_cell_run`] the two scroll planes end with, so the entry decode, the
-//! flip, the palette and the colour-0 transparency of genvdp.txt section 13 are
-//! written once for the three name tables.
+//! [`Vdp::fill_cell_run`] the two scroll planes end with, so the entry decode,
+//! the flip, the palette and the colour-0 transparency of genvdp.txt section 13
+//! are written once for the three name tables.
 //!
-//! TODO(#289): four readings here go beyond what genvdp.txt settles - that R17 and
-//! R18 are an intersection ([`Vdp::window_line`]), that the window has to be shown
-//! for its bug to bite ([`Vdp::window_edge_bug`]), that the bug moves the name
-//! table fetch of a column and not its VSRAM word ([`Vdp::render_window_run`]'s
-//! caller), and what a window fetch reads past the end of its own table - and each
-//! is pinned by a test here so that a correction cannot be quiet.
-
+//! TODO(#289): the four readings of genvdp.txt this file makes and its prose does
+//! not settle - the intersection of [`Vdp::window_line`] and
+//! [`Vdp::window_columns`], that the window has to be shown for the bug of
+//! [`Vdp::window_edge_bug`] to bite, that the bug moves a name table fetch and not
+//! the VSRAM word of the same column, and what [`Vdp::render_window_run`] reads
+//! past the end of its own table. Each is pinned by a test here so that a change
+//! of reading cannot be quiet.
+//!
 use crate::Vdp;
 use crate::WIDTH_H40;
 use crate::planes::{CELL_COLUMN, CELL_ROWS, Plane};
