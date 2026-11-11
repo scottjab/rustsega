@@ -782,6 +782,66 @@ mod tests {
         );
     }
 
+    /// The Z80's VBlank interrupt: genvdp.txt never mentions it (see the `vdp`
+    /// crate's `Z80_INT_MCLK` for what it is inferred from), but
+    /// [`vdp::Vdp::z80_int_line`] is the wire and this scheduler is what drives it -
+    /// so a frame gives the sound CPU exactly one interrupt, not one per instruction
+    /// of the pulse that carries it.
+    #[test]
+    fn z80_int_on_vblank() {
+        // `$0000`: `EI`, then `HALT` - and at `$38`, the IM 1 entry point, `INC A`,
+        // 64 `NOP`, `EI`, `HALT`. Two choices there are doing specific work:
+        //
+        // - `HALT` rather than `RET` at the end. The chip is then waiting for the
+        //   next pulse instead of unwinding a return address, so nothing about the
+        //   stack or the address it came back to can be what the count depends on.
+        // - the 64 `NOP` are not filler. `Z80_INT_MCLK` holds the line for 2560
+        //   master clocks, about 170 T-states, and `/INT` is a level: a handler that
+        //   reopened interrupts after 12 T-states would be re-entered several times
+        //   before the VDP let go, which is exactly what this test must not do. 64
+        //   `NOP` is 256 T-states, so `EI` lands after the pulse has gone and a frame
+        //   is one count rather than sixty.
+        let mut program = vec![0x76_u8; 0x7B];
+        program[0] = 0xFB;
+        program[0x38] = 0x3C;
+        program[0x39..0x79].fill(0x00);
+        program[0x79] = 0xFB;
+
+        let mut bus = Bus::new(rom_image(), VERSION);
+        bus.z80.ram[..program.len()].copy_from_slice(&program);
+        release_z80_reset(&mut bus);
+        // Releasing reset is the edge `run_line` answers with `Z80::reset`, and that
+        // reset clears the interrupt mode armed just below, so take the pulse here
+        // rather than leave it for the line loop to spend on a chip whose mode the
+        // test has already chosen.
+        assert!(
+            bus.take_z80_reset(),
+            "releasing reset is the pulse the scheduler answers"
+        );
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        let mut z80 = Z80::new();
+        z80.reset();
+        // The mode a real program's `IM 1` would ask for. It is armed from here
+        // rather than by the program because this checkout's z80 ED table does not
+        // decode `$ED $55` to it, and changing `crates/z80` is outside this ticket.
+        // The wire is what #75 owns; how it was armed is not.
+        z80.set_im(z80::IntMode::Mode1);
+
+        let mut s = Scheduler::new(Region::Usa);
+        let mut counted = Vec::new();
+        for _ in 0..3 {
+            s.run_frame(&mut cpu, &mut z80, &mut bus);
+            counted.push(z80_a(&z80).wrapping_sub(A_RESET));
+        }
+
+        assert_eq!(
+            counted,
+            vec![1, 2, 3],
+            "one Z80 interrupt per frame, not several per VBlank pulse"
+        );
+    }
+
     /// One [`Scheduler::run_frame`] is one whole raster.
     ///
     /// The VDP raises `frame_done` at VBlank start, 224 lines into a 262 line NTSC
