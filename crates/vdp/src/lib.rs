@@ -4,9 +4,9 @@
 //! registers, the register writes, and the mode getters every later VDP ticket
 //! reads, the two ports the 68k reaches them with (`ports`: control port
 //! writes and data port writes and reads), the status register the control port
-//! reads answer (`status`), and the 68k to VDP DMA (`dma`). The fill and copy
-//! DMA modes are M4-08 (#86), rendering starts at M4-10 (#88), and timing after
-//! that.
+//! reads answer (`status`), the beam position and the HV counter port (`hv`),
+//! and the 68k to VDP DMA (`dma`). The fill and copy DMA modes are M4-08 (#86),
+//! rendering starts at M4-10 (#88), and timing after that.
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
@@ -14,6 +14,7 @@
 
 mod dma;
 mod framebuffer;
+mod hv;
 mod ports;
 mod regs;
 mod status;
@@ -151,6 +152,18 @@ pub struct Vdp {
     /// TODO(M4-22 #101): DMA timing, which is what would set and clear it; the
     /// transfers of M4-07 (#85) run in one call and so are never seen busy.
     dma_busy: bool,
+    /// The scanline the beam is on: 0 is the first line of the frame, and the
+    /// frame is 262 lines on NTSC and 313 on PAL. Only [`Vdp::set_position`]
+    /// moves it, so until M4-06 (#84) runs the scheduler that calls it the beam
+    /// sits at the start of line 0 and the HV counter reads 0 (M4-05, #83).
+    line: u16,
+    /// Master clocks into [`Vdp::line`], `0..hv::MCLKS_PER_LINE`.
+    line_mclk: u32,
+    /// The HV counter frozen by R0 bit 1 (M3), `None` while the bit is clear.
+    ///
+    /// `Some` from the moment M3 goes up to the moment it comes down, which is
+    /// what [`Vdp::hv_counter`] answers with while it is set (M4-05, #83).
+    hv_latch: Option<u16>,
     /// The frame the renderer draws into. Read through [`Vdp::frame`].
     frame_buffer: FrameBuffer,
     /// Which crystal the chip is clocked by: `true` for PAL, which can drive a
@@ -186,6 +199,9 @@ impl Vdp {
             in_vblank: false,
             in_hblank: false,
             dma_busy: false,
+            line: 0,
+            line_mclk: 0,
+            hv_latch: None,
             frame_buffer: FrameBuffer::new(),
             pal,
         }
@@ -206,11 +222,19 @@ impl Vdp {
     /// Registers 24 to 31 do not exist and writes to them are ignored rather
     /// than panicking: the control port decode of `ports` hands this function
     /// the 5-bit field of a `100r rrrr` command word, which can name them
-    /// (genvdp.txt section 7 "VDP ports").
+    ///
+    /// R0 is the one register whose write does something outside the register
+    /// file: bit 1 (M3) latching the HV counter as it goes up and releasing it
+    /// as it comes down (M4-05, #83, and [`Vdp::hv_counter`]).
     pub fn write_register(&mut self, reg: u8, value: u8) {
-        if let Some(slot) = self.regs.get_mut(usize::from(reg)) {
-            *slot = value;
+        let index = usize::from(reg);
+        let Some(previous) = self.regs.get(index).copied() else {
+            return;
+        };
+        if index == regs::R0 {
+            self.m3_written(previous, value);
         }
+        self.regs[index] = value;
     }
 
     /// Raw read of register `reg`, for the code that wants a register rather
@@ -239,9 +263,11 @@ impl Vdp {
     }
 
     /// R0 bit 1 (M3): latch and freeze the HV counter instead of letting it
-    /// count (genvdp.txt section 5 "HV Counter"; plutiedev "$80xx").
+    /// count (genvdp.txt section 4 "Interrupts" and section 17 "$00"; plutiedev
+    /// "$80xx"). [`Vdp::hv_counter`] is the side that holds the value.
     ///
-    /// TODO(M4-05 #83): the counter and the latch.
+    /// Unlike the other bits of R0 this one is read by [`Vdp::hv_counter`] and
+    /// by nothing else: it is not a display mode.
     #[inline]
     pub fn hv_counter_latch(&self) -> bool {
         self.regs[regs::R0] & (1 << 1) != 0

@@ -1009,8 +1009,8 @@ impl Bus {
     }
 
     /// VDP port word read: the data port, the status register behind a control
-    /// port read, and the HV counter are the three ports with a read, and the HV
-    /// counter is the only one of the three without an answer of its own yet.
+    /// port read, and the HV counter are the three ports with a read, and each of
+    /// the three is now the chip's own function.
     ///
     /// The data port is the chip's own [`Vdp::read_data`], which decides which
     /// memory the code register points at, what the read is masked by, and how the
@@ -1022,11 +1022,17 @@ impl Bus {
     /// abandons it. That is what `status_read_word_and_bytes` and
     /// [`Self::status_read_clears_the_command_latch`] hold still.
     ///
+    /// The HV counter is the chip's own [`Vdp::hv_counter`] (M4-05, #83): the
+    /// `VC7-VC0` / `HC8-HC1` word of genvdp.txt section 5, which needs no byte
+    /// fix-up on the way because the even lane of that word is the V counter and
+    /// the odd lane the H one ("For 8-bit reads, the even byte (e.g. C00008h)
+    /// returns the V counter, and the odd byte (e.g. C00009h) returns the H
+    /// counter"). A VDP that has been reset has not been told where its beam is,
+    /// so the counter reads 0 until M4-06 (#84) starts walking the position.
+    ///
     /// The rest of the area answers [`OPEN_BUS_WORD`], the value the rest of the
-    /// undecoded map answers, because nothing can produce anything else: the HV
-    /// counter is M4-05 (#83). The port decode is done anyway, and is the reason
-    /// this is not one `OPEN_BUS_WORD` - it is where that ticket arrives, and it is
-    /// what those tests and [`Self::hv_counter_read`] are really testing.
+    /// undecoded map answers, because nothing can produce anything else: the PSG
+    /// and the debug pair have no read, which is the next paragraph.
     ///
     /// The PSG and the debug pair have no read in any case: plutiedev "Memory map"
     /// gives the PSG as write-only and the debug ports no function, and Genesis
@@ -1039,8 +1045,9 @@ impl Bus {
             // of what it does (genvdp.txt section 7: "It is cleared when the
             // control port is read").
             Some(VdpPort::Control) => self.vdp.read_status(),
-            // TODO(M4-05 #83): `self.vdp.hv_counter()`.
-            Some(VdpPort::HvCounter) => OPEN_BUS_WORD,
+            // The beam position, as the `VC7-VC0` / `HC8-HC1` word of genvdp.txt
+            // section 5 (`Vdp::hv_counter`, M4-05 #83).
+            Some(VdpPort::HvCounter) => self.vdp.hv_counter(),
             Some(VdpPort::Psg) | Some(VdpPort::Debug) => OPEN_BUS_WORD,
             // The corner of the area that decodes to nothing: see
             // [`VDP_HANG_BIT`] for what it does on real hardware, and M3-16 (#77)
@@ -3809,21 +3816,35 @@ mod tests {
     /// The HV counter block is read-only, reads as the counter on either lane,
     /// and is not any other port of the area.
     ///
-    /// Like the status register the value waits for M4-05 (#83), so this is a
-    /// decode test and a write-does-nothing test; see [`Bus::read_vdp_word`] for
-    /// what the placeholder is and why.
+    /// The value is the VDP's own counter since M4-05 (#83), so this is a
+    /// decode test, a byte-lane test, a value test and a write-does-nothing test.
     #[test]
     fn hv_counter_read() {
         let mut bus = Bus::new(Vec::new(), NO_TMSS);
 
+        // A VDP that has never been told where its beam is sits at the start of
+        // line 0, which is 0x00 for both counters (M4-06 #84 is what walks the
+        // position; see [`Vdp::set_position`]).
+        assert_eq!(
+            bus.read_word(0xC00008),
+            0x0000,
+            "not the open-bus placeholder"
+        );
+
         // The block is 0xC00008-0xC0000F: four words of counter, all of them the
         // same one (plutiedev "Memory map" lists $C00008 and $C0000C, and every
         // port mirrors every other word).
+        bus.vdp.set_position(0xEA, 640);
         for addr in [0xC00008u32, 0xC0000A, 0xC0000C, 0xC0000E] {
             let word = bus.read_word(addr);
+            assert_eq!(word, 0xEA20, "{addr:#08x} is the counter");
             assert_eq!(bus.read_byte(addr), (word >> 8) as u8, "{addr:#08x}");
             assert_eq!(bus.read_byte(addr + 1), (word & 0xFF) as u8, "{addr:#08x}");
         }
+        // And the two halves of the word are the two counters of genvdp.txt
+        // section 5: V on the even lane, H on the odd one.
+        assert_eq!(bus.read_byte(0xC00008), 0xEA, "V counter");
+        assert_eq!(bus.read_byte(0xC00009), 0x20, "H counter");
 
         for addr in [0xC00008u32, 0xC0000C] {
             bus.write_word(addr, 0xDEAD);
