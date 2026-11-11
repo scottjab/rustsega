@@ -1264,5 +1264,16 @@ mod tests {
             &[1; 4],
             "full screen mode has no 2-cell column, so the two words are not read there either"
         );
+
+        // H40, where the two words do say something, and full screen mode, where
+        // there is no partial column to read them with.
+        vdp.write_register(12, 0x81);
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..4],
+            &[1; 4],
+            "H40 in full screen mode: vsram[19] & vsram[39] is 3, and plane y stays 0"
+        );
     }
 }
