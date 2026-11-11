@@ -4,6 +4,7 @@ pub mod bus;
 pub mod cart;
 pub mod config;
 pub mod io;
+pub mod scheduler;
 pub mod z80_bus;
 
 pub use bus::Bus;
@@ -11,6 +12,7 @@ pub use cart::{
     LoadError, Regions, RomHeader, compute_checksum, deinterleave, is_smd, normalize_rom,
     parse_header,
 };
+pub use scheduler::Scheduler;
 pub use z80_bus::{Z80Side, Z80View};
 // `Region` is the console this emulator presents, one of three; `Regions` above
 // is what a cartridge header claims at 0x1F0, a set of three booleans. The names
