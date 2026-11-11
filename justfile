@@ -2,6 +2,10 @@
 
 core := "-p m68k -p z80 -p vdp -p ym2612 -p sn76489 -p genesis"
 
+# The VDP debug views are behind a cargo feature, off by default, so nothing
+# else compiles them at all: `just check` has to say so twice (#104).
+vdp-debug := "-p vdp --features debug-views"
+
 default: check
 
 # Everything a commit must pass.
@@ -15,9 +19,11 @@ fmt-check:
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy {{vdp-debug}} --all-targets -- -D warnings
 
 test:
     cargo nextest run --workspace --no-tests=pass
+    cargo nextest run {{vdp-debug}}
 
 # Includes slow #[ignore] suites (SingleStepTests, long ROM runs).
 test-all:

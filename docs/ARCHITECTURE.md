@@ -262,6 +262,30 @@ of every entry:
 * It is chip state, not part of the line snapshot above: the chip takes no VRAM
   write while a line is being drawn.
 
+### VDP debug views
+
+`crates/vdp/src/debug.rs` (M4-24, #104) renders VDP internals into RGBA buffers for
+`headless`, the web UI and agents to look at. It is behind the `debug-views` cargo
+feature, default off, so no release build of the emulator or the WASM core carries
+it, and `just check` runs `cargo nextest run -p vdp --features debug-views` and the
+same for clippy - without the feature the module is not compiled at all:
+
+* `tiles(palette)`, `plane(PlaneView::A | B | Window)`, `palette()` return a
+  `DebugImage { width, height, pixels }` of the same `0xAABBGGRR` pixels
+  `FrameBuffer` holds, and `sprite_list()` returns the SAT walk as a
+  `Vec<SpriteInfo>` for text. These are slow-path: they allocate, and none of
+  them runs on the beam.
+* A plane view ignores the scroll: it is the name table as written, of the R16
+  size the chip is in now (the window's size is fixed by the display width), with
+  a 1 px white rectangle over the visible area of the two scroll planes. Cells
+  come from `Vdp::fill_cell_run`, so the entry decode is the renderer's and not a
+  second reading of it. `PlaneView` is a debug-local three-way choice rather than
+  a third `planes::Plane` variant, because the renderer must not be handed the
+  window - it has no scroll and no R16 size.
+* `sprite_list()` walks the live SAT chain, the way `sprites::Vdp::sprite_list`
+  does, not the list of the line being drawn, which is a line old (#311) and is
+  not reachable from outside the beam.
+
 ### Audio chips
 
 ```rust

@@ -17,6 +17,10 @@ which runs `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D wa
 `cargo nextest run --workspace` (or `cargo test --workspace`), and the wasm build
 of the core crates.
 
+Feature-gated code is checked with its feature on, because a gated module is not
+compiled at all by the workspace run: `just check` adds the clippy and nextest of
+`-p vdp --features debug-views` (the VDP debug views, #104) to its own.
+
 ## Layers of tests
 
 | Layer | Where | What |
