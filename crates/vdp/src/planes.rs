@@ -256,9 +256,9 @@ impl Vdp {
     ///
     /// What this does not know: the display-enable and left-column-blank bits of
     /// R0/R1, [`Vdp::active_width`] - `out` is all [`WIDTH_H40`] pixels wide in
-    /// H32 too, and the columns past the active display are the overscan the
-    /// compositor drops - shadow and highlight, the window, the sprites, and any
-    /// RGBA. All of that is M4-17 (#95).
+    /// H32 too, and the columns past the active display of a line are the
+    /// overscan its compositor leaves out - shadow and highlight, the window, the
+    /// sprites, and any RGBA. All of that is `compose`'s, from M4-17 (#95) on.
     pub fn render_plane_line(&self, plane: Plane, line: u16, out: &mut [u8; WIDTH_H40]) {
         let len = out.len();
         self.render_plane_run(plane, usize::from(line), 0..len, 0, out);

@@ -19,8 +19,9 @@
 //! and painted at one of the three intensities of [`Intensity`]: shadow where no
 //! plane has its priority bit, normal where one does, and highlight where a sprite
 //! operator raised what was already normal (genvdp.txt section 16, M4-18 #96). The
-//! left column and the rest of the mode detail are M4-19 (#97) and the interlaced
-//! fields M4-20 (#98).
+//! row is then cut to the width of the line's mode, blanked at the left for R0 bit
+//! 5 and padded with the backdrop for whatever the frame has room for but the mode
+//! does not (M4-19 #97). The interlaced fields are M4-20 (#98).
 //!
 //! Two oddities of that section are outside the ticket and are not modelled: a
 //! sprite pixel of colour 14 of any palette line shows at normal intensity
@@ -315,9 +316,9 @@ impl Vdp {
             // The backdrop of a switched-off display is the whole line, at the
             // normal intensity of [`Vdp::backdrop_pixel`]: the half of section 16
             // belongs to the display, and "the overscan region outside of the
-            // display area is always shown at normal intensity". The whole row of
-            // the frame it is, so that a display switched off on an H32 line of
-            // an H40 frame leaves no live pixels at its right edge either.
+            // display area is always shown at normal intensity". It is the whole
+            // row of the frame, so a display switched off on an H32 line of an
+            // H40 frame leaves no live pixels at its right edge either.
             let backdrop = self.backdrop_pixel();
             self.frame_buffer.pixels[start..start + stride].fill(backdrop);
             return;
@@ -337,7 +338,11 @@ impl Vdp {
         let cram = self.cram_pixels();
         let backdrop = self.backdrop_index();
         let shadow_highlight = self.shadow_highlight_enabled();
-        let blank = usize::from(self.left_column_blank()) * LEFT_COLUMN;
+        let blank = if self.left_column_blank() {
+            LEFT_COLUMN
+        } else {
+            0
+        };
         let row = &mut self.frame_buffer.pixels[start..start + stride];
         compose_row(
             row,
@@ -356,8 +361,8 @@ impl Vdp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::color::color;
     use crate::WIDTH_H32;
+    use crate::color::color;
     use crate::planes::testutil::{
         CELL_TILE_ROWS, PLANE_A_BASE, PLANE_B_BASE, PLANE_COLUMNS, PLANE_ROWS, fill_tile_row,
         plane_vdp, put_entry, put_word,
@@ -736,8 +741,10 @@ mod tests {
             vdp.write_register(1, 0x48);
             vdp.render_line(0);
             assert_eq!(
-                vdp.frame().height, height,
-                "{} with R1 bit 3 set", if pal { "PAL" } else { "NTSC" }
+                vdp.frame().height,
+                height,
+                "{} with R1 bit 3 set",
+                if pal { "PAL" } else { "NTSC" }
             );
         }
 

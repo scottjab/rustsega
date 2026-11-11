@@ -16,7 +16,10 @@ pub const MAX_HEIGHT: usize = 2 * LINES_V30;
 /// `pixels` is allocated once, at [`MAX_WIDTH`] x [`MAX_HEIGHT`], and never
 /// resized: `width` and `height` say how much of it belongs to the current
 /// frame, which is how a game changing mode mid-frame costs no allocation. The
-/// row stride is `width`.
+/// row stride is `width`, so it belongs to the frame as a whole rather than to
+/// the line that set it: [`Vdp::render_line`] takes it from the mode of line 0
+/// and keeps it to the end of the frame, and a line of a narrower mode draws
+/// what it has and takes the backdrop for the rest of the row (M4-19, #97).
 ///
 /// [`Vdp::render_line`] fills it a line at a time, from the backdrop up through
 /// the planes and the sprites (M4-17, #95); a VDP that has not drawn a frame
@@ -35,8 +38,9 @@ impl FrameBuffer {
     /// A black frame sized for the largest picture the VDP can produce.
     ///
     /// Starts at the widest mode and the commonest height because `width` and
-    /// `height` only describe what the renderer has drawn so far, and the
-    /// renderer that sets them is a later ticket (M4-19, #97).
+    /// `height` only describe the frame that has been drawn so far, and the line
+    /// that decides them is the first of a frame rather than this constructor
+    /// ([`Vdp::render_line`], M4-19 #97).
     pub fn new() -> Self {
         Self {
             width: MAX_WIDTH,

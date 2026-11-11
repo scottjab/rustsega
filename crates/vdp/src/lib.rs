@@ -13,8 +13,8 @@
 //! (`planes`), and the sprite attribute table and the sprite layer of a line
 //! (`sprites`), and the priority compositor that turns the three layer buffers of
 //! a line into the pixels of a frame-buffer row (`compose`), shadow and highlight
-//! included (M4-18 #96). The left column and the interlaced fields are still to
-//! come (M4-19 #97, M4-20 #98).
+//! and the mode sizes and edges of M4-19 (#97) included. The interlaced fields of
+//! M4-20 (#98) are still to come.
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
@@ -325,6 +325,10 @@ impl Vdp {
     /// R0 bit 5 (LCB): blank the leftmost 8 pixels of the display, filling them
     /// with the backdrop colour (genvdp.txt section 17 "$00"; plutiedev
     /// "$80xx").
+    ///
+    /// Read per line by [`Vdp::render_line`]'s compositor rather than once a
+    /// frame, so the bit may be written at any point of a raster and what it says
+    /// is true of the next line drawn (M4-19, #97).
     #[inline]
     pub fn left_column_blank(&self) -> bool {
         self.regs[regs::R0] & (1 << 5) != 0
@@ -668,6 +672,11 @@ impl Vdp {
     /// in V30 mode: on NTSC the frame has no room for the extra 16 lines, and
     /// V28 is 224 everywhere (genvdp.txt section 17 "$01"; plutiedev "$81xx":
     /// "V30 mode only works properly on PAL systems").
+    ///
+    /// A NTSC chip with the bit set shows no stable picture on hardware. It is
+    /// rendered as the 224 lines of V28 all the same and nothing is said about
+    /// it: the bit is legal to write, a game may hold it set across a mode
+    /// change, and there is no console-side diagnostic to warn (M4-19, #97).
     ///
     /// TODO(M4-20 #98): interlace mode 2 draws 480 lines, which this does not
     /// report yet.
