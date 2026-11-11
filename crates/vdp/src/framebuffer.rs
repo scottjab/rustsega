@@ -28,7 +28,9 @@ pub const MAX_HEIGHT: usize = 2 * LINES_V30;
 pub struct FrameBuffer {
     /// Active width in pixels: 256 (H32) or 320 (H40).
     pub width: usize,
-    /// Active height in lines: 224, 240, or 480 in interlace mode 2.
+    /// Active height in lines: 224, 240, or the 448 and 480 of interlace mode 2,
+    /// where the two fields of a frame share these rows two lines at a time
+    /// ([`Vdp::frame_height`], M4-20 #98).
     pub height: usize,
     /// The pixels, row-major, `MAX_WIDTH * MAX_HEIGHT` of them.
     pub pixels: Vec<u32>,

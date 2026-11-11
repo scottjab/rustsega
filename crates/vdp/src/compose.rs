@@ -21,7 +21,8 @@
 //! operator raised what was already normal (genvdp.txt section 16, M4-18 #96). The
 //! row is then cut to the width of the line's mode, blanked at the left for R0 bit
 //! 5 and padded with the backdrop for whatever the frame has room for but the mode
-//! does not (M4-19 #97). The interlaced fields are M4-20 (#98).
+//! does not (M4-19 #97). Interlace mode 2 draws half a frame per field, into every
+//! other row of the frame buffer, which is [`Vdp::display_line`] (M4-20 #98).
 //!
 //! Two oddities of that section are outside the ticket and are not modelled: a
 //! sprite pixel of colour 14 of any palette line shows at normal intensity
@@ -292,14 +293,17 @@ impl Vdp {
 
     /// Draw one line of the picture: genvdp.txt section 14 over the plane B, the
     /// plane A / window and the sprite layer buffers of `line`, at the intensity
-    /// section 16 gives each pixel of them, into row `line` of [`Vdp::frame`].
+    /// section 16 gives each pixel of them, into row [`Vdp::display_line`]`(line)`
+    /// of [`Vdp::frame`] - row `line` itself except in interlace mode 2.
     ///
     /// Public and callable on its own, as `docs/ARCHITECTURE.md` puts it
     /// ("Render one line directly. Public for tests; the scheduler uses
     /// advance()"); `timing::finish_line` calls it once for every line of the
-    /// active display as the beam finishes it (M4-06, #84). Lines outside the
-    /// active display are not drawn at all, which is what the `M4-20` (#98)
-    /// interlaced fields will have to live with.
+    /// active display as the beam finishes it (M4-06, #84). `line` is a line of the
+    /// beam, `0..Vdp::active_height`, and a line outside it is not drawn at all: in
+    /// interlace mode 2 the beam still scans 224 lines of a 448-line picture and the
+    /// other half of the frame belongs to the field before and after this one, which
+    /// is what keeps a woven frame of #98 woven.
     ///
     /// With R1 bit 6 (DISP) clear the layers are not drawn and the whole line is
     /// the backdrop colour (genvdp.txt section 17 "$01"). Nothing of the line is
@@ -317,19 +321,22 @@ impl Vdp {
     /// Everything else of the line is read at the moment it is drawn, R12
     /// included, as [`Vdp::window_base`] and [`Vdp::sprite_base`] do too.
     pub fn render_line(&mut self, line: u16) {
-        let height = self.active_height();
-        let y = usize::from(line);
-        if y >= height {
+        if usize::from(line) >= self.active_height() {
             return;
         }
+        // The line of the picture this beam line of this field draws: `line` itself
+        // uninterlaced, `line * 2 + field` in interlace mode 2, where the two fields
+        // of a frame share one frame buffer and each writes the lines of its own
+        // field and leaves the other field's lines alone (#98).
+        let display_line = self.display_line(line);
         let width = self.active_width();
-        if y == 0 {
+        if usize::from(line) == 0 {
             self.frame_buffer.width = width;
-            self.frame_buffer.height = height;
+            self.frame_buffer.height = self.frame_height();
         }
 
         let stride = self.frame_buffer.width;
-        let start = y * stride;
+        let start = usize::from(display_line) * stride;
         if !self.display_enabled() {
             // The backdrop of a switched-off display is the whole line, at the
             // normal intensity of [`Vdp::backdrop_pixel`]: the half of section 16
@@ -349,9 +356,9 @@ impl Vdp {
         let mut plane_b = [0; WIDTH_H40];
         let mut plane_a = [0; WIDTH_H40];
         let mut sprites = [0; WIDTH_H40];
-        self.render_plane_line(Plane::B, line, &mut plane_b);
-        self.render_plane_a_line_with_window(line, &mut plane_a);
-        self.render_sprite_line(line, &mut sprites);
+        self.render_plane_line(Plane::B, display_line, &mut plane_b);
+        self.render_plane_a_line_with_window(display_line, &mut plane_a);
+        self.render_sprite_line(display_line, &mut sprites);
 
         let cram = self.cram_pixels();
         let mode = LineMode {
@@ -376,7 +383,7 @@ mod tests {
     use crate::color::color;
     use crate::planes::testutil::{
         CELL_TILE_ROWS, PLANE_A_BASE, PLANE_B_BASE, PLANE_COLUMNS, PLANE_ROWS, fill_tile_row,
-        plane_vdp, put_entry, put_word,
+        fill_tile_row_of_height, plane_vdp, put_entry, put_word,
     };
 
     /// The palette each layer of these tests draws from, one apiece, with
@@ -1093,5 +1100,126 @@ mod tests {
                 "CRAM entry {index:#04x} of a display with no shadow/highlight is its own colour"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // Interlace mode 2 (M4-20 #98): two fields, 448 lines of picture.
+    // ---------------------------------------------------------------------
+
+    /// Rows of a plane cell of interlace mode 2 (genvdp.txt section 12).
+    const MODE2_ROWS: usize = 16;
+
+    /// [`compose_vdp`] in interlace mode 2, R12 LSM = `11`, with cell (0,0) naming
+    /// tile 3: a 16-row pattern whose rows 0 and 3 are [`COLOUR`] and whose other
+    /// rows are transparent. Whether a given frame line is colour or the backdrop
+    /// therefore says which pattern row it was drawn from.
+    fn interlaced_compose_vdp() -> Vdp {
+        let mut vdp = compose_vdp();
+        vdp.write_register(12, 0x06);
+        put_entry(&mut vdp, PLANE_A_BASE, 0, entry(PLANE_A, 3, false));
+        for row in [0usize, 3] {
+            fill_tile_row_of_height(&mut vdp, 3, row, COLOUR, MODE2_ROWS);
+        }
+        vdp
+    }
+
+    /// Interlace mode 2: the frame is two fields and each field writes every other
+    /// line of the frame buffer - `line * 2 + field` - so the two fields of a beam
+    /// line land on the two lines of the picture they belong to and leave the lines
+    /// of the other field where they are, which is the woven frame of #98.
+    #[test]
+    fn interlace_mode_2_draws_each_field_on_its_own_frame_lines() {
+        let mut vdp = interlaced_compose_vdp();
+        let plane_a = pixel_of((PLANE_A << 4) | COLOUR);
+        let backdrop = pixel_of(BACKDROP);
+
+        vdp.odd_frame = false;
+        vdp.render_line(0);
+        vdp.odd_frame = true;
+        vdp.render_line(0);
+        vdp.odd_frame = false;
+        vdp.render_line(1);
+        vdp.odd_frame = true;
+        vdp.render_line(1);
+
+        assert!(
+            row(&vdp, 0)[..8].iter().all(|&p| p == plane_a),
+            "beam line 0 of field 0 is pattern row 0, which is opaque"
+        );
+        assert!(
+            row(&vdp, 1)[..8].iter().all(|&p| p == backdrop),
+            "beam line 0 of field 1 is pattern row 1, which is transparent"
+        );
+        assert!(
+            row(&vdp, 2)[..8].iter().all(|&p| p == backdrop),
+            "beam line 1 of field 0 is pattern row 2, which is transparent"
+        );
+        assert!(
+            row(&vdp, 3)[..8].iter().all(|&p| p == plane_a),
+            "and beam line 1 of field 1 is pattern row 3, which is opaque again"
+        );
+        assert!(
+            row(&vdp, 4)[..8].iter().all(|&p| p == 0),
+            "nothing past the four lines asked for was drawn"
+        );
+    }
+
+    /// Interlace mode 2 doubles the height of the picture: 448 lines, 480 with PAL
+    /// in V30. The beam still scans 224 of them, so [`Vdp::active_height`] - the
+    /// number `timing` starts VBlank on - does not move (#98).
+    #[test]
+    fn interlace_mode_2_doubles_the_frame_height() {
+        let mut vdp = interlaced_compose_vdp();
+        vdp.render_line(0);
+        assert_eq!(vdp.frame().height, 448, "224 lines drawn twice");
+        assert_eq!(vdp.active_height(), 224, "the beam still scans 224 lines");
+
+        let mut mode1 = compose_vdp();
+        mode1.write_register(12, 0x02);
+        mode1.render_line(0);
+        assert_eq!(mode1.frame().height, 224, "mode 1 is progressive");
+
+        let mut progressive = compose_vdp();
+        progressive.render_line(0);
+        assert_eq!(progressive.frame().height, 224, "and so is no interlace");
+
+        let mut pal = Vdp::new(true);
+        pal.write_register(1, 0x48); // display on, V30
+        pal.write_register(12, 0x06);
+        pal.render_line(0);
+        assert_eq!(pal.frame().height, 480, "240 lines drawn twice");
+        assert!(
+            pal.frame().pixels.len() >= 320 * 480,
+            "the frame buffer has room for the tallest picture it can be asked for"
+        );
+    }
+
+    /// Mode 1 is the one #98 calls "render like non interlaced": the field flag and
+    /// the HV counter move and the picture does not, so the odd field draws line 0
+    /// into line 0 of the frame buffer just as the even one does.
+    #[test]
+    fn interlace_mode_1_draws_every_line_of_its_field() {
+        let mut vdp = compose_vdp();
+        vdp.write_register(12, 0x02);
+        put_entry(&mut vdp, PLANE_A_BASE, 0, entry(PLANE_A, 1, false));
+        solid(&mut vdp, 1, COLOUR);
+        vdp.odd_frame = true;
+
+        vdp.render_line(0);
+
+        let plane_a = pixel_of((PLANE_A << 4) | COLOUR);
+        assert_eq!(
+            vdp.frame().height,
+            224,
+            "mode 1 does not double the picture"
+        );
+        assert!(
+            row(&vdp, 0)[..8].iter().all(|&p| p == plane_a),
+            "the odd field draws its line 0 into frame line 0"
+        );
+        assert!(
+            row(&vdp, 1).iter().all(|&p| p == 0),
+            "and nothing was shifted down to frame line 1"
+        );
     }
 }

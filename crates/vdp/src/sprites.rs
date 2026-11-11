@@ -16,14 +16,14 @@
 //!
 //! The per-line sprite and pixel limits, the SOVR status bit they set, collision
 //! and the masking a sprite at X = 0 does to the sprites behind it are all here as
-//! of M4-16 (#94). Not here is the priority resolution against the planes, which is
-//! M4-17 (#95), nor the 11-bit y coordinate and 8x16 cells of interlace mode 2,
-//! which are M4-20 (#98), nor the X = 1 masking mode 2 of genvdp.txt section 15,
-//! which is #292.
+//! of M4-16 (#94), and the 8x16 cells and doubled y origin of interlace mode 2 of
+//! M4-20 (#98) are: [`Vdp::cell_height`] and [`ORIGIN_MODE2`]. Not here is the
+//! priority resolution against the planes, which is M4-17 (#95), nor the X = 1
+//! masking mode 2 of genvdp.txt section 15, which is #292.
 
 use crate::pattern::{NameEntry, read_word, tile_row};
-use crate::planes::{CELL_ROWS, PRIORITY_SHIFT};
-use crate::{Vdp, WIDTH_H32, WIDTH_H40};
+use crate::planes::{CELL_WIDTH, PRIORITY_SHIFT};
+use crate::{InterlaceMode, Vdp, WIDTH_H32, WIDTH_H40};
 
 /// Bytes of one SAT entry: genvdp.txt section 15, "The table is 640 bytes in
 /// size. Each 8-byte entry has the following format".
@@ -80,19 +80,27 @@ const MAX_DOTS_LINE_H32: usize = WIDTH_H32;
 /// 15), so the screen coordinate of a sprite is its raw one less this.
 const ORIGIN: i32 = 128;
 
+/// The origin of the display on the vertical axis of interlace mode 2: double
+/// [`ORIGIN`], because the y field counts the 448 lines of that picture and not
+/// the 224 of the beam (ticket #98: "Sprite Y is 10 bits with offset 256 instead
+/// of 128"). The field itself stays the 10 bits of genvdp.txt section 15; only
+/// what a bit of it means moves, exactly as it does for the plane fetch of
+/// [`crate::planes`] and for [`Vdp::display_line`].
+const ORIGIN_MODE2: i32 = 256;
+
 /// One SAT entry: the `y`, `h`, `v`, `l`, `p`, `c`, `n` and `x` of genvdp.txt
 /// section 15.
 ///
 /// The 10-bit y and the 9-bit x are kept as the table holds them, still in the
-/// virtual space of that section; the screen position is the raw one less
-/// [`ORIGIN`], which [`Vdp::render_sprite_line`] works out instead of storing it
+/// virtual space of that section; the screen position is the raw one less the
+/// origin of its axis, [`ORIGIN`] across and [`ORIGIN`] or [`ORIGIN_MODE2`]
+/// down, which [`Vdp::render_sprite_line`] works out instead of storing it
 /// twice.
-///
-/// TODO(M4-20 #98): interlace mode 2 makes the y field 11 bits and turns the 8x8
-/// cells of a sprite into 8x16 ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Sprite {
-    /// Word 0 bits 9-0: the y coordinate of the sprite in the virtual space.
+    /// Word 0 bits 9-0: the y coordinate of the sprite in the virtual space, in
+    /// the lines of the display - 224 of them, or the 448 of interlace mode 2
+    /// where the origin of the screen is 256 rather than [`ORIGIN`].
     pub y: u16,
     /// Word 3 bits 8-0: the x coordinate of the sprite in the virtual space.
     pub x: u16,
@@ -207,10 +215,15 @@ impl Vdp {
     /// transparency test of the compositor is then unambiguous and cannot pick up a
     /// stale priority bit.
     ///
-    /// A sprite is `width_cells * height_cells` of the 8 pixel cells of a plane,
-    /// so at most 4 of them across and 4 down: four [`tile_row`] fetches per line
-    /// per sprite at most, and no allocation. Which cell a sprite's pattern index
-    /// names is the column-major rule of [`Vdp::fill_sprite_line`].
+    /// A sprite is `width_cells * height_cells` of the cells of a plane, [`CELL_WIDTH`]
+    /// pixels across and [`Vdp::cell_height`] lines down, so at most 4 of them across
+    /// and 4 down: four [`tile_row`] fetches per line per sprite at most, and no
+    /// allocation. Which cell a sprite's pattern index names is the column-major rule
+    /// of [`Vdp::fill_sprite_line`].
+    ///
+    /// `line` is a line of the picture, [`Vdp::display_line`] of the beam line, so in
+    /// interlace mode 2 a sprite is 16 lines to a cell rather than 8 and `y` counts
+    /// from [`ORIGIN_MODE2`] rather than from [`ORIGIN`] (#98).
     ///
     /// Both limits of section 15 "Sprite Drawing Limitations" that a line spends are
     /// counted by [`LineWalk`] as the list is walked, and both are spent by the
@@ -255,13 +268,17 @@ impl Vdp {
             (MAX_SPRITES_LINE_H32, MAX_DOTS_LINE_H32)
         };
         let prev_line_dot_overflow = self.prev_line_dot_overflow;
+        let origin_y = self.sprite_y_origin();
+        let cell_rows = self.cell_height();
         let mut walk = LineWalk::default();
 
         for sprite in self.sprite_list() {
-            // The sprite occupies the lines `y - ORIGIN` to `y - ORIGIN` plus its
-            // own height, and `row` is which row of that it is drawing.
-            let row = i32::from(line) - (i32::from(sprite.y) - ORIGIN);
-            let height = (usize::from(sprite.height_cells) * CELL_ROWS) as i32;
+            // The sprite occupies the lines `y - origin_y` to `y - origin_y` plus
+            // its own height, and `row` is which row of that it is drawing. `line`
+            // is a line of the picture, so in interlace mode 2 a sprite is twice
+            // as tall as it is elsewhere and 256 of `y` is the top of the screen.
+            let row = i32::from(line) - (i32::from(sprite.y) - origin_y);
+            let height = (usize::from(sprite.height_cells) * cell_rows) as i32;
             if row < 0 || row >= height {
                 continue;
             }
@@ -283,16 +300,28 @@ impl Vdp {
         self.prev_line_dot_overflow = walk.dot_overflow;
     }
 
+    /// Where the top of the display is in the y coordinates of the sprite table:
+    /// [`ORIGIN`], or [`ORIGIN_MODE2`] in interlace mode 2, where y counts the
+    /// doubled lines of the picture (#98).
+    #[inline]
+    fn sprite_y_origin(&self) -> i32 {
+        if self.interlace_mode() == InterlaceMode::Mode2 {
+            ORIGIN_MODE2
+        } else {
+            ORIGIN
+        }
+    }
+
     /// Draw `row` - the row of `sprite` counting down from its top, 0..the height
     /// of the sprite in pixels - over `out`, writing only the pixels that are
     /// still transparent; see [`Vdp::render_sprite_line`] for who that leaves.
     ///
     /// `pixels` is how much of the sprite the dot limit left it, and cells of
-    /// [`CELL_ROWS`] is the step it is cut in: INFERRED, and the rule the tests of
+    /// [`CELL_WIDTH`] is the step it is cut in: INFERRED, and the rule the tests of
     /// this ticket fix in. genvdp.txt gives only the 320 and 256 of the limit and
     /// never says what a line that runs out of them does to the sprite it runs out
     /// on, and a sprite is fetched a cell at a time in the cell order of its own
-    /// pattern, so what is left of one is its first `pixels / CELL_ROWS` cells and
+    /// pattern, so what is left of one is its first `pixels / CELL_WIDTH` cells and
     /// not its first `pixels` pixels of pattern read any which way. The cells kept
     /// are the ones the loop reaches first, which are the leftmost ones on screen -
     /// the cut is at the right of the sprite, where a line runs out.
@@ -322,20 +351,22 @@ impl Vdp {
             tile,
         } = sprite.pattern;
         let height_cells = usize::from(sprite.height_cells);
+        let cell_rows = self.cell_height();
         let mut collision = false;
         // The cell row of the sprite to fetch, mirrored by vflip; the row of the
-        // pattern inside it stays `row % CELL_ROWS` because `tile_row` mirrors that
-        // with the same flag, and the two together are the one mirror.
+        // pattern inside it stays `row % cell_rows` because `tile_row` mirrors that
+        // with the same flag, and the two together are the one mirror. `cell_rows`
+        // is the 16 of interlace mode 2 there, not the 8 of a normal cell (#98).
         let cell_row = if vflip {
-            height_cells - 1 - row / CELL_ROWS
+            height_cells - 1 - row / cell_rows
         } else {
-            row / CELL_ROWS
+            row / cell_rows
         };
-        let row_in_cell = row % CELL_ROWS;
+        let row_in_cell = row % cell_rows;
         let layer_base = (u16::from(palette) << 4) | (u16::from(priority) << PRIORITY_SHIFT);
         let left = i32::from(sprite.x) - ORIGIN;
 
-        for cell in 0..pixels / CELL_ROWS {
+        for cell in 0..pixels / CELL_WIDTH {
             let column = if hflip {
                 usize::from(sprite.width_cells) - 1 - cell
             } else {
@@ -348,9 +379,9 @@ impl Vdp {
                 row_in_cell,
                 vflip,
                 hflip,
-                CELL_ROWS,
+                cell_rows,
             );
-            let x0 = left + (cell * CELL_ROWS) as i32;
+            let x0 = left + (cell * CELL_WIDTH) as i32;
             for (offset, index) in indices.into_iter().enumerate() {
                 let x = x0 + offset as i32;
                 if x < 0 || usize::try_from(x).unwrap_or(usize::MAX) >= out.len() {
@@ -423,7 +454,7 @@ impl LineWalk {
             self.overflow = true;
             return None;
         }
-        let dots = usize::from(sprite.width_cells) * CELL_ROWS;
+        let dots = usize::from(sprite.width_cells) * CELL_WIDTH;
         let allowed = if self.dots + dots > max_dots {
             self.overflow = true;
             self.dot_overflow = true;
@@ -451,7 +482,9 @@ impl LineWalk {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planes::testutil::{fill_tile_row, put_tile_row, put_word};
+    use crate::planes::testutil::{
+        CELL_TILE_ROWS, fill_tile_row, fill_tile_row_of_height, put_tile_row, put_word,
+    };
 
     /// SAT base of these tests: R5 = `0x78` is 0xF000 both under the H32 mask of
     /// `0x7F` and under the H40 one of `0x7E`, so changing the display width does
@@ -509,7 +542,7 @@ mod tests {
     /// pattern pixel has.
     fn solid_cells(vdp: &mut Vdp, first: u16, count: usize) {
         for n in 0..count {
-            for row in 0..CELL_ROWS {
+            for row in 0..CELL_TILE_ROWS {
                 fill_tile_row(vdp, first + n as u16, row, (n + 1) as u8);
             }
         }
@@ -518,7 +551,7 @@ mod tests {
     /// `count` rows of `tile` filled with `colour`, the helper the flips and the
     /// row tests need because a sprite reads one row per line.
     fn solid_tile(vdp: &mut Vdp, tile: u16, colour: u8) {
-        for row in 0..CELL_ROWS {
+        for row in 0..CELL_TILE_ROWS {
             fill_tile_row(vdp, tile, row, colour);
         }
     }
@@ -629,7 +662,7 @@ mod tests {
 
         for cell_row in 0..4usize {
             let mut line = blank_line();
-            vdp.render_sprite_line((cell_row * CELL_ROWS) as u16, &mut line);
+            vdp.render_sprite_line((cell_row * CELL_TILE_ROWS) as u16, &mut line);
             assert_eq!(
                 &line[0..8],
                 &[(cell_row + 1) as u8; 8],
@@ -855,7 +888,7 @@ mod tests {
     #[test]
     fn a_sprite_partly_above_the_display_shows_its_lower_rows() {
         let mut vdp = sprite_vdp();
-        for row in 0..CELL_ROWS {
+        for row in 0..CELL_TILE_ROWS {
             fill_tile_row(&mut vdp, 1, row, (row + 1) as u8);
         }
         put_sprite(&mut vdp, 0, 128 - 3, 128, (1, 1), 0, 1);
@@ -1055,7 +1088,7 @@ mod tests {
     /// undoes because a wide sprite is several tiles and not one.
     fn solid_span(vdp: &mut Vdp, first: u16, count: usize, colour: u8) {
         for tile in 0..count {
-            for row in 0..CELL_ROWS {
+            for row in 0..CELL_TILE_ROWS {
                 fill_tile_row(vdp, first + tile as u16, row, colour);
             }
         }
@@ -1474,5 +1507,82 @@ mod tests {
             vdp.sprite_overflow,
             "the mask is the 21st sprite of the line, and is counted as one"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Interlace mode 2 (M4-20 #98): 8x16 cells and the 256 origin.
+    // ---------------------------------------------------------------------
+
+    /// Rows of a sprite cell of interlace mode 2 (genvdp.txt section 12: "A
+    /// pattern is an 8x8 or 8x16 (interlace mode 2 only) pixel block").
+    const MODE2_ROWS: usize = 16;
+
+    /// `tile` as a 16-row pattern of `colour`.
+    fn solid_cell_16(vdp: &mut Vdp, tile: u16, colour: u8) {
+        for row in 0..MODE2_ROWS {
+            fill_tile_row_of_height(vdp, tile, row, colour, MODE2_ROWS);
+        }
+    }
+
+    /// Interlace mode 2 doubles the height of a sprite cell and moves the origin of
+    /// the y coordinate from 128 to 256 (ticket #98: "Sprite Y is 10 bits with
+    /// offset 256 instead of 128, sprite heights double"), so a 2-cell sprite at
+    /// `y = 256` covers display lines 0..32: the first cell of 16 lines, then the
+    /// second, and nothing at line 32.
+    #[test]
+    fn interlace_mode_2_sprites_are_8x16_from_an_origin_of_256() {
+        let mut vdp = sprite_vdp();
+        vdp.write_register(12, 0x06);
+        solid_cell_16(&mut vdp, 1, 1);
+        solid_cell_16(&mut vdp, 2, 2);
+        put_sprite(&mut vdp, 0, 256, 128, (1, 2), 0, 1);
+
+        for line in [0u16, 15] {
+            let mut out = blank_line();
+            vdp.render_sprite_line(line, &mut out);
+            assert_eq!(
+                &out[0..8],
+                &[1; 8],
+                "display line {line} is still the first cell of the sprite"
+            );
+        }
+        for line in [16u16, 31] {
+            let mut out = blank_line();
+            vdp.render_sprite_line(line, &mut out);
+            assert_eq!(
+                &out[0..8],
+                &[2; 8],
+                "display line {line} is the cell below it, 16 lines down"
+            );
+        }
+
+        let mut out = blank_line();
+        vdp.render_sprite_line(32, &mut out);
+        assert_eq!(
+            out,
+            blank_line(),
+            "two cells of 16 lines end at display line 32"
+        );
+    }
+
+    /// The other half of the 256 origin: the `y` that sat a sprite on the top line
+    /// of an uninterlaced display is half the picture above it in mode 2, so it
+    /// draws on no line at all.
+    #[test]
+    fn interlace_mode_2_moves_the_sprite_y_origin_to_256() {
+        let mut vdp = sprite_vdp();
+        vdp.write_register(12, 0x06);
+        solid_cell_16(&mut vdp, 1, 3);
+        put_sprite(&mut vdp, 0, 128, 128, (1, 1), 0, 1);
+
+        for line in [0u16, 15] {
+            let mut out = blank_line();
+            vdp.render_sprite_line(line, &mut out);
+            assert_eq!(
+                out,
+                blank_line(),
+                "y = 128 is 128 lines of the picture above the display in mode 2"
+            );
+        }
     }
 }

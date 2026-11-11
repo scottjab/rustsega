@@ -78,8 +78,10 @@ impl NameEntry {
 /// `tile * 64`, which is how the same rule is sometimes written, is a different
 /// address: it numbers the 8x16 patterns instead of the 32-byte blocks the name
 /// field actually selects, so it doubles every address below `tile_addr` and
-/// would need a 128 KiB VRAM to hold an 11-bit name. Interlace mode 2 is
-/// M4-20 (#98); its addressing test should expect `(tile & !1) * 32`.
+/// would need a 128 KiB VRAM to hold an 11-bit name. The 8x16 case is interlace
+/// mode 2 (M4-20, #98), whose cell height `crate::planes` reads from R12 and
+/// passes to this function and to `tile_row` from the plane, window and sprite
+/// fetches that call it.
 #[inline]
 pub const fn tile_addr(tile: u16, tile_height: usize) -> usize {
     let name = tile as usize;

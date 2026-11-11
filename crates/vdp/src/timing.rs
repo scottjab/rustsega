@@ -610,4 +610,24 @@ mod tests {
         plain.advance(262 * MCLKS_PER_LINE);
         assert!(!plain.odd_frame, "and with no interlace d4 stays clear");
     }
+
+    /// The mode 2 half of the same rule, which #98 adds a use for: the flag is the
+    /// field the renderer draws, so it alternates in mode 2 exactly as it does in
+    /// mode 1 - "This applies to both interlace modes" (genvdp.txt section 6).
+    #[test]
+    fn odd_frame_flag_alternates_in_interlace_mode_2() {
+        let mut vdp = running(false);
+        vdp.write_register(12, 0x06);
+
+        vdp.advance(262 * MCLKS_PER_LINE);
+        let first = vdp.odd_frame;
+        vdp.advance(262 * MCLKS_PER_LINE);
+        assert_eq!(vdp.odd_frame, !first, "a frame later the field has flipped");
+
+        vdp.advance(262 * MCLKS_PER_LINE);
+        assert_eq!(
+            vdp.odd_frame, first,
+            "and back again, so it is a toggle and not a clock"
+        );
+    }
 }
