@@ -1175,6 +1175,23 @@ mod tests {
             &[row_colour(1); 16],
             "and the vscroll changes at pixel 16, not where plane x crosses a 16 pixel boundary"
         );
+
+        // An hscroll of 4 puts the plane cells astride the 16 pixel boundary, so
+        // the fetch of a cell has to stop at the column edge: the plane row of
+        // the two columns is all that changes there.
+        put_scroll(&mut vdp, 0, 4, 0);
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..16],
+            &[row_colour(0); 16],
+            "the 4 partial pixels and the 12 that end screen column 0 both read vsram[0]"
+        );
+        assert_eq!(
+            &out[16..32],
+            &[row_colour(1); 16],
+            "column 1 still starts at pixel 16, a third of the way into a plane cell"
+        );
     }
 
     /// The left column quirk of the ticket, which is a model of undocumented
