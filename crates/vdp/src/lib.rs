@@ -3,9 +3,10 @@
 //! What lives here today is the state layer: the three memories, the 24
 //! registers, the register writes, and the mode getters every later VDP ticket
 //! reads, the two ports the 68k reaches them with (`ports`: control port
-//! writes and data port writes and reads), and the 68k to VDP DMA (`dma`). The
-//! status register is M4-04 (#82), the fill and copy DMA modes M4-08 (#86),
-//! rendering starts at M4-10 (#88), and timing after that.
+//! writes and data port writes and reads), the status register the control port
+//! reads answer (`status`), and the 68k to VDP DMA (`dma`). The fill and copy
+//! DMA modes are M4-08 (#86), rendering starts at M4-10 (#88), and timing after
+//! that.
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
@@ -15,6 +16,7 @@ mod dma;
 mod framebuffer;
 mod ports;
 mod regs;
+mod status;
 
 pub use dma::DmaBus;
 pub use framebuffer::FrameBuffer;
@@ -98,6 +100,57 @@ pub struct Vdp {
     /// consumes it; the fill and copy modes of M4-08 (#86) will take their turn
     /// with it too.
     dma_requested: bool,
+    /// Status bit 7 (F): a vertical interrupt is waiting for the 68k.
+    ///
+    /// Set at VBlank start and cleared by the interrupt acknowledge, never by
+    /// the status read that shows it (genvdp.txt section 6: "Bit 7 is set when a
+    /// vertical interrupt occurs ... Reading the control port does not clear
+    /// this bit"). TODO(M4-06 #84): the interrupt that sets and clears it.
+    vint_pending: bool,
+    /// Status bit 6 (SOVR): too many sprites on the scan line just drawn.
+    ///
+    /// "Set when too many sprites are on the current scan line, meaning when the
+    /// VDP parses the 21st sprite in 40-cell mode or the 17th sprite in 32-cell
+    /// mode from the sprite list" (genvdp.txt section 6). Cleared by the status
+    /// read that reports it, see [`Vdp::read_status`].
+    ///
+    /// TODO(M4-16 #93): the sprite limit that sets it.
+    sprite_overflow: bool,
+    /// Status bit 5 (C): two sprites with non-transparent pixels overlapped.
+    ///
+    /// "Set when any sprites have non-transparent pixels overlapping one
+    /// another. This may hold true for sprites outside of the display area too"
+    /// (genvdp.txt section 6). Cleared by the status read, as bit 6 is.
+    ///
+    /// TODO(M4-16 #93): the collision detection that sets it.
+    sprite_collision: bool,
+    /// Status bit 4 (ODD): this frame is the odd one of an interlace pair.
+    ///
+    /// "Set when the display is interlaced, and in the odd frame, otherwise it
+    /// is cleared in the even frame. This applies to both interlace modes"
+    /// (genvdp.txt section 6). Clear always while the frame counter does not
+    /// exist: TODO(M4-05 #83).
+    odd_frame: bool,
+    /// Status bit 3 (VB): the vertical blanking signal is live.
+    ///
+    /// "Set on line E0h, at H counter cycle AAh, and cleared on line FFh, at H
+    /// counter cycle AAh" (genvdp.txt section 6). A switched-off display reads
+    /// as blanking whatever this field says; `status` says where that comes from.
+    ///
+    /// TODO(M4-05 #83): the frame counter that sets and clears it.
+    in_vblank: bool,
+    /// Status bit 2 (HB): the horizontal blanking signal is live.
+    ///
+    /// "Set at H counter cycle E4h and cleared at H counter cycle 08h"
+    /// (genvdp.txt section 6). TODO(M4-05 #83): the dot counter that sets it.
+    in_hblank: bool,
+    /// Status bit 1: a DMA is running. "Set for the duration of a DMA
+    /// operation ... only useful for fills and copies, since the 68000 is frozen
+    /// during 68k -> VDP transfers" (genvdp.txt section 6).
+    ///
+    /// TODO(M4-22 #101): DMA timing, which is what would set and clear it; the
+    /// transfers of M4-07 (#85) run in one call and so are never seen busy.
+    dma_busy: bool,
     /// The frame the renderer draws into. Read through [`Vdp::frame`].
     frame_buffer: FrameBuffer,
     /// Which crystal the chip is clocked by: `true` for PAL, which can drive a
@@ -126,6 +179,13 @@ impl Vdp {
             pending: false,
             fifo_last: 0,
             dma_requested: false,
+            vint_pending: false,
+            sprite_overflow: false,
+            sprite_collision: false,
+            odd_frame: false,
+            in_vblank: false,
+            in_hblank: false,
+            dma_busy: false,
             frame_buffer: FrameBuffer::new(),
             pal,
         }

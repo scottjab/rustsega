@@ -1009,19 +1009,24 @@ impl Bus {
     }
 
     /// VDP port word read: the data port, the status register behind a control
-    /// port read, and the HV counter are the three ports with a read, and the data
-    /// port is the only one of the three that has an answer yet.
+    /// port read, and the HV counter are the three ports with a read, and the HV
+    /// counter is the only one of the three without an answer of its own yet.
     ///
     /// The data port is the chip's own [`Vdp::read_data`], which decides which
     /// memory the code register points at, what the read is masked by, and how the
     /// address register moves on (M4-03, #81).
     ///
+    /// The control port is the chip's own [`Vdp::read_status`] (M4-04, #82), and
+    /// neither read is passive: reading either port clears the write-pending flag
+    /// (genvdp.txt section 7), so a status read in the middle of a command word
+    /// abandons it. That is what `status_read_word_and_bytes` and
+    /// [`Self::status_read_clears_the_command_latch`] hold still.
+    ///
     /// The rest of the area answers [`OPEN_BUS_WORD`], the value the rest of the
-    /// undecoded map answers, because nothing can produce anything else: the
-    /// status register is M4-04 (#82) and the HV counter M4-05 (#83). The port
-    /// decode is done anyway, and is the reason this is not one `OPEN_BUS_WORD` -
-    /// it is where each of those tickets arrives, and it is what the tests of these
-    /// reads (`status_read_word_and_bytes`, [`Self::hv_counter_read`]) hold still.
+    /// undecoded map answers, because nothing can produce anything else: the HV
+    /// counter is M4-05 (#83). The port decode is done anyway, and is the reason
+    /// this is not one `OPEN_BUS_WORD` - it is where that ticket arrives, and it is
+    /// what those tests and [`Self::hv_counter_read`] are really testing.
     ///
     /// The PSG and the debug pair have no read in any case: plutiedev "Memory map"
     /// gives the PSG as write-only and the debug ports no function, and Genesis
@@ -1030,10 +1035,12 @@ impl Bus {
     fn read_vdp_word(&mut self, addr: u32) -> u16 {
         match vdp_port(addr) {
             Some(VdpPort::Data) => self.vdp.read_data(),
-            // TODO(M4-04 #82): `self.vdp.read_status()`, which also clears the
-            //   write-pending flag (genvdp.txt section 7).
+            // The status read, which clears the write-pending flag with the rest
+            // of what it does (genvdp.txt section 7: "It is cleared when the
+            // control port is read").
+            Some(VdpPort::Control) => self.vdp.read_status(),
             // TODO(M4-05 #83): `self.vdp.hv_counter()`.
-            Some(VdpPort::Control) | Some(VdpPort::HvCounter) => OPEN_BUS_WORD,
+            Some(VdpPort::HvCounter) => OPEN_BUS_WORD,
             Some(VdpPort::Psg) | Some(VdpPort::Debug) => OPEN_BUS_WORD,
             // The corner of the area that decodes to nothing: see
             // [`VDP_HANG_BIT`] for what it does on real hardware, and M3-16 (#77)
@@ -3715,19 +3722,27 @@ mod tests {
         }
     }
 
-    /// A read of the control port is the status read, not a control port write:
-    /// the half-written command word in the latch has to survive it, or the data
-    /// port write that finishes it lands in the wrong memory.
+    /// A read of the control port is the status read, not a control port write,
+    /// and the status read is not free: it ends whatever command word was
+    /// half-written into the latch.
     ///
-    /// The value the port answers is the placeholder [`Bus::read_vdp_word`]
-    /// documents, because the VDP has no status register until M4-04 (#82); what
-    /// this pins down is the decode, the two byte lanes of the word, and that
-    /// reading leaves the chip alone.
+    /// The value is the chip's own status register (M4-04, #82). For a VDP that
+    /// has been built and never run that is `0x3608`: the d15-d10 constants the
+    /// VDP drives (`0x3400`, genvdp.txt section 6), FIFO empty (d9, and there is
+    /// no FIFO yet to say otherwise), and VB (d3) because the display is off
+    /// until a game turns it on. What this pins down is the decode, the two byte
+    /// lanes of the word, and the latch.
     #[test]
     fn status_read_word_and_bytes() {
         let mut bus = Bus::new(Vec::new(), NO_TMSS);
 
         let word = bus.read_word(0xC00004);
+        assert_eq!(
+            word, 0x3608,
+            "the control port is the status register now, not the open bus it \
+             read until #82: 0x3400 of driven constants | FIFO empty | the VB \
+             bit a switched-off display reads"
+        );
         assert_eq!(
             bus.read_byte(0xC00004),
             (word >> 8) as u8,
@@ -3740,9 +3755,11 @@ mod tests {
         );
 
         // Half a command word down, then the status read every VBL handler does
-        // somewhere, then the second half. A read that fed the control port
-        // anything at all would consume the pending half here and the write
-        // below would be ignored.
+        // somewhere. "It is cleared when the control port is read" (genvdp.txt
+        // section 7), so the pending half is gone before the second half is sent:
+        // `second` is a first half in its own right, the code register it leaves
+        // is a read code, and the data port word that follows is ignored rather
+        // than landing at $0004.
         set_reg(&mut bus, 15, 2);
         let (first, second) = vram_write_cmd(0x0004);
         bus.write_word(0xC00004, first);
@@ -3752,8 +3769,40 @@ mod tests {
         bus.write_word(0xC00000, 0x1234);
         assert_eq!(
             &bus.vdp.vram[4..6],
-            &[0x12, 0x34],
-            "a status read left the command latch alone"
+            &[0x00, 0x00],
+            "a status read abandons the command word in the latch"
+        );
+    }
+
+    /// The 68k-side proof of the one thing a status read does to the chip besides
+    /// answering: "It is cleared when the control port is read" (genvdp.txt
+    /// section 7), so the control port judges the next word from scratch again.
+    ///
+    /// A register write is the observable case, because "You cannot write to a
+    /// VDP register if the pending flag is set to one": with the latch still set
+    /// the register write is swallowed as the second half of the command, and
+    /// with the status read in between it reaches the register.
+    #[test]
+    fn status_read_clears_the_command_latch() {
+        let (first, _second) = vram_write_cmd(0x0004);
+
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        bus.write_word(0xC00004, first);
+        let status = bus.read_word(0xC00004);
+        bus.write_word(0xC00004, 0x8F04);
+        assert_eq!(
+            bus.vdp.reg(15),
+            4,
+            "R15 was written, so the status read of {status:#06x} ended the command word"
+        );
+
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        bus.write_word(0xC00004, first);
+        bus.write_word(0xC00004, 0x8F04);
+        assert_eq!(
+            bus.vdp.reg(15),
+            0,
+            "without the read in between 0x8F04 is the second half of the command"
         );
     }
 

@@ -13,7 +13,7 @@
 //! Data port reads ([`Vdp::read_data`]) are the other half of the same pair of
 //! ports: the code register says which memory to read and the last word written
 //! to the port fills the bits that memory does not drive. Not here either: the
-//! status register read that also clears `pending` (M4-04, #82), and the FIFO
+//! control port read of the status register, which is `status`, and the FIFO
 //! with the read prefetch that real hardware runs behind the read side
 //! (M4-21a, #99).
 

@@ -615,10 +615,14 @@ mod tests {
         // bus: after `Bus::new` the code register is a VRAM read and VRAM is
         // zeroed, so the port answers a real VRAM word and the Z80 sees its high
         // byte - the same answer the 68k gets at 0xC00000, which is what this
-        // window exists to guarantee. The status register (M4-04, #82) and the HV
-        // counter (M4-05, #83) lanes are still the open-bus placeholder.
+        // window exists to guarantee.
         assert_eq!(read(&mut bus, 0x7F00), 0x00);
-        assert_eq!(read(&mut bus, 0x7F04), 0xFF);
+        // The control port is the chip's status register since M4-04 (#82), so
+        // this lane answers the high byte of the word a fresh NTSC VDP gives:
+        // 0x3608, whose 0x36 is the d15-d10 constants the VDP drives (0x3400)
+        // with the FIFO-empty flag (d9) on top. The HV counter (M4-05, #83) and
+        // PSG lanes are still the open-bus placeholder.
+        assert_eq!(read(&mut bus, 0x7F04), 0x36);
         assert_eq!(read(&mut bus, 0x7F08), 0xFF);
         // The PSG is write-only, so reading its port answers the same way.
         assert_eq!(read(&mut bus, 0x7F11), 0xFF);
