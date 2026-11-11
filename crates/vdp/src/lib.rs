@@ -10,7 +10,8 @@
 //! (`timing`), and the CRAM to pixel conversion with its colour LUT (`color`),
 //! and the name table entries and the pattern rows they point at (`pattern`),
 //! and the plane A and plane B layer buffers read from those tables
-//! (`planes`).
+//! (`planes`), and the sprite attribute table and the sprite layer of a line
+//! (`sprites`).
 //! Rendering is M4-10 (#88) onwards, so the line renderer that `timing` calls
 //! is the backdrop stub of M4-17 (#95).
 //!
@@ -26,6 +27,7 @@ pub mod pattern;
 mod planes;
 mod ports;
 mod regs;
+mod sprites;
 mod status;
 mod timing;
 mod window;
