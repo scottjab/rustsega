@@ -200,8 +200,9 @@ impl Vdp {
     /// * a fill pays one slot of every line and moves nothing: 17 and 15 active,
     ///   204 and 166 blank, one short of the transfer in all four columns.
     ///   Nothing says where in the line that slot goes, so it is the first one
-    ///   and the four counts come out right. INFERRED - see the module note,
-    ///   TODO(#101).
+    ///   and the four counts come out right. INFERRED, TODO(#101): the fill and
+    ///   copy figures are what #101 was given rather than something a page was
+    ///   found for, and #305 is checking them against the Sega manual.
     ///
     /// A line with the display off is a blank one here: nothing is being fetched
     /// so [`BLANK_H40`] is the schedule, which is the same reading
@@ -220,11 +221,7 @@ impl Vdp {
         } else {
             &ACTIVE_H32
         };
-        if fill {
-            &line[1..]
-        } else {
-            line
-        }
+        if fill { &line[1..] } else { line }
     }
 
     /// How many of the DMA's access slots the master clocks in `(from, to]` of

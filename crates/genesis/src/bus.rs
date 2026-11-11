@@ -4005,6 +4005,10 @@ mod tests {
     /// the write. #85 says this on the method, and that the call is a no-op
     /// whenever the write asked for no DMA.
     ///
+    /// "Ran" is not "finished" since #101: the transfer is timed by the VDP's
+    /// access slots, so the words arrive as the beam goes round and the test has
+    /// to move it.
+    ///
     /// The registers are genvdp.txt section 11 and plutiedev "$93xx" to "$97xx":
     /// R1 M1 (bit 4) allows DMA, R19/R20 the word count, R21/R22/R23 the source
     /// address, and R15 is the destination's own step, set to 2 like every DMA
@@ -4031,14 +4035,21 @@ mod tests {
         let (first, second) = dma_cmd(0x0000);
         bus.write_word(0xC00004, first);
         bus.write_word(0xC00004, second);
+        assert!(
+            !bus.vdp.dma_requested(),
+            "the request was run rather than left standing"
+        );
+        assert!(
+            bus.vdp.vram[0..8].iter().all(|&byte| byte == 0),
+            "and it is a transfer of access slots, not of this call: nothing has landed yet (#101)"
+        );
+        // Eight slots for the four VRAM words, and a line of the display-off VDP
+        // these tests run has 167 of them: one line of beam is the whole transfer.
+        bus.vdp.advance(TEST_VDP_LINE);
         assert_eq!(
             &bus.vdp.vram[0..8],
             &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0],
             "the four words of work RAM are in VRAM"
-        );
-        assert!(
-            !bus.vdp.dma_requested(),
-            "the request was run rather than left standing"
         );
 
         // The cartridge as the source, which is the other memory a DMA reads and
@@ -4055,6 +4066,7 @@ mod tests {
         let (first, second) = dma_cmd(0x0000);
         bus.write_word(0xC00004, first);
         bus.write_word(0xC00004, second);
+        bus.vdp.advance(TEST_VDP_LINE);
         assert_eq!(
             &bus.vdp.vram[0..8],
             &[0xCA, 0xFE, 0xBA, 0xBE, 0x11, 0x22, 0x33, 0x44],

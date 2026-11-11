@@ -138,8 +138,9 @@ impl Vdp {
     /// count of the write, the same way it adds `dma_68k_stall_mclk`.
     pub fn data_port_stall_mclk(&self) -> u32;
     pub fn hv_counter(&self) -> u16;
-    /// After every control port write the bus glue calls this to run any DMA
-    /// the write requested (write_control only flags it).
+    /// After every control port write the bus glue calls this to start any DMA
+    /// the write requested (write_control only flags it). Starting is not
+    /// finishing: the transfer takes access slots, and `advance` spends them.
     pub fn run_dma(&mut self, bus: &mut impl DmaBus);
     /// Advance the VDP by master clocks. Renders lines and raises IRQs as it goes.
     pub fn advance(&mut self, mclk: u32);
@@ -147,7 +148,10 @@ impl Vdp {
     pub fn ack_irq(&mut self, level: u8);
     pub fn z80_int_line(&self) -> bool;
     pub fn frame_done(&mut self) -> bool;    // true once per frame, at VBlank start
-    pub fn dma_68k_stall_mclk(&mut self) -> u32;
+    /// Master clocks the 68k is still frozen for by a 68k -> VDP DMA, `0` for a
+    /// fill, a copy, and no DMA at all. The bus glue (M3-16) adds it to the
+    /// cycle count of the command word that started the transfer.
+    pub fn dma_68k_stall_mclk(&self) -> u32;
     /// Render one line directly. Public for tests; the scheduler uses advance().
     pub fn render_line(&mut self, line: u16);
     pub fn frame(&self) -> &FrameBuffer;
@@ -177,13 +181,42 @@ The VDP write FIFO (`crates/vdp/src/fifo.rs`, M4-21a #99) is what makes
   `dma_68k_stall_mclk` the same glue already reads.
 * A data port read drains the FIFO first, so a read never sees a location as it
   was before the write the 68k queued for it.
-* The slot schedule is the placeholder M4-21b (#100) replaces: one slot every 32
-  master clocks over the active display, one every 16 while blanking, and no
-  wait at all while the display is off - which is why the pre-FIFO data port
-  tests of M4-02 and M4-03 need no `advance` in them.
-* DMA writes go straight to memory, because a 68k-to-VDP transfer is thousands
-  of writes run in one call and the FIFO is four deep. M4-22 (#101) owns the
-  timing of DMA.
+* The slots are the ones `crates/vdp/src/slots.rs` tabulates per mode and per
+  part of the line (M4-21b #100): 18 of an active H40 line and 16 of an active
+  H32 one, 205 and 167 of a blank line, and no wait at all while the display is
+  off - which is why the pre-FIFO data port tests of M4-02 and M4-03 need no
+  `advance` in them.
+* A DMA write goes straight to memory rather than onto the FIFO, because a
+  68k-to-VDP transfer is thousands of writes and the FIFO is four deep. It
+  still costs slots, and they are the same slots: see "VDP DMA timing".
+
+### VDP DMA timing
+
+`crates/vdp/src/dma.rs` (M4-07 #85, M4-08 #86) runs the three DMA modes over
+the access slots of `slots.rs` rather than inside the call that started them
+(M4-22, #101):
+
+* `run_dma` and the data port write that arms a fill *start* a transfer. It is
+  spent one unit per access slot by `advance`, so VRAM is partly written while a
+  transfer runs, which games rely on.
+* A unit is a word of a 68k transfer and a byte of a fill or a copy. It costs
+  two slots for a VRAM word and a copied byte - VRAM is byte wide, and a copy
+  reads as well as writes - and one for a CRAM or VSRAM word and a fill step.
+  That is the Sega DMA bandwidth table out of the slot schedule: 18 bytes an
+  active H40 line for a 68k transfer, 17 for a fill and 9 for a copy; 205, 204
+  and 102 in blanking; and the H32 column of 16 / 15 / 8 and 167 / 166 / 83.
+  A fill pays one slot of every line and moves nothing.
+* A 68k transfer freezes the 68k for its whole length, and
+  `dma_68k_stall_mclk` is how long: the time to the last of the transfer's
+  slots. A fill and a copy hold the 68k off the data port instead, which is
+  what status bit 1 says, and report no stall.
+* A transfer's source words are read when it starts, because `advance` has no
+  bus to read them with and the frozen 68k cannot change them meanwhile. That is
+  a promise `DmaBus` carries: a read may not do anything the first of them would
+  not have done.
+* The length registers are spent, and a transfer's source registers moved on,
+  when the last slot arrives rather than when the command word is written, and
+  status bit 1 comes down with them.
 
 ### Audio chips
 

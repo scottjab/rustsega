@@ -21,8 +21,10 @@
 //! 68k is frozen while one runs - the number the bus glue of M3-16 (#77) waits.
 //!
 //! Not modelled: the read FIFO quirk that makes the first word of a
-//! 68k-to-VRAM transfer wrong on real hardware (#303), and the CRAM "dots" a
-//! write during active display leaves behind (out of scope for #101).
+//! 68k-to-VRAM transfer wrong on real hardware (#306), and the CRAM "dots" a
+//! write during active display leaves behind (out of scope for #101). The four
+//! bandwidth figures the slot costs below reproduce are ticket-stated rather
+//! than quoted from the Sega manual, and #305 is checking them.
 
 use crate::DmaMode;
 use crate::Vdp;
@@ -195,7 +197,9 @@ impl Running {
     /// copied before the slot that writes it.
     fn unit_is_due(&self) -> bool {
         match self {
-            Self::Transfer { slots, per_unit, .. } => *slots % u32::from(*per_unit) == 0,
+            Self::Transfer {
+                slots, per_unit, ..
+            } => *slots % u32::from(*per_unit) == 0,
             Self::Fill { .. } => true,
             Self::Copy { slots, .. } => *slots % u32::from(COPY_SLOTS) == 0,
         }
@@ -563,8 +567,8 @@ impl Vdp {
     /// frozen during 68k -> VDP transfers" (genvdp.txt section 6).
     ///
     /// The time is counted along the DMA's own slot schedule one line at a time
-    /// ([`Vdp::dma_slot_table`]), so a transfer that started mid-active-line ends
-    /// where 18 slots a line put it rather than where a flat rate would.
+    /// (`slots::Vdp::dma_slot_table`), so a transfer that started mid-active-line
+    /// ends where 18 slots a line put it rather than where a flat rate would.
     pub fn dma_68k_stall_mclk(&self) -> u32 {
         match &self.dma {
             Some(running @ Running::Transfer { .. }) => {
@@ -982,7 +986,6 @@ mod tests {
         );
     }
 
-
     /// A 68k transfer writes the memories, not the data port, so it does not
     /// run a fill that is already waiting for a port write: "Any write to the
     /// data port will then start a VRAM fill" (genvdp.txt section 11 "VRAM
@@ -1282,7 +1285,10 @@ mod tests {
             "one line of blanking, not more: {stall} of {MCLKS_PER_LINE}"
         );
         vdp.advance(stall - 1);
-        assert!(vdp.dma_busy, "one clock short of the last slot of the last word");
+        assert!(
+            vdp.dma_busy,
+            "one clock short of the last slot of the last word"
+        );
         vdp.advance(1);
         assert!(!vdp.dma_busy, "and on that clock the transfer is done");
         assert_eq!(vdp.line, 0, "inside the line it started on");
@@ -1355,7 +1361,11 @@ mod tests {
         copy_source(&mut copy, 0x0100);
         start_and_run(&mut copy, copy_write_cmd(0x0200));
         assert!(copy.dma_busy, "and a copy runs, busy,");
-        assert_eq!(copy.dma_68k_stall_mclk(), 0, "and holds the 68k for nothing");
+        assert_eq!(
+            copy.dma_68k_stall_mclk(),
+            0,
+            "and holds the 68k for nothing"
+        );
     }
 
     /// A copy moves one byte per *two* slots - one to read the source and one to
@@ -1414,19 +1424,35 @@ mod tests {
         active.write_register(1, 0x40);
         active.write_register(12, 0x81);
         assert_eq!(active.dma_slot_table(false).len(), 18, "active H40");
-        assert_eq!(active.dma_slot_table(true).len(), 17, "and a fill, one less");
+        assert_eq!(
+            active.dma_slot_table(true).len(),
+            17,
+            "and a fill, one less"
+        );
 
         active.write_register(12, 0x00);
         assert_eq!(active.dma_slot_table(false).len(), 16, "active H32");
-        assert_eq!(active.dma_slot_table(true).len(), 15, "and a fill, one less");
+        assert_eq!(
+            active.dma_slot_table(true).len(),
+            15,
+            "and a fill, one less"
+        );
 
         let mut blank = h40_in_vblank();
         assert_eq!(blank.dma_slot_table(false).len(), 205, "blank H40");
-        assert_eq!(blank.dma_slot_table(true).len(), 204, "and a fill, one less");
+        assert_eq!(
+            blank.dma_slot_table(true).len(),
+            204,
+            "and a fill, one less"
+        );
 
         blank.write_register(12, 0x00);
         assert_eq!(blank.dma_slot_table(false).len(), 167, "blank H32");
-        assert_eq!(blank.dma_slot_table(true).len(), 166, "and a fill, one less");
+        assert_eq!(
+            blank.dma_slot_table(true).len(),
+            166,
+            "and a fill, one less"
+        );
 
         assert_eq!(
             Vdp::new(false).dma_slot_table(false).len(),
