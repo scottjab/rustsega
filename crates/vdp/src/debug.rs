@@ -236,11 +236,11 @@ pub fn tiles(vdp: &Vdp, palette: u8) -> DebugImage {
     let base = (palette & 0x03) << 4;
     let mut image = DebugImage::new(
         TILE_COLUMNS * CELL_WIDTH,
-        TILES.div_ceil(TILE_COLUMNS) * CELL_WIDTH,
+        TILES.div_ceil(TILE_COLUMNS) * CELL_ROWS,
     );
     for tile in 0..TILES {
         let x = (tile % TILE_COLUMNS) * CELL_WIDTH;
-        let y = (tile / TILE_COLUMNS) * CELL_WIDTH;
+        let y = (tile / TILE_COLUMNS) * CELL_ROWS;
         for row in 0..CELL_ROWS {
             let indices = tile_row(&vdp.vram, tile as u16, row, false, false, CELL_ROWS);
             for (offset, index) in indices.iter().enumerate() {
