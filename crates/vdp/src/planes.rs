@@ -151,8 +151,21 @@ impl Vdp {
         }
     }
 
-    /// The horizontal scroll value of `plane` on `line`: the 10-bit value of the
-    /// table entry that R11's mode says this line reads, at
+    /// The horizontal scroll value of `plane` on `line`, as the line is drawn
+    /// with it: the [`crate::latch::LineState`] value latched at the start of its
+    /// active display while a line is being drawn, and
+    /// [`Vdp::hscroll_table`] read now otherwise. `line` is the row of the table
+    /// that live walk indexes.
+    #[inline]
+    pub(crate) fn line_hscroll(&self, plane: Plane, line: usize) -> usize {
+        match self.latched_hscroll(plane) {
+            Some(hscroll) => hscroll,
+            None => self.hscroll_table(plane, line),
+        }
+    }
+
+    /// The horizontal scroll value of `plane` on `line`, read from the table now:
+    /// the 10-bit value of the entry that R11's mode says this line reads, at
     /// [`Vdp::hscroll_base`] plus `index * HSCROLL_ENTRY` plus this plane's word.
     ///
     /// genvdp.txt section 13 "Horizontal Scrolling" gives the walk of the table
@@ -175,7 +188,7 @@ impl Vdp {
     /// pinned by `interlace_mode_2_walks_the_horizontal_scroll_table_by_display_line`,
     /// and TODO(M6-06 #125) to confirm it on hardware with a scroll test ROM.
     #[inline]
-    pub(crate) fn line_hscroll(&self, plane: Plane, line: usize) -> usize {
+    pub(crate) fn hscroll_table(&self, plane: Plane, line: usize) -> usize {
         let cell_rows = self.cell_height();
         let index = match self.hscroll_mode() {
             HScrollMode::Full => 0,
@@ -213,7 +226,7 @@ impl Vdp {
         } else {
             0
         } + plane.scroll_vsram_word();
-        usize::from(self.vsram[index] & self.vscroll_mask())
+        usize::from(self.latched_vsram()[index] & self.vscroll_mask())
     }
 
     /// The width of a vertical scroll value: 11 bits in interlace mode 2, where
@@ -257,7 +270,8 @@ impl Vdp {
         }
         let [first, second] = LEFT_COLUMN_WORDS;
         let mask = self.vscroll_mask();
-        usize::from(self.vsram[first] & self.vsram[second] & mask)
+        let vsram = self.latched_vsram();
+        usize::from(vsram[first] & vsram[second] & mask)
     }
 
     /// Fill `out` with one line of `plane`: one [`u8`] per pixel, bits 5-0 the

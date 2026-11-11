@@ -61,7 +61,7 @@ const HBLANK_SET_MCLK_H32: u32 = 2940;
 const HBLANK_CLEAR_MCLK_H40: u32 = 81;
 /// Master clocks into the line at which status bit 2 goes down, H32: the ticket's
 /// 0x05 again, ten master clocks to the pixel, so 100.
-const HBLANK_CLEAR_MCLK_H32: u32 = 100;
+pub(crate) const HBLANK_CLEAR_MCLK_H32: u32 = 100;
 
 /// How long the VDP holds the Z80's interrupt line at VBlank, in master clocks.
 ///
@@ -207,6 +207,14 @@ impl Vdp {
             // M4-23 can move it to the clock.
             self.in_vblank = false;
         }
+
+        // A beam that `set_position` jumped into the middle of this line walked
+        // past no event of it, so if where it landed is past the latch point the
+        // line still has to be latched - the `render_line` at the end of it reads
+        // that latch (#102).
+        if self.line_mclk >= self.hblank_clear_mclk() {
+            self.latch_line_state();
+        }
     }
 
     /// The first line of a frame.
@@ -223,6 +231,10 @@ impl Vdp {
     fn line_event(&mut self) {
         if self.line_mclk == self.hblank_clear_mclk() {
             self.in_hblank = false;
+            // The active display begins here, so this is where the line's scroll
+            // and mode state stops being writable: `latch` is what the line is
+            // drawn from from now on (M4-23, #102).
+            self.latch_line_state();
         } else {
             self.in_hblank = true;
             self.hint_step();
