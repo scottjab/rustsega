@@ -54,8 +54,9 @@ Rules:
 - One scanline = 3420 master clocks. 262 lines per frame (313 PAL).
 - The scheduler in `genesis` runs line by line. Within a line it interleaves
   the 68000 and Z80 in small cycle slices, and fires HINT/VINT at the right
-  master-clock position. Sub-line accuracy (FIFO stalls, mid-line register
-  writes) comes later as separate tickets.
+  master-clock position. Sub-line accuracy (the FIFO stall of `Vdp`, mid-line
+  register writes) comes later as separate tickets: the VDP has reported its
+  side of the write FIFO since M4-21a (#99), and `genesis` has to act on it.
 
 ## Core APIs (initial shape, tickets may refine)
 
@@ -126,10 +127,16 @@ pub trait DmaBus { fn read_word(&mut self, addr: u32) -> u16; } // 68k-side memo
 
 impl Vdp {
     pub fn new(pal: bool) -> Self;
+    /// Queue a data port write: it reaches VRAM/CRAM/VSRAM at the next external
+    /// access slot, not in this call. See "VDP write FIFO" below.
     pub fn write_data(&mut self, value: u16);
     pub fn read_data(&mut self) -> u16;
     pub fn write_control(&mut self, value: u16);
     pub fn read_status(&mut self) -> u16;
+    /// Master clocks the 68k is held for by a data port write, `0` when the
+    /// write is taken straight away. The bus glue (M3-16) adds it to the cycle
+    /// count of the write, the same way it adds `dma_68k_stall_mclk`.
+    pub fn data_port_stall_mclk(&self) -> u32;
     pub fn hv_counter(&self) -> u16;
     /// After every control port write the bus glue calls this to run any DMA
     /// the write requested (write_control only flags it).
@@ -152,6 +159,31 @@ pub struct FrameBuffer {
     pub pixels: Vec<u32>, // fixed capacity 320*480, RGBA8888 little endian (0xAABBGGRR as u32)
 }
 ```
+
+The VDP write FIFO (`crates/vdp/src/fifo.rs`, M4-21a #99) is what makes
+`write_data` a queue rather than a write:
+
+* A data port write goes onto a four-entry FIFO carrying the code register, the
+  address register and the word. Address auto-increment happens at enqueue time,
+  because the access the 68k made is the access that counted.
+* An entry reaches its memory at an external access slot: two slots for a VRAM
+  word, which is byte wide, one for a CRAM or VSRAM word.
+* Status bit 9 is FIFO empty and bit 8 is FIFO full; both read 0 in the neutral
+  state of one to three entries.
+* A write that finds the FIFO full is not lost: it waits on the port, and
+  `data_port_stall_mclk` is how long the 68k is held for. That is the design
+  chosen over `write_data` returning an indication, because the bus has to be
+  able to act on it without the write being issued twice, and it matches the
+  `dma_68k_stall_mclk` the same glue already reads.
+* A data port read drains the FIFO first, so a read never sees a location as it
+  was before the write the 68k queued for it.
+* The slot schedule is the placeholder M4-21b (#100) replaces: one slot every 32
+  master clocks over the active display, one every 16 while blanking, and no
+  wait at all while the display is off - which is why the pre-FIFO data port
+  tests of M4-02 and M4-03 need no `advance` in them.
+* DMA writes go straight to memory, because a 68k-to-VDP transfer is thousands
+  of writes run in one call and the FIFO is four deep. M4-22 (#101) owns the
+  timing of DMA.
 
 ### Audio chips
 

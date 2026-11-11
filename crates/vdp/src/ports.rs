@@ -21,8 +21,8 @@
 //! prefetch that real hardware runs behind the read side, which is M4-21b
 //! (#100).
 
-use crate::fifo;
 use crate::Vdp;
+use crate::fifo;
 
 /// Bit 5 of the code register: the DMA trigger. genvdp.txt section 7 "VDP
 /// ports": "Setting CD5 will trigger a DMA operation."

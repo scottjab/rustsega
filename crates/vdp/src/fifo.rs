@@ -26,8 +26,8 @@
 //! and are not the FIFO's business, but they do wait for what is already
 //! queued, so [`Vdp::read_data`] drains it first.
 
-use crate::ports::{DataTarget, data_target};
 use crate::Vdp;
+use crate::ports::{DataTarget, data_target};
 
 /// Entries the write FIFO holds.
 ///

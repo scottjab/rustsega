@@ -1066,6 +1066,11 @@ impl Bus {
     /// That duplication is the whole story on the chip's side: [`Vdp::write_data`]
     /// and [`Vdp::write_control`] are word functions and the VDP never learns that
     /// the 68k only sent eight of the sixteen bits.
+    ///
+    /// A data port write is queued rather than performed - it is a write FIFO
+    /// entry on its way to a memory (`vdp::fifo`, M4-21a #99) - and this does not
+    /// wait for it. [`Vdp::data_port_stall_mclk`] is the wait, and M3-16 (#77) is
+    /// the ticket that adds it to the 68k's cycles.
     fn write_vdp_byte(&mut self, addr: u32, value: u8) {
         match vdp_port(addr) {
             Some(VdpPort::Data) => self.vdp.write_data(u16::from_be_bytes([value, value])),
@@ -3788,8 +3793,9 @@ mod tests {
     ///
     /// The value is the chip's own status register (M4-04, #82). For a VDP that
     /// has been built and never run that is `0x3608`: the d15-d10 constants the
-    /// VDP drives (`0x3400`, genvdp.txt section 6), FIFO empty (d9, and there is
-    /// no FIFO yet to say otherwise), and VB (d3) because the display is off
+    /// VDP drives (`0x3400`, genvdp.txt section 6), FIFO empty (d9, and a VDP
+    /// that has never been written to has nothing on its write FIFO), and VB
+    /// (d3) because the display is off
     /// until a game turns it on. What this pins down is the decode, the two byte
     /// lanes of the word, and the latch.
     #[test]
