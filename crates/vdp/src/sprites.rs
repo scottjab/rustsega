@@ -219,7 +219,19 @@ impl Vdp {
     /// the display - "Sprites that are outside of the physical display area are still
     /// taken into account".
     ///
-    /// TODO(M4-16 #94): collision and the masking of a sprite at x = 0.
+    /// Collision is d5 of the status register, "Set when any sprites have
+    /// non-transparent pixels overlapping one another" (section 6), and it is
+    /// detected here as the second sprite of a pair finding a pixel already taken:
+    /// [`Vdp::fill_sprite_line`] only writes a transparent pixel, so an overlap of
+    /// two opaque ones is exactly the write it does not make. What the sprite did not
+    /// draw collides with nothing, so a pixel clipped off the display, one the dot
+    /// limit removed and the whole of a masked sprite are not detection material.
+    /// genvdp.txt does not say whether the pixels off the display count - it lists
+    /// "Sprite collisions and overflows outside of the physical display area" as an
+    /// open question of its own - so this follows the display-area-only reading and
+    /// the tests of #94 fix it in for M6-06 to change loudly.
+    ///
+    /// TODO(M4-16 #94): the masking of a sprite at x = 0.
     pub fn render_sprite_line(&mut self, line: u16, out: &mut [u8; WIDTH_H40]) {
         out.fill(0);
         let (max_sprites, max_dots) = if self.h40() {
@@ -240,10 +252,11 @@ impl Vdp {
             let Some(pixels) = walk.admit(&sprite, max_sprites, max_dots) else {
                 break;
             };
-            self.fill_sprite_line(&sprite, row as usize, pixels, out);
+            walk.collision |= self.fill_sprite_line(&sprite, row as usize, pixels, out);
         }
 
         self.sprite_overflow |= walk.overflow;
+        self.sprite_collision |= walk.collision;
     }
 
     /// Draw `row` - the row of `sprite` counting down from its top, 0..the height
@@ -276,7 +289,7 @@ impl Vdp {
     /// [`tile_row`] does with the same flag. Mirroring the cell index and passing
     /// `row` to [`tile_row`] unmirrored is the same thing as mirroring the row and
     /// dropping the flag, so each axis is mirrored once here and nowhere else.
-    fn fill_sprite_line(&self, sprite: &Sprite, row: usize, pixels: usize, out: &mut [u8]) {
+    fn fill_sprite_line(&self, sprite: &Sprite, row: usize, pixels: usize, out: &mut [u8]) -> bool {
         let NameEntry {
             priority,
             palette,
@@ -285,6 +298,7 @@ impl Vdp {
             tile,
         } = sprite.pattern;
         let height_cells = usize::from(sprite.height_cells);
+        let mut collision = false;
         // The cell row of the sprite to fetch, mirrored by vflip; the row of the
         // pattern inside it stays `row % CELL_ROWS` because `tile_row` mirrors that
         // with the same flag, and the two together are the one mirror.
@@ -319,11 +333,17 @@ impl Vdp {
                     continue;
                 }
                 let x = x as usize;
-                if index != 0 && out[x] == 0 {
-                    out[x] = (layer_base + u16::from(index)) as u8;
+                if index != 0 {
+                    if out[x] == 0 {
+                        out[x] = (layer_base + u16::from(index)) as u8;
+                    } else {
+                        // Two sprites, one pixel, both opaque: d5 of section 6.
+                        collision = true;
+                    }
                 }
             }
         }
+        collision
     }
 }
 
@@ -344,6 +364,9 @@ struct LineWalk {
     /// SOVR, from a sprite past either of the two limits of the line: see
     /// [`Vdp::sprite_overflow`].
     overflow: bool,
+    /// d5: two sprites of this line drew an opaque pixel in the same place, and
+    /// [`Vdp::fill_sprite_line`] is what noticed.
+    collision: bool,
 }
 
 impl LineWalk {
@@ -1101,6 +1124,9 @@ mod tests {
     /// pixel cell, so a cut lands on a cell boundary and cuts the sprite from its
     /// right, the end the pixels of a line are fetched in.
     ///
+    /// Returns whether any opaque pixel of it found an opaque pixel of an earlier
+    /// sprite of the line already in place, which is d5 of the status register.
+    ///
     /// The 288 and the 24 are spent outside the display, as in
     /// [`a_full_dot_line_cuts_a_later_sprite_to_nothing`].
     #[test]
@@ -1126,5 +1152,102 @@ mod tests {
             "and nothing of its other three cells, which had no dots left"
         );
         assert!(vdp.sprite_overflow, "344 dots on a 320 dot line");
+    }
+
+    /// genvdp.txt section 6 d5: "Set when any sprites have non-transparent pixels
+    /// overlapping one another", and section 15's front-to-back rule means an overlap
+    /// is the second sprite of the pair finding a pixel already taken. The two here
+    /// overlap by 4 pixels, which is enough: one pixel of overlap is enough on real
+    /// hardware too.
+    #[test]
+    fn overlapping_opaque_pixels_of_two_sprites_set_the_collision_flag() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 1);
+        solid_tile(&mut vdp, 2, 2);
+        put_sprite(&mut vdp, 0, 128, 128, (1, 1), 1, 1);
+        put_sprite(&mut vdp, 1, 128, 128 + 4, (1, 1), 0, 2);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[0..8], &[1; 8], "the first sprite owns the overlap");
+        assert_eq!(
+            &line[8..12],
+            &[2; 4],
+            "and the second draws the rest of itself"
+        );
+        assert!(
+            vdp.sprite_collision,
+            "d5 C, set by the 4 pixels they both cover"
+        );
+    }
+
+    /// The other half of "non-transparent": the second sprite lands on pixels the
+    /// first does not draw, so nothing overlaps and the flag stays clear even though
+    /// the two sprites sit on the very same 8 pixels.
+    #[test]
+    fn a_transparent_overlap_does_not_collide() {
+        let mut vdp = sprite_vdp();
+        put_tile_row(&mut vdp, 1, 0, &[0, 0, 0, 0, 5, 5, 5, 5]);
+        put_tile_row(&mut vdp, 2, 0, &[9, 9, 9, 9, 0, 0, 0, 0]);
+        put_sprite(&mut vdp, 0, 128, 128, (1, 1), 1, 1);
+        put_sprite(&mut vdp, 1, 128, 128, (1, 1), 0, 2);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            &line[0..4],
+            &[9; 4],
+            "the second sprite draws through the transparency of the first"
+        );
+        assert_eq!(
+            &line[4..8],
+            &[5; 4],
+            "and the first through that of the second, the two covering one line"
+        );
+        assert!(
+            !vdp.sprite_collision,
+            "and a pixel the first sprite does not draw cannot collide with it"
+        );
+    }
+
+    /// Nothing overlapping, nothing set: sprites that miss each other, on the line and
+    /// down the frame, leave d5 alone.
+    #[test]
+    fn sprites_that_do_not_overlap_do_not_collide() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 1);
+        put_sprite(&mut vdp, 0, 128, 128, (1, 1), 1, 1);
+        put_sprite(&mut vdp, 1, 128, 128 + 8, (1, 1), 0, 1);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[0..16], [1; 16].as_slice(), "side by side");
+        assert!(!vdp.sprite_collision, "touching is not overlapping");
+
+        let mut below = sprite_vdp();
+        put_sprite(&mut below, 0, 128, 128, (1, 1), 1, 1);
+        put_sprite(&mut below, 1, 128 + 8, 128, (1, 1), 0, 1);
+        below.render_sprite_line(0, &mut line);
+        assert!(!below.sprite_collision, "the two are on different lines");
+    }
+
+    /// Only what the sprite draws can collide, so the pixels of it the dot limit
+    /// removed collide with nothing: the same two sprites that overlap in
+    /// [`overlapping_opaque_pixels_of_two_sprites_set_the_collision_flag`], with the
+    /// second one reached by a line that has no dots left for it.
+    #[test]
+    fn a_sprite_cut_to_nothing_does_not_collide() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        wide_sprites(&mut vdp, 11);
+        for index in 0..10usize {
+            wide_sprite(&mut vdp, index, 128, 460, index as u8 + 1);
+        }
+        put_sprite(&mut vdp, 10, 128, 128, (1, 1), 0, 1);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(line, blank_line(), "the eleventh sprite is cut to nothing");
+        assert!(!vdp.sprite_collision, "and so collides with nothing");
     }
 }
