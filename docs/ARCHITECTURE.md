@@ -173,16 +173,25 @@ pub struct Genesis { /* cpu, z80, vdp, ym, psg, cart, ram, io ... */ }
 impl Genesis {
     pub fn new(rom: &[u8], config: Config) -> Result<Self, LoadError>;
     pub fn reset(&mut self);                 // soft reset (reset button)
-    pub fn run_frame(&mut self);             // runs until the next VBlank start
+    pub fn run_frame(&mut self);             // runs one whole frame: until the beam is back at the top of the screen
     pub fn frame(&self) -> &FrameBuffer;
     pub fn drain_audio(&mut self, out: &mut Vec<i16>); // interleaved stereo at config.sample_rate
     pub fn set_pad(&mut self, port: usize, buttons: Buttons); // bitflags: UP DOWN LEFT RIGHT A B C START X Y Z MODE
-    pub fn save_state(&self) -> Vec<u8>;
+    pub fn save_state(&self) -> Result<Vec<u8>, StateError>;
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), StateError>;
     pub fn sram(&self) -> Option<&[u8]>;
     pub fn load_sram(&mut self, data: &[u8]);
 }
 ```
+
+`run_frame` used to be described as running "until the next VBlank start", and the
+VDP does raise its frame flag there - line 224 of a 262 line NTSC frame. It runs
+the rest of the raster as well, so that one call is one frame and takes exactly
+one of those flags with it; ending at VBlank start would make the first call 224
+lines and every later one 262. See `Scheduler::run_frame`.
+
+`save_state` returns a `Result` because saying "no save-state format in this
+build" is not something a `Vec<u8>` can say (M6-07 #127 fills it in).
 
 ### web
 

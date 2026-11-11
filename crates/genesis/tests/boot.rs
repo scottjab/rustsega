@@ -37,20 +37,25 @@ fn fake_rom(program: &[u16]) -> Vec<u8> {
     rom
 }
 
-/// `move.w #$value, (VDP_CONTROL)`: one VDP register command, which is how every
-/// real program sets the chip up (plutiedev "VDP registers"). `MOVE.W #imm,
-/// (xxx).L` is `33FC imm32 addr32` - MOVE's destination field is the swapped one,
-/// `crates/m68k/src/ops/move_.rs`'s module docs - and the disassembler of
-/// `m68k::disassemble` is what checked this encoding.
-fn vdp_command(value: u16) -> Vec<u16> {
+/// `move.w #$value, (addr).L`. `MOVE.W #imm, (xxx).L` is `33FC imm32 addr32` -
+/// MOVE's destination field is the swapped one, per
+/// `crates/m68k/src/ops/move_.rs`'s module docs - and `m68k::disassemble` is what
+/// checked the encoding.
+fn store_word(addr: u32, value: u16) -> Vec<u16> {
     let word = value.to_be_bytes();
-    let addr = VDP_CONTROL.to_be_bytes();
+    let addr = addr.to_be_bytes();
     vec![
         0x33FC,
         u16::from_be_bytes([word[0], word[1]]),
         u16::from_be_bytes([addr[0], addr[1]]),
         u16::from_be_bytes([addr[2], addr[3]]),
     ]
+}
+
+/// The same at the VDP's control port: one register command, which is how every
+/// real program sets the chip up (plutiedev "VDP registers").
+fn vdp_command(value: u16) -> Vec<u16> {
+    store_word(VDP_CONTROL, value)
 }
 
 /// `move.b (addr).L, (dest).L`, then `bra.b` back over it: a program that samples
@@ -156,7 +161,8 @@ fn run_frame_returns_frame_of_expected_size() {
             );
         }
         assert_eq!(
-            frame.pixels[frame.height * width], 0,
+            frame.pixels[frame.height * width],
+            0,
             "and nothing past the last active line was painted"
         );
     }
@@ -169,8 +175,11 @@ fn run_frame_returns_frame_of_expected_size() {
 fn set_pad_visible_to_game() {
     // `move.b ($A10003).L, ($FF0000).L` forever: work RAM holds port 1's pin
     // levels, sampled again and again (plutiedev "I/O ports", `IoData1`).
-    let mut machine = Genesis::new(&fake_rom(&sample_forever(0xA1_0003, PAD_COPY)), Config::default())
-        .expect("a ROM with a header loads");
+    let mut machine = Genesis::new(
+        &fake_rom(&sample_forever(0xA1_0003, PAD_COPY)),
+        Config::default(),
+    )
+    .expect("a ROM with a header loads");
 
     // Nothing attached yet, so every line is high: a game may use that to find
     // out that the port is empty (plutiedev "Controllers", "Checking if there's
@@ -191,6 +200,49 @@ fn set_pad_visible_to_game() {
             "{buttons:?} reaches the program through the port"
         );
     }
+}
+
+/// The reset button, by the three things it is allowed to change: the 68000 goes
+/// back to its own reset vector, the VDP goes back to its power-on registers, and
+/// work RAM does not go anywhere - a reset is not a power cycle, and games leave
+/// variables there on purpose. See [`Genesis::reset`] for what each of the three
+/// cites.
+#[test]
+fn reset_restarts_the_68k_and_the_vdp_and_keeps_work_ram() {
+    // One store into work RAM, one VDP register command, then a wait in place:
+    // after a frame there is something to see in each of the three the reset
+    // button is allowed to change.
+    let mut program = store_word(PAD_COPY, 0x1234);
+    program.extend(vdp_command(0x8000 | (0x0C << 8) | 0x81));
+    program.push(0x60FE);
+
+    let mut machine =
+        Genesis::new(&fake_rom(&program), Config::default()).expect("a ROM with a header loads");
+    machine.run_frame();
+    assert_eq!(
+        machine.bus().ram[0..2],
+        [0x12, 0x34],
+        "the program wrote work RAM"
+    );
+    assert_eq!(machine.bus().vdp.reg(12), 0x81, "and the VDP's register");
+
+    machine.reset();
+
+    assert_eq!(
+        machine.cpu().pc,
+        CODE,
+        "the 68k is back at the vector it was reset from"
+    );
+    assert_eq!(
+        machine.bus().vdp.reg(12),
+        0,
+        "the VDP went back to its power-on registers with the rest of the bus"
+    );
+    assert_eq!(
+        machine.bus().ram[0..2],
+        [0x12, 0x34],
+        "and work RAM stayed where it was: a reset is not a power cycle"
+    );
 }
 
 /// The API stubs that the audio and save-state tickets have to fill answer with
@@ -218,7 +270,9 @@ fn stubs_answer_without_panicking() {
 #[test]
 #[ignore = "needs a commercial ROM; skips without one"]
 fn sonic_boots_to_non_blank_screen() {
-    let path = require_data!(testkit::commercial_rom("Sonic The Hedgehog (USA, Europe).md"));
+    let path = require_data!(testkit::commercial_rom(
+        "Sonic The Hedgehog (USA, Europe).md"
+    ));
     let rom = std::fs::read(&path).expect("Sonic is readable");
     let mut machine = Genesis::new(&rom, Config::default()).expect("Sonic loads");
 
@@ -226,14 +280,28 @@ fn sonic_boots_to_non_blank_screen() {
         machine.run_frame();
     }
 
-    let frame = machine.frame();
-    let colours: std::collections::HashSet<u32> =
-        frame.pixels[..frame.width * frame.height].iter().copied().collect();
+    // What this can prove today is that the game reached the chip: 300 frames of
+    // Sonic write its title art into VRAM and its palette into CRAM. A picture is
+    // not on the table yet, because the VDP's renderer is the backdrop-only stub
+    // M4-06 (#84) left behind and real line rendering is M4-17 (#95): `frame()`
+    // of any ROM at all is one colour however much the game has drawn.
+    let vdp = &machine.bus().vdp;
     assert!(
-        colours.len() > 4,
-        "300 frames in, the screen is still {} colours",
-        colours.len()
+        vdp.vram.iter().any(|&byte| byte != 0),
+        "300 frames in, Sonic has still written nothing to VRAM"
     );
+    assert!(
+        vdp.cram.iter().any(|&word| word != 0),
+        "and nothing to CRAM: the palette it is drawing with never arrived"
+    );
+
+    let frame = machine.frame();
+    // TODO(M4-17 #95): the screen, once `Vdp::render_line` renders a line. Until
+    // then this is the check the ticket was written with, in place and off:
+    //
+    // let colours: std::collections::HashSet<u32> =
+    //     frame.pixels[..frame.width * frame.height].iter().copied().collect();
+    // assert!(colours.len() > 4, "the screen is only {} colours", colours.len());
 
     let out = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/test-output/sonic_300.png");
