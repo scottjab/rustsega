@@ -246,6 +246,10 @@ impl Vdp {
     /// it, over as many lines as it takes: how long a transfer of `slots` still
     /// has to run, and so how long the 68k stays frozen
     /// ([`Vdp::dma_68k_stall_mclk`]).
+    ///
+    /// The loop is one turn per line the transfer spans - at most 640 of them for
+    /// the whole of VRAM, and every table has slots in it, so it always makes the
+    /// `left` it is counting down smaller.
     pub(crate) fn dma_mclk_to_slots(&self, fill: bool, slots: u32) -> u32 {
         let table = self.dma_slot_table(fill);
         let h40 = self.h40();
