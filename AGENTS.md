@@ -102,25 +102,51 @@ gh pr create --fill --body "Closes #<N>
 <what you did, what tests you added, anything surprising>"
 ```
 
-Then wait for CI:
+Then wait for CI. Every push to `main` and every PR runs the `CI` workflow,
+which is `just check` on a runner. There is no "this repo has no CI yet" state.
+
+The gate is a reported `pass`. `pending`, `queued`, `no checks reported` and an
+empty check list are not passes and none of them authorise a merge: a run that
+has not registered yet and a run still waiting for a runner both read as
+nothing-to-do, and a local `just check` after the rebase is not a substitute for
+seeing the CI run go green.
+
+Don't read CI with `gh pr checks --watch`. It prints `no checks reported` for
+the first few seconds of every PR, before the workflow has registered, and its
+coloured output breaks parsing. Read the run itself instead:
 
 ```sh
-gh pr checks --watch
+sha=$(gh pr view <N> --json headRefOid -q .headRefOid)
+gh run list --commit "$sha" --json status,conclusion
 ```
 
-- If it says `no checks reported`, the repo has no CI yet (it gets added in
-  ticket M0-01). In that case, `just check` passing locally after the rebase is
-  enough. Go ahead and merge.
-- If checks run and any fail, fix them on the same branch. Do not merge red.
-
-Merge and clean up:
+Merge only when the newest `CI` run on your PR head SHA reports
+`status: completed` and `conclusion: success`. To block on a run, bound the
+wait, because a queued run can outlast your whole session:
 
 ```sh
-gh pr merge --squash --delete-branch
+timeout 300 gh run watch <run-id> --exit-status
+```
+
+If CI is still `queued` or `pending` when your time budget runs out, stop.
+Report "PR <N> up, CI pending" and let whoever is watching it merge. One bounded
+look, no retry loop.
+
+If a run fails, fix it on the same branch and push. Do not merge red.
+
+Merge by PR number. Another agent may be working in this same checkout, so do
+not `git checkout` or `git pull` here just to merge; `gh pr merge` takes the
+number and does not need your branch checked out.
+
+```sh
+gh pr merge --squash --delete-branch <N>
 ```
 
 If the merge fails because main moved (conflict or "not up to date"), go back
 to the rebase step above, then try the merge again.
+
+Then update the tracking issue. Run the `git` half only when this checkout is
+yours alone:
 
 ```sh
 git checkout main && git pull
