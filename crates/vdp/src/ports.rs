@@ -10,9 +10,12 @@
 //! The 68k-side window that calls these two functions is `genesis`'s job
 //! (M3-09, #69); this file is the chip.
 //!
-//! Not here: data port reads and the read buffer behind them (M4-03, #81),
-//! which is why a read code only ever drops a write, and the status register
-//! read that also clears `pending` (M4-04, #82).
+//! Data port reads ([`Vdp::read_data`]) are the other half of the same pair of
+//! ports: the code register says which memory to read and the last word written
+//! to the port fills the bits that memory does not drive. Not here either: the
+//! status register read that also clears `pending` (M4-04, #82), and the FIFO
+//! with the read prefetch that real hardware runs behind the read side
+//! (M4-21a, #99).
 
 use crate::Vdp;
 
@@ -76,6 +79,30 @@ pub(crate) mod testutil {
     pub(crate) fn vsram_write_cmd(addr: u16) -> (u16, u16) {
         (0x4000 | (addr & 0x3FFF), 0x0010 | ((addr >> 14) & 0x0003))
     }
+
+    /// Control port words that set up a VRAM read at `addr`: code `0000`, so
+    /// CD1-CD0 are zero in the first half and the second half is A15-A14 alone.
+    pub(crate) fn vram_read_cmd(addr: u16) -> (u16, u16) {
+        (addr & 0x3FFF, (addr >> 14) & 0x0003)
+    }
+
+    /// Control port words that set up a CRAM read at `addr`. The code is
+    /// `1000`, which is CD3, and CD3 rides in bit 5 of the second word.
+    pub(crate) fn cram_read_cmd(addr: u16) -> (u16, u16) {
+        (addr & 0x3FFF, 0x0020 | ((addr >> 14) & 0x0003))
+    }
+
+    /// Control port words that set up a VSRAM read at `addr` (code `0100`, so
+    /// CD2, which rides in bit 4 of the second word).
+    pub(crate) fn vsram_read_cmd(addr: u16) -> (u16, u16) {
+        (addr & 0x3FFF, 0x0010 | ((addr >> 14) & 0x0003))
+    }
+
+    /// Control port words that set up the undocumented 8-bit VRAM read, whose
+    /// code `1100` is not in the genvdp.txt table at all.
+    pub(crate) fn vram_byte_read_cmd(addr: u16) -> (u16, u16) {
+        (addr & 0x3FFF, 0x0030 | ((addr >> 14) & 0x0003))
+    }
 }
 
 /// Is `value` a VDP register write?
@@ -132,6 +159,46 @@ const fn data_target(code: u8) -> DataTarget {
         0b0011 => DataTarget::Cram,
         0b0101 => DataTarget::Vsram,
         _ => DataTarget::Ignored,
+    }
+}
+
+/// What a data port read does, decoded from the code register.
+///
+/// The read codes of the genvdp.txt section 7 table - `0000` VRAM, `0100`
+/// VSRAM, `1000` CRAM - plus `1100`, the 8-bit VRAM read that table does not
+/// list and that no document describes beyond the emulators that implement it
+/// (Genesis Plus GX's `vdp_68k_data_r_m5` case `0x0C`).
+///
+/// CD4 is ignored exactly as it is for a write ("For data port accesses and
+/// 68k to VDP DMA, the state of CD4 is ignored", genvdp.txt section 7).
+/// Genesis Plus GX instead switches on `code & 0x1F`, so a read with CD4 set
+/// falls into its default case and it comments that case "normally locks VDP,
+/// hard reset required"; the doc says it should not, so this does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadTarget {
+    /// `0000`: read a VRAM word.
+    Vram,
+    /// `0100`: read a VSRAM word.
+    Vsram,
+    /// `1000`: read a CRAM word.
+    Cram,
+    /// `1100`: read one byte of VRAM, undocumented.
+    VramByte,
+    /// A write code, or a code with no read at all: no memory is reached, see
+    /// [`Vdp::read_data`].
+    NoRead,
+}
+
+/// The code register entry a data port read works on.
+///
+/// Masked to CD3-CD0 for the reason [`data_target`] gives for masking it there.
+const fn read_target(code: u8) -> ReadTarget {
+    match code & 0x0F {
+        0b0000 => ReadTarget::Vram,
+        0b0100 => ReadTarget::Vsram,
+        0b1000 => ReadTarget::Cram,
+        0b1100 => ReadTarget::VramByte,
+        _ => ReadTarget::NoRead,
     }
 }
 
@@ -221,6 +288,48 @@ const VSRAM_WORD_BITS: u16 = 0x07FF;
 /// The colour bits of a CRAM word as the 68k writes them: `----bbb0 ggg0 rrr0`
 /// (genvdp.txt section 9 "CRAM").
 const CRAM_COLOR_BITS: u16 = 0x0EEE;
+/// The four bits a CRAM word has no colour in, and bit 0: a CRAM read answers
+/// those from the port (`----bbb0 ggg0 rrr0` again, and Genesis Plus GX's
+/// `fifo[fifo_idx] & ~0xEEE`).
+const CRAM_UNUSED_BITS: u16 = !CRAM_COLOR_BITS;
+/// The top five bits of a VSRAM word, which hold no scroll value and come back
+/// from the port on a read.
+const VSRAM_UNUSED_BITS: u16 = !VSRAM_WORD_BITS;
+
+/// Index of the VSRAM word a read at `addr` names.
+///
+/// The addresses are the write's - bits 6 through 1 - but there is no "ignore
+/// it" for a read. Genesis Plus GX wraps an index past the 40th word back to
+/// address 0 ("Wrap to address 0 (TODO: check if still true with Genesis 3
+/// model)", `vdp_68k_data_r_m5` case `0x04`), which is what this does; genvdp.txt
+/// section 10 only covers writes ("Writes to the addresses beyond 50h are
+/// ignored").
+const fn vsram_read_index(addr: u16) -> usize {
+    let word = ((addr >> 1) & 0x3F) as usize;
+    if word < crate::VSRAM_WORDS { word } else { 0 }
+}
+
+/// The CRAM word a read answers: the colour from CRAM, the rest from the port.
+///
+/// "Unused bits are set using data from next available FIFO entry" (Genesis Plus
+/// GX's `vdp_68k_data_r_m5` case `0x08`), where the FIFO entry is what
+/// `Vdp::fifo_last` stands in for until M4-21a (#99).
+const fn cram_read_word(stored: u16, port: u16) -> u16 {
+    (stored & CRAM_COLOR_BITS) | (port & CRAM_UNUSED_BITS)
+}
+
+/// The VSRAM word a read answers: the 11 bits of scroll value from VSRAM, the
+/// top five from the port (see [`cram_read_word`] for where that comes from).
+const fn vsram_read_word(stored: u16, port: u16) -> u16 {
+    (stored & VSRAM_WORD_BITS) | (port & VSRAM_UNUSED_BITS)
+}
+
+/// The word an 8-bit VRAM read answers: the one byte it read (zero-extended) as
+/// the low byte, the port's own value on top of it (`data |= fifo[fifo_idx] &
+/// ~0xFF`, Genesis Plus GX's case `0x0C`).
+const fn vram_byte_read_word(byte: u16, port: u16) -> u16 {
+    (byte & 0x00FF) | (port & 0xFF00)
+}
 
 impl Vdp {
     /// Write the control port (`$C00004`, and its mirror at `$C00006`).
@@ -270,8 +379,10 @@ impl Vdp {
     pub fn write_data(&mut self, value: u16) {
         // Whatever the code register makes of the access, it happened: the
         // write-pending flag "is cleared when the data port is written to or
-        // read from" (genvdp.txt section 7).
+        // read from" (genvdp.txt section 7), and the port now carries this word
+        // for the read side of the chip ([`Vdp::read_data`]).
         self.pending = false;
+        self.fifo_last = value;
 
         match data_target(self.code) {
             DataTarget::Vram => {
@@ -295,11 +406,72 @@ impl Vdp {
 
         self.addr = increment(self.addr, self.auto_increment());
     }
+
+    /// Read the data port (`$C00000`, and its mirror at `$C00002`).
+    ///
+    /// The code register picks the memory, and each memory drives only part of
+    /// the 16-bit bus: a CRAM word has no colour in five of its bits, a VSRAM
+    /// word has no scroll value in its top five, and the undocumented 8-bit VRAM
+    /// read moves one byte. The rest of the word comes back from
+    /// [`Vdp::fifo_last`], the last word written to the port, which is where
+    /// real hardware uses the FIFO it keeps between the port and the memories
+    /// (Nemesis's FIFO research on SpritesMind; Genesis Plus GX's
+    /// `vdp_68k_data_r_m5` says so for each of the four read codes).
+    ///
+    /// Reading with a write code reaches no memory at all and returns
+    /// [`Vdp::fifo_last`] whole. "You cannot write data after setting up a read
+    /// operation, or read data after setting up a write operation. The write or
+    /// read is ignored" (genvdp.txt section 7) says the read does nothing, but
+    /// not what the port answers; Genesis Plus GX leaves its read switch with
+    /// `data = 0`, which would be all-zero. This returns the last word the bus
+    /// was driven with instead, the same value a read of a partial word falls
+    /// back on. TODO(M4-21a #99): the FIFO decides this properly.
+    ///
+    /// Like a write, the access happened whatever the code made of it, so the
+    /// address register moves on by R15 and `pending` clears.
+    ///
+    /// TODO(M4-21a #99): real hardware prefetches the word when the read command
+    /// is set up, which is what makes reading the port right after a command
+    /// word return the old word and the VDP lock up if the command was a write.
+    /// There is no prefetch here, so no delay and no lock.
+    pub fn read_data(&mut self) -> u16 {
+        self.pending = false;
+
+        let value = match read_target(self.code) {
+            ReadTarget::Vram => {
+                // Bit 0 of the address does not swap anything on a read: the
+                // word is the two bytes of the even address, high byte first
+                // (Genesis Plus GX reads `vram[addr & 0xFFFE]`).
+                let base = usize::from(self.addr & !1);
+                u16::from_be_bytes([self.vram[base], self.vram[base + 1]])
+            }
+            ReadTarget::Cram => {
+                cram_read_word(self.cram[cram_word_index(self.addr)], self.fifo_last)
+            }
+            ReadTarget::Vsram => {
+                vsram_read_word(self.vsram[vsram_read_index(self.addr)], self.fifo_last)
+            }
+            // "Read one byte from VRAM adjacent address" (Genesis Plus GX's
+            // `vdp_68k_data_r_m5` case `0x0C`): the byte on the other side of
+            // the even/odd pair the address sits in.
+            ReadTarget::VramByte => vram_byte_read_word(
+                u16::from(self.vram[usize::from(self.addr ^ 1)]),
+                self.fifo_last,
+            ),
+            ReadTarget::NoRead => self.fifo_last,
+        };
+
+        self.addr = increment(self.addr, self.auto_increment());
+        value
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::{cram_write_cmd, vram_write_cmd, vsram_write_cmd};
+    use super::testutil::{
+        cram_read_cmd, cram_write_cmd, vram_byte_read_cmd, vram_read_cmd, vram_write_cmd,
+        vsram_read_cmd, vsram_write_cmd,
+    };
     use super::*;
 
     /// A control port register write, the way the 68k sends one.
@@ -534,6 +706,208 @@ mod tests {
     }
 
     #[test]
+    fn vram_read_returns_the_word_the_data_port_put_there() {
+        let mut vdp = Vdp::new(false);
+        set_reg(&mut vdp, 15, 2);
+        vram_write_at(&mut vdp, 0x0100);
+        vdp.write_data(0xBEEF);
+
+        let (first, second) = vram_read_cmd(0x0100);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data(), 0xBEEF);
+    }
+
+    /// A read does not have the odd-address byte swap a write has: genvdp.txt
+    /// section 8 documents the swap for writing 16-bit data, and Genesis Plus
+    /// GX reads `vram[addr & 0xFFFE]` with bit 0 of the address doing nothing
+    /// (`vdp_68k_data_r_m5`, case `0x00`).
+    #[test]
+    fn vram_read_at_an_odd_address_reads_the_same_word() {
+        let mut vdp = Vdp::new(false);
+        set_reg(&mut vdp, 15, 2);
+        vram_write_at(&mut vdp, 0x0100);
+        vdp.write_data(0xBEEF);
+
+        let (first, second) = vram_read_cmd(0x0101);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data(), 0xBEEF, "no byte swap on a read");
+    }
+
+    /// Two reads in a row with R15 = 2 are the two words the address walked
+    /// over, which is how a game reads a palette back off the chip.
+    #[test]
+    fn vram_reads_walk_the_address_register_by_r15() {
+        let mut vdp = Vdp::new(false);
+        set_reg(&mut vdp, 15, 2);
+        vram_write_at(&mut vdp, 0x0000);
+        vdp.write_data(0x1122);
+        vdp.write_data(0x3344);
+
+        let (first, second) = vram_read_cmd(0x0000);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data(), 0x1122);
+        assert_eq!(vdp.read_data(), 0x3344);
+    }
+
+    /// A CRAM read is the stored colour word back again (`----bbb0 ggg0 rrr0`,
+    /// genvdp.txt section 9), which is only true because the colour bits of
+    /// `0x0ACE` are all live bits.
+    #[test]
+    fn cram_read_returns_the_colour_that_was_written() {
+        let mut vdp = Vdp::new(false);
+        let (first, second) = cram_write_cmd(0x0000);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        vdp.write_data(0x0ACE);
+        assert_eq!(vdp.cram[0], 0x0ACE);
+
+        let (first, second) = cram_read_cmd(0x0000);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data(), 0x0ACE);
+    }
+
+    /// The four bits of a CRAM word that are not colour, and bit 0, come back
+    /// as the last word written to the data port: "Unused bits are set using
+    /// data from next available FIFO entry" (Genesis Plus GX's
+    /// `vdp_68k_data_r_m5`, case `0x08`, where the FIFO entry stands where
+    /// `fifo_last` stands here until M4-21a #99).
+    #[test]
+    fn cram_read_fills_its_unused_bits_from_the_last_written_word() {
+        let mut vdp = Vdp::new(false);
+        let (first, second) = cram_write_cmd(0x0000);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        vdp.write_data(0x0ACE);
+
+        // Something else through the port to give `fifo_last` the bits CRAM
+        // cannot hold, then back to the CRAM word.
+        set_reg(&mut vdp, 15, 0);
+        vram_write_at(&mut vdp, 0x0200);
+        vdp.write_data(0xF111);
+
+        let (first, second) = cram_read_cmd(0x0000);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data(), 0x0ACE | 0xF111);
+    }
+
+    #[test]
+    fn vsram_read_returns_the_word_that_was_written() {
+        let mut vdp = Vdp::new(false);
+        let (first, second) = vsram_write_cmd(0x0004);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        vdp.write_data(0x0123);
+
+        let (first, second) = vsram_read_cmd(0x0004);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data(), 0x0123);
+    }
+
+    /// Reading VSRAM where no word lives gives word 0 again.
+    ///
+    /// genvdp.txt section 10 only says "Writes to the addresses beyond 50h are
+    /// ignored"; for reads Genesis Plus GX wraps the index back to address 0
+    /// ("Wrap to address 0 (TODO: check if still true with Genesis 3 model)",
+    /// `vdp_68k_data_r_m5`, case `0x04`). Its own TODO is why this is a wrap and
+    /// not a hard fact.
+    #[test]
+    fn vsram_read_past_the_fortieth_word_wraps_to_the_first() {
+        let mut vdp = Vdp::new(false);
+        vdp.vsram[0] = 0x00AA;
+
+        for addr in [0x0050u16, 0x0052, 0x007E] {
+            let (first, second) = vsram_read_cmd(addr);
+            vdp.write_control(first);
+            vdp.write_control(second);
+            assert_eq!(vdp.read_data(), 0x00AA, "read at {addr:#05x}");
+        }
+    }
+
+    /// The undocumented 8-bit VRAM read returns the byte on the other side of
+    /// the address: `1100` reads `vram[addr ^ 1]`, so the byte at $201 is what a
+    /// read at $200 answers (Genesis Plus GX's `vdp_68k_data_r_m5`, case `0x0C`:
+    /// "Read one byte from VRAM adjacent address").
+    #[test]
+    fn eight_bit_vram_read_returns_the_adjacent_byte() {
+        let mut vdp = Vdp::new(false);
+        vdp.vram[0x0200] = 0x12;
+        vdp.vram[0x0201] = 0x34;
+
+        let (first, second) = vram_byte_read_cmd(0x0200);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data() & 0xFF, 0x34);
+    }
+
+    /// ...and the top byte of that read is the port's own, the same open bus as
+    /// the CRAM and VSRAM reads ("Unused bits are set using data from next
+    /// available FIFO entry", Genesis Plus GX case `0x0C`).
+    #[test]
+    fn eight_bit_vram_read_fills_its_top_byte_from_the_last_written_word() {
+        let mut vdp = Vdp::new(false);
+        set_reg(&mut vdp, 15, 0);
+        vram_write_at(&mut vdp, 0x0000);
+        vdp.write_data(0xABCD);
+        vdp.vram[0x0201] = 0x34;
+
+        let (first, second) = vram_byte_read_cmd(0x0200);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data(), 0xAB34);
+    }
+
+    /// A read is a data port access like a write is, so the write-pending flag
+    /// goes: "It is cleared when the data port is written to or read from"
+    /// (genvdp.txt section 7).
+    #[test]
+    fn a_data_port_read_clears_pending() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_control(vram_read_cmd(0x0000).0);
+        assert!(vdp.pending);
+        vdp.read_data();
+        assert!(!vdp.pending);
+    }
+
+    /// Reading with a write code in the code register reads nothing.
+    ///
+    /// "You cannot write data after setting up a read operation, or read data
+    /// after setting up a write operation" (genvdp.txt section 7). What the port
+    /// answers instead is not in any document: Genesis Plus GX leaves its read
+    /// switch and returns 0 (`vdp_68k_data_r_m5`, `data = 0` and the default
+    /// case), while the 68k side of a real machine still has the last value the
+    /// bus was holding. This returns `fifo_last`, the last word written through
+    /// the port, because that is the value the bus was last driven with and it
+    /// is the same answer the three read codes give for the bits their memory
+    /// does not drive. TODO(M4-21a #99): a real FIFO decides it.
+    ///
+    /// The access still happened, so the address still moves on.
+    #[test]
+    fn reading_after_a_write_command_is_the_last_written_word() {
+        for code in [0b0001u8, 0b0011, 0b0101] {
+            let mut vdp = Vdp::new(false);
+            set_reg(&mut vdp, 15, 2);
+            // A command word for the write mode `code` at address $0100: CD1-CD0
+            // in the first half, CD5-CD2 and A15-A14 in the second.
+            vdp.write_control(((u16::from(code) & 0x03) << 14) | 0x0100);
+            vdp.write_control((u16::from(code) & 0x3C) << 2);
+            assert_eq!(vdp.code, code);
+
+            vdp.write_data(0xBEEF);
+            assert_eq!(vdp.read_data(), 0xBEEF, "code {code:#06b} is a write");
+            assert_eq!(
+                vdp.addr, 0x0104,
+                "code {code:#06b}: the port was read, so the address moved on"
+            );
+        }
+    }
+
+    #[test]
     fn register_writes_need_bits_15_14_and_a_clear_pending_flag() {
         assert!(is_register_write(0x8F02, false));
         assert!(is_register_write(0x9FFF, false), "bit 13 does not matter");
@@ -603,6 +977,74 @@ mod tests {
             DataTarget::Ignored,
             "the undocumented 8-bit VRAM read"
         );
+    }
+
+    #[test]
+    fn the_code_register_picks_the_memory_a_read_reaches() {
+        assert_eq!(read_target(0x00), ReadTarget::Vram);
+        assert_eq!(read_target(0x04), ReadTarget::Vsram);
+        assert_eq!(read_target(0x08), ReadTarget::Cram);
+        assert_eq!(
+            read_target(0x0C),
+            ReadTarget::VramByte,
+            "the undocumented 8-bit VRAM read"
+        );
+        assert_eq!(
+            read_target(0x1C),
+            ReadTarget::VramByte,
+            "CD4 (0x10) is ignored for data port accesses"
+        );
+        assert_eq!(
+            read_target(0x28),
+            ReadTarget::Cram,
+            "CD5 (0x20) is the DMA trigger, not another destination"
+        );
+        assert_eq!(read_target(0x01), ReadTarget::NoRead, "VRAM write");
+        assert_eq!(read_target(0x03), ReadTarget::NoRead, "CRAM write");
+        assert_eq!(read_target(0x05), ReadTarget::NoRead, "VSRAM write");
+        assert_eq!(
+            read_target(0x02),
+            ReadTarget::NoRead,
+            "and so are the codes with no access at all"
+        );
+    }
+
+    #[test]
+    fn a_cram_read_is_the_colour_plus_the_port() {
+        assert_eq!(cram_read_word(0x0ACE, 0xFFFF), 0x0ACE | 0xF111);
+        assert_eq!(
+            cram_read_word(0xFFFF, 0x0000),
+            0x0EEE,
+            "CRAM itself never holds the other five bits"
+        );
+        assert_eq!(cram_read_word(0x0000, 0xF111), 0xF111);
+    }
+
+    #[test]
+    fn a_vsram_read_is_the_scroll_value_plus_the_port() {
+        assert_eq!(vsram_read_word(0x0123, 0xFFFF), 0x0123 | 0xF800);
+        assert_eq!(vsram_read_word(0xFFFF, 0x0000), 0x07FF);
+        assert_eq!(vsram_read_word(0x0000, 0xF800), 0xF800);
+    }
+
+    #[test]
+    fn an_eight_bit_vram_read_is_one_byte_low_and_the_port_high() {
+        assert_eq!(vram_byte_read_word(0x34, 0xAB00), 0xAB34);
+        assert_eq!(vram_byte_read_word(0x00, 0xFFFF), 0xFF00);
+        assert_eq!(vram_byte_read_word(0xFF, 0x0000), 0x00FF);
+    }
+
+    #[test]
+    fn a_vsram_read_index_wraps_past_the_last_word() {
+        assert_eq!(vsram_read_index(0x0004), 2);
+        assert_eq!(vsram_read_index(0x0005), 2, "address bit 0 has no effect");
+        assert_eq!(vsram_read_index(0x004E), 39);
+        assert_eq!(
+            vsram_read_index(0x0050),
+            0,
+            "index 40 is nowhere: read word 0"
+        );
+        assert_eq!(vsram_read_index(0x007E), 0);
     }
 
     #[test]

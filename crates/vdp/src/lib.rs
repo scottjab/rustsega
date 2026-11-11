@@ -50,9 +50,8 @@ pub struct Vdp {
     /// `Vdp` never puts 64 KiB on the caller's stack; the length is fixed at
     /// `VRAM_SIZE` by [`Vdp::new`] and nothing resizes it.
     ///
-    /// The data port writes it (M4-02, #80, in `ports`).
-    ///
-    /// TODO(M4-03 #81): the data port reads it, with the same byte order.
+    /// The data port writes it (M4-02, #80, in `ports`) and reads it (M4-03,
+    /// #81), big endian: the high byte of a word is at the even address.
     pub vram: Box<[u8]>,
     /// CRAM: 64 words of 9-bit colour in `0000 BBB0 GGG0 RRR0` form
     /// (genvdp.txt section 9: `----bbb-ggg-rrr-`).
@@ -85,6 +84,16 @@ pub struct Vdp {
     /// and the second half, a data port access, and a control port read clear
     /// (genvdp.txt section 7).
     pending: bool,
+    /// The last word written to the data port.
+    ///
+    /// The read side answers the bits the memory it read does not drive from
+    /// this, and the whole word when the code register holds a write code
+    /// ([`Vdp::read_data`], M4-03 #81).
+    ///
+    /// A stand-in for the VDP's four-entry FIFO, which is what supplies those
+    /// bits on real hardware: unlike the FIFO this has no depth and no timing.
+    /// TODO(M4-21a #99): the FIFO itself, with the read prefetch that feeds it.
+    fifo_last: u16,
     /// Set by a command word with CD5 while R1 M1 allows DMA (genvdp.txt
     /// section 7: "Setting CD5 will trigger a DMA operation"). [`Vdp::run_dma`]
     /// consumes it; the fill and copy modes of M4-08 (#86) will take their turn
@@ -116,6 +125,7 @@ impl Vdp {
             code: 0,
             addr: 0,
             pending: false,
+            fifo_last: 0,
             dma_requested: false,
             frame_buffer: FrameBuffer::new(),
             pal,
