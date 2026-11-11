@@ -46,8 +46,10 @@
 //!
 //! [mapper]: crate::cart::mapper
 //!
-//! [`m68k::Bus::int_ack`] is deliberately left at the trait default: returning
-//! `None` *is* what a Genesis does, always autovectoring.
+//! [`m68k::Bus::int_ack`] returns `None`, which *is* what a Genesis does - it always
+//! autovectors - but it is not a no-op: since M3-14 (#75) it is also the acknowledge
+//! [`Bus::vdp`] is waiting for, and the only thing that clears a pending VINT or HINT
+//! (genvdp.txt section 6: "Reading the control port does not clear this bit").
 //! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`], the Z80's control
 //! lines and - since M3-09 (#69) put one here - [`Bus::vdp`].
 
@@ -1560,8 +1562,9 @@ fn io_word(byte: u8) -> u16 {
     u16::from_be_bytes([byte, byte])
 }
 
-/// `int_ack` is deliberately left at the `m68k::Bus` default; the module docs say
-/// why.
+/// The 68000's view of the bus. `int_ack` is the one method that is not a memory
+/// access, and since M3-14 (#75) it is the acknowledge the VDP waits for; the module
+/// docs say what both halves of it are for.
 impl m68k::Bus for Bus {
     fn read_byte(&mut self, addr: u32) -> u8 {
         let addr = addr & ADDR_MASK;
@@ -1631,6 +1634,23 @@ impl m68k::Bus for Bus {
             Region::Tmss => self.write_tmss_word(addr, value),
             Region::Unmapped => self.write_unmapped_word(addr, value),
         }
+    }
+
+    /// Interrupt acknowledge: the 68000 has taken a level, so the VDP stops offering
+    /// it, and the answer is `None` because a Genesis always autovectors.
+    ///
+    /// The acknowledge is not optional on the VDP's side. genvdp.txt section 6 says of
+    /// status bit 7 that "Reading the control port does not clear this bit", so
+    /// nothing the 68k does to read the chip takes the interrupt away, and
+    /// [`Vdp::ack_irq`] is the only thing that does - which is what stops a level 6
+    /// being offered again the moment the handler enables interrupts (M3-14, #75).
+    ///
+    /// Levels the VDP has no business clearing are ignored by [`Vdp::ack_irq`] itself,
+    /// which is why level 2 - the TH pin of the I/O registers - can be passed straight
+    /// through here too.
+    fn int_ack(&mut self, level: u8) -> Option<u8> {
+        self.vdp.ack_irq(level);
+        None
     }
 
     /// The `RESET` instruction restarts the console, so the I/O chip's registers
@@ -1728,6 +1748,10 @@ mod tests {
     /// NTSC machine without TMSS ([`crate::Region::Usa`]). Deliberately not
     /// [`OPEN_BUS`], so a stub read cannot pass on the version register's value.
     const TEST_VERSION: u8 = 0xA0;
+
+    /// Master clocks in one VDP scanline, for the tests that walk the beam with
+    /// [`Vdp::advance`] rather than through the scheduler.
+    const TEST_VDP_LINE: u32 = 3420;
 
     #[test]
     fn reads_rom_bytes_and_words() {
@@ -2011,11 +2035,40 @@ mod tests {
         assert_eq!(bus.read_byte(RAM_START), 0x12, "work RAM survives RESET");
     }
 
+    /// `int_ack` has both halves since M3-14 (#75), and this pins both: the level
+    /// goes to [`Vdp::ack_irq`] so the VDP stops offering it, and the answer is
+    /// still `None` because a Genesis always autovectors and the bus never gives the
+    /// CPU a vector number.
     #[test]
-    fn int_ack_keeps_the_m68k_default() {
-        // A Genesis always autovectors, so the bus never gives the CPU a vector.
+    fn int_ack_clears_the_vdp_and_keeps_autovectoring() {
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
-        assert_eq!(bus.int_ack(2), None);
+        assert_eq!(
+            bus.int_ack(2),
+            None,
+            "level 2 is the I/O chip's, not the VDP's"
+        );
+
+        // A VINT that has actually happened, so there is something to clear.
+        bus.vdp.write_register(1, 0x60);
+        bus.vdp.advance(225 * TEST_VDP_LINE);
+        assert_eq!(bus.vdp.pending_irq(), Some(6), "the VINT is being offered");
+        assert_eq!(
+            bus.int_ack(4),
+            None,
+            "and a level 4 acknowledge is None too"
+        );
+        assert_eq!(
+            bus.vdp.pending_irq(),
+            Some(6),
+            "which leaves the level 6 the level 4 was not about"
+        );
+
+        assert_eq!(bus.int_ack(6), None, "autovector, so no vector number");
+        assert_eq!(
+            bus.vdp.pending_irq(),
+            None,
+            "and the VDP stopped offering it"
+        );
     }
 
     // ---- Z80 bus arbitration, Z80 reset, and the 68k's way into the sound side ----
