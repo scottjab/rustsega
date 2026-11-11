@@ -1095,7 +1095,10 @@ mod tests {
         );
 
         let held = iterations(&mut s, &mut cpu, &mut z80, &mut bus, lines);
-        assert!(held < free / 2, "{held} iterations with a DMA, {free} without");
+        assert!(
+            held < free / 2,
+            "{held} iterations with a DMA, {free} without"
+        );
 
         // The freeze and the loop share the line budget, so the iterations the
         // freeze cost are the freeze: `reported` master clocks, to within the one

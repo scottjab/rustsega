@@ -100,7 +100,7 @@ const MCLK_PER_Z80: u32 = 15;
 /// whose bus cycle is counted in its own clocks; the number of wait states is the
 /// ticket's and is not something this ticket could reach a page for.
 ///
-/// TODO(M3-16 #77): verify against a hardware source.
+/// TODO(M3-16 #77): verify against a hardware source. [#308](https://github.com/scottjab/rustsega/issues/308) is open on it.
 pub(crate) const Z80_AREA_WAIT_MCLK: u32 = MCLK_PER_68K;
 
 /// Master clocks a Z80 access to the 68k bus costs the Z80: about 3.3 T-states,
@@ -111,7 +111,7 @@ pub(crate) const Z80_AREA_WAIT_MCLK: u32 = MCLK_PER_68K;
 /// whole master clocks instead of carrying the fraction over thousands of
 /// accesses (see [`Bus::pending_z80_stall`]).
 ///
-/// TODO(M3-16 #77): verify against a hardware source.
+/// TODO(M3-16 #77): verify against a hardware source. [#308](https://github.com/scottjab/rustsega/issues/308) is open on it.
 pub(crate) const Z80_WINDOW_WAIT_MCLK: u32 = (33 * MCLK_PER_Z80 + 5) / 10;
 
 /// Master clocks a Z80 access to the 68k bus costs the 68000: about 11 of its
@@ -124,7 +124,7 @@ pub(crate) const Z80_WINDOW_WAIT_MCLK: u32 = (33 * MCLK_PER_Z80 + 5) / 10;
 /// T-states is 50 - which is what both being averages gets up to; both are
 /// charged because both are what the ticket names.
 ///
-/// TODO(M3-16 #77): verify against a hardware source.
+/// TODO(M3-16 #77): verify against a hardware source. [#308](https://github.com/scottjab/rustsega/issues/308) is open on it.
 pub(crate) const Z80_WINDOW_STEAL_MCLK: u32 = 11 * MCLK_PER_68K;
 
 // Region boundaries, from plutiedev "Memory map".
@@ -4362,7 +4362,10 @@ mod tests {
 
         let active = burst(0, 310, 6);
         let blank = burst(230, 310, 6);
-        assert!(blank > 0, "the fifth and sixth writes are held even in VBlank");
+        assert!(
+            blank > 0,
+            "the fifth and sixth writes are held even in VBlank"
+        );
         assert!(
             active > 5 * blank,
             "two slots of an active line is not two slots of a blank one: {active} vs {blank}"
