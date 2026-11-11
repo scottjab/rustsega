@@ -14,6 +14,11 @@
 //! plane fetch, but they do share its two operations: the word read and
 //! [`crate::pattern::tile_row`].
 //!
+//! The entries are not read straight out of VRAM. The VDP keeps the first four
+//! bytes of each of them - the y, the size and the link - in its own
+//! [`SpriteCache`], which only a write to that area of VRAM feeds
+//! ([`Vdp::write_vram_byte`]) and which [`sprite_at`] reads (M4-23b, #103).
+//!
 //! The per-line sprite and pixel limits, the SOVR status bit they set, collision
 //! and the masking a sprite at X = 0 does to the sprites behind it are all here as
 //! of M4-16 (#94), and the 8x16 cells and doubled y origin of interlace mode 2 of
@@ -36,6 +41,17 @@ const Y_WORD: usize = 0;
 const SIZE_WORD: usize = 1;
 const PATTERN_WORD: usize = 2;
 const X_WORD: usize = 3;
+
+/// The bytes of an entry the VDP keeps for itself: its `Index + 0` and `Index + 2`
+/// words, the y and the size/link (#103). The other four bytes of an entry, the
+/// pattern and the x, are read from VRAM on every fetch.
+const ENTRY_CACHE_BYTES: usize = 4;
+
+/// The cache lines of the table: its 80 entries of [`ENTRY_BYTES`] apiece, which
+/// is the 640 bytes of genvdp.txt section 15 and the `MAX_SPRITES_H40` sprites a
+/// walk of it may visit. The cache does not shrink in 32-cell mode, where only 64
+/// of them are ever reached.
+const CACHE_ENTRIES: usize = 80;
 
 /// Bits 11-10 (`hs`) and 9-8 (`vs`) of the size word are the width and the height
 /// of a sprite in cells, and bits 6-0 its link: `-hhvv` and `-lllllll` of the
@@ -117,18 +133,105 @@ pub(crate) struct Sprite {
     pub pattern: NameEntry,
 }
 
-/// The SAT entry `index`: the four words at `base + index * ENTRY_BYTES`, read the
-/// way [`read_word`] reads every VDP table.
-pub(crate) fn sprite_at(vram: &[u8], base: usize, index: usize) -> Sprite {
+/// The SAT entry `index`: its y, size and link out of [`SpriteCache`], and its
+/// pattern and x out of the two words at `base + index * ENTRY_BYTES + 4` of
+/// `vram`, read the way [`read_word`] reads every VDP table (M4-23b, #103).
+///
+/// The split is the cache's: the four bytes the VDP holds are the y word and the
+/// size/link word, and the two it never holds are the pattern and the x.
+pub(crate) fn sprite_at(vram: &[u8], cache: &SpriteCache, base: usize, index: usize) -> Sprite {
     let entry = base + index * ENTRY_BYTES;
-    let size = read_word(vram, entry + SIZE_WORD * 2);
+    let [y, size] = match cache.line(index) {
+        // `Y_WORD` is 0 and `SIZE_WORD` 1, so a cache line holds the two words in
+        // the same order VRAM holds them.
+        Some(line) => [
+            u16::from_be_bytes([line[Y_WORD * 2], line[Y_WORD * 2 + 1]]),
+            u16::from_be_bytes([line[SIZE_WORD * 2], line[SIZE_WORD * 2 + 1]]),
+        ],
+        None => [
+            read_word(vram, entry + Y_WORD * 2),
+            read_word(vram, entry + SIZE_WORD * 2),
+        ],
+    };
     Sprite {
-        y: read_word(vram, entry + Y_WORD * 2) & 0x3FF,
+        y: y & 0x3FF,
         x: read_word(vram, entry + X_WORD * 2) & 0x1FF,
         width_cells: ((size >> WIDTH_SHIFT) & SIZE_MASK) as u8 + 1,
         height_cells: ((size >> HEIGHT_SHIFT) & SIZE_MASK) as u8 + 1,
         link: (size & LINK_MASK) as u8,
         pattern: NameEntry::decode(read_word(vram, entry + PATTERN_WORD * 2)),
+    }
+}
+
+/// The VDP's own copy of the first four bytes of every entry of the SAT
+/// (M4-23b, #103).
+///
+/// A sprite fetch is a walk of a table in VRAM and cannot afford to wait on the
+/// bus for all eight bytes of every entry it touches, so the VDP keeps the y, the
+/// size and the link of each one itself and reads only the pattern and the x from
+/// VRAM. [`SpriteCache::write`] is the only thing that fills this, which makes the
+/// cache a mirror of the table *as it was written* rather than of the table as it
+/// is:
+///
+/// - a VRAM write whose address lies in the SAT area of the moment, and in the
+///   first four bytes of one of its entries, updates that entry's line;
+/// - moving the SAT with R5 refills nothing, so a table moved to under one that
+///   was never written is drawn with the y, the size and the link of the old one
+///   until the game writes the new entries. [`crate::latch`] is the same trick
+///   played on the scroll tables by #102, and the tests of this file are what fix
+///   the two apart.
+///
+/// It follows that the cache is chip state rather than line state: the chip takes
+/// no VRAM write while a line is being drawn, so there is nothing for
+/// [`crate::latch`] to keep it out of, and it is deliberately not part of
+/// [`crate::latch::LineState`].
+///
+/// All zero to begin with, because that is what VRAM is to begin with: the two
+/// agree before the chip has been talked to, and [`Vdp::new`] is the only thing
+/// that clears VRAM, so a reset - which rebuilds the chip, `genesis::Bus` - leaves
+/// them agreeing again.
+#[derive(Debug)]
+pub(crate) struct SpriteCache {
+    /// One line per entry, holding `line[0..2]` the y word and `line[2..4]` the
+    /// size/link word as big-endian bytes.
+    lines: [[u8; ENTRY_CACHE_BYTES]; CACHE_ENTRIES],
+}
+
+impl SpriteCache {
+    /// The cache of a table nobody has written yet: all zero, like VRAM.
+    pub(crate) fn new() -> Self {
+        Self {
+            lines: [[0; ENTRY_CACHE_BYTES]; CACHE_ENTRIES],
+        }
+    }
+
+    /// The cache line of entry `index`, or `None` for an index past the 80
+    /// entries the cache holds. A link of 80..=127 therefore keeps reading VRAM,
+    /// the one corner of the walk this model does not cache; see the TODO on
+    /// [`SpriteList`] for what such an entry really reads.
+    pub(crate) fn line(&self, index: usize) -> Option<&[u8; ENTRY_CACHE_BYTES]> {
+        self.lines.get(index)
+    }
+
+    /// The byte `byte` written to VRAM byte `address`, of a table based at `base`:
+    /// [`Vdp::write_vram_byte`] calls this for every write the chip makes, so the
+    /// cache follows the table the SAT is on now rather than any table this model
+    /// knows the name of.
+    pub(crate) fn write(&mut self, address: usize, byte: u8, base: usize) {
+        // `checked_sub` because an address below `base` is simply not in the
+        // table, and a `usize` subtraction of the kind would wrap instead.
+        let Some(offset) = address.checked_sub(base) else {
+            return;
+        };
+        if offset >= CACHE_ENTRIES * ENTRY_BYTES {
+            return;
+        }
+        let entry = offset / ENTRY_BYTES;
+        let inside = offset % ENTRY_BYTES;
+        if inside >= ENTRY_CACHE_BYTES {
+            return;
+        }
+        self.lines[entry][inside] = byte;
     }
 }
 
@@ -148,8 +251,11 @@ pub(crate) fn sprite_at(vram: &[u8], base: usize, index: usize) -> Sprite {
 /// past the table, and every limit it does give is a count of sprites rather than
 /// of addresses. TODO(M4-16 #94): what a link past the table really reads.
 pub(crate) struct SpriteList<'a> {
-    /// The VRAM the table is read from.
+    /// The VRAM the table is read from: the pattern and the x of every entry.
     vram: &'a [u8],
+    /// The y, the size and the link of every entry, which the VDP does not go to
+    /// VRAM for (#103).
+    cache: &'a SpriteCache,
     /// The table base, from [`Vdp::sprite_base`].
     base: usize,
     /// The entry to read next, and `None` once an entry's link field is zero or
@@ -172,7 +278,7 @@ impl Iterator for SpriteList<'_> {
             return None;
         }
         self.remaining -= 1;
-        let sprite = sprite_at(self.vram, self.base, index);
+        let sprite = sprite_at(self.vram, self.cache, self.base, index);
         self.next = match sprite.link {
             0 => None,
             link => Some(usize::from(link)),
@@ -184,9 +290,14 @@ impl Iterator for SpriteList<'_> {
 impl Vdp {
     /// The sprite list of the SAT at [`Vdp::sprite_base`], starting at entry 0 and
     /// ending at the first zero link or at the sprite limit of the display width.
+    ///
+    /// The y, the size and the link come from [`Vdp::sprite_cache`] and the
+    /// pattern and the x from [`Vdp::vram`], which is what makes moving R5 between
+    /// the two a move of half an entry (#103).
     pub(crate) fn sprite_list(&self) -> SpriteList<'_> {
         SpriteList {
             vram: &self.vram,
+            cache: &self.sprite_cache,
             base: usize::from(self.sprite_base()),
             next: Some(0),
             remaining: if self.h40() {
@@ -491,6 +602,12 @@ mod tests {
     /// not move the table (genvdp.txt section 17 "$05").
     const SPRITE_BASE: usize = 0xF000;
 
+    /// The other table of the #103 tests: R5 = `0x70` is 0xE000 under the H32 mask
+    /// these tests run in, far enough from [`SPRITE_BASE`] that the two 640-byte
+    /// tables do not overlap.
+    const OTHER_SPRITE_REG: u8 = 0x70;
+    const OTHER_SPRITE_BASE: usize = 0xE000;
+
     /// A VDP with its SAT at [`SPRITE_BASE`].
     fn sprite_vdp() -> Vdp {
         let mut vdp = Vdp::new(false);
@@ -516,8 +633,23 @@ mod tests {
         link: u8,
         pattern: u16,
     ) {
+        put_sprite_at(vdp, SPRITE_BASE, index, y, x, cells, link, pattern);
+    }
+
+    /// [`put_sprite`] for a table at `base` rather than at [`SPRITE_BASE`], for
+    /// the tests that move the SAT with R5 (#103).
+    fn put_sprite_at(
+        vdp: &mut Vdp,
+        base: usize,
+        index: usize,
+        y: u16,
+        x: u16,
+        cells: (u8, u8),
+        link: u8,
+        pattern: u16,
+    ) {
         let (width, height) = cells;
-        let entry = SPRITE_BASE + index * ENTRY_BYTES;
+        let entry = base + index * ENTRY_BYTES;
         put_word(vdp, entry, y);
         put_word(
             vdp,
@@ -566,7 +698,7 @@ mod tests {
         for offset in (0..ENTRY_BYTES).step_by(2) {
             put_word(&mut vdp, entry + offset, 0xFFFF);
         }
-        let sprite = sprite_at(&vdp.vram, SPRITE_BASE, 3);
+        let sprite = sprite_at(&vdp.vram, &vdp.sprite_cache, SPRITE_BASE, 3);
         assert_eq!(sprite.y, 0x3FF, "word 0 bits 9-0 are y");
         assert_eq!(sprite.x, 0x1FF, "word 3 bits 8-0 are x");
         assert_eq!(sprite.width_cells, 4, "word 1 bits 11-10: 11b is 4 cells");
@@ -582,7 +714,7 @@ mod tests {
             put_word(&mut vdp, entry + offset, 0);
         }
         put_word(&mut vdp, entry + 2, 0x8080);
-        let sprite = sprite_at(&vdp.vram, SPRITE_BASE, 3);
+        let sprite = sprite_at(&vdp.vram, &vdp.sprite_cache, SPRITE_BASE, 3);
         assert_eq!(
             sprite.link, 0,
             "`-lllllll`: bit 7 of the byte is not an eighth link bit"
@@ -1584,5 +1716,120 @@ mod tests {
                 "y = 128 is 128 lines of the picture above the display in mode 2"
             );
         }
+    }
+
+    // The internal sprite attribute cache of M4-23b (#103): what the VDP keeps of
+    // the SAT, and what it therefore does not go back to VRAM for.
+
+    /// #103 test 1: "Write a SAT at 0xF000, render: sprite visible. Move R5 to
+    /// point at 0xE000 ... Y/size/link still come from the old cache, X/tile from
+    /// the new table."
+    ///
+    /// The second table is written while R5 still names the first, which is what
+    /// keeps it out of the cache: only a write inside the SAT of the moment
+    /// updates it. Moving the table is not such a write, and nothing else
+    /// refills it either - "Games (and test ROMs) see stale Y/size/link until
+    /// they rewrite the entries".
+    #[test]
+    fn a_moved_sat_table_keeps_the_y_size_and_link_of_the_old_one() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 3);
+        solid_tile(&mut vdp, 2, 5);
+
+        // The table R5 points at now: one 8x8 sprite on the top line at x 10,
+        // the end of the list.
+        put_sprite(&mut vdp, 0, 128, 128 + 10, (1, 1), 0, 1);
+        // And the table R5 is about to point at. Its entry 0 is 32 lines below
+        // the top of the display and links on to entry 1, which is on it, so a
+        // walk of *that* list draws at x 60 and not at all on line 0.
+        put_sprite_at(
+            &mut vdp,
+            OTHER_SPRITE_BASE,
+            0,
+            128 + 32,
+            128 + 20,
+            (1, 1),
+            1,
+            2,
+        );
+        put_sprite_at(&mut vdp, OTHER_SPRITE_BASE, 1, 128, 128 + 60, (1, 1), 0, 2);
+
+        let mut before = blank_line();
+        vdp.render_sprite_line(0, &mut before);
+        assert_eq!(
+            &before[10..18],
+            &[3; 8],
+            "the table at 0xF000 draws its one sprite"
+        );
+
+        vdp.write_register(5, OTHER_SPRITE_REG);
+
+        // Entry 0 of the new table, as the VDP still sees it: the y, the size and
+        // the link of the old one - so on this line, and the list ends with it -
+        // and the pattern and the x of the new one.
+        let mut after = blank_line();
+        vdp.render_sprite_line(0, &mut after);
+        let mut want = [0; WIDTH_H40];
+        want[20..28].fill(5);
+        assert_eq!(after, want, "x and the pattern word are read from VRAM");
+    }
+
+    /// The other half of the same rule, in the direction a game actually goes in:
+    /// "Games ... see stale Y/size/link *until they rewrite the entries*", so a
+    /// write to the table after the move is a write to the cache.
+    #[test]
+    fn a_rewrite_after_the_move_is_what_refreshes_the_cache() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 3);
+        put_sprite(&mut vdp, 0, 128, 128 + 10, (1, 1), 0, 1);
+
+        vdp.write_register(5, OTHER_SPRITE_REG);
+        put_sprite_at(
+            &mut vdp,
+            OTHER_SPRITE_BASE,
+            0,
+            128 + 8,
+            128 + 20,
+            (1, 1),
+            0,
+            1,
+        );
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(8, &mut line);
+        assert_eq!(
+            &line[20..28],
+            &[3; 8],
+            "0xE000 is the SAT now, so its writes are cached"
+        );
+    }
+
+    /// "Any VRAM write whose address falls in `[sat_base, sat_base + 80 * 8)` and
+    /// in the first 4 bytes of an entry also updates the cache", and the other
+    /// four bytes of an entry never do: the pattern word and the x stay VRAM's.
+    #[test]
+    fn only_the_first_four_bytes_of_an_entry_are_cached() {
+        let mut vdp = sprite_vdp();
+        // y = 0x1234, size = 2 cells across and 3 down with link 9, which is the
+        // word `(1 << 10) | (2 << 8) | 9` = 0x0609.
+        put_sprite(&mut vdp, 0, 0x1234, 0x0ABC, (2, 3), 9, 0x7654);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0x12, 0x34, 0x06, 0x09]),
+            "the y word and the size/link word of the entry, as VRAM holds them"
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(1).copied(),
+            Some([0; ENTRY_CACHE_BYTES]),
+            "an entry nobody has written is still the zero VRAM starts at"
+        );
+
+        put_word(&mut vdp, SPRITE_BASE + 4, 0xFFFF);
+        put_word(&mut vdp, SPRITE_BASE + 6, 0xFFFF);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0x12, 0x34, 0x06, 0x09]),
+            "the pattern and x words of an entry are not cache material"
+        );
     }
 }
