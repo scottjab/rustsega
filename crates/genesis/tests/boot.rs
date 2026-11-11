@@ -125,7 +125,10 @@ fn new_sets_pc_from_vector() {
 
 /// One `run_frame` is one frame of the picture, and `frame` reports the geometry
 /// the VDP's mode asks for: 320x224 in H40 and 256x224 in H32, so a front end
-/// never draws a 320 wide row into a 256 wide frame.
+/// never draws a 320 wide row into a 256 wide frame. The geometry is the mode of
+/// the frame's first line, and the line is latched before this program gets as
+/// far as its mode write (#102), so the test runs two frames: the first proves
+/// the latch, the second the geometry.
 #[test]
 fn run_frame_returns_frame_of_expected_size() {
     // R1 = $40 turns the display on, R12 = $81 is H40 (RS0 and RS1) and R12 =
@@ -139,11 +142,26 @@ fn run_frame_returns_frame_of_expected_size() {
             .expect("a ROM with a header loads");
         machine.run_frame();
 
+        // The frame a mode is asked for in is not the frame that shows it. This
+        // program's write to R12 lands on line 0 at master clock 140, and a line
+        // is drawn from the state latched at the start of its active display -
+        // master clock 100 in H32 and 81 in H40 (M4-23, #102) - so a write 40
+        // clocks into the active display of line 0 is too late for line 0 and too
+        // late for the frame whose geometry line 0 fixes. Frame 0 is the 256 pixels
+        // of the mode the VDP reset into; the frame after is the one asked for.
+        assert_eq!(
+            (machine.frame().width, machine.frame().height),
+            (256, 224),
+            "R12 = {reg12:#04x} is written after the latch of line 0, so frame 0 is the mode it reset into"
+        );
+
+        machine.run_frame();
+
         let frame = machine.frame();
         assert_eq!(
             (frame.width, frame.height),
             (width, 224),
-            "R12 = {reg12:#04x} is a {width} x 224 display"
+            "R12 = {reg12:#04x} is a {width} x 224 display from the frame after"
         );
 
         // The frame buffer keeps room for the biggest picture the VDP can make,

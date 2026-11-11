@@ -35,6 +35,10 @@
 //! porch of the line before. The two differ only for a write in the first 81
 //! clocks of an H40 line, or the first 100 of an H32 one.
 //!
+//! Sprites are not latched here: the sprite list is still a walk of the VRAM of
+//! the moment, which is #311, and the cache of the table's first four bytes per
+//! entry is #103.
+//!
 //! TODO(#102): pin the latch point with a scroll test ROM (M6-06), including
 //! whether a write inside that first-blanking window reaches the line it is
 //! written on; `latch_point` below names the clock so there is one place to

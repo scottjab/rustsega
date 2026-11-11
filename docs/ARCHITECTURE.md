@@ -218,6 +218,31 @@ the access slots of `slots.rs` rather than inside the call that started them
   when the last slot arrives rather than when the command word is written, and
   status bit 1 comes down with them.
 
+### VDP per-line latching
+
+`crates/vdp/src/latch.rs` (M4-23, #102) is what makes a raster effect written in
+a HINT handler look right. A line is drawn from a snapshot of the state it needs,
+taken once at the start of its active display - the H-blank release point
+`timing` already stops the beam at, 81 master clocks in H40 and 100 in H32 - and
+not from the chip as it stands when the line is drawn:
+
+* The snapshot is the two horizontal scroll values of the line (read out of the
+  scroll table at that moment, which is where hardware reads it), the whole of
+  VSRAM and the whole register file. `advance` takes it; nothing else does.
+* A register, VSRAM or scroll-table write that lands mid line therefore shows on
+  the next line, and the frame the mode is asked for in is the frame before the
+  one that shows it. `frame.width` is the mode of the frame's first line, so the
+  latch of that one line fixes the geometry of the whole frame.
+* The latch is a read-side view only: writes still reach the live registers and
+  the live VSRAM, and `line_reg` / `latched_vsram` / `latched_hscroll` are the
+  three places the renderer reads them. They answer live state outside
+  `render_line`, so `render_plane_line` and a `render_line` call for a line the
+  beam never latched work as they always did.
+* The exact clock of the latch is INFERRED, with a TODO on `latch.rs` for the
+  scroll ROM of M6-06. Sprites are not in the snapshot at all: genvdp.txt's
+  sprite list is a VRAM walk of the moment, and the cache of its first four bytes
+  per entry is #103.
+
 ### Audio chips
 
 ```rust
