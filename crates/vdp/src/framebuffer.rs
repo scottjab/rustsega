@@ -1,6 +1,6 @@
 //! The picture the VDP produces.
 
-use crate::{LINES_V30, WIDTH_H40};
+use crate::{Vdp, LINES_V30, WIDTH_H40};
 
 /// Widest picture the VDP can produce: 40 cells in H40 (R12, genvdp.txt
 /// section 17 "$0C").
@@ -56,6 +56,56 @@ impl FrameBuffer {
 impl Default for FrameBuffer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Vdp {
+    /// Draw one line of the picture: the backdrop colour, right across it.
+    ///
+    /// Public and callable on its own, as `docs/ARCHITECTURE.md` puts it
+    /// ("Render one line directly. Public for tests; the scheduler uses
+    /// advance()"). `timing::advance` calls it once for each line of the active
+    /// display as the beam finishes it (M4-06, #84).
+    ///
+    /// The body is the stub of the ticket: the planes and the sprites are the
+    /// rendering tickets (M4-10 #88 onwards) and M4-17 (#95) replaces this
+    /// whole function. What it does today is enough for the timing to be
+    /// testable and for the frame to be the size the mode says: the row is
+    /// written, and `width` and `height` describe it.
+    pub fn render_line(&mut self, line: u16) {
+        let height = self.active_height();
+        let y = usize::from(line);
+        if y >= height {
+            return;
+        }
+
+        let width = self.active_width();
+        let colour = self.backdrop_pixel();
+        let frame = &mut self.frame_buffer;
+        frame.width = width;
+        frame.height = height;
+
+        let start = y * width;
+        frame.pixels[start..start + width].fill(colour);
+    }
+
+    /// The backdrop colour as a frame-buffer pixel: R7's index into CRAM
+    /// (genvdp.txt section 17 "$07": "Bits 5-0 of this register select a palette
+    /// entry to be used as the backdrop color"), expanded from the 9-bit
+    /// `0000 BBB0 GGG0 RRR0` of section 9 to eight bits a channel.
+    ///
+    /// A plain bit replication, which is all the stub of [`Vdp::render_line`]
+    /// needs; the DAC levels and the shadow/highlight halves of the range are
+    /// M4-09 (#87).
+    pub(crate) fn backdrop_pixel(&self) -> u32 {
+        let colour = u32::from(self.cram[usize::from(self.backdrop_index())]);
+        // Three bits to eight, by repeating the top bits of the value: 0b101
+        // becomes 0b10110100, so black stays black and white stays white.
+        let expand = |v: u32| (v << 5) | (v << 2) | (v >> 1);
+        let r = expand((colour >> 1) & 0x07);
+        let g = expand((colour >> 5) & 0x07);
+        let b = expand((colour >> 9) & 0x07);
+        0xFF00_0000 | (b << 16) | (g << 8) | r
     }
 }
 
