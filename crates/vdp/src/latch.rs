@@ -181,7 +181,8 @@ mod tests {
     use crate::color::{Intensity, color};
     use crate::hv::MCLKS_PER_LINE;
     use crate::planes::testutil::{
-        PLANE_A_BASE, column_colour, fill_columns, fill_rows, put_scroll, row_colour, scroll_vdp,
+        CELL_TILE_ROWS, PLANE_A_BASE, column_colour, fill_columns, fill_rows, fill_tile_row,
+        put_scroll, put_sprite_at, put_word, row_colour, scroll_vdp,
     };
     use crate::timing::HBLANK_CLEAR_MCLK_H32;
 
@@ -366,5 +367,167 @@ mod tests {
             "line 11 opens with the 8 backdrop pixels of LCB"
         );
         assert_eq!(&line[8..], &plane_columns(0)[8..]);
+    }
+
+    /// The SAT of the sprite tests below: R5 = `0x78` is 0xF000 in H32 (genvdp.txt
+    /// section 17 "$05"), clear of the pattern, plane and scroll tables
+    /// [`scroll_vdp`] and [`fill_tile_row`] put to other uses.
+    const SPRITE_BASE: usize = 0xF000;
+    /// The CRAM index a sprite of these tests draws: palette 3, colour 1, the
+    /// `palette * 16 + colour` of genvdp.txt section 9 that a sprite layer byte
+    /// carries. [`fill_cram`] gives every entry its own colour, so a sprite pixel
+    /// says which entry it came from and colour 2 means the second pattern tile.
+    const SPRITE_ENTRY: usize = 3 * 16 + 1;
+    /// The word 2 of a sprite of these tests: palette 3, tile 1, flips and
+    /// priority clear.
+    const SPRITE_PATTERN: u16 = (3 << 13) | 1;
+
+    /// [`running`] with the SAT at [`SPRITE_BASE`] and tile 1 solid in colour 1: the
+    /// one-cell, 8x8 sprite of the tests below. The two plane tables are empty, so
+    /// a sprite pixel is the only thing a row of the frame can be carrying.
+    fn sprite_running() -> Vdp {
+        let mut vdp = running(0b00);
+        vdp.write_register(5, 0x78);
+        for row in 0..CELL_TILE_ROWS {
+            fill_tile_row(&mut vdp, 1, row, 1);
+        }
+        vdp
+    }
+
+    /// A row of the frame with nothing on it but the backdrop colour.
+    fn backdrop_row() -> Vec<u32> {
+        vec![pixel_of(0); 256]
+    }
+
+    /// A row of the frame carrying the sprite of these tests: the 8 pixels of
+    /// `entry`'s colour at x 20, and backdrop either side of them.
+    fn sprite_row(entry: usize) -> Vec<u32> {
+        let mut row = backdrop_row();
+        row[20..28].fill(pixel_of(entry));
+        row
+    }
+
+    /// The sprite of picture line `line` at screen x 20, at entry 0 of the list and
+    /// ending it.
+    fn sprite_on_line(vdp: &mut Vdp, line: u16) {
+        put_sprite_at(
+            vdp,
+            SPRITE_BASE,
+            0,
+            u16::from(line) + 128,
+            128 + 20,
+            (1, 1),
+            0,
+            SPRITE_PATTERN,
+        );
+    }
+
+    /// #311: "a sprite added to the SAT during line N-1's active display does not
+    /// show on line N, shows on N+1". The list of a line is walked during the line
+    /// before, at the same point of it that #102 reads the scroll tables and the
+    /// mode registers from, so a write that is late for the scroll is exactly as
+    /// late for a sprite.
+    #[test]
+    fn a_sprite_added_in_mid_line_shows_on_the_line_after_the_next() {
+        let mut vdp = sprite_running();
+
+        // Line 9 is into its active display, so the walk that decides what line 10
+        // draws has been and gone by the time of the write.
+        vdp.advance(9 * MCLKS_PER_LINE);
+        vdp.advance(HBLANK_CLEAR_MCLK_H32 + 100);
+        assert_eq!((vdp.line, vdp.line_mclk), (9, HBLANK_CLEAR_MCLK_H32 + 100));
+        sprite_on_line(&mut vdp, 10);
+
+        vdp.advance(MCLKS_PER_LINE - vdp.line_mclk);
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!((vdp.line, vdp.line_mclk), (11, 0), "line 10 is drawn");
+        assert_eq!(
+            row(&vdp, 10),
+            backdrop_row(),
+            "and the entry is not in its list"
+        );
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(
+            row(&vdp, 11),
+            sprite_row(SPRITE_ENTRY),
+            "line 11 walks the table again, and finds it"
+        );
+    }
+
+    /// The other half of the same rule, and the same half the scroll have: the walk
+    /// of the line after is at the start of the active display of this one, so a
+    /// write in the blankening of line 9 is in time for line 10.
+    #[test]
+    fn a_sprite_added_in_the_blankening_of_a_line_shows_on_the_next_line() {
+        let mut vdp = sprite_running();
+
+        vdp.advance(9 * MCLKS_PER_LINE);
+        assert_eq!((vdp.line, vdp.line_mclk), (9, 0));
+        sprite_on_line(&mut vdp, 10);
+
+        vdp.advance(MCLKS_PER_LINE);
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!((vdp.line, vdp.line_mclk), (11, 0));
+        assert_eq!(
+            row(&vdp, 10),
+            sprite_row(SPRITE_ENTRY),
+            "line 10 is searched after the write"
+        );
+    }
+
+    /// It is the y of the entry that the walk reads, not only the link that reaches
+    /// it: a sprite moved down a line halfway across line 9 is drawn on line 10 all
+    /// the same, because line 10 was searched while the sprite was still there.
+    #[test]
+    fn a_sprite_moved_in_mid_line_is_drawn_where_the_line_before_saw_it() {
+        let mut vdp = sprite_running();
+        sprite_on_line(&mut vdp, 10);
+
+        vdp.advance(9 * MCLKS_PER_LINE);
+        vdp.advance(HBLANK_CLEAR_MCLK_H32 + 100);
+        sprite_on_line(&mut vdp, 11);
+
+        vdp.advance(MCLKS_PER_LINE - vdp.line_mclk);
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(
+            row(&vdp, 10),
+            sprite_row(SPRITE_ENTRY),
+            "line 10 draws the y of its own search, not the y of the moment"
+        );
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(
+            row(&vdp, 11),
+            sprite_row(SPRITE_ENTRY),
+            "and line 11 draws the moved one"
+        );
+    }
+
+    /// The other side of the #103 split, which #311 leaves where it is: the pattern
+    /// is not part of the walk of the line before, it is fetched by the line that
+    /// draws the sprite. So a pattern written halfway across line 9 is on line 10,
+    /// one line earlier than an entry written at the same moment would be.
+    #[test]
+    fn a_sprite_pattern_written_in_mid_line_shows_on_the_next_line() {
+        let mut vdp = sprite_running();
+        for row in 0..CELL_TILE_ROWS {
+            fill_tile_row(&mut vdp, 2, row, 2);
+        }
+        sprite_on_line(&mut vdp, 10);
+
+        vdp.advance(9 * MCLKS_PER_LINE);
+        vdp.advance(HBLANK_CLEAR_MCLK_H32 + 100);
+        // Word 2 of entry 0, the pattern, now naming tile 2: colour 2 is CRAM entry
+        // one above the colour of tile 1.
+        put_word(&mut vdp, SPRITE_BASE + 4, (3 << 13) | 2);
+
+        vdp.advance(MCLKS_PER_LINE - vdp.line_mclk);
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(
+            row(&vdp, 10),
+            sprite_row(SPRITE_ENTRY + 1),
+            "the pattern of line 10 is read by line 10"
+        );
     }
 }

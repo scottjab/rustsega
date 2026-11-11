@@ -32,7 +32,7 @@ use crate::{InterlaceMode, Vdp, WIDTH_H32, WIDTH_H40};
 
 /// Bytes of one SAT entry: genvdp.txt section 15, "The table is 640 bytes in
 /// size. Each 8-byte entry has the following format".
-const ENTRY_BYTES: usize = 8;
+pub(crate) const ENTRY_BYTES: usize = 8;
 
 /// The four words of one entry, as the `Index + 0`, `Index + 2`, `Index + 4` and
 /// `Index + 6` of that section: the y coordinate, the two size fields with the
@@ -56,8 +56,8 @@ const CACHE_ENTRIES: usize = 80;
 /// Bits 11-10 (`hs`) and 9-8 (`vs`) of the size word are the width and the height
 /// of a sprite in cells, and bits 6-0 its link: `-hhvv` and `-lllllll` of the
 /// section, whose "00b=1 cell, 11b=4 cells" is the `+ 1` of [`sprite_at`].
-const HEIGHT_SHIFT: u32 = 8;
-const WIDTH_SHIFT: u32 = 10;
+pub(crate) const HEIGHT_SHIFT: u32 = 8;
+pub(crate) const WIDTH_SHIFT: u32 = 10;
 const SIZE_MASK: u16 = 0x03;
 
 /// Bits 6-0 of the size word: "l = Link field", and "The 7-bit link field in each
@@ -603,7 +603,7 @@ impl LineWalk {
 mod tests {
     use super::*;
     use crate::planes::testutil::{
-        CELL_TILE_ROWS, fill_tile_row, fill_tile_row_of_height, put_tile_row, put_word,
+        CELL_TILE_ROWS, fill_tile_row, fill_tile_row_of_height, put_sprite_at, put_tile_row, put_word,
     };
 
     /// SAT base of these tests: R5 = `0x78` is 0xF000 both under the H32 mask of
@@ -629,10 +629,11 @@ mod tests {
         [0; WIDTH_H40]
     }
 
-    /// SAT entry `index`: `y` and `x` the raw coordinates of the virtual 512x512
-    /// space of genvdp.txt section 15, `cells` the `(width, height)` of the sprite
-    /// in cells of 8 pixels, `link` the index of the next entry of the list or 0 to
-    /// stop, and `pattern` word 2, the name-table-style pattern of the entry.
+    /// [`put_sprite_at`] at these tests' own [`SPRITE_BASE`]: `y` and `x` the raw
+    /// coordinates of the virtual 512x512 space of genvdp.txt section 15, `cells`
+    /// the `(width, height)` of the sprite in cells of 8 pixels, `link` the index of
+    /// the next entry of the list or 0 to stop, and `pattern` word 2, the
+    /// name-table-style pattern of the entry.
     fn put_sprite(
         vdp: &mut Vdp,
         index: usize,
@@ -645,35 +646,6 @@ mod tests {
         put_sprite_at(vdp, SPRITE_BASE, index, y, x, cells, link, pattern);
     }
 
-    /// [`put_sprite`] for a table at `base` rather than at [`SPRITE_BASE`], for
-    /// the tests that move the SAT with R5 (#103).
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a SAT entry is six fields, all worth naming"
-    )]
-    fn put_sprite_at(
-        vdp: &mut Vdp,
-        base: usize,
-        index: usize,
-        y: u16,
-        x: u16,
-        cells: (u8, u8),
-        link: u8,
-        pattern: u16,
-    ) {
-        let (width, height) = cells;
-        let entry = base + index * ENTRY_BYTES;
-        put_word(vdp, entry, y);
-        put_word(
-            vdp,
-            entry + 2,
-            ((u16::from(width) - 1) << WIDTH_SHIFT)
-                | ((u16::from(height) - 1) << HEIGHT_SHIFT)
-                | u16::from(link),
-        );
-        put_word(vdp, entry + 4, pattern);
-        put_word(vdp, entry + 6, x);
-    }
 
     /// The word 2 naming `tile` in `palette`, priority and flips clear.
     fn palette_tile(palette: u8, tile: u16) -> u16 {

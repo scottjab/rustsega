@@ -448,6 +448,7 @@ pub(crate) mod testutil {
     use crate::VRAM_SIZE;
     use crate::Vdp;
     use crate::pattern::tile_addr;
+    use crate::sprites;
 
     /// Plane A table base of the plane tests: R2 = `0x30` is 0xC000.
     pub(crate) const PLANE_A_BASE: usize = 0xC000;
@@ -488,6 +489,41 @@ pub(crate) mod testutil {
     /// Entry `cell` of the name table at `base`: `base + cell * 2`.
     pub(crate) fn put_entry(vdp: &mut Vdp, base: usize, cell: usize, word: u16) {
         put_word(vdp, base + cell * 2, word);
+    }
+
+    /// SAT entry `index` of the table at `base`.
+    ///
+    /// `y` and `x` the raw coordinates of
+    /// the virtual 512x512 space of genvdp.txt section 15, `cells` the `(width,
+    /// height)` of the sprite in cells of 8 pixels, `link` the index of the next
+    /// entry of the list or 0 to stop, and `pattern` word 2, the name-table-style
+    /// pattern of the entry.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a SAT entry is six fields, all worth naming"
+    )]
+    pub(crate) fn put_sprite_at(
+        vdp: &mut Vdp,
+        base: usize,
+        index: usize,
+        y: u16,
+        x: u16,
+        cells: (u8, u8),
+        link: u8,
+        pattern: u16,
+    ) {
+        let (width, height) = cells;
+        let entry = base + index * sprites::ENTRY_BYTES;
+        put_word(vdp, entry, y);
+        put_word(
+            vdp,
+            entry + 2,
+            ((u16::from(width) - 1) << sprites::WIDTH_SHIFT)
+                | ((u16::from(height) - 1) << sprites::HEIGHT_SHIFT)
+                | u16::from(link),
+        );
+        put_word(vdp, entry + 4, pattern);
+        put_word(vdp, entry + 6, x);
     }
 
     /// A [`plane_vdp`] with the horizontal scroll table at [`HSCROLL_BASE`] and
