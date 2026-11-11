@@ -7,13 +7,15 @@
 //! reads answer (`status`), the beam position and the HV counter port (`hv`),
 //! and the three DMA modes, the 68k transfer, the fill and the copy (`dma`),
 //! and the beam timing that drives the status flags and raises the interrupts
-//! (`timing`). Rendering is M4-10 (#88) onwards, so the line renderer that
-//! `timing` calls is the backdrop stub of M4-17 (#95).
+//! (`timing`), and the CRAM to pixel conversion with its colour LUT (`color`).
+//! Rendering is M4-10 (#88) onwards, so the line renderer that `timing` calls
+//! is the backdrop stub of M4-17 (#95).
 //!
 //! Register bit documentation cites Charles MacDonald's `genvdp.txt` by section
 //! number and the plutiedev "VDP register reference" pages by the port address
 //! of the register (`$83xx` is R3), which is how each is usually quoted.
 
+pub mod color;
 mod dma;
 mod framebuffer;
 mod hv;
@@ -22,6 +24,7 @@ mod regs;
 mod status;
 mod timing;
 
+pub use color::{ColorLut, Intensity};
 pub use dma::DmaBus;
 pub use framebuffer::FrameBuffer;
 pub use regs::{DmaMode, HScrollMode, InterlaceMode};
@@ -61,8 +64,8 @@ pub struct Vdp {
     /// CRAM: 64 words of 9-bit colour in `0000 BBB0 GGG0 RRR0` form
     /// (genvdp.txt section 9: `----bbb-ggg-rrr-`).
     ///
-    /// TODO(M4-09 #87): conversion of these words to DAC levels, including the
-    /// shadow/highlight halves of the range.
+    /// These are the colours as the game wrote them; [`color::color`] and
+    /// [`ColorLut`] turn one into a pixel.
     pub cram: [u16; CRAM_WORDS],
     /// VSRAM: 40 words of vertical scroll values (genvdp.txt section 10).
     ///
@@ -200,6 +203,14 @@ pub struct Vdp {
     /// `Some` from the moment M3 goes up to the moment it comes down, which is
     /// what [`Vdp::hv_counter`] answers with while it is set (M4-05, #83).
     hv_latch: Option<u16>,
+    /// Every CRAM colour at every intensity, built once by [`Vdp::new`] from
+    /// [`color::color`] so that painting a pixel costs a lookup and no
+    /// allocation (M4-09, #87).
+    ///
+    /// Boxed for the same reason [`Vdp::vram`] is: 3 x 512 `u32` is 6 KiB, and
+    /// a `Vdp` value is meant to stay a few hundred bytes, which the
+    /// `vdp_values_stay_off_the_stack` test keeps true.
+    color_lut: Box<ColorLut>,
     /// The frame the renderer draws into. Read through [`Vdp::frame`].
     frame_buffer: FrameBuffer,
     /// Which crystal the chip is clocked by: `true` for PAL, which can drive a
@@ -243,6 +254,7 @@ impl Vdp {
             line_mclk: 0,
             line_started: false,
             hv_latch: None,
+            color_lut: Box::new(ColorLut::new()),
             frame_buffer: FrameBuffer::new(),
             pal,
         }

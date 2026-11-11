@@ -1,5 +1,6 @@
 //! The picture the VDP produces.
 
+use crate::color::Intensity;
 use crate::{LINES_V30, Vdp, WIDTH_H40};
 
 /// Widest picture the VDP can produce: 40 cells in H40 (R12, genvdp.txt
@@ -92,21 +93,20 @@ impl Vdp {
 
     /// The backdrop colour as a frame-buffer pixel: R7's index into CRAM
     /// (genvdp.txt section 17 "$07": "Bits 5-0 of this register select a palette
-    /// entry to be used as the backdrop color"), expanded from the 9-bit
-    /// `0000 BBB0 GGG0 RRR0` of section 9 to eight bits a channel.
+    /// entry to be used as the backdrop color") through the colour LUT, so the
+    /// 9-bit `0000 BBB0 GGG0 RRR0` of section 9 becomes a pixel at the DAC
+    /// levels of [`crate::color::color`] (M4-09, #87).
     ///
-    /// A plain bit replication, which is all the stub of [`Vdp::render_line`]
-    /// needs; the DAC levels and the shadow/highlight halves of the range are
-    /// M4-09 (#87).
+    /// At [`Intensity::Normal`]: genvdp.txt section 16 does show the backdrop at
+    /// half intensity, "while the overscan region outside of the display area is
+    /// always shown at normal intensity" and "if a background tile has high
+    /// priority, then the corresponding 8x8 block of the backdrop color will be
+    /// shown at normal intensity". Picking between the two per pixel needs the
+    /// plane priority data, which is the renderer's; M4-17 (#95) replaces this
+    /// whole function.
     pub(crate) fn backdrop_pixel(&self) -> u32 {
-        let colour = u32::from(self.cram[usize::from(self.backdrop_index())]);
-        // Three bits to eight, by repeating the top bits of the value: 0b101
-        // becomes 0b10110100, so black stays black and white stays white.
-        let expand = |v: u32| (v << 5) | (v << 2) | (v >> 1);
-        let r = expand((colour >> 1) & 0x07);
-        let g = expand((colour >> 5) & 0x07);
-        let b = expand((colour >> 9) & 0x07);
-        0xFF00_0000 | (b << 16) | (g << 8) | r
+        let colour = self.cram[usize::from(self.backdrop_index())];
+        self.color_lut.pixel(colour, Intensity::Normal)
     }
 }
 
@@ -121,6 +121,24 @@ mod tests {
         assert_eq!(fb.height, 224);
         assert_eq!(fb.pixels.len(), 320 * 480);
         assert!(fb.pixels.iter().all(|&p| p == 0));
+    }
+
+    /// The backdrop is converted by the DAC levels of `color`, not by the
+    /// three-bit replication the M4-06 stub used (M4-09, #87): `0x0002` is red
+    /// 52 (`0x34`), where the replication gave 36 (`0x24`).
+    #[test]
+    fn backdrop_pixel_uses_the_colour_conversion() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(7, 0x09);
+        for (cram, want) in [
+            (0x0002_u16, 0xFF00_0034_u32),
+            (0x0000, 0xFF00_0000),
+            (0x0EEE, 0xFFFF_FFFF),
+            (0x0E00, 0xFFFF_0000),
+        ] {
+            vdp.cram[9] = cram;
+            assert_eq!(vdp.backdrop_pixel(), want, "CRAM entry 9 = {cram:#06x}");
+        }
     }
 
     #[test]
