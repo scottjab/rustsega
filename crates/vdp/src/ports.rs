@@ -46,7 +46,7 @@ const CODE_HIGH: u8 = 0x3C;
 /// "You cannot write data after setting up a read operation, or read data
 /// after setting up a write operation. The write or read is ignored."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DataTarget {
+pub(crate) enum DataTarget {
     /// `0001`: write a VRAM word.
     Vram,
     /// `0011`: write a CRAM word.
@@ -103,6 +103,14 @@ pub(crate) mod testutil {
     pub(crate) fn vram_byte_read_cmd(addr: u16) -> (u16, u16) {
         (addr & 0x3FFF, 0x0030 | ((addr >> 14) & 0x0003))
     }
+
+    /// Control port words that set up a VRAM copy to `addr`: the code of a
+    /// VRAM read with CD4 and CD5 set - "CD4 is only set for the the VRAM copy
+    /// DMA mode" and CD5 is the DMA itself (genvdp.txt section 7 "Here is a
+    /// table of code register settings", section 11 "VRAM copy").
+    pub(crate) fn copy_write_cmd(addr: u16) -> (u16, u16) {
+        (addr & 0x3FFF, 0x00C0 | ((addr >> 14) & 0x0003))
+    }
 }
 
 /// Is `value` a VDP register write?
@@ -153,7 +161,7 @@ const fn second_word(code: u8, addr: u16, value: u16) -> (u8, u16) {
 /// Only CD3-CD0 matter: "CD4 is only set for the the VRAM copy DMA mode. For
 /// data port accesses and 68k to VDP DMA, the state of CD4 is ignored"
 /// (genvdp.txt section 7).
-const fn data_target(code: u8) -> DataTarget {
+pub(crate) const fn data_target(code: u8) -> DataTarget {
     match code & 0x0F {
         0b0001 => DataTarget::Vram,
         0b0011 => DataTarget::Cram,
@@ -266,7 +274,7 @@ const fn vsram_word_index(addr: u16) -> Option<usize> {
 /// register names. [`Vdp::read_data`] masks the address it uses per memory (VRAM
 /// whole 64 KiB, CRAM and VSRAM bits 6-1); reads increment with this same
 /// function, because the access happened either way.
-const fn increment(addr: u16, step: u8) -> u16 {
+pub(crate) const fn increment(addr: u16, step: u8) -> u16 {
     addr.wrapping_add(step as u16)
 }
 
@@ -383,7 +391,23 @@ impl Vdp {
         // for the read side of the chip ([`Vdp::read_data`]).
         self.pending = false;
         self.fifo_last = value;
+        self.write_target_word(value);
 
+        // The data port write is also what starts a DMA fill that a command
+        // word has armed: "Any write to the data port will then start a VRAM
+        // fill" (genvdp.txt section 11 "VRAM fill"). `dma::Vdp::run_fill` is
+        // where that lives, and it does nothing at all whenever no fill is
+        // waiting - which is every other write to the port, the words a 68k to
+        // VDP transfer writes included.
+        self.run_fill(value);
+    }
+
+    /// The word goes to the memory the code register names, and the address
+    /// register moves on by R15.
+    ///
+    /// Split out of [`Vdp::write_data`] because a DMA fill to CRAM or VSRAM
+    /// repeats this whole-word write on every step of its own (`dma`, #86).
+    pub(crate) fn write_target_word(&mut self, value: u16) {
         match data_target(self.code) {
             DataTarget::Vram => {
                 let (even, bytes) = vram_word_bytes(self.addr, value);

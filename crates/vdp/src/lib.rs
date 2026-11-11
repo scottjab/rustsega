@@ -101,9 +101,17 @@ pub struct Vdp {
     fifo_last: u16,
     /// Set by a command word with CD5 while R1 M1 allows DMA (genvdp.txt
     /// section 7: "Setting CD5 will trigger a DMA operation"). [`Vdp::run_dma`]
-    /// consumes it; the fill and copy modes of M4-08 (#86) will take their turn
-    /// with it too.
+    /// consumes it, and each mode of genvdp.txt section 11 takes its turn there:
+    /// the 68k transfer and the copy run, and the fill goes to
+    /// [`Vdp::dma_fill_pending`] because it waits for a data port write.
     dma_requested: bool,
+    /// A DMA fill that is waiting for the data port write which starts it.
+    ///
+    /// Set when a command word with CD5 asks for the fill mode (R23 bits 7-6
+    /// `10`) and cleared by [`Vdp::run_fill`] (`dma`) when the next word
+    /// reaches the data port: "Any write to the data port will then start a
+    /// VRAM fill" (genvdp.txt section 11 "VRAM fill").
+    dma_fill_pending: bool,
     /// Status bit 7 (F): a vertical interrupt is waiting for the 68k.
     ///
     /// Set at VBlank start and cleared by the interrupt acknowledge, never by
@@ -171,8 +179,11 @@ pub struct Vdp {
     /// operation ... only useful for fills and copies, since the 68000 is frozen
     /// during 68k -> VDP transfers" (genvdp.txt section 6).
     ///
-    /// TODO(M4-22 #101): DMA timing, which is what would set and clear it; the
-    /// transfers of M4-07 (#85) run in one call and so are never seen busy.
+    /// Only a fill is ever seen busy, and only between the command word that
+    /// arms it and the data port write that runs it (`dma::Vdp::arm_fill`,
+    /// M4-08 #86). TODO(M4-22 #101): DMA timing, which is what would set and
+    /// clear it for the transfers of M4-07 (#85) and the copies of #86 too -
+    /// both of which run in one call and so finish before anything can read it.
     dma_busy: bool,
     /// The scanline the beam is on: 0 is the first line of the frame, and the
     /// frame is 262 lines on NTSC and 313 on PAL. [`Vdp::advance`] walks it and
@@ -217,6 +228,7 @@ impl Vdp {
             pending: false,
             fifo_last: 0,
             dma_requested: false,
+            dma_fill_pending: false,
             vint_pending: false,
             sprite_overflow: false,
             sprite_collision: false,
@@ -555,11 +567,15 @@ impl Vdp {
         self.regs[regs::R18] & 0x1F
     }
 
-    /// DMA length in words, R19 low and R20 high (genvdp.txt section 11
+    /// DMA length, R19 low and R20 high (genvdp.txt section 11
     /// "DMA"; plutiedev "$93xx/$94xx").
     ///
-    /// The raw field: a transfer reads it through `dma::words_to_transfer`,
-    /// which is where the 0-means-0x10000 rule lives.
+    /// The raw field, which is either a count of words or a count of bytes: a
+    /// 68k transfer counts 16-bit words (genvdp.txt "Registers 19, 20, specify
+    /// how many 16-bit words to transfer") and a fill or a copy counts bytes
+    /// ("... how many 8-bit bytes to fill", "... to copy"). `dma::words_to_transfer`
+    /// and `dma::bytes_to_move` are where those two readings, and the rule that
+    /// a field of 0 means 0x10000 of them, live.
     #[inline]
     pub fn dma_length(&self) -> u16 {
         u16::from(self.regs[regs::R19]) | (u16::from(self.regs[regs::R20]) << 8)
@@ -580,10 +596,24 @@ impl Vdp {
             | ((u32::from(self.regs[regs::R23]) & 0x7F) << 17)
     }
 
+    /// The VRAM source address of a copy: R21 bits 7-0 and R22 bits 15-8
+    /// (genvdp.txt section 11 "VRAM copy": "#21: S07 S06 ... S00, #22: S15 S14
+    /// ... S08", and "the address bits in register 23 are ignored").
+    ///
+    /// All 16 bits of the two registers are address here, unlike
+    /// [`Vdp::dma_source`]: a 68k transfer reads words, so its R21 holds bits
+    /// 8-1, while a copy reads bytes.
+    #[inline]
+    pub fn dma_copy_source(&self) -> u16 {
+        u16::from(self.regs[regs::R21]) | (u16::from(self.regs[regs::R22]) << 8)
+    }
+
     /// R23 bits 7-6 (DMD1-0): which DMA the command asked for (genvdp.txt
     /// section 11; plutiedev "$97xx").
     ///
-    /// TODO(M4-08 #86): the fill and copy modes; the 68000 transfer is `dma`.
+    /// All three modes are in `dma`: the 68000 transfer runs from
+    /// [`Vdp::run_dma`], the copy runs from there too, and the fill waits for
+    /// the next data port write.
     #[inline]
     pub fn dma_mode(&self) -> DmaMode {
         regs::decode_dma_mode(self.regs[regs::R23])

@@ -15,6 +15,7 @@
 //! stall that goes with it, and the read FIFO quirk that makes the first word
 //! of a 68k-to-VRAM transfer wrong on real hardware. All three are M4-22 (#101).
 
+use crate::ports::{data_target, increment, DataTarget};
 use crate::DmaMode;
 use crate::Vdp;
 use crate::regs;
@@ -69,6 +70,25 @@ const fn words_to_transfer(length: u16) -> u32 {
     }
 }
 
+/// Bytes to fill or copy for a length field of `length`.
+///
+/// The same field that is a word count for a 68k transfer is a **byte** count
+/// for the other two modes: "Registers 19, 20, specify how many 8-bit bytes to
+/// fill" and "... to copy" (genvdp.txt section 11 "VRAM fill", "VRAM copy").
+///
+/// Zero is [`DMA_FULL_LENGTH`] here too. genvdp.txt section 11 says only
+/// "When the length field is set to zero, the length is treated as FFFFh", but
+/// its own fill pseudocode counts with `while (--length)`, which walks the
+/// counter through 0 to FFFFh and stops after FFFFh + 1 steps; Genesis Plus GX
+/// spells the same thing out as `dma_length = ...; if (!dma_length) dma_length
+/// = 0x10000;` for the fill and the copy alike.
+const fn bytes_to_move(length: u16) -> u32 {
+    match length as u32 {
+        0 => DMA_FULL_LENGTH,
+        bytes => bytes,
+    }
+}
+
 /// The source address of the next word in a 68k transfer.
 ///
 /// Add 2 to the offset, keep the block: see [`DMA_BLOCK_MASK`] and
@@ -110,10 +130,169 @@ impl Vdp {
             return;
         }
         self.dma_requested = false;
-        if !transfer_allowed(self.dma_enabled(), self.dma_mode()) {
+        match self.dma_mode() {
+            // A fill does not run here: it waits for the data port write that
+            // starts it (`Vdp::run_fill`). Being armed is as far as the command
+            // word gets, and it is the R1 M1 bit that allows it, the same bit
+            // `transfer_allowed` reads for the 68k transfer.
+            DmaMode::Fill if self.dma_enabled() => self.arm_fill(),
+            DmaMode::Copy if self.dma_enabled() => self.run_copy(),
+            _ if transfer_allowed(self.dma_enabled(), self.dma_mode()) => self.run_transfer(bus),
+            _ => {}
+        }
+    }
+
+    /// Arm the DMA fill that the next data port write starts.
+    fn arm_fill(&mut self) {
+        self.dma_fill_pending = true;
+        // "Bit 1 is set for the duration of a DMA operation. This is only
+        // useful for fills and copies" (genvdp.txt section 6), and a fill is
+        // running from the command word: it has been started, it is only
+        // waiting for its data. Genesis Plus GX sets its DMA busy the same way
+        // when it sees the fill mode in the command word.
+        self.dma_busy = true;
+    }
+
+    /// Run the fill that [`Vdp::arm_fill`] armed, if there is one, with `value`
+    /// as the word the data port has just been written.
+    ///
+    /// The reference for the whole of this is genvdp.txt section 11 "VRAM
+    /// fill", which gives the fill as "C" pseudocode. Quoted in full, because
+    /// the exact byte sequence is the part everyone gets wrong:
+    ///
+    /// ```text
+    ///  void vram_fill(int data)
+    ///  {
+    ///     /* Write lower byte to address specified */
+    ///     vram[address] = (data >> 0) & 0xFF;
+    ///
+    ///     do {
+    ///         /* Write upper byte to adjacent address */
+    ///         vram[address ^ 1] = (data >> 8) & 0xFF;
+    ///
+    ///         /* Increment address register */
+    ///         address += vdp_reg[15];
+    ///     } while(--length)
+    ///  }
+    /// ```
+    ///
+    /// Read against the port rules of M4-02 (#80), the first line of that
+    /// pseudocode is the data port write that got us here: `Vdp::write_data`
+    /// has already written the whole word, swapped for an odd address, by the
+    /// time this runs. So the loop starts from where that write left the
+    /// address register - the address of the write plus one step of R15 - and
+    /// the MSB is what it repeats, `length` times, on top of a word that has
+    /// already been written in the ordinary way. Genesis Plus GX's
+    /// `vdp_dma_fill` is called the same way, after the port write has moved
+    /// the register on, and its loop is `WRITE_BYTE(vram, addr ^ 1, data)` then
+    /// `addr += reg[15]`.
+    ///
+    /// The MSB is also what makes an 8-bit write to the data port a byte fill:
+    /// "a distinction between 8-bit and 16-bit VRAM fills do not exist. There
+    /// is only one type of fill, and depending on how you write to the data port
+    /// will determine the kind of data used in the fill" (genvdp.txt section 7
+    /// "8-bit port access"), and a byte write arrives here as that byte
+    /// duplicated in both halves.
+    ///
+    /// Two things about the counts, both of which the tests pin:
+    ///
+    /// - The length is a **byte** count here, not the word count of a 68k
+    ///   transfer: "Registers 19, 20, specify how many 8-bit bytes to fill"
+    ///   (genvdp.txt section 11), so a length of N is N writes of one byte on
+    ///   top of the word that starts the fill - which is what every game that
+    ///   fills relies on.
+    /// - One byte per step means R15 is the stride: R15 = 1 walks a contiguous
+    ///   run of the MSB, R15 = 2 leaves the other bytes of VRAM alone.
+    ///
+    /// CRAM and VSRAM take the whole word every step instead of a byte, because
+    /// they are word-wide memories and a fill to them is "the same as normal ...
+    /// data port access" (genvdp.txt section 11). That is the doc's own "I'd
+    /// assume" - the one fill rule genvdp.txt admits it never verified - with
+    /// Genesis Plus GX's `vdp_dma_fill` behind it, which writes `fifo[fifo_idx]`,
+    /// the whole of the last word, at every step of a CRAM or VSRAM fill.
+    pub(crate) fn run_fill(&mut self, value: u16) {
+        if !self.dma_fill_pending {
             return;
         }
+        self.dma_fill_pending = false;
+        // M4-22 (#101) is what will make a fill take time; until then the write
+        // that starts it is the write that finishes it.
+        self.dma_busy = false;
 
+        let steps = bytes_to_move(self.dma_length());
+        match data_target(self.code) {
+            DataTarget::Vram => {
+                let byte = (value >> 8) as u8;
+                for _ in 0..steps {
+                    // `addr ^ 1` is the byte on the other side of the pair the
+                    // address sits in, and the address register then moves on by
+                    // R15: the two lines of the pseudocode quoted above.
+                    self.vram[usize::from(self.addr ^ 1)] = byte;
+                    self.addr = increment(self.addr, self.auto_increment());
+                }
+            }
+            DataTarget::Cram | DataTarget::Vsram => {
+                for _ in 0..steps {
+                    self.write_target_word(value);
+                }
+            }
+            // A code register that names no memory still costs the step: the
+            // address moves on whatever the fill wrote (Genesis Plus GX's
+            // default case: "invalid destination does nothing ... address is
+            // still incremented").
+            DataTarget::Ignored => {
+                for _ in 0..steps {
+                    self.addr = increment(self.addr, self.auto_increment());
+                }
+            }
+        }
+
+        // The count is spent, as it is after a 68k transfer: "After either:
+        // length regs 0" is how the ticket puts it, and the same write-back of
+        // R19/R20 is what a game that polls the DMA sees.
+        self.regs[regs::R19] = 0;
+        self.regs[regs::R20] = 0;
+    }
+
+    /// Copy VRAM to VRAM: [`Vdp::dma_copy_source`] to the address register,
+    /// [`bytes_to_move`] of them, one byte per step.
+    ///
+    /// genvdp.txt section 11 "VRAM copy" is short: "The VDP will read a byte
+    /// from the source address which is then incremented by one. The data will
+    /// then be written to the destination address, which is incremented by
+    /// register #15."
+    ///
+    /// What it does not say is that both addresses are used one byte off: the
+    /// copy reads `src ^ 1` and writes `dst ^ 1`, the same adjacent-byte rule
+    /// as the fill. Nothing in genvdp.txt covers this, so it is **inferred** -
+    /// from the ticket and from Genesis Plus GX's `vdp_dma_copy`, which reads
+    /// `READ_BYTE(vram, source ^ 1)` and writes `WRITE_BYTE(vram, addr ^ 1,
+    /// data)`. For the common set-up, where the step is 1 and the source and
+    /// destination parities match, the two readings give the same VRAM and only
+    /// the order of the writes differs; with a step of 2 they do not, and a
+    /// test pins this one.
+    ///
+    /// Runs from [`Vdp::run_dma`], straight out, because "In the case of DMA
+    /// transfer or DMA copy, the operation will start immediately after writing
+    /// this value" (plutiedev "Start DMA") - unlike the fill, which waits for
+    /// the data port.
+    fn run_copy(&mut self) {
+        let steps = bytes_to_move(self.dma_length());
+        let mut src = self.dma_copy_source();
+        for _ in 0..steps {
+            let byte = self.vram[usize::from(src ^ 1)];
+            self.vram[usize::from(self.addr ^ 1)] = byte;
+            src = src.wrapping_add(1);
+            self.addr = increment(self.addr, self.auto_increment());
+        }
+
+        self.regs[regs::R19] = 0;
+        self.regs[regs::R20] = 0;
+        self.dma_busy = false;
+    }
+
+    /// The 68k to VDP transfer itself.
+    fn run_transfer(&mut self, bus: &mut impl DmaBus) {
         let words = words_to_transfer(self.dma_length());
         let mut src = self.dma_source();
 
@@ -125,6 +304,13 @@ impl Vdp {
         // flow the glue uses, a call straight after the command word, that
         // word has just cleared the flag, so this is the same value twice.
         let pending = self.pending;
+        // Nor is a fill left waiting by a transfer. Only a data port write
+        // starts one (genvdp.txt section 11 "VRAM fill") and these words come
+        // from the bus, so the transfer has to leave the pending fill for the
+        // next port write to find - which matters because the two modes are
+        // the same CD5 command read with a different R23, so a game can ask
+        // for one and then the other without a write in between.
+        let fill_pending = self.dma_fill_pending;
         for _ in 0..words {
             let value = bus.read_word(src);
             // TODO(M4-22 #101): the first word of a 68k-to-VRAM transfer is
@@ -134,6 +320,7 @@ impl Vdp {
             src = next_source(src);
         }
         self.pending = pending;
+        self.dma_fill_pending = fill_pending;
 
         // The count is spent and the source moved on, both of which software
         // can see (genvdp.txt section 11 "DMA"; plutiedev "$93xx" to "$96xx").
@@ -148,7 +335,7 @@ impl Vdp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::testutil::{cram_write_cmd, vram_write_cmd, vsram_write_cmd};
+    use crate::ports::testutil::{copy_write_cmd, cram_write_cmd, vram_write_cmd, vsram_write_cmd};
 
     /// A 68k bus for these tests: a handful of words laid down at byte
     /// addresses, and every read recorded.
@@ -481,5 +668,183 @@ mod tests {
         assert_eq!(source_fields(0x000108), (0x84, 0x00));
         assert_eq!(source_fields(0x0002_0002), (0x01, 0x00));
         assert_eq!(source_fields(0x00FE_FFFE), (0xFF, 0x7F));
+    }
+
+    /// R23 bits 7-6 for a fill, and for a copy (genvdp.txt section 11).
+    const FILL: u8 = 0b10 << 6;
+    const COPY: u8 = 0b11 << 6;
+
+    /// Set up a fill or a copy: `length` in bytes (R19 low, R20 high), the
+    /// address register stepping by `step` (R15), R1 M1 set so the DMA is
+    /// allowed, and R23 holding `mode` ( [`FILL`] or [`COPY`]).
+    ///
+    /// All of this has to happen before the command word, because a register
+    /// write clears the code register ([`Vdp::write_control`]).
+    fn dma_set_up(vdp: &mut Vdp, mode: u8, length: u16, step: u8) {
+        vdp.write_register(19, length as u8);
+        vdp.write_register(20, (length >> 8) as u8);
+        vdp.write_register(15, step);
+        vdp.write_register(1, 0x10);
+        vdp.write_register(23, mode);
+    }
+
+    /// The source registers of a copy: R21 is bits 7-0 and R22 bits 15-8 of
+    /// the VRAM byte address (genvdp.txt section 11 "VRAM copy"), which is
+    /// byte addressing rather than the `S08-S01` of a 68k transfer.
+    fn copy_source(vdp: &mut Vdp, src: u16) {
+        vdp.write_register(21, src as u8);
+        vdp.write_register(22, (src >> 8) as u8);
+    }
+
+    /// Write the command word and let the glue have its turn at the DMA.
+    ///
+    /// Neither a fill nor a copy reads the 68k bus, so the fake handed to
+    /// `run_dma` is an empty one; the assertions on it are that it stayed that
+    /// way.
+    fn start_and_run(vdp: &mut Vdp, cmd: (u16, u16)) {
+        start_dma(vdp, cmd);
+        let mut bus = FakeBus::default();
+        vdp.run_dma(&mut bus);
+        assert!(bus.reads.is_empty(), "neither a fill nor a copy is on the 68k bus");
+    }
+
+    #[test]
+    fn a_fill_waits_for_the_data_port_write() {
+        let mut vdp = Vdp::new(false);
+        dma_set_up(&mut vdp, FILL, 4, 1);
+        start_and_run(&mut vdp, vram_write_cmd(0x2000));
+
+        assert!(
+            vdp.vram[0x2000..0x2006].iter().all(|&byte| byte == 0),
+            "the command word alone fills nothing: \"Any write to the data port will then start a VRAM fill\" (genvdp.txt section 11)"
+        );
+        assert!(
+            vdp.dma_busy,
+            "and the busy bit is set for the wait, which is why it is \"only useful for fills and copies\" (genvdp.txt section 6)"
+        );
+    }
+
+    #[test]
+    fn a_fill_repeats_the_high_byte_along_the_address_register() {
+        let mut vdp = Vdp::new(false);
+        dma_set_up(&mut vdp, FILL, 4, 1);
+        start_and_run(&mut vdp, vram_write_cmd(0x2000));
+
+        vdp.write_data(0xAB00);
+
+        assert_eq!(
+            &vdp.vram[0x2000..0x2006],
+            [0xAB, 0x00, 0xAB, 0xAB, 0x00, 0xAB],
+            "the word first (0xAB00 big-endian at 0x2000), then 0xAB at 0x2000, 0x2003, 0x2002 and 0x2005: four steps of `addr ^= 1` and `addr += 1` from the 0x2001 the data port write left behind. See the quote on `Vdp::run_fill`."
+        );
+        assert_eq!(
+            vdp.addr, 0x2005,
+            "the address register ends where the last step pointed"
+        );
+    }
+
+    #[test]
+    fn a_fill_with_a_step_of_two_writes_every_other_byte() {
+        let mut vdp = Vdp::new(false);
+        dma_set_up(&mut vdp, FILL, 4, 2);
+        start_and_run(&mut vdp, vram_write_cmd(0x2000));
+
+        vdp.write_data(0xAB00);
+
+        assert_eq!(
+            &vdp.vram[0x2000..0x200A],
+            [0xAB, 0x00, 0x00, 0xAB, 0x00, 0xAB, 0x00, 0xAB, 0x00, 0xAB],
+            "one byte per step, so a step of 2 leaves the even bytes of VRAM alone: the fill writes bytes, not words (genvdp.txt section 11 \"VRAM fill\")"
+        );
+    }
+
+    #[test]
+    fn a_fill_spends_its_length_and_clears_busy() {
+        let mut vdp = Vdp::new(false);
+        dma_set_up(&mut vdp, FILL, 4, 1);
+        start_and_run(&mut vdp, vram_write_cmd(0x2000));
+        assert_eq!((vdp.reg(19), vdp.reg(20)), (4, 0));
+
+        vdp.write_data(0xAB00);
+
+        assert_eq!(
+            (vdp.reg(19), vdp.reg(20)),
+            (0, 0),
+            "the count is spent, as it is after a 68k transfer"
+        );
+        assert!(!vdp.dma_busy, "and the fill is over");
+    }
+
+    #[test]
+    fn a_cram_fill_writes_the_whole_word_every_step() {
+        let mut vdp = Vdp::new(false);
+        dma_set_up(&mut vdp, FILL, 4, 2);
+        start_and_run(&mut vdp, cram_write_cmd(0x0000));
+
+        vdp.write_data(0x1234);
+
+        assert_eq!(
+            &vdp.cram[0..5],
+            [0x0224, 0x0224, 0x0224, 0x0224, 0x0224],
+            "CRAM is word-wide, so a fill to it repeats the whole word - masked to ----bbb0 ggg0 rrr0 like any other CRAM write - rather than one byte of it (genvdp.txt section 11: CRAM fills are \"the same as normal ... data port access\")"
+        );
+    }
+
+    #[test]
+    fn a_copy_moves_bytes_to_the_address_register() {
+        let mut vdp = Vdp::new(false);
+        vdp.vram[0x0100..0x0104].copy_from_slice(&[1, 2, 3, 4]);
+        dma_set_up(&mut vdp, COPY, 4, 1);
+        copy_source(&mut vdp, 0x0100);
+
+        start_and_run(&mut vdp, copy_write_cmd(0x0200));
+
+        assert_eq!(
+            &vdp.vram[0x0200..0x0204],
+            [1, 2, 3, 4],
+            "four bytes of 0x0100 at 0x0200, in order, with nothing else of VRAM touched"
+        );
+        assert!(vdp.vram[0x0204..0x0210].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn a_copy_with_a_step_of_two_spreads_bytes() {
+        let mut vdp = Vdp::new(false);
+        vdp.vram[0x0100..0x0104].copy_from_slice(&[1, 2, 3, 4]);
+        dma_set_up(&mut vdp, COPY, 4, 2);
+        copy_source(&mut vdp, 0x0100);
+
+        start_and_run(&mut vdp, copy_write_cmd(0x0200));
+
+        assert_eq!(
+            &vdp.vram[0x0200..0x0208],
+            [0x00, 2, 0x00, 1, 0x00, 4, 0x00, 3],
+            "one byte per step, and the copy works a byte off the address it names on both sides (see `Vdp::run_copy`), so the pairs arrive swapped"
+        );
+    }
+
+    #[test]
+    fn a_copy_spends_its_length_and_clears_busy() {
+        let mut vdp = Vdp::new(false);
+        dma_set_up(&mut vdp, COPY, 4, 1);
+        copy_source(&mut vdp, 0x0100);
+        assert_eq!((vdp.reg(19), vdp.reg(20)), (4, 0));
+
+        start_and_run(&mut vdp, copy_write_cmd(0x0200));
+
+        assert_eq!(
+            (vdp.reg(19), vdp.reg(20)),
+            (0, 0),
+            "the count is spent by a copy as it is by a fill"
+        );
+        assert!(!vdp.dma_busy, "and the copy is over");
+    }
+
+    #[test]
+    fn a_zero_length_is_all_of_them() {
+        assert_eq!(bytes_to_move(0), 0x1_0000);
+        assert_eq!(bytes_to_move(1), 1);
+        assert_eq!(bytes_to_move(4), 4);
+        assert_eq!(bytes_to_move(0xFFFF), 0xFFFF);
     }
 }
