@@ -30,6 +30,7 @@ pub mod pattern;
 mod planes;
 mod ports;
 mod regs;
+mod slots;
 mod sprites;
 mod status;
 mod timing;
