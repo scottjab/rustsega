@@ -1,4 +1,5 @@
-//! Plane A and plane B line rendering (M4-11, #89).
+//! Plane A and plane B line rendering (M4-11 #89, and its horizontal scroll of
+//! M4-12 #90).
 //!
 //! One line of one scroll plane as a layer buffer: a [`u8`] per pixel holding a
 //! CRAM index rather than a colour, so the compositing of M4-17 (#95) can still
@@ -8,7 +9,7 @@
 //! repeats either.
 
 use crate::pattern::{NameEntry, read_word, tile_row};
-use crate::{Vdp, WIDTH_H40};
+use crate::{HScrollMode, Vdp, WIDTH_H40};
 
 /// Rows of a plane cell, and so of the pattern a plane cell names.
 ///
@@ -28,6 +29,16 @@ const MAX_ENTRIES: usize = 4096;
 /// (#95) wants it. genvdp.txt section 14 moves a plane's pixels from `B`/`C`
 /// to `E'`/`F'` when the entry sets the flag.
 const PRIORITY_SHIFT: u32 = 6;
+
+/// Bits of a horizontal scroll table entry that the VDP reads: genvdp.txt
+/// section 13 "Horizontal Scrolling", "x = Horizontal scroll value (0-3FFh)"
+/// and "Bits D15 through D10 are ignored by the VDP".
+const HSCROLL_MASK: u16 = 0x3FF;
+
+/// Bytes between one horizontal scroll entry and the next: the 16-bit word of
+/// plane A and the 16-bit word of plane B, which that section describes as
+/// "Scroll values for planes A and B are stored in an interleaved fashion".
+const HSCROLL_ENTRY: usize = 4;
 
 /// Which of the two scroll planes to render (genvdp.txt section 13 "Background
 /// Layers": "The VDP manages two background layers, called plane A and plane B").
@@ -53,9 +64,51 @@ impl Plane {
         };
         usize::from(base)
     }
+
+    /// Which of the two words of a horizontal scroll entry this plane reads.
+    ///
+    /// genvdp.txt section 13 "Horizontal Scrolling": "Entry #0 of the table is
+    /// for plane A, entry #1 is for plane B, and this repeats for the entire
+    /// length of the table."
+    #[inline]
+    fn scroll_word(self) -> usize {
+        match self {
+            Plane::A => 0,
+            Plane::B => 2,
+        }
+    }
 }
 
 impl Vdp {
+    /// The horizontal scroll value of `plane` on `line`: the 10-bit value of the
+    /// table entry that R11's mode says this line reads, at
+    /// [`Vdp::hscroll_base`] plus `index * HSCROLL_ENTRY` plus this plane's word.
+    ///
+    /// genvdp.txt section 13 "Horizontal Scrolling" gives the walk of the table
+    /// as the `get_scroll` pseudocode of that section, over R11 bits 1-0
+    /// (section 17 "$0B", HSCR/LSCR):
+    ///
+    /// - `00` full screen: one entry for the whole frame, `index = 0`;
+    /// - `01` invalid, "the first eight lines": `index = line & 7`. The doc says
+    ///   of it "This mode is identical to per-line scrolling, however the VDP
+    ///   will only read the first sixteen entries in the scroll table for every
+    ///   line of the display", and sixteen 16-bit words are exactly the eight
+    ///   lines of two words that `line & 7` addresses, so its prose and its
+    ///   pseudocode agree;
+    /// - `10` per cell: `index = line & !7`, one entry per 8-line cell row;
+    /// - `11` per line: `index = line`.
+    #[inline]
+    fn line_hscroll(&self, plane: Plane, line: usize) -> usize {
+        let index = match self.hscroll_mode() {
+            HScrollMode::Full => 0,
+            HScrollMode::EightLines => line & (CELL_ROWS - 1),
+            HScrollMode::PerCell => line & !(CELL_ROWS - 1),
+            HScrollMode::PerLine => line,
+        };
+        let addr = usize::from(self.hscroll_base()) + index * HSCROLL_ENTRY + plane.scroll_word();
+        usize::from(read_word(&self.vram, addr) & HSCROLL_MASK)
+    }
+
     /// Fill `out` with one line of `plane`: one [`u8`] per pixel, bits 5-0 the
     /// CRAM index (`palette * 16 + colour`, the 6-bit index of CRAM's 64 words,
     /// genvdp.txt section 9) and bit 6 the cell's priority flag.
@@ -67,10 +120,23 @@ impl Vdp {
     /// it and of nothing else, and the stale priority bit of a transparent cell
     /// cannot leak into the layer above.
     ///
-    /// There is no scrolling yet, so a pixel maps to the plane unchanged: plane x
-    /// is `x` and plane y is `line`, a cell is 8 pixels by 8 pixels, and both
-    /// axes wrap at the plane size of R16. The fetch runs a cell at a time - eight
-    /// pixels, one row of one pattern - and allocates nothing.
+    /// Horizontal scroll: a pixel of the line comes from plane x
+    /// `(x - hscroll) & (width * 8 - 1)` of this plane, and plane y is still
+    /// `line` until M4-13 (#91) adds vertical scroll. `hscroll` is
+    /// [`Vdp::line_hscroll`] of this very plane and line, and only its low three
+    /// bits are a sub-cell offset, so a scroll of 8 moves the plane exactly one
+    /// cell and a scroll of 3 starts the fetch three pixels into the first
+    /// visible cell. genvdp.txt section 13 is clear on the wrap ("When the scroll
+    /// value is larger than the width of the playfield, the display wraps
+    /// horizontally") and on the size of the value, but NOT on its direction: it
+    /// says only that "the lower three bits of the scroll value provide a pixel
+    /// offset into each column comprised of one pattern". Subtracting the value,
+    /// so that a larger one moves the plane right, is what #90 works to and what
+    /// the tests here fix in. It is INFERRED, not documented.
+    ///
+    /// A cell is still 8 pixels by 8 pixels and both axes wrap at the plane size
+    /// of R16. The fetch runs one cell of the plane at a time - eight pixels, or
+    /// the remainder of one at the left edge of the line - and allocates nothing.
     ///
     /// Invalid plane sizes, which genvdp.txt section 13 calls the combinations
     /// over its 8192-byte table (128x128 and 64x128), have no documented
@@ -97,18 +163,28 @@ impl Vdp {
         let line = usize::from(line);
         let row_base = ((line / CELL_ROWS) % height) * width;
         let cell_row = line % CELL_ROWS;
+        let scroll = self.line_hscroll(plane, line);
+        // The plane is `width * 8` pixels wide, and every valid width of R16 is a
+        // power of two, so masking is wrapping the plane x.
+        let plane_mask = width * CELL_ROWS - 1;
 
-        for (column, pixels) in out.chunks_mut(CELL_ROWS).enumerate() {
-            let entry_index = (row_base + column % width) & (MAX_ENTRIES - 1);
+        let mut x = 0;
+        while x < out.len() {
+            let plane_x = x.wrapping_sub(scroll) & plane_mask;
+            let offset = plane_x % CELL_ROWS;
+            let run = (CELL_ROWS - offset).min(out.len() - x);
+            let entry_index = (row_base + plane_x / CELL_ROWS) & (MAX_ENTRIES - 1);
             let entry = read_word(&self.vram, base + entry_index * 2);
             let cell = NameEntry::decode(entry);
             let indices = tile_row(
                 &self.vram, cell.tile, cell_row, cell.vflip, cell.hflip, CELL_ROWS,
             );
             let layer_base = (cell.palette << 4) | (u8::from(cell.priority) << PRIORITY_SHIFT);
-            for (pixel, index) in pixels.iter_mut().zip(indices) {
+            let pixels = &mut out[x..x + run];
+            for (pixel, index) in pixels.iter_mut().zip(indices[offset..].iter().copied()) {
                 *pixel = if index == 0 { 0 } else { layer_base | index };
             }
+            x += run;
         }
     }
 }
@@ -123,6 +199,15 @@ pub(crate) mod testutil {
     pub(crate) const PLANE_A_BASE: usize = 0xC000;
     /// Plane B table base of the plane tests: R4 = `0x07` is 0xE000.
     pub(crate) const PLANE_B_BASE: usize = 0xE000;
+    /// Horizontal scroll table base of the scroll tests: R13 = `0x3F` is 0xFC00,
+    /// clear of the pattern and name tables the plane tests use.
+    pub(crate) const HSCROLL_BASE: usize = 0xFC00;
+    /// Cell columns and cell rows of the 32x32 playfield of [`plane_vdp`].
+    pub(crate) const PLANE_COLUMNS: usize = 32;
+    pub(crate) const PLANE_ROWS: usize = 32;
+    /// Rows of a plane pattern, so the number of [`fill_tile_row`] calls that
+    /// make one solid tile.
+    pub(crate) const CELL_TILE_ROWS: usize = 8;
 
     /// A VDP with plane A at 0xC000, plane B at 0xE000 and a 32x32 playfield:
     /// the register set every plane test starts from.
@@ -145,6 +230,48 @@ pub(crate) mod testutil {
     /// Entry `cell` of the name table at `base`: `base + cell * 2`.
     pub(crate) fn put_entry(vdp: &mut Vdp, base: usize, cell: usize, word: u16) {
         put_word(vdp, base + cell * 2, word);
+    }
+
+    /// A [`plane_vdp`] with the horizontal scroll table at [`HSCROLL_BASE`] and
+    /// R11 bits 1-0 (the scroll mode) set to `mode`.
+    pub(crate) fn scroll_vdp(mode: u8) -> Vdp {
+        let mut vdp = plane_vdp();
+        vdp.write_register(13, 0x3F);
+        vdp.write_register(11, mode);
+        vdp
+    }
+
+    /// The horizontal scroll entry of `index`: plane A at `base + index * 4`,
+    /// plane B at the next word (genvdp.txt section 13 "Horizontal Scrolling":
+    /// "Scroll values for planes A and B are stored in an interleaved fashion").
+    pub(crate) fn put_scroll(vdp: &mut Vdp, index: usize, plane_a: u16, plane_b: u16) {
+        put_word(vdp, HSCROLL_BASE + index * 4, plane_a);
+        put_word(vdp, HSCROLL_BASE + index * 4 + 2, plane_b);
+    }
+
+    /// The whole 32x32 plane of the table at `base` as one distinct colour per
+    /// cell column: every cell of column `column` names tile `column + 1`, and
+    /// that tile is solid [`column_colour`] in all 8 of its rows. Filled over all
+    /// 32 cell rows, so any display line of the plane reads a cell and the
+    /// colour of a pixel says which column of the plane it came from.
+    pub(crate) fn fill_columns(vdp: &mut Vdp, base: usize) {
+        for column in 0..PLANE_COLUMNS {
+            let tile = (column + 1) as u16;
+            for row in 0..PLANE_ROWS {
+                put_entry(vdp, base, row * PLANE_COLUMNS + column, tile);
+            }
+            for row in 0..CELL_TILE_ROWS {
+                fill_tile_row(vdp, tile, row, column_colour(column));
+            }
+        }
+    }
+
+    /// The colour [`fill_columns`] gives cell column `column`: 1..=15, so no
+    /// column is transparent and no two neighbouring columns match. The plane is
+    /// 32 columns and 15 does not divide 32, so the wrap at column 32/0 differs
+    /// too (`column_colour(31)` is 2, `column_colour(0)` is 1).
+    pub(crate) fn column_colour(column: usize) -> u8 {
+        (column % 15 + 1) as u8
     }
 
     /// One row of `tile`, filled with the colour index `colour`.
@@ -439,6 +566,232 @@ mod tests {
             out_h32[256..264],
             out_h32[0..8],
             "and still wraps at cell 32"
+        );
+    }
+
+    /// The 8 pixels `out` must hold at screen x 0 when the fetch starts at plane
+    /// x `plane_x`, on the 32-column plane of [`fill_columns`]: the plane wraps
+    /// at its own width of 256 pixels, so plane x 256 is plane x 0.
+    fn expect_from(plane_x: usize) -> [u8; 8] {
+        std::array::from_fn(|i| column_colour(((plane_x + i) % 256) / 8))
+    }
+
+    /// The scroll tests all read a plane whose first cell row is one colour per
+    /// cell column, and assert where the scroll puts plane x 0.
+    fn scrolled_plane(mode: u8) -> Vdp {
+        let mut vdp = scroll_vdp(mode);
+        fill_columns(&mut vdp, PLANE_A_BASE);
+        vdp
+    }
+
+    /// The whole line [`fill_columns`] draws when the fetch is scrolled by
+    /// `scroll`: screen x shows plane x `(x - scroll) & 255`, the rule of
+    /// [`Vdp::render_plane_line`] and of genvdp.txt section 13 "When the scroll
+    /// value is larger than the width of the playfield, the display wraps
+    /// horizontally".
+    fn expected_line(scroll: usize) -> [u8; 320] {
+        std::array::from_fn(|x| column_colour((x + 256 - scroll) % 256 / 8))
+    }
+
+    /// The scroll value `out` was drawn with, told apart over the whole line:
+    /// [`column_colour`] repeats every 15 columns, so 8 pixels of one colour
+    /// would also be cell 15 or cell 30.
+    fn scroll_of(out: &[u8; 320]) -> usize {
+        (0..256)
+            .find(|&scroll| out == &expected_line(scroll))
+            .expect("the line is some scroll of the fill_columns plane")
+    }
+
+    /// Full-screen mode (`00`) reads one entry, and a scroll of 8 is a whole
+    /// cell: what was at plane x 0 is at screen x 8, and the 8 pixels before it
+    /// are the end of the plane (genvdp.txt section 13 "Horizontal Scrolling":
+    /// "The upper seven bits provide an offset into each column of the name
+    /// table" and "When the scroll value is larger than the width of the
+    /// playfield, the display wraps horizontally").
+    #[test]
+    fn full_scroll_of_8_moves_plane_a_one_cell_right() {
+        let mut vdp = scrolled_plane(0b00);
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            scroll_of(&out),
+            0,
+            "an all-zero entry leaves the plane where it was"
+        );
+
+        put_scroll(&mut vdp, 0, 8, 0);
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[8..16],
+            &[column_colour(0); 8],
+            "screen pixel 8 shows what was at plane x 0"
+        );
+        assert_eq!(
+            &out[0..8],
+            &[column_colour(31); 8],
+            "and screen pixel 0 shows the end of the plane, one cell before its start"
+        );
+        assert_eq!(out, expected_line(8), "the whole line is shifted");
+    }
+
+    /// A scroll of 3 is not a whole cell, so the fetch starts mid-tile: 3 pixels
+    /// of the last cell of the plane, then the 5 remaining pixels of cell 0,
+    /// then 3 pixels of cell 1 at screen x 8 (genvdp.txt section 13: "The lower
+    /// three bits of the scroll value provide a pixel offset into each column
+    /// comprised of one pattern").
+    #[test]
+    fn full_scroll_of_3_fetches_plane_a_mid_cell() {
+        let mut vdp = scrolled_plane(0b00);
+        put_scroll(&mut vdp, 0, 3, 0);
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[3..11],
+            &expect_from(0),
+            "screen pixel 3 shows plane x 0, and the 8 pixels of cell 0 run over a cell boundary on the screen"
+        );
+        assert_eq!(
+            &out[0..3],
+            &[column_colour(31); 3],
+            "the 3 pixels before it are the last 3 of the plane"
+        );
+        assert_eq!(
+            out,
+            expected_line(3),
+            "and every cell of the line is fetched 3 pixels late"
+        );
+    }
+
+    /// 0x3FF is -1 of the 10-bit scroll value, so screen x 0 shows plane x 1: a
+    /// 32-column plane wraps at its own 256 pixels, not at 1024, and the top 6
+    /// bits of the entry word are ignored (genvdp.txt section 13: "x = Horizontal
+    /// scroll value (0-3FFh)", "Bits D15 through D10 are ignored by the VDP").
+    #[test]
+    fn full_scroll_of_0x3ff_shows_plane_x_1_at_screen_x_0() {
+        let mut vdp = scrolled_plane(0b00);
+        put_scroll(&mut vdp, 0, 0x3FF, 0);
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &expect_from(1),
+            "plane x 1 at screen x 0: 7 pixels of cell 0, then cell 1 one pixel early"
+        );
+
+        // Bits 15-10 of the word are ignored, so this is the same scroll value.
+        put_scroll(&mut vdp, 0, 0xFC00 | 0x3FF, 0);
+        let mut same = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut same);
+        assert_eq!(same, out, "only the low 10 bits of the entry are read");
+    }
+
+    /// Per-line mode (`11`) reads `base + line * 4`, so line 5 and line 6 move
+    /// differently (genvdp.txt section 13 "Horizontal Scrolling", the `case 0x03`
+    /// of its `get_scroll` pseudocode).
+    #[test]
+    fn per_line_mode_reads_the_entry_of_its_own_line() {
+        let mut vdp = scrolled_plane(0b11);
+        put_scroll(&mut vdp, 5, 8, 0);
+        put_scroll(&mut vdp, 6, 16, 0);
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 5, &mut out);
+        assert_eq!(scroll_of(&out), 8, "line 5 uses the entry of index 5");
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 6, &mut out);
+        assert_eq!(
+            scroll_of(&out),
+            16,
+            "line 6 uses the different entry of index 6, not index 5"
+        );
+    }
+
+    /// Per-cell mode (`10`) reads `base + (line & !7) * 4`, so every line of one
+    /// cell row shares a scroll value: lines 8..15 all use the entry of index 8
+    /// (genvdp.txt section 13, the `case 0x02` of its pseudocode, "Every row").
+    #[test]
+    fn per_cell_mode_shares_one_entry_over_eight_lines() {
+        let mut vdp = scrolled_plane(0b10);
+        put_scroll(&mut vdp, 1, 3, 0);
+        put_scroll(&mut vdp, 8, 8, 0);
+
+        for line in 8..16 {
+            let mut out = blank_line();
+            vdp.render_plane_line(Plane::A, line, &mut out);
+            assert_eq!(
+                scroll_of(&out),
+                8,
+                "line {line} uses the entry of index 8, not the one of index {} that a numbered read would pick",
+                line / 8
+            );
+        }
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 7, &mut out);
+        assert_eq!(
+            scroll_of(&out),
+            0,
+            "the cell row above still uses its own entry, index 0"
+        );
+    }
+
+    /// The invalid mode `01` is per-line scrolling over the first eight entries
+    /// only, which is `base + (line & 7) * 4` (genvdp.txt section 13: "This mode
+    /// is identical to per-line scrolling, however the VDP will only read the
+    /// first sixteen entries in the scroll table for every line of the display"
+    /// - sixteen 16-bit words are the 8 lines of 2 words this mode addresses).
+    #[test]
+    fn invalid_mode_01_repeats_the_first_eight_entries() {
+        let mut vdp = scrolled_plane(0b01);
+        for index in 0..8 {
+            put_scroll(&mut vdp, index, (8 * (index + 1)) as u16, 0);
+        }
+        // The entry a per-line read would take for lines 8..16, and a read that
+        // mistook this mode for per-cell would take for lines 8..15.
+        put_scroll(&mut vdp, 8, 96, 0);
+
+        for line in 0..16u16 {
+            let mut out = blank_line();
+            vdp.render_plane_line(Plane::A, line, &mut out);
+            assert_eq!(
+                scroll_of(&out),
+                8 * (usize::from(line) % 8 + 1),
+                "line {line} uses the entry of index {}",
+                line % 8
+            );
+        }
+    }
+
+    /// Plane B takes the second word of the entry, plane A the first, and each
+    /// plane moves by its own value while reading the same table
+    /// (genvdp.txt section 13: "Entry #0 of the table is for plane A, entry #1 is
+    /// for plane B, and this repeats for the entire length of the table").
+    #[test]
+    fn plane_b_uses_the_second_word_of_the_scroll_entry() {
+        let mut vdp = scroll_vdp(0b00);
+        fill_columns(&mut vdp, PLANE_A_BASE);
+        fill_columns(&mut vdp, PLANE_B_BASE);
+        put_scroll(&mut vdp, 0, 0, 8);
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            scroll_of(&out),
+            0,
+            "plane A reads the first word of the entry, which is zero here"
+        );
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::B, 0, &mut out);
+        assert_eq!(
+            scroll_of(&out),
+            8,
+            "plane B reads the second word of the entry, which is 8"
         );
     }
 }
