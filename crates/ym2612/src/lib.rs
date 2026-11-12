@@ -1,22 +1,26 @@
 //! Yamaha YM2612 FM synthesizer.
 //!
 //! What lives here today is the bus interface, the register file and the two
-//! timers of M5-03 (#107): the four ports the 68k and the Z80 reach the chip
-//! through (`write`), the two 256-register banks behind them and the latched
-//! address each one writes to (`regs`), the status byte a read of any port
-//! answers with (`read_status`) with its BUSY flag and its two timer overflow
-//! flags, and timer A and timer B (`timers`). `clock` is the sample step those
-//! timers count in and still returns silence: the operators, envelope generator
-//! and slot output of M5-04 (#108) onwards are not here yet.
+//! timers of M5-03 (#107) and the phase generator of M5-04 (#108): the four
+//! ports the 68k and the Z80 reach the chip through (`write`), the two
+//! 256-register banks behind them and the latched address each one writes to
+//! (`regs`), the status byte a read of any port answers with (`read_status`)
+//! with its BUSY flag and its two timer overflow flags, timer A and timer B
+//! (`timers`), and the F-Num, block, detune, multiple and key-on behind the 24
+//! phase counters (`phase`). `clock` is the sample step those timers and counters
+//! run in and still returns silence: the envelope generator and the slot output
+//! of M5-05 (#109) onwards are not here yet.
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
 //! the Genesis part shares, and plutiedev's "YM2612 registers" page where that
 //! one is terse.
 
+mod phase;
 mod regs;
 mod timers;
 
+use phase::PhaseGen;
 use regs::{PART_I, PART_II};
 
 /// Port 0: address, part I.
@@ -57,14 +61,17 @@ const INTERNAL_CYCLES_PER_SAMPLE: u32 = 24;
 /// is where that measurement is being collected.
 const BUSY_INTERNAL_CYCLES: u32 = 32;
 
-/// The YM2612: its four bus ports, its two register banks, its status byte and
-/// its two timers.
+/// The YM2612: its four bus ports, its two register banks, its status byte, its
+/// two timers and its phase counters.
 pub struct Ym2612 {
     /// The two banks of registers and the address each part last latched.
     regs: regs::RegFile,
     /// Timer A and timer B, driven by the writes to `&24`-`&27` and read back
     /// through the two low bits of the status byte.
     timers: timers::Timers,
+    /// The 24 phase counters of the operators, driven by the writes to `&28`,
+    /// `&30`-`&3E` and `&A0`-`&A6`.
+    phases: PhaseGen,
     /// Internal cycles left of the BUSY flag: any positive value reads as busy,
     /// and a write refills it with [`BUSY_INTERNAL_CYCLES`].
     busy: u32,
@@ -77,6 +84,7 @@ impl Ym2612 {
         Self {
             regs: regs::RegFile::new(),
             timers: timers::Timers::new(),
+            phases: PhaseGen::new(),
             busy: 0,
         }
     }
@@ -103,7 +111,8 @@ impl Ym2612 {
     }
 
     /// A data port write to `part`: store the byte at that part's latched
-    /// register, then tell the timers if that register was one of theirs.
+    /// register, then tell the timers and the phase generator if that register
+    /// was one of theirs.
     fn write_data(&mut self, part: usize, value: u8) {
         let register = self.regs.address(part);
         self.regs.write(part, register, value);
@@ -112,6 +121,8 @@ impl Ym2612 {
             let config = self.regs.timer_config();
             self.timers.register_written(register, value, &config);
         }
+
+        self.phases.register_written(part, register, value);
 
         self.busy = BUSY_INTERNAL_CYCLES;
     }
@@ -144,12 +155,14 @@ impl Ym2612 {
     /// (docs/ARCHITECTURE.md, "Clocks and timing") - and return the `(left,
     /// right)` sample.
     ///
-    /// Both are 0 for now: the FM sum of M5-04 (#108) and on goes left and the
-    /// DAC of M5-11 (#116) goes right. What the step does today is run the two
-    /// timers and let BUSY run down.
+    /// Both are 0 for now: the FM sum goes left and the DAC of M5-11 (#116)
+    /// goes right, and the slot output needs the envelope generator of M5-05
+    /// (#109). What the step does today is run the two timers, advance the 24
+    /// phase counters and let BUSY run down.
     pub fn clock(&mut self) -> (i16, i16) {
         let config = self.regs.timer_config();
         self.timers.tick(&config);
+        self.phases.tick();
         self.busy = self.busy.saturating_sub(INTERNAL_CYCLES_PER_SAMPLE);
         (0, 0)
     }
@@ -193,6 +206,18 @@ mod tests {
     /// Register 0x27 bit 5: reset the timer B overflow flag.
     const RESET_B: u8 = 0x20;
 
+    /// Register `&28`: bits 7-4 the key-on of operators S4, S3, S2, S1, bits
+    /// 2-0 the channel (YM2608 application manual "3. Register descriptions",
+    /// `&28`).
+    const REG_KEY_ON: u8 = 0x28;
+
+    /// `&28` bit 4: key on operator 1.
+    const KEY_ON_S1: u8 = 0x10;
+    /// `&28` bit 5: key on operator 2.
+    const KEY_ON_S2: u8 = 0x20;
+    /// `&28` bit 6: key on operator 3.
+    const KEY_ON_S3: u8 = 0x40;
+
     /// Status bit 7: the chip is still chewing on the last write.
     const STATUS_BUSY: u8 = 0x80;
     /// Status bit 1: timer B overflowed while its enable bit was set.
@@ -224,6 +249,12 @@ mod tests {
     /// Load the 8-bit timer B value (`&26`).
     fn set_timer_b(chip: &mut Ym2612, value: u8) {
         write_reg(chip, ADDR_1, DATA_1, REG_TIMER_B, value);
+    }
+
+    /// What the phase generator holds for one operator: `slot` of `channel`,
+    /// with the slot indices of [`phase::SLOT_S1`] and friends.
+    fn operator(chip: &Ym2612, channel: usize, slot: usize) -> phase::Operator {
+        chip.phases.channel(channel).operators[slot]
     }
 
     /// Advance `chip` by `samples` output samples.
@@ -403,5 +434,169 @@ mod tests {
         assert!(!bit(chip.read_status(), STATUS_TIMER_A));
         chip.clock();
         assert!(bit(chip.read_status(), STATUS_TIMER_A));
+    }
+
+    #[test]
+    fn slot_offset_mapping() {
+        let mut chip = Ym2612::new();
+
+        // A per-operator register number is first + slot offset + channel, and
+        // the slot offsets of the group run S1, S3, S2, S4: +0x0 is operator 1,
+        // +0x4 is operator 3, +0x8 is operator 2 and +0xC is operator 4. So +4
+        // has to land on operator 3 and leave operator 2 alone (YM2608
+        // application manual "3. Register descriptions").
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x34, 0x12);
+        let op3 = operator(&chip, 0, phase::SLOT_S3);
+        assert_eq!((op3.dt, op3.mul), (1, 2));
+        assert_eq!(operator(&chip, 0, phase::SLOT_S2).mul, 0);
+        assert_eq!(operator(&chip, 0, phase::SLOT_S1).mul, 0);
+
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x38, 0x23);
+        let op2 = operator(&chip, 0, phase::SLOT_S2);
+        assert_eq!((op2.dt, op2.mul), (2, 3));
+
+        // The channel is the low two bits of the offset, and a part's channels
+        // are the global channels 0-2 for part I and 3-5 for part II.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x31, 0x07);
+        assert_eq!(operator(&chip, 1, phase::SLOT_S1).mul, 7);
+        write_reg(&mut chip, ADDR_2, DATA_2, 0x34, 0x05);
+        assert_eq!(operator(&chip, 3, phase::SLOT_S3).mul, 5);
+        assert_eq!(operator(&chip, 0, phase::SLOT_S3).mul, 2);
+    }
+
+    #[test]
+    fn fnum_latch_applies_on_a0() {
+        let mut chip = Ym2612::new();
+
+        // &A4 is block in bits 5-3 and F-Num 10-8 in bits 2-0. It goes to a
+        // latch and nothing else: the pair reaches the phase generator with the
+        // next &A0 write (YM2608 application manual "3. Register descriptions",
+        // `&A0` and `&A4`).
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA4, 0x24);
+        let before = chip.phases.channel(0);
+        assert_eq!(
+            (before.fnum, before.block),
+            (0, 0),
+            "&A4 alone changes nothing"
+        );
+
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA0, 0x69);
+        let after = chip.phases.channel(0);
+        assert_eq!((after.fnum, after.block), (0x469, 4));
+
+        // A second &A0 write applies the latch it still holds and only replaces
+        // the low eight bits.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA0, 0x01);
+        let again = chip.phases.channel(0);
+        assert_eq!((again.fnum, again.block), (0x401, 4));
+
+        // The latch is per channel: writing the next channel of part I leaves the
+        // channel written above alone.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA5, 0x08);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA1, 0x10);
+        assert_eq!(chip.phases.channel(1).fnum, 0x010);
+        assert_eq!(chip.phases.channel(0).fnum, 0x401);
+    }
+
+    #[test]
+    fn phase_counts_the_increment_every_sample() {
+        // The smallest interesting increment: mul 1, block 0 and F-Num 2 is
+        // (2 << 0) >> 1 = 1, so the phase is the sample count.
+        let mut chip = Ym2612::new();
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x30, 0x01);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA0, 0x02);
+
+        for expected in 1..=5u32 {
+            chip.clock();
+            assert_eq!(operator(&chip, 0, phase::SLOT_S1).phase, expected);
+        }
+    }
+
+    #[test]
+    fn phase_wraps_at_20_bits() {
+        let mut chip = Ym2612::new();
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x30, 0x0F);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA4, 0x3F);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA0, 0xFF);
+
+        clock_for(&mut chip, 1);
+        assert_eq!(operator(&chip, 0, phase::SLOT_S1).phase, 0xDFC40);
+        clock_for(&mut chip, 1);
+        assert_eq!(
+            operator(&chip, 0, phase::SLOT_S1).phase,
+            2 * 0xDFC40 - 0x10_0000,
+            "the counter is 20 bits, so it wraps rather than saturating"
+        );
+    }
+
+    #[test]
+    fn keyon_resets_phase() {
+        let mut chip = Ym2612::new();
+        // Channel 1 operator 1: mul 1, block 4, F-Num 0x469, which is an
+        // increment of (0x469 << 4) >> 1 = 0x2348 a sample.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x30, 0x01);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA4, 0x24);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA0, 0x69);
+        assert_eq!(operator(&chip, 0, phase::SLOT_S1).phase, 0);
+
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1);
+        clock_for(&mut chip, 3);
+        assert_eq!(operator(&chip, 0, phase::SLOT_S1).phase, 3 * 0x2348);
+
+        // Keying an operator that is already on is not a key-on: the phase runs
+        // on from where it is.
+        let phase = operator(&chip, 0, phase::SLOT_S1).phase;
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1);
+        assert_eq!(operator(&chip, 0, phase::SLOT_S1).phase, phase);
+
+        // Only a key-on of an operator that is off restarts it at 0.
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, 0);
+        assert!(!operator(&chip, 0, phase::SLOT_S1).key_on);
+        clock_for(&mut chip, 2);
+        assert_ne!(operator(&chip, 0, phase::SLOT_S1).phase, 0);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1);
+        assert_eq!(operator(&chip, 0, phase::SLOT_S1).phase, 0);
+    }
+
+    #[test]
+    fn keyon_channel_field_selects_the_six_channels() {
+        let mut chip = Ym2612::new();
+
+        // &28 bits 2-0 are absolute channel numbers, not part-relative ones:
+        // 0-2 are the part I channels, 4-6 the part II ones (YM2608 application
+        // manual `&28`). 3 and 7 are the undecoded slots of each part and key
+        // nothing at all.
+        for (field, channel) in [(0, 0), (1, 1), (2, 2), (4, 3), (5, 4), (6, 5)] {
+            write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1 | field);
+            assert!(
+                operator(&chip, channel, phase::SLOT_S1).key_on,
+                "channel field {field} keys on channel {channel}"
+            );
+        }
+
+        let mut chip = Ym2612::new();
+        for field in [3, 7] {
+            write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1 | field);
+            for channel in 0..6 {
+                assert!(
+                    !operator(&chip, channel, phase::SLOT_S1).key_on,
+                    "channel field {field} is not decoded"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn keyon_operator_bits_are_s4_s3_s2_s1() {
+        let mut chip = Ym2612::new();
+
+        // &28 bits 7-4 are operators S4, S3, S2 and S1 in that order, while the
+        // register offsets of a channel run S1, S3, S2, S4: so bit 5 is the
+        // operator that lives at +0x8 and bit 6 the one at +0x4.
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S2 | KEY_ON_S3);
+        assert!(operator(&chip, 0, phase::SLOT_S2).key_on);
+        assert!(operator(&chip, 0, phase::SLOT_S3).key_on);
+        assert!(!operator(&chip, 0, phase::SLOT_S1).key_on);
+        assert!(!operator(&chip, 0, phase::SLOT_S4).key_on);
     }
 }
