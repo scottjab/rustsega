@@ -6,9 +6,8 @@
 //! together, what `&B0` says about feedback, and what the channel sounds like
 //! once its four operators have answered. [`FmChannel::step`] is the whole of
 //! it - one call per output sample, after the phase counters and the envelopes
-//! have moved - and [`FmChannel::output`] is the 14-bit sum it leaves behind.
-//! The DAC of M5-07b (#112) is what reads that sum, which is why the sum is
-//! `#[allow(dead_code)]` here.
+//! have moved - and [`FmChannel::output`] is the 14-bit sum it leaves behind,
+//! which the DAC of M5-07b (#112) in [`crate::output`] reads every sample.
 //!
 //! ## The connection table
 //!
@@ -271,12 +270,9 @@ impl FmChannel {
         self.mix = self.sum();
     }
 
-    /// The channel sum of the last step, 14-bit signed.
-    ///
-    /// `#[allow(dead_code)]` because the chip has nowhere to put it yet: the DAC
-    /// output stage of M5-07b (#112) is the first reader, and until then only
-    /// this module's tests ask for it.
-    #[allow(dead_code)]
+    /// The channel sum of the last step, 14-bit signed, which
+    /// [`crate::Ym2612::clock`]
+    /// hands to the DAC of [`crate::output`] every sample (M5-07b, #112).
     pub(crate) fn output(&self) -> i16 {
         self.mix
     }
