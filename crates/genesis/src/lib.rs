@@ -202,9 +202,11 @@ impl Genesis {
     /// What it mixes is everything the chips have made that has not been handed
     /// out yet - what [`crate::Scheduler::run_frame`] ran them to - and so the
     /// number of output frames is whatever that much master clock is worth at
-    /// `sample_rate`: about 801 for a 60 Hz NTSC raster and about 767 for a PAL
-    /// one at 48 kHz, rather than a number the caller can predict from the rate
-    /// alone. That is how `sample_rate` stays exactly `sample_rate` over an
+    /// `sample_rate`: about 801 for a 60 Hz NTSC raster and about 966 for a PAL
+    /// one at 48 kHz - the two regions' frame rates, 59.92 and 49.70, the other
+    /// way round, so a PAL frame is more audio than an NTSC one and not less -
+    /// rather than a number the caller can predict from the rate alone. That is
+    /// how `sample_rate` stays exactly `sample_rate` over an
     /// afternoon instead of drifting by the fraction a per-frame rounding throws
     /// away ([`crate::audio::Mixer`] is where that is done, and
     /// `audio::tests::output_count_exact_over_one_second` holds it).

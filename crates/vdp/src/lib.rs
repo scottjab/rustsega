@@ -811,10 +811,22 @@ impl Vdp {
     /// V28 is 224 everywhere (genvdp.txt section 17 "$01"; plutiedev "$81xx":
     /// "V30 mode only works properly on PAL systems").
     ///
-    /// A NTSC chip with the bit set shows no stable picture on hardware. It is
-    /// rendered as the 224 lines of V28 all the same and nothing is said about
-    /// it: the bit is legal to write, a game may hold it set across a mode
-    /// change, and there is no console-side diagnostic to warn (M4-19, #97).
+    /// A NTSC chip with the bit set shows no stable picture on hardware, and the
+    /// reason is where the 16 lines come from: V30 is 240 lines of picture in
+    /// either standard, and it borrows them from the blanking - "8 more lines
+    /// from each of the borders, i.e. 16 total", Kabuto's "Vertical Display"
+    /// row - while the retrace stays the 262 line frame it always was. The
+    /// picture runs into the vertical sync and a CRT loses it. The same table's
+    /// NTSC V30 column tells it on the counters too: the V counter has no jump
+    /// at all there, `0x000-0x1FF`, and VBlank is still set at `0xEF` to `0xF0`,
+    /// which is 22 lines from the end of a 262 line frame.
+    ///
+    /// None of it is modelled: an NTSC chip with the bit set draws the 224 lines
+    /// of V28 and nothing is said about it. The bit is legal to write, a game
+    /// may hold it set across a mode change, and there is no console-side
+    /// diagnostic to warn (M4-19, #97). `crates/genesis/tests/pal_timing.rs`
+    /// pins both halves of that decision - 240 on PAL, 224 on NTSC - against
+    /// these citations (M6-12, #132).
     ///
     /// This is the height of the *beam*: the number of lines the raster scans
     /// before VBlank, which is what `timing` starts VBlank on and what

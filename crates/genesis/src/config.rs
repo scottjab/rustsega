@@ -91,9 +91,15 @@ impl Region {
     /// and docs/ARCHITECTURE.md "Clocks and timing" gives 313 lines for PAL
     /// against the 262 of NTSC.
     ///
-    /// What it decides in the emulator today is the scanline count of a frame, in
-    /// [`crate::Scheduler::new`]; the master clock frequency itself is only what turns
-    /// those counts into seconds.
+    /// What it decides is everything the two consoles do differently, in three
+    /// places: the scanline count of a frame ([`crate::Scheduler::new`], 313 for
+    /// PAL and 262 for NTSC), the VMOD bit 6 of the hardware version register
+    /// below - which is the chip's PAL pin as far as a program is concerned,
+    /// through [`crate::Bus`], and so what allows [`vdp::Vdp::v30_mode`] to have
+    /// its 240 lines - and the crystal, in [`Self::master_clock_hz`], which is
+    /// only ever used to turn master clocks into seconds
+    /// ([`crate::audio::Mixer`]). `tests/pal_timing.rs` checks the three of
+    /// them together (M6-12, #132).
     pub fn is_pal(self) -> bool {
         matches!(self, Self::Europe)
     }
