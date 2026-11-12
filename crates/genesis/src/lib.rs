@@ -25,6 +25,8 @@ pub mod z80_bus;
 
 use m68k::Bus as _;
 use m68k::M68k;
+
+use crate::audio::Mixer;
 use z80::Z80;
 
 pub use bus::Bus;
@@ -38,7 +40,7 @@ pub use z80_bus::{Z80Side, Z80View};
 // `Region` is the console this emulator presents, one of three; `Regions` above
 // is what a cartridge header claims at 0x1F0, a set of three booleans. The names
 // are close on purpose and `config::Config::resolve_region` is the mapping.
-pub use config::{Config, Region, RegionSetting};
+pub use config::{Config, LowPass, Region, RegionSetting};
 // `Buttons` is what a front end feeds the emulated pads: docs/ARCHITECTURE.md,
 // "Input: one `InputState` that merges keyboard, Gamepad API, and touch overlay
 // into `Buttons` per port".
@@ -64,6 +66,16 @@ pub struct Genesis {
     bus: Bus,
     /// The master clock the two CPUs and the VDP share.
     scheduler: Scheduler,
+    /// The mixer that turns the two chips' own rates into `config.sample_rate`
+    /// for [`Genesis::drain_audio`] - the resampler, the levels, the DC blocker
+    /// and the board's low-pass (M5-14, #119).
+    ///
+    /// It lives here rather than on [`Bus`] because it is the host's audio set-up
+    /// - rate, PSG level and filter come from [`Config`] - and the bus is built
+    /// from a version byte with no [`Config`] in sight. Its clock position is
+    /// the mixer's own and is never wound back, so a reset of the chips does not
+    /// make the mixer ask for samples it has already had.
+    mixer: Mixer,
 }
 
 impl Genesis {
@@ -113,6 +125,7 @@ impl Genesis {
             z80: Z80::new(),
             bus,
             scheduler: Scheduler::new(region),
+            mixer: Mixer::new(region.master_clock_hz(), &config),
         })
     }
 
@@ -181,16 +194,28 @@ impl Genesis {
         self.bus.vdp.frame()
     }
 
-    /// Append the audio mixed since the last call to `out`, interleaved stereo at
-    /// `config.sample_rate`.
+    /// Append the console's audio since the last call to `out`, interleaved
+    /// stereo `i16` at `config.sample_rate` (docs/ARCHITECTURE.md, "genesis").
     ///
-    /// A stub that appends nothing: nothing is mixed yet. The raw material is
-    /// there already - the [`crate::audio`] buffers hold the frame that has just
-    /// run, the YM2612's at one sample per 1008 master clocks and the PSG's at one
-    /// per 240.
-    /// TODO(M5-14 #119): the mixer, the band-limited resampler and the Model 1
-    /// low-pass filter that fill this in, and that will drain those buffers.
-    pub fn drain_audio(&mut self, _out: &mut Vec<i16>) {}
+    /// What it mixes is everything the chips have made that has not been handed
+    /// out yet - what [`crate::Scheduler::run_frame`] ran them to - and so the
+    /// number of output frames is whatever that much master clock is worth at
+    /// `sample_rate`: about 801 for a 60 Hz NTSC raster and about 767 for a PAL
+    /// one at 48 kHz, rather than a number the caller can predict from the rate
+    /// alone. That is how `sample_rate` stays exactly `sample_rate` over an
+    /// afternoon instead of drifting by the fraction a per-frame rounding throws
+    /// away ([`crate::audio::Mixer`] is where that is done, and
+    /// `audio::tests::output_count_exact_over_one_second` holds it).
+    ///
+    /// A frame's sound is handed out once: calling this again after one
+    /// [`Genesis::run_frame`] appends the next frame's worth, and calling it
+    /// again without one appends nothing. `out` is only ever appended to, so a
+    /// caller that wants a fresh buffer passes an empty one, and one that wants
+    /// to keep its own capacity does what any `Vec` user does and reserves.
+    pub fn drain_audio(&mut self, out: &mut Vec<i16>) {
+        let frame = self.bus.audio.frame();
+        self.mixer.mix(&frame, out);
+    }
 
     /// Say what the pad on port `port` is reporting: [`Buttons`], one bit per
     /// button (docs/ARCHITECTURE.md, "Input").

@@ -41,9 +41,9 @@
 //! Each chip's output goes into its own buffer, and the two buffers are the state
 //! of a frame rather than of the machine: [`Audio::start_frame`] `clear`s them,
 //! which keeps whatever capacity the first frame needed and allocates nothing
-//! after it. Nothing reads them yet - resampling, mixing and
-//! [`crate::Genesis::drain_audio`] are M5-14 (#119) - but a buffer that grew for
-//! ever would be a leak with no reader to notice it.
+//! after it. [`Audio::frame`] hands them to [`Mixer`], which is what
+//! [`crate::Genesis::drain_audio`] runs them through, and the mixer's own buffers
+//! are reserved once for the same reason: a frame of audio must not allocate.
 
 use sn76489::Sn76489;
 use ym2612::Ym2612;
@@ -94,8 +94,9 @@ pub struct Audio {
     /// The YM2612's output for the frame now running, one `(left, right)` per
     /// sample at [`YM_SAMPLE_MCLK`] apart.
     ///
-    /// Raw and unresampled: the resampler, the Model 1 low-pass and the mix down
-    /// to `config.sample_rate` are M5-14 (#119), which is what will drain this.
+    /// Raw and unresampled, in `ym2612`'s own units: what turns them into the
+    /// host's rate and levels is [`Mixer`], reached through [`Audio::frame`] and
+    /// [`crate::Genesis::drain_audio`] (M5-14, #119).
     pub ym_samples: Vec<(i16, i16)>,
     /// The PSG's output for the frame now running, one sum per tick of
     /// [`PSG_TICK_MCLK`] (SMS Power, "SN76489": the chip has one output pin).
@@ -178,9 +179,10 @@ impl Audio {
 
     /// Discard the frame that just ran, keeping the capacity.
     ///
-    /// Called by [`crate::Scheduler::run_frame`] as a frame starts. Nothing
-    /// drains these buffers yet, and when M5-14 (#119) does it will be the frame
-    /// that has just run that it takes.
+    /// Called by [`crate::Scheduler::run_frame`] as a frame starts, so the frame
+    /// a caller wants is the one that has just run and is still in here: this is
+    /// what [`Audio::frame`] and [`crate::Genesis::drain_audio`] read before the
+    /// next frame's samples begin arriving.
     pub fn start_frame(&mut self) {
         self.ym_samples.clear();
         self.psg_samples.clear();
@@ -684,7 +686,7 @@ struct FilterState {
 /// ## Time, and why it is counted in master clocks
 ///
 /// Both streams and the output are positions on the same master clock, and the
-/// mixer keeps time as one number: [`Mixer::out_pos`] is the master clock of the
+/// mixer keeps time as one number: `out_pos` is the master clock of the
 /// next output sample, in units of `1 / sample_rate` so that it stays whole. The
 /// output rate is therefore exactly `sample_rate` of the host's clock by
 /// construction rather than by averaging, and a frame produces however many
