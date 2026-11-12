@@ -1608,7 +1608,7 @@ mod tests {
                     "the right side of a discrete chip is ladder only: {right:?}"
                 );
                 assert!(
-                    right.iter().any(|sample| *sample == -24),
+                    right.contains(&-24),
                     "and a panned-off channel with a negative sum is at -4: {right:?}"
                 );
             }

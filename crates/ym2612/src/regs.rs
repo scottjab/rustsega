@@ -330,9 +330,9 @@ impl RegFile {
     /// `&B4` would mean a chip that hears nothing at all (see [`PAN_BOTH`]).
     pub(crate) fn new() -> Self {
         let mut banks = [[0; REGISTERS]; PARTS];
-        for part in 0..PARTS {
+        for bank in banks.iter_mut() {
             for channel in 0..CHANNELS_PER_PART {
-                banks[part][usize::from(REG_AMS_PMS) + channel] = PAN_BOTH;
+                bank[usize::from(REG_AMS_PMS) + channel] = PAN_BOTH;
             }
         }
         Self {
