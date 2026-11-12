@@ -17,7 +17,11 @@
 //! and the ladder of M5-07b (#112) (`output`). The LFO of M5-08 (#113) is the
 //! wobble underneath all of it: one 7-bit counter of `&22`'s making (`lfo`), read
 //! out once as an attenuation added to the envelopes and once as an offset on the
-//! F-Nums behind the phase counters.
+//! F-Nums behind the phase counters. The channel 3 modes of M5-09 (#114) are the
+//! two exceptions on top of all that: `&27` bits 7-6 either give operators 1 to 3 of
+//! channel 3 F-Nums of their own out of `&A8`-`&AE` (`phase`), or - in CSM mode -
+//! key the four operators of the channel at every timer A overflow of `timers`,
+//! which [`Ym2612::csm_step`] passes to `envelope`.
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
@@ -104,6 +108,10 @@ pub struct Ym2612 {
     /// Which DAC to model: [`ChipModel::Ym2612`], the discrete chip with its
     /// ladder effect, until something says otherwise (M5-07b, #112).
     model: ChipModel,
+    /// Whether channel 3 is keyed on by CSM right now: the pulse of a timer A
+    /// overflow in CSM mode, held for the one sample and released by the first
+    /// sample that overflows no more (M5-09, #114, and [`Ym2612::csm_step`]).
+    csm_key: bool,
     /// Internal cycles left of the BUSY flag: any positive value reads as busy,
     /// and a write refills it with [`BUSY_INTERNAL_CYCLES`].
     busy: u32,
@@ -121,6 +129,7 @@ impl Ym2612 {
             lfo: Lfo::new(),
             channels: std::array::from_fn(|_| FmChannel::new()),
             model: ChipModel::Ym2612,
+            csm_key: false,
             busy: 0,
         }
     }
@@ -230,6 +239,7 @@ impl Ym2612 {
     pub fn clock(&mut self) -> (i16, i16) {
         let config = self.regs.timer_config();
         self.timers.tick(&config);
+        self.csm_step();
         self.lfo.tick();
         self.phases.tick(self.lfo.pms(), self.lfo.pm_phase());
         self.envelopes.tick(&self.phases);
@@ -244,6 +254,30 @@ impl Ym2612 {
         let mix = std::array::from_fn(|channel| self.channels[channel].output());
         let sample = output::mix(mix, self.model);
         (sample, sample)
+    }
+
+    /// The CSM key of channel 3, one sample in.
+    ///
+    /// In CSM mode - `&27` 10 - every timer A overflow keys the four operators of
+    /// channel 3 on, and the first sample that overflows no more keys them off
+    /// again, which is what makes the mode a way of striking a drum: the driver
+    /// runs timer A at the rate it wants the noise to hit and never writes `&28`
+    /// for channel 3 at all (YM2608 application manual `&27`, M5-09 #114, and
+    /// [`crate::envelope::EnvelopeGen::csm_key`] for the half of it the envelopes do
+    /// and [`crate::phase::PhaseGen::key_state`] for the `&28` state that holds an
+    /// operator on through the end of a pulse).
+    ///
+    /// The mode is read as a whole, so 11 - which the register lists call "CSM and
+    /// frequency mode" - does not key anything either: like 01, it is only the
+    /// frequency half for this model. Nothing here moves the phase counters, whose
+    /// key state is `&28`'s alone.
+    fn csm_step(&mut self) {
+        let csm = self.regs.ch3_mode() == regs::CH3_MODE_CSM && self.timers.overflowed_a();
+        if csm == self.csm_key {
+            return;
+        }
+        self.csm_key = csm;
+        self.envelopes.csm_key(&self.phases, csm);
     }
 
     /// What one operator is attenuated by as the channel mix reads it: its
@@ -1066,5 +1100,248 @@ mod tests {
             "the swing is symmetric about the F-Num that was written"
         );
         assert_eq!((highest, lowest), (1024 + 48, 1024 - 48));
+    }
+
+    /// Channel 3 of the two channel 3 modes of M5-09 (#114): part I's third
+    /// channel, so channel index 2 and register offset 2.
+    const CHANNEL3: usize = 2;
+
+    /// `&27` bits 7-6, the channel 3 mode: 00 normal, 01 the special frequency
+    /// mode, 10 CSM.
+    const MODE_NORMAL: u8 = 0x00;
+    /// `&27` 01: the special frequency mode, where operators 1 to 3 of channel 3
+    /// read `&A8`-`&AE` instead of the channel's own `&A2`/`&A6` (YM2608
+    /// application manual `&A8`).
+    const MODE_SPECIAL: u8 = 0x40;
+    /// `&27` 10: CSM, the special frequency mode and the timer A key-on of
+    /// channel 3 on top of it (`&27`, and [`crate::timers`]).
+    const MODE_CSM: u8 = 0x80;
+    /// `&27` 11: the mode the register lists call "CSM and frequency mode". It is
+    /// the special frequency mode alone, without the CSM key-on: the mode decode
+    /// of #114 turns CSM on for mode 10 only, and
+    /// [`csm_only_in_csm_mode_keys_on`] pins the difference.
+    const MODE_SPECIAL_AND_CSM: u8 = 0xC0;
+
+    /// Channel 3 at block 1, F-Num `fnum`, with every one of its operators at
+    /// detune 0 and multiple 1: at block 1 with no detune and a multiple of 1 the
+    /// phase increment of an operator is its F-Num unchanged
+    /// ([`crate::phase::increment`]), so a measured increment reads back the
+    /// frequency an operator was given (`&30`, `&A2`, `&A6`).
+    fn tune_channel_three(chip: &mut Ym2612, fnum: u16) {
+        for slot in 0..4u8 {
+            // The `&30` group is slot stride 4 and channel stride 1, and channel 3
+            // is offset 2 of part I (`crate::regs::operator_of`).
+            write_reg(chip, ADDR_1, DATA_1, 0x32 + slot * 4, 0x01);
+        }
+        // `&A6` first and `&A2` second, because `&A6` latches and `&A2` applies
+        // (#108).
+        write_reg(
+            chip,
+            ADDR_1,
+            DATA_1,
+            0xA6,
+            0x08 | ((fnum >> 8) as u8 & 0x07),
+        );
+        write_reg(chip, ADDR_1, DATA_1, 0xA2, fnum as u8);
+    }
+
+    /// One of channel 3's special-mode frequency pairs: `low` the `&A8`, `&A9` or
+    /// `&AA` of the operator, whose partner is `low + 4` and which is latched the
+    /// same way `&A4` latches `&A0` (YM2608 application manual `&A8`).
+    fn set_special_fnum(chip: &mut Ym2612, low: u8, fnum: u16) {
+        write_reg(
+            chip,
+            ADDR_1,
+            DATA_1,
+            low + 4,
+            0x08 | ((fnum >> 8) as u8 & 0x07),
+        );
+        write_reg(chip, ADDR_1, DATA_1, low, fnum as u8);
+    }
+
+    /// The phase increment of channel 3's `slot` over the next sample: the two
+    /// channel 3 modes of #114 are a mapping from registers to frequency
+    /// generators and to keys, so this is what reading one means.
+    fn ch3_step(chip: &mut Ym2612, slot: usize) -> u32 {
+        let before = operator(chip, CHANNEL3, slot).phase;
+        chip.clock();
+        operator(chip, CHANNEL3, slot).phase.wrapping_sub(before) & PHASE_MASK
+    }
+
+    /// The envelope state of each of channel 3's four operators.
+    fn ch3_states(chip: &Ym2612) -> [envelope::State; 4] {
+        std::array::from_fn(|slot| chip.envelopes.envelope(CHANNEL3, slot).state())
+    }
+
+    /// Channel 3 special mode gives operators 1, 2 and 3 the frequencies of
+    /// `&A9`/`&AD`, `&AA`/`&AE` and `&A8`/`&AC` and leaves operator 4 on the
+    /// channel's own `&A2`/`&A6`; in normal mode all four operators share that one
+    /// F-Num even when the special registers are written (YM2608 application
+    /// manual `&A8`, and #114).
+    #[test]
+    fn special_mode_uses_per_op_fnum() {
+        let mut chip = Ym2612::new();
+        tune_channel_three(&mut chip, 0x300);
+        set_special_fnum(&mut chip, 0xA9, 0x100);
+        set_special_fnum(&mut chip, 0xAA, 0x200);
+        set_special_fnum(&mut chip, 0xA8, 0x380);
+
+        // Normal mode with the special registers already written: they are stored,
+        // since the register file is the whole state of a write-only chip, but they
+        // reach no operator.
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, MODE_NORMAL);
+        let normal = [
+            ch3_step(&mut chip, phase::SLOT_S1),
+            ch3_step(&mut chip, phase::SLOT_S2),
+            ch3_step(&mut chip, phase::SLOT_S3),
+            ch3_step(&mut chip, phase::SLOT_S4),
+        ];
+        assert_eq!(
+            normal, [0x300; 4],
+            "normal mode is one F-Num for all four operators"
+        );
+
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, MODE_SPECIAL);
+        let special = [
+            ch3_step(&mut chip, phase::SLOT_S1),
+            ch3_step(&mut chip, phase::SLOT_S2),
+            ch3_step(&mut chip, phase::SLOT_S3),
+            ch3_step(&mut chip, phase::SLOT_S4),
+        ];
+        assert_eq!(
+            special,
+            [0x100, 0x200, 0x380, 0x300],
+            "special mode is three extra frequency generators, and operator 4 keeps the channel"
+        );
+
+        // Mode 11 is the special frequency mode too: the extra registers are heard
+        // and it is only the key-on of CSM that mode 10 adds.
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, MODE_SPECIAL_AND_CSM);
+        let both = [
+            ch3_step(&mut chip, phase::SLOT_S1),
+            ch3_step(&mut chip, phase::SLOT_S2),
+            ch3_step(&mut chip, phase::SLOT_S3),
+            ch3_step(&mut chip, phase::SLOT_S4),
+        ];
+        assert_eq!(both, special, "mode 11 has the frequencies of mode 01");
+    }
+
+    /// Which operator each of `&A8`-`&AE` belongs to: `&A8`/`&AC` is operator 3,
+    /// so writing it moves operator 3 alone, and `&A3`/`&A7` - the pair a YM2612
+    /// has no decode for at all - move nothing (YM2608 application manual `&A8`;
+    /// the mapping is the one M5-09 #114 names).
+    #[test]
+    fn a8_maps_to_op3() {
+        let mut chip = Ym2612::new();
+        tune_channel_three(&mut chip, 0x300);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, MODE_SPECIAL);
+
+        // Only the `&A8`/`&AC` pair, and nothing else of the special group: an
+        // F-Num of 0 for the two operators that have their own and are untouched.
+        set_special_fnum(&mut chip, 0xA8, 0x180);
+        let steps = [
+            ch3_step(&mut chip, phase::SLOT_S1),
+            ch3_step(&mut chip, phase::SLOT_S2),
+            ch3_step(&mut chip, phase::SLOT_S3),
+            ch3_step(&mut chip, phase::SLOT_S4),
+        ];
+        assert_eq!(
+            steps,
+            [0, 0, 0x180, 0x300],
+            "`&A8` is operator 3: not operator 1, and not operator 4, which keeps `&A2`"
+        );
+
+        // `&A3` and `&A7` are not the second pair of anything: the chip does not
+        // decode them, so they leave the whole of channel 3 where it was.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA7, 0x0F);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA3, 0xFF);
+        let after = [
+            ch3_step(&mut chip, phase::SLOT_S1),
+            ch3_step(&mut chip, phase::SLOT_S2),
+            ch3_step(&mut chip, phase::SLOT_S3),
+            ch3_step(&mut chip, phase::SLOT_S4),
+        ];
+        assert_eq!(after, steps, "`&A3` and `&A7` are undecoded addresses");
+    }
+
+    /// CSM: a timer A overflow keys all four operators of channel 3 on, and the
+    /// next sample keys them off again unless something else holds them, so a timer
+    /// A period of three samples is an attack on every third sample and a release
+    /// on the one after it. CSM does not ask for the status flag either: the timer
+    /// A overflow enable of `&27` bit 2 stays clear throughout (YM2608 application
+    /// manual `&27`, M5-09 #114, and `crate::timers`).
+    #[test]
+    fn csm_keys_on_at_timer_a_overflow() {
+        let mut chip = Ym2612::new();
+        // 1021 of the 1024 counts of timer A: an overflow on the third sample, the
+        // sixth, the ninth (`&24`, `&25`, and `crate::timers`).
+        set_timer_a(&mut chip, 1021);
+        // CSM mode and the load bit of timer A together, and bit 2 - the overflow
+        // enable - left clear.
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, MODE_CSM | LOAD_A);
+
+        for _ in 0..4 {
+            for _ in 0..2 {
+                chip.clock();
+                assert_eq!(
+                    ch3_states(&chip),
+                    [envelope::State::Release; 4],
+                    "a sample with no overflow is a sample with no key on"
+                );
+            }
+            chip.clock();
+            assert_eq!(
+                ch3_states(&chip),
+                [envelope::State::Attack; 4],
+                "the overflow sample keys the four operators of channel 3 on"
+            );
+            assert!(
+                !bit(chip.read_status(), STATUS_TIMER_A),
+                "CSM runs off the overflow, not off the status flag it does not set"
+            );
+        }
+    }
+
+    /// A `&28` key on holds channel 3 through CSM: the key off that follows an
+    /// overflow ends the CSM pulse, and an operator the driver is holding on stays
+    /// in its attack (`&28`, `&27`, and #114).
+    #[test]
+    fn csm_key_is_held_by_a_real_key_on() {
+        let mut chip = Ym2612::new();
+        set_timer_a(&mut chip, 1021);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, MODE_CSM | LOAD_A);
+        // All four operators of channel 3 keyed on by hand: channel field 2, which
+        // is `&28`'s absolute number for the same channel (`crate::phase`).
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_ALL | 2);
+
+        // Past one overflow and the sample after it, which is where the CSM pulse
+        // would have released them on its own.
+        clock_for(&mut chip, 5);
+        assert_eq!(
+            ch3_states(&chip),
+            [envelope::State::Attack; 4],
+            "`&28` is holding channel 3, so the end of a CSM pulse releases nothing"
+        );
+    }
+
+    /// Only mode 10 keys anything on: normal mode and the special frequency modes
+    /// leave channel 3's envelopes where they are through a hundred timer A
+    /// overflows (YM2608 application manual `&27`, and #114 for the mode 11 that
+    /// takes the frequencies of CSM and none of its key-on).
+    #[test]
+    fn csm_only_in_csm_mode_keys_on() {
+        for mode in [MODE_NORMAL, MODE_SPECIAL, MODE_SPECIAL_AND_CSM] {
+            let mut chip = Ym2612::new();
+            set_timer_a(&mut chip, 1021);
+            write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, mode | LOAD_A);
+
+            clock_for(&mut chip, 30);
+            assert_eq!(
+                ch3_states(&chip),
+                [envelope::State::Release; 4],
+                "mode {:02b} is not a CSM mode",
+                mode >> 6
+            );
+        }
     }
 }

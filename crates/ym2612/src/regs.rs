@@ -17,6 +17,7 @@
 //! [`REG_LFO`] and [`REG_AMS_PMS`] mean something now; the DAC enable and DAC
 //! value (`&2A`, `&2B`) are only stored, for M5-11 (#116).
 
+use crate::phase::{SLOT_S1, SLOT_S2, SLOT_S3};
 use crate::timers::TimerConfig;
 
 /// Bank index of part I: slots 1 to 3 and the global registers.
@@ -90,6 +91,19 @@ pub(crate) const REG_FNUM_LOW: u8 = 0xA0;
 /// application manual `&A4`).
 pub(crate) const REG_BLOCK_FNUM: u8 = 0xA4;
 
+/// Register `&A8`, the first of the channel 3 special-mode F-Num low group of
+/// M5-09 (#114): `&A8`, `&A9` and `&AA` are the low bytes of operators 3, 1 and 2
+/// of channel 3, and the chip takes them in groups of four addresses like the
+/// `&A0` group does - which is why `&AB` and `&AF`, the fourth of each, are not
+/// decoded and `&A3`/`&A7` are not registers of anything (YM2608 application
+/// manual `&A8`, and see [`ch3_frequency_of`]).
+pub(crate) const REG_CH3_FNUM_LOW: u8 = 0xA8;
+
+/// Register `&AC`, the block and F-Num high of the channel 3 special-mode group:
+/// `&AC`, `&AD` and `&AE` are the three addresses of one latch, the `&A4` of this
+/// group, which any of `&A8`-`&AA` applies (YM2608 application manual `&AC`).
+pub(crate) const REG_CH3_BLOCK_FNUM: u8 = 0xAC;
+
 /// Register `&B0`, the first of the algorithm and feedback group: `&B0` +
 /// channel, bits 5-3 the feedback of operator 1 and bits 2-0 the connection mode
 /// of the channel's four operators. One register per channel rather than one per
@@ -152,6 +166,24 @@ pub(crate) const RESET_A_BIT: u8 = 0x10;
 /// `&27` bit 5: a write with this bit set clears status bit 1.
 pub(crate) const RESET_B_BIT: u8 = 0x20;
 
+/// Shift from `&27`'s bits 7-6, the channel 3 mode of M5-09 (#114), to their value.
+pub(crate) const CH3_MODE_SHIFT: u8 = 6;
+
+/// `&27` 00: channel 3 like any other channel, one F-Num for its four operators.
+pub(crate) const CH3_MODE_NORMAL: u8 = 0;
+
+/// `&27` 10: CSM, the special frequency mode with a key-on of all four operators
+/// of channel 3 at every timer A overflow (`crate::timers`, and M5-09 #114).
+///
+/// The other three values of the field get no constant of their own, because none of
+/// them is a decision: 01 is the special frequency mode, where operators 1 to 3 of
+/// channel 3 take their F-Nums from `&A8`-`&AE` and operator 4 keeps
+/// `&A2`/`&A6` ([`ch3_frequency_of`], [`crate::phase::Special`]), and 11 - what the
+/// register lists call "CSM and frequency mode" - is 01 as far as this model goes.
+/// Anything but [`CH3_MODE_NORMAL`] has the extra F-Nums; only this value has the
+/// key-on.
+pub(crate) const CH3_MODE_CSM: u8 = 2;
+
 /// The `(channel, operator)` a per-operator register number of `part` addresses.
 ///
 /// The number is `group + slot offset + channel`: the detune and multiple group
@@ -183,9 +215,43 @@ pub(crate) fn operator_of_group(part: usize, first: u8, register: u8) -> Option<
 
 /// The channel of `part` that a channel-level register addresses: `first` +
 /// channel, with the part's fourth address - `&A3`, `&A7` and everything above
-/// `&A8` - not decoded (YM2608 application manual `&A0`, `&A4`).
+/// `&A8` - not decoded (YM2608 application manual `&A0`, `&A4`). `&A8` to `&AE`
+/// of part I are the channel 3 registers of [`ch3_frequency_of`], not a third and
+/// fourth channel of these two groups.
 pub(crate) fn channel_of_register(part: usize, first: u8, register: u8) -> Option<usize> {
     channel_of(part, register.checked_sub(first)?)
+}
+
+/// The channel 3 operator that `register` of the special-mode group addresses, and
+/// whether it is the F-Num low or the block and F-Num high half of that operator's
+/// pair: `&A8`/`&AC` is operator 3, `&A9`/`&AD` operator 1 and `&AA`/`&AE`
+/// operator 2, while operator 4 has no pair of its own and keeps the `&A2`/`&A6` of
+/// the channel itself. `&AB` and `&AF`, the fourth address of each half, are not
+/// decoded, and neither is anything of part II (YM2608 application manual `&A8`;
+/// M5-09 #114).
+///
+/// The decode is the chip's own: it takes the channel number from the low two bits
+/// of the address and the half from `address & 0xFC`, which is what folds `&A8`,
+/// `&A9` and `&AA` onto one register number and `&AC`, `&AD` and `&AE` onto the
+/// next. One consequence worth naming is that the three high addresses are one
+/// latch, not three: `&AD` is a way of writing the `&AC` of operator 3 as much as
+/// of operator 1, exactly as one `&A4` latches for all of `&A0`-`&A2`.
+pub(crate) fn ch3_frequency_of(part: usize, register: u8) -> Option<(usize, bool)> {
+    if part != PART_I {
+        return None;
+    }
+    let slot = match register & 0x03 {
+        0 => SLOT_S3,
+        1 => SLOT_S1,
+        2 => SLOT_S2,
+        _ => return None,
+    };
+    let high = match register & 0xFC {
+        REG_CH3_FNUM_LOW => false,
+        REG_CH3_BLOCK_FNUM => true,
+        _ => return None,
+    };
+    Some((slot, high))
 }
 
 /// The global channel number of a part's channel 0-2: part I is channels 0-2 and
@@ -247,6 +313,18 @@ impl RegFile {
     /// about, `&24` to `&27`.
     pub(crate) fn is_timer_register(register: u8) -> bool {
         (REG_TIMER_A_LOW..=REG_CONTROL).contains(&register)
+    }
+
+    /// The channel 3 mode, `&27` bits 7-6 as one number: [`CH3_MODE_NORMAL`],
+    /// [`CH3_MODE_SPECIAL`] or [`CH3_MODE_CSM`]. Part I only, like the timers
+    /// beside it (YM2608 application manual `&27`, and M5-09 #114).
+    ///
+    /// A mode of 3 is the special frequency mode as far as this model is
+    /// concerned: it is not [`CH3_MODE_CSM`], so the CSM key-on of
+    /// [`crate::Ym2612`] does not run in it even though the register lists name
+    /// that value "CSM and frequency mode".
+    pub(crate) fn ch3_mode(&self) -> u8 {
+        self.read(PART_I, REG_CONTROL) >> CH3_MODE_SHIFT
     }
 
     /// Timer A as its 10 bits go: `&24` is A0-A7 and `&25` bits 1-0 are A8-A9
