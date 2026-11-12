@@ -53,10 +53,11 @@
 //! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`], the Z80's control
 //! lines and - since M3-09 (#69) put one here - [`Bus::vdp`].
 
+use crate::audio::Audio;
 use crate::cart::{Eeprom, Mapper, Sram, eeprom, mapper, sram};
 use crate::config::version_is_pal;
 use crate::io::Io;
-use crate::z80_bus::{self, YM_STATUS_IDLE, Z80Side};
+use crate::z80_bus::{self, Z80Side};
 use m68k::ADDR_MASK;
 use vdp::Vdp;
 
@@ -545,14 +546,24 @@ pub struct Bus {
     /// the scheduler, is the thing that will know what time it is, and it says so
     /// with `bus.io.set_time(cycles)` ([`Io::set_time`]).
     pub io: Io,
-    /// The sound CPU's own hardware: 8 KiB of RAM, the bank shift register, and
-    /// the YM2612 and PSG until those crates exist.
+    /// The sound CPU's own hardware: 8 KiB of RAM and the bank shift register.
+    /// The two chips that used to be logs here are on [`Bus::audio`] since
+    /// M5-13 (#118).
     ///
     /// Owned by the 68k's bus rather than by a [`crate::Z80View`] so that the one
     /// machine has one bank register and one RAM, reachable from both sides; see
     /// the module docs of [`crate::z80_bus`]. The Z80 runs on the same board as
     /// this bus, and stepping it is `Z80View::new(&mut bus)`.
     pub z80: Z80Side,
+    /// The sound chips: the YM2612 and the PSG, with the master-clock positions
+    /// that say when each is asked for a sample.
+    ///
+    /// One of each for the whole machine, reached from both sides: the 68k's
+    /// `$A04000`-`$A04003` and the Z80's `$4000`-`$4003` are one YM2612's four
+    /// ports, and `$C00011`, `$A07F11` and `$7F11` are one PSG port (plutiedev,
+    /// "Memory map"). M5-13 (#118) is what put chips here instead of the logs
+    /// [`Z80Side`] used to hold, and the scheduler is what clocks them.
+    pub audio: Audio,
     /// The VDP: the chip behind [`Region::Vdp`], and the one the ports of M3-09
     /// (#69) reach.
     ///
@@ -702,6 +713,7 @@ impl Bus {
             version,
             io: Io::new(),
             z80: Z80Side::new(),
+            audio: Audio::new(),
             // The VDP's `PAL` pin is wired to the same console that reports VMOD
             // in [`Bus::version`], so a PAL machine gives the chip the 240-line
             // crystal that [`Vdp::v30_mode`] is allowed to use.
@@ -960,7 +972,7 @@ impl Bus {
             return;
         }
         if asserted {
-            self.z80.ym_reset();
+            self.audio.ym_reset();
         } else {
             self.z80_reset_pulse = true;
         }
@@ -1311,15 +1323,12 @@ impl Bus {
 
     /// One byte to the PSG, from the VDP's PSG port at `$C00011`.
     ///
-    /// Into [`Z80Side::psg_log`], the one log the chip has: the Z80's own `0x7F11`
-    /// and the 68k's `0xA07F11` window have been writing it since M3-07 (#67) and
-    /// M3-08 (#68), and this port is a third spelling of the same wire rather than
-    /// a second PSG.
-    ///
-    /// TODO(M5-13 #118): the `sn76489::Sn76489` that replaces the log, per
-    /// docs/ARCHITECTURE.md "Audio chips".
+    /// Into [`Audio::psg_write`], which catches the chip up to the current master
+    /// clock first: the Z80's own `0x7F11` and the 68k's `0xA07F11` window have
+    /// been writing the same PSG since M3-07 (#67) and M3-08 (#68), and this port
+    /// is a third spelling of the same wire rather than a second PSG.
     fn psg_write(&mut self, value: u8) {
-        self.z80.psg_log.push(value);
+        self.audio.psg_write(value);
     }
 
     /// Z80 bus byte read: one of the sound side's devices, or open bus if the 68k does
@@ -1339,7 +1348,7 @@ impl Bus {
             // A read of the YM2612 is its status byte whichever port was used: the
             // chip has exactly one readable register, so the Z80's own view answers
             // the same way for all four.
-            SoundSide::Ym => YM_STATUS_IDLE,
+            SoundSide::Ym => self.audio.ym_read_status(),
             // The bank register has no read handler in any reference, and the PSG is
             // write-only.
             SoundSide::Bank | SoundSide::Psg | SoundSide::Nothing => OPEN_BUS,
@@ -1371,9 +1380,9 @@ impl Bus {
         }
         match SoundSide::decode(addr) {
             SoundSide::Ram => self.z80.ram[z80_bus::ram_index(addr as u16)] = value,
-            SoundSide::Ym => self.z80.ym_log.push((z80_bus::ym_port(addr as u16), value)),
+            SoundSide::Ym => self.audio.ym_write(z80_bus::ym_port(addr as u16), value),
             SoundSide::Bank => self.z80.shift_in(value),
-            SoundSide::Psg => self.z80.psg_log.push(value),
+            SoundSide::Psg => self.audio.psg_write(value),
             SoundSide::Nothing => {}
         }
     }
@@ -1655,7 +1664,7 @@ fn is_version_register(addr: u32) -> bool {
 enum SoundSide {
     /// The 8 KiB of sound RAM, mirrored at `0x2000` inside the window.
     Ram,
-    /// The YM2612: four ports at `addr & 3`, in [`Z80Side::ym_log`].
+    /// The YM2612: four ports at `addr & 3`, into [`Bus::audio`].
     Ym,
     /// The bank shift register: `0x6000-0x60FF`, in [`Z80Side::bank`].
     ///
@@ -1664,7 +1673,7 @@ enum SoundSide {
     /// there is one register to accept it in.
     Bank,
     /// The PSG port: `0xA07F11` and its `0x13`/`0x15`/`0x17` mirrors, which are the
-    /// port the Z80 sees at `0x7F11` and the 68k sees at `0xC00011`. One port, one log,
+    /// port the Z80 sees at `0x7F11` and the 68k sees at `0xC00011`. One port, one chip,
     /// three spellings - see [`z80_bus::is_psg_port`].
     Psg,
     /// Anything else in the area: the gaps of the Z80 map, and the rest of the VDP
@@ -1889,7 +1898,7 @@ impl m68k::Bus for Bus {
         self.z80_busreq = false;
         self.z80_reset = true;
         self.z80_reset_pulse = false;
-        self.z80.ym_reset();
+        self.audio.ym_reset();
         self.z80.bank = 0;
         // TMSS: `RESET` restarts the console, and a console that restarts asks the
         // security question again. Genesis Plus GX's `gen_reset` clears its TMSS
@@ -2294,6 +2303,24 @@ mod tests {
         bus.write_word(Z80_BUSREQ, 0x0000);
     }
 
+    /// Status bit 7 of the YM2612: still busy with the last write, which only a
+    /// data-port write starts (`ym2612::Ym2612::write`, and the YM2608 application
+    /// manual's status description).
+    const YM_BUSY: u8 = 0x80;
+
+    /// Has the PSG taken no write at all?
+    ///
+    /// Its power-on state is every channel at attenuation 15 and every tone period
+    /// at 0 ([`sn76489::Sn76489::new`]), and none of the bytes these tests aim at a
+    /// locked port, an even lane or the HV counter leaves that. This is what
+    /// "nothing reached the PSG" means now that the chip is a chip rather than the
+    /// log M3-07 (#67) left in its place (M5-13, #118).
+    fn psg_untouched(bus: &Bus) -> bool {
+        (0..4).all(|channel| {
+            bus.audio.psg.attenuation(channel) == 15 && bus.audio.psg.tone_period(channel) == 0
+        })
+    }
+
     /// Release the Z80's reset line - `move.w #$100, (Z80Reset)`.
     fn release_the_z80_reset(bus: &mut Bus) {
         bus.write_word(Z80_RESET_REG, 0x0100);
@@ -2491,10 +2518,10 @@ mod tests {
 
         // Asserting an already asserted line is neither a release nor an edge, so the
         // YM2612 hanging off the same pin is held in reset rather than reset again.
-        let ym_resets = bus.z80.ym_resets;
+        let ym_resets = bus.audio.ym_resets;
         bus.write_word(Z80_RESET_REG, 0x0000);
         assert!(!bus.take_z80_reset());
-        assert_eq!(bus.z80.ym_resets, ym_resets, "no edge, no YM2612 reset");
+        assert_eq!(bus.audio.ym_resets, ym_resets, "no edge, no YM2612 reset");
 
         // The release edge, and the scheduler's side of the handshake: the bus raises
         // the pulse, the scheduler answers it with the CPU's own reset.
@@ -2514,7 +2541,7 @@ mod tests {
         // calls `ym_reset` in the same branch that asserts the Z80's reset.
         bus.write_word(Z80_RESET_REG, 0x0000);
         assert_eq!(
-            bus.z80.ym_resets,
+            bus.audio.ym_resets,
             ym_resets + 1,
             "asserting reset reaches the YM2612"
         );
@@ -2577,31 +2604,55 @@ mod tests {
     }
 
     /// `0xA04000-0xA05FFF` is the YM2612, the same four ports at `addr & 3` that #67
-    /// gave the Z80, logging into the same list: bank 0 at `0xA04000/1` and bank 1 at
-    /// `0xA04002/3` (plutiedev "YM2612 register reference", and BlastEm's
-    /// `io_write`, which picks the port from bits 0 and 1 of the area offset).
+    /// gave the Z80: bank 0 at `0xA04000/1` and bank 1 at `0xA04002/3` (plutiedev
+    /// "YM2612 register reference", and BlastEm's `io_write`, which picks the port
+    /// from bits 0 and 1 of the area offset).
+    ///
+    /// The chip cannot be read back, so the ports are told apart by what they do:
+    /// only a data-port write raises BUSY ([`crate::Audio::ym_write`], and
+    /// `ym2612::Ym2612::write`), and a register the Z80 loaded is visible in the
+    /// status the 68k reads.
     #[test]
     fn ym2612_ports_are_reachable_from_the_68k() {
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         request_the_z80_bus(&mut bus);
 
-        bus.write_byte(0xA04000, 0x28);
-        bus.write_byte(0xA04001, 0xB3);
-        bus.write_byte(0xA04002, 0x27);
-        bus.write_byte(0xA04003, 0x00);
-        bus.write_byte(0xA04006, 0x11);
+        // `0xA04006` is `0xA04002` again - the four repeat every 4 bytes across the
+        // whole area - and that is part II's *address* port, which is not a write to
+        // a register and so does not hold the chip busy. `0xA04007` is the data port
+        // beside it, and does.
         assert_eq!(
-            bus.z80.ym_log,
-            vec![(0, 0x28), (1, 0xB3), (2, 0x27), (3, 0x00), (2, 0x11)],
-            "four ports, repeating every 4 bytes, in the Z80's log"
+            bus.read_byte(0xA04000) & YM_BUSY,
+            0,
+            "idle before any write"
+        );
+        bus.write_byte(0xA04006, 0x27);
+        assert_eq!(
+            bus.read_byte(0xA04000) & YM_BUSY,
+            0,
+            "0xA04006 is the mirrored part II address port, not a data write"
+        );
+        bus.write_byte(0xA04007, 0x00);
+        assert_ne!(
+            bus.read_byte(0xA04000) & YM_BUSY,
+            0,
+            "0xA04007 is the mirrored part II data port, and only a data write is busy"
         );
 
-        // One chip: the Z80's write to its own 0x4001 joins the same list.
-        Z80View::new(&mut bus).write(0x4001, 0x2A);
-        assert_eq!(bus.z80.ym_log.last(), Some(&(1, 0x2A)));
-
-        // A read is the status port, and the stub is never busy.
-        assert_eq!(bus.read_byte(0xA04000), 0x00);
+        // One chip, not one per CPU: the timer the Z80 loads through its own
+        // `0x4000`-`0x4003` is the one whose overflow the 68k reads at `0xA04000`.
+        Z80View::new(&mut bus).write(0x4000, 0x24);
+        Z80View::new(&mut bus).write(0x4001, 0xFF);
+        Z80View::new(&mut bus).write(0x4000, 0x25);
+        Z80View::new(&mut bus).write(0x4001, 0x03);
+        Z80View::new(&mut bus).write(0x4000, 0x27);
+        Z80View::new(&mut bus).write(0x4001, 0x05);
+        bus.audio.advance_to(crate::audio::YM_SAMPLE_MCLK);
+        assert_ne!(
+            bus.read_byte(0xA04000) & 0x01,
+            0,
+            "timer A loaded by the Z80 overflows into the status the 68k reads"
+        );
     }
 
     /// `0xA07F11` is the PSG port the Z80 sees at `0x7F11`, which #67 settled as one
@@ -2613,18 +2664,25 @@ mod tests {
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         request_the_z80_bus(&mut bus);
 
+        // `0x9F` is channel 0's volume at 15 and `0x13` a data byte under the same
+        // latch, which is channel 0's volume at 3 (SMS Power, "SN76489", register
+        // writes). Both bytes have to have arrived for that to be the answer.
         bus.write_byte(0xA07F11, 0x9F);
-        bus.write_byte(0xA07F13, 0x10);
-        assert_eq!(bus.z80.psg_log, vec![0x9F, 0x10]);
+        bus.write_byte(0xA07F13, 0x13);
+        assert_eq!(bus.audio.psg.attenuation(0), 3);
 
         // The even byte of the pair is not the port, and neither is any other lane
         // of the VDP window; the 68k has its own VDP ports for those.
-        bus.write_byte(0xA07F10, 0x00);
-        bus.write_byte(0xA07F00, 0xFF);
-        assert_eq!(bus.z80.psg_log, vec![0x9F, 0x10]);
+        bus.write_byte(0xA07F10, 0x06);
+        bus.write_byte(0xA07F00, 0x07);
+        assert_eq!(bus.audio.psg.attenuation(0), 3);
 
-        Z80View::new(&mut bus).write(0x7F11, 0x20);
-        assert_eq!(bus.z80.psg_log, vec![0x9F, 0x10, 0x20], "one PSG, one log");
+        Z80View::new(&mut bus).write(0x7F11, 0x22);
+        assert_eq!(
+            bus.audio.psg.attenuation(0),
+            2,
+            "one PSG, whichever of the three spellings a byte arrived by"
+        );
 
         // The PSG is write-only, so a read of its port is nothing's.
         assert_eq!(bus.read_byte(0xA07F11), OPEN_BUS);
@@ -2872,7 +2930,7 @@ mod tests {
             bus.write_byte(addr, 0x5A);
             assert!(bus.locked_up, "{addr:#08x} is inside the lock");
             assert!(
-                bus.z80.psg_log.is_empty(),
+                psg_untouched(&bus),
                 "{addr:#08x} must not reach the PSG while locked"
             );
         }
@@ -4111,7 +4169,7 @@ mod tests {
             "the counter block is not the data port"
         );
         assert_eq!(bus.vdp.reg(15), 0, "and not the control port");
-        assert!(bus.z80.psg_log.is_empty(), "and not the PSG");
+        assert!(psg_untouched(&bus), "and not the PSG");
     }
 
     /// Which addresses of [`Region::Vdp`] are the data port.
@@ -4164,29 +4222,41 @@ mod tests {
     /// (plutiedev "Memory map": "PSG is normally accessed by byte, so you'll
     /// generally see $C00011 instead").
     ///
-    /// The sound chip is [`crate::z80_bus::Z80Side::psg_log`] until M5-13 (#118)
-    /// puts an `sn76489::Sn76489` on the bus, which is the placeholder M3-07
-    /// (#67) left on the Z80's route to it; both CPUs share that one log.
+    /// The chip behind the port is the real `sn76489::Sn76489` of M5-13 (#118), so
+    /// what a port write has to show is the register it landed on: `0x8n` latches
+    /// channel 0's tone register with its low nibble (SMS Power, "SN76489", register
+    /// writes), and the nibble says which of the four mirrors delivered it.
     #[test]
     fn psg_write_logged() {
         let mut bus = Bus::new(Vec::new(), NO_TMSS);
-        for addr in [0xC00011u32, 0xC00013, 0xC00015, 0xC00017] {
-            bus.write_byte(addr, 0x8F);
+        for (nibble, lane) in [0xC00011u32, 0xC00013, 0xC00015, 0xC00017]
+            .iter()
+            .enumerate()
+        {
+            bus.write_byte(*lane, 0x80 | nibble as u8);
+            assert_eq!(
+                bus.audio.psg.tone_period(0),
+                nibble as u16,
+                "{lane:#08x} is the PSG port, and its byte arrived"
+            );
         }
-        assert_eq!(bus.z80.psg_log, vec![0x8F; 4], "one byte, one write");
 
         // A word write to the pair is the PSG too, and the byte it sends is the
         // low one: the same byte a `move.b` at $C00011 leaves there (Genesis Plus
         // GX's `vdp_write_word` does `psg_write(cycles, data & 0xFF)`).
         bus.write_word(0xC00010, 0x002A);
-        assert_eq!(bus.z80.psg_log, vec![0x8F, 0x8F, 0x8F, 0x8F, 0x2A]);
+        assert_eq!(
+            bus.audio.psg.tone_period(0),
+            0x2A3,
+            "the low byte 0x2A is the data half of channel 0's tone under the latch, \n             on top of the 3 the last mirror left"
+        );
 
         // The even lane of the pair, on its own, is nothing: the PSG only has the
         // odd byte of it (`is_psg_port`, and Genesis Plus GX's
         // `vdp_write_byte` writing its $10/$14 case `if (address & 1)`).
         let mut bus = Bus::new(Vec::new(), NO_TMSS);
         bus.write_byte(0xC00010, 0x8F);
-        assert!(bus.z80.psg_log.is_empty(), "the even lane is not the PSG");
+        assert!(psg_untouched(&bus), "the even lane is not the PSG");
 
         // None of this is the VDP: the PSG lives in the VDP's port pair but the
         // PSG is not the VDP.

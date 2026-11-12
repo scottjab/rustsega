@@ -34,6 +34,17 @@
 //!
 //! ## Waiting, which is also clocked
 //!
+//! ## The sound chips are a third pair of positions
+//!
+//! [`Bus::audio`] holds the YM2612 and the PSG, and neither of them runs on the
+//! master clock or on either CPU's: one YM2612 sample is 1008 master clocks and
+//! one PSG tick 240 of them ([`crate::audio::YM_SAMPLE_MCLK`],
+//! [`crate::audio::PSG_TICK_MCLK`]). They are not stepped from here beyond being
+//! told what time it is - [`crate::Audio::set_now`] before each slice, clamped to
+//! the end of the line, and [`crate::Audio::advance_to`] at the end of every line -
+//! because each chip runs itself up to that time when it is written to. See
+//! [`crate::audio`] for why catching up is exact rather than an approximation.
+//!
 //! Three of the bus's timing effects are a chip being held rather than running: a
 //! 68k -> VDP DMA, a data port write to a full FIFO, and an access on the wrong
 //! side of the arbitration between the two CPUs. None of them changes what the
@@ -52,11 +63,11 @@ use z80::Z80;
 
 /// Master clocks in one scanline: 3420 of them, in both regions
 /// (docs/ARCHITECTURE.md, "Clocks and timing").
-const MASTER_CLOCKS_PER_LINE: u64 = 3420;
+pub(crate) const MASTER_CLOCKS_PER_LINE: u64 = 3420;
 /// Master clocks per 68000 clock: the 68000 runs at master / 7.
-const MASTER_CLOCKS_PER_68K: u64 = 7;
+pub(crate) const MASTER_CLOCKS_PER_68K: u64 = 7;
 /// Master clocks per Z80 T-state: the Z80 runs at master / 15.
-const MASTER_CLOCKS_PER_Z80: u64 = 15;
+pub(crate) const MASTER_CLOCKS_PER_Z80: u64 = 15;
 /// The most slices one line may take, which is a guard on the line loop rather than a
 /// limit on it: 3420 slices is more than four times the most a line can legitimately
 /// need.
@@ -72,7 +83,7 @@ const MAX_SLICES_PER_LINE: u32 = MASTER_CLOCKS_PER_LINE as u32;
 /// Scanlines in one NTSC frame.
 const LINES_PER_FRAME_NTSC: u16 = 262;
 /// Scanlines in one PAL frame.
-const LINES_PER_FRAME_PAL: u16 = 313;
+pub(crate) const LINES_PER_FRAME_PAL: u16 = 313;
 
 /// The line loop of the console: `docs/ARCHITECTURE.md`, "Clocks and timing".
 pub struct Scheduler {
@@ -150,6 +161,11 @@ impl Scheduler {
             }
 
             if self.z80_is_behind(line_end) {
+                // The sound chips are told what time it is before the chip runs,
+                // not after, because a write made by this instruction is charged
+                // to the position it started from: an instruction cannot be
+                // stopped half way (see [`crate::Audio::set_now`]).
+                bus.audio.set_now(self.z80_clock.min(line_end));
                 if bus.z80_can_run() {
                     Self::charge(
                         &mut self.z80_clock,
@@ -177,6 +193,7 @@ impl Scheduler {
                 self.m68k_clock = line_end;
                 bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
             } else {
+                bus.audio.set_now(self.m68k_clock.min(line_end));
                 let cycles = cpu.step(bus);
                 Self::charge(
                     &mut self.m68k_clock,
@@ -194,6 +211,14 @@ impl Scheduler {
             self.sync_vdp(bus);
             Self::update_interrupts(cpu, z80, &bus.vdp);
         }
+
+        // The line is over, so every clock it held is now payable to the sound
+        // chips: run them to the end of it here rather than leaving the whole
+        // line's samples for the next write or the next frame. `line_end` is the
+        // exact end of the raster, and the per-slice positions above were clamped
+        // to it, which is what makes a frame's sample count a whole number of
+        // frame lengths rather than a function of where the instructions fell.
+        bus.audio.advance_to(line_end);
 
         self.master_clock += MASTER_CLOCKS_PER_LINE;
         self.line = (self.line + 1) % self.lines_per_frame;
@@ -237,6 +262,9 @@ impl Scheduler {
     /// [`Scheduler::lines_per_frame`] lines, and it takes exactly one `frame_done`
     /// with it (`run_frame_ends_at_vblank` holds the two together).
     pub fn run_frame(&mut self, cpu: &mut M68k, z80: &mut Z80, bus: &mut Bus) {
+        // A frame of sound starts with the frame of picture: the buffers hold what
+        // this raster produces and nothing older (see [`crate::Audio::start_frame`]).
+        bus.audio.start_frame();
         let mut lines = 0_u32;
         while !bus.vdp.frame_done() {
             lines += 1;

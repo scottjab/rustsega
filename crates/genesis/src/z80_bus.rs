@@ -27,11 +27,12 @@
 //! does, and it is what lets a region that does not exist yet answer a Z80 access
 //! exactly as it answers a 68k one.
 //!
-//! ## Audio is not here
+//! ## Audio is on the bus, not here
 //!
-//! `crates/ym2612` and `crates/sn76489` are stubs, so YM2612 and PSG accesses go
-//! into logs on [`Z80Side`] for now; the TODOs on those fields name the tickets
-//! that replace them. Reads of the YM2612 report a status byte that is not busy.
+//! The YM2612 and the PSG are one chip each for the whole machine, so they live on
+//! [`Bus::audio`](crate::Bus::audio) and both sides write them from there
+//! (M5-13, #118). What this module keeps is only the decode of which of the four
+//! YM ports an address names and of which lanes of the VDP window are the PSG.
 
 use crate::bus::{Bus, OPEN_BUS};
 use m68k::Bus as _;
@@ -58,14 +59,6 @@ const WINDOW_START: u16 = 0x8000;
 
 /// The YM2612 decodes four ports, so these - and no more - address bits reach it.
 const YM_PORT_MASK: u16 = 0x03;
-/// A YM2612 status byte with bit 7 clear. Bit 7 is the busy/IRQ flag the driver
-/// waits on; the chip is never busy while it is a log, and `ym2612::Ym2612`
-/// (M5-03 #107) will answer this itself.
-///
-/// Crate-visible because the 68k reads the same chip through its `0xA04000` window
-/// (plutiedev "YM2612 register reference": the flag-clearing read is at $A04000).
-pub(crate) const YM_STATUS_IDLE: u8 = 0x00;
-
 /// The bank register selects 68k addresses this far up: it holds bits 15-23, and
 /// a 9-bit register times 32 KiB is the whole 24 bit address bus.
 const BANK_SHIFT: u32 = 15;
@@ -160,55 +153,15 @@ pub struct Z80Side {
     /// Z80's reset line and bus request are M3-08 (#68), which is where any reset
     /// of it belongs.
     pub bank: u16,
-    /// Every YM2612 write as `(port, value)`, port being 0-3 from [`ym_port`].
-    ///
-    /// TODO(M5-13 #118): replaced by the `ym2612::Ym2612` the bus will own
-    /// (register interface M5-03 #107), which takes exactly this
-    /// `write(port, value)` (docs/ARCHITECTURE.md, "Audio chips").
-    pub ym_log: Vec<(u8, u8)>,
-    /// How many times this bus has driven the YM2612's reset line.
-    ///
-    /// The chip's `/RESET` pin is tied to the Z80's own reset line, so the 68k resets
-    /// it with `0xA11200`: BlastEm's reset handler calls `ym_reset` in the branch that
-    /// asserts Z80 reset, and Genesis Plus GX's `gen_zreset_w` calls `fm_reset` on
-    /// both edges of the line and its `gen_reset` once more for the console's
-    /// `RESET`. `crates/ym2612` is still a one-line stub, so the event is counted
-    /// rather than delivered; [`Z80Side::ym_reset`] is the hook M5 replaces.
-    ///
-    /// Counted per edge, not per level: `crate::bus::Bus::new` starts with the line held
-    /// asserted, and that is the Z80 not having been let go yet rather than a reset
-    /// anyone performed. The console's `RESET` counts even when the line was already
-    /// held, because Genesis Plus GX's `gen_reset` calls `fm_reset` there too.
-    pub ym_resets: usize,
-    /// Every PSG write: the byte that reached the PSG port, oldest first.
-    ///
-    /// TODO(M5-13 #118): replaced by the `sn76489::Sn76489` the bus will own
-    /// (M5-01 #105), which takes exactly this `write(value)`
-    /// (docs/ARCHITECTURE.md, "Audio chips").
-    pub psg_log: Vec<u8>,
 }
 
 impl Z80Side {
-    /// A sound side with empty RAM, an empty bank register and no audio logged.
+    /// A sound side with empty RAM and an empty bank register.
     pub fn new() -> Self {
         Self {
             ram: Box::new([0; ZRAM_SIZE]),
             bank: 0,
-            ym_log: Vec::new(),
-            ym_resets: 0,
-            psg_log: Vec::new(),
         }
-    }
-
-    /// Assert the YM2612's reset line, which the hardware ties to the Z80's.
-    ///
-    /// The chip is a stub, so all this does is record that it happened. See
-    /// [`Z80Side::ym_resets`] for the hardware, and `crate::bus` for the two callers:
-    /// the 68k's write to `0xA11200` and [`m68k::Bus::reset_devices`].
-    ///
-    /// TODO(M5-13 #118): calls `ym2612::Ym2612::reset` on the chip the bus will own.
-    pub fn ym_reset(&mut self) {
-        self.ym_resets += 1;
     }
 
     /// Shift one write of the bank register in: bit 0 of `value` becomes the new
@@ -267,7 +220,7 @@ impl Z80Bus for Z80View<'_> {
             // A read of the YM2612 reads its status, whatever the port was: the
             // chip only has the one readable register (plutiedev "YM2612 register
             // reference": the flag-clearing read is at $A04000).
-            Region::Ym => YM_STATUS_IDLE,
+            Region::Ym => self.sys.audio.ym_read_status(),
             Region::Bank => OPEN_BUS,
             Region::Unused => OPEN_BUS,
             // The PSG is write-only, so a Z80 read of any VDP port is the 68k's
@@ -284,12 +237,12 @@ impl Z80Bus for Z80View<'_> {
     fn write(&mut self, addr: u16, value: u8) {
         match Region::decode(addr) {
             Region::Ram => self.sys.z80.ram[ram_index(addr)] = value,
-            Region::Ym => self.sys.z80.ym_log.push((ym_port(addr), value)),
+            Region::Ym => self.sys.audio.ym_write(ym_port(addr), value),
             Region::Bank => self.sys.z80.shift_in(value),
             Region::Unused => {}
             Region::Vdp => {
                 if is_psg_port(addr) {
-                    self.sys.z80.psg_log.push(value);
+                    self.sys.audio.psg_write(value);
                 } else {
                     self.sys.write_byte(vdp_port_addr(addr), value);
                 }
@@ -377,7 +330,7 @@ pub(crate) fn is_psg_port(addr: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::bus::Bus;
-    use crate::z80_bus::{Z80View, ZRAM_SIZE};
+    use crate::z80_bus::{Z80View, ZRAM_SIZE, ym_port};
     use m68k::Bus as _;
     use z80::Z80Bus as _;
 
@@ -385,6 +338,18 @@ mod tests {
     /// NTSC machine without TMSS ([`crate::Region::Usa`]). Never read through the
     /// Z80 address space, so no Z80 stub can pass on its value.
     const TEST_VERSION: u8 = 0xA0;
+
+    /// Status bit 7 of the YM2612: busy with the last write, which only a data-port
+    /// write starts (`ym2612::Ym2612::write`).
+    const YM_BUSY: u8 = 0x80;
+
+    /// Has the PSG taken no write at all? Its power-on state is every channel at
+    /// attenuation 15 and every tone period at 0 ([`sn76489::Sn76489::new`]).
+    fn psg_untouched(bus: &Bus) -> bool {
+        (0..4).all(|channel| {
+            bus.audio.psg.attenuation(channel) == 15 && bus.audio.psg.tone_period(channel) == 0
+        })
+    }
 
     /// A ROM image big enough for two bank windows, with no byte of it reading as
     /// a plausible default.
@@ -553,57 +518,87 @@ mod tests {
         assert_eq!(read(&mut bus, 0x8010), 0x6C);
     }
 
+    /// The YM2612's four ports repeat every 4 bytes across the whole 8 KiB of the
+    /// `0x4000`-`0x5FFF` window, so it is exactly these two address bits that name
+    /// one - see [`ym_port`] for why `& 1` would be the wrong mask.
+    ///
+    /// The chip itself has no readback, so the port an address names is checked
+    /// against [`ym_port`] and the reach of the decode against the one thing a
+    /// YM2612 will say about a write: only a data port holds it busy
+    /// (`ym2612::Ym2612::write`, M5-13 #118).
     #[test]
     fn ym_writes_logged_with_port() {
+        for (addr, port) in [
+            (0x4000u16, 0),
+            (0x4001, 1),
+            (0x4002, 2),
+            (0x4003, 3),
+            (0x4004, 0),
+            (0x5FFC, 0),
+            (0x5FFD, 1),
+            (0x5FFE, 2),
+            (0x5FFF, 3),
+        ] {
+            assert_eq!(ym_port(addr), port, "{addr:#05x}");
+        }
+
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
-
-        write(&mut bus, 0x4000, 0x28);
-        write(&mut bus, 0x4001, 0xB3);
-        write(&mut bus, 0x4002, 0x27);
-        write(&mut bus, 0x4003, 0x00);
-        assert_eq!(
-            bus.z80.ym_log,
-            vec![(0x00, 0x28), (0x01, 0xB3), (0x02, 0x27), (0x03, 0x00)]
-        );
-
-        // The four ports repeat every 4 bytes across the whole 8 KiB window.
-        write(&mut bus, 0x4004, 0x11);
+        assert_eq!(read(&mut bus, 0x4000) & YM_BUSY, 0, "idle before any write");
+        // 0x5FFD is port 1, part I's data port: the chip is busy with it, and the
+        // only thing that made it so is a write that decoded to a data port.
         write(&mut bus, 0x5FFD, 0x22);
-        assert_eq!(&bus.z80.ym_log[4..], &[(0x00, 0x11), (0x01, 0x22)]);
+        assert_ne!(
+            read(&mut bus, 0x4000) & YM_BUSY,
+            0,
+            "a mirrored data port is a write"
+        );
     }
 
     #[test]
     fn ym_reads_report_not_busy() {
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
 
-        // Bit 7 of the YM2612 status byte is the busy/IRQ flag; the stub is never
-        // busy, and a read is not an access worth logging.
+        // Bit 7 of the YM2612 status byte is the busy flag, and a chip that has
+        // been written nothing is not busy. Every port answers it, because the
+        // status register is the only readable one (plutiedev "YM2612 register
+        // reference").
         for port in [0x4000u16, 0x4001, 0x4002, 0x4003, 0x5FFC] {
-            assert_eq!(read(&mut bus, port), 0x00);
+            assert_eq!(read(&mut bus, port) & YM_BUSY, 0, "{port:#05x}");
         }
-        assert!(bus.z80.ym_log.is_empty());
+
+        // And a read of it is not itself a write to the chip.
+        let _ = read(&mut bus, 0x4001);
+        assert_eq!(read(&mut bus, 0x4000) & YM_BUSY, 0);
     }
 
     #[test]
     fn psg_write_at_7f11_logged() {
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
 
-        write(&mut bus, 0x7F11, 0x9F);
-        assert_eq!(bus.z80.psg_log, vec![0x9F]);
+        // `0x92` is channel 0's volume at 2, and every byte after it is a data byte
+        // under that same latch taking its own low nibble (SMS Power, "SN76489",
+        // register writes). A different nibble each time is what shows that all four
+        // of the addresses below delivered rather than one of them doing all four.
+        write(&mut bus, 0x7F11, 0x92);
+        assert_eq!(bus.audio.psg.attenuation(0), 2);
 
         // The VDP ports mirror every other word, so 0x7F13/15/17 are the same PSG
         // port (plutiedev "Memory map": PSG at $C00010/$C00014, "all VDP ports are
         // mirrored every other word"; Genesis Plus GX's `vdp_write_byte` takes
         // $11/$13/$15/$17 that way too).
-        write(&mut bus, 0x7F13, 0x10);
-        write(&mut bus, 0x7F15, 0x20);
-        write(&mut bus, 0x7F17, 0x30);
-        assert_eq!(bus.z80.psg_log, vec![0x9F, 0x10, 0x20, 0x30]);
+        for (lane, attenuation) in [(0x7F13u16, 3), (0x7F15, 4), (0x7F17, 5)] {
+            write(&mut bus, lane, 0x10 | attenuation);
+            assert_eq!(
+                bus.audio.psg.attenuation(0),
+                attenuation,
+                "{lane:#05x} is the same PSG port"
+            );
+        }
 
         // The even byte of the pair is not the PSG port: the PSG is reached by byte
         // access on the odd lane only.
-        write(&mut bus, 0x7F10, 0x00);
-        assert_eq!(bus.z80.psg_log, vec![0x9F, 0x10, 0x20, 0x30]);
+        write(&mut bus, 0x7F10, 0x06);
+        assert_eq!(bus.audio.psg.attenuation(0), 5);
     }
 
     #[test]
@@ -613,8 +608,8 @@ mod tests {
         // The data and control ports of the VDP, inside the same 0x7F00 window.
         write(&mut bus, 0x7F00, 0xFF);
         write(&mut bus, 0x7F04, 0x80);
-        assert!(bus.z80.psg_log.is_empty());
-        assert!(bus.z80.ym_log.is_empty());
+        assert!(psg_untouched(&bus));
+        assert_eq!(bus.audio.ym_read_status(), 0, "and the YM2612 saw nothing");
 
         // What the 68k's VDP ports answer is what the Z80 gets. The data port has
         // a read of the chip's own since M4-03 (#81), so it no longer answers open
@@ -669,7 +664,13 @@ mod tests {
         assert_eq!(bus.vdp.reg(15), 0x8F, "0x7F04 is the control port");
 
         write(&mut bus, 0x7F11, 0x2A);
-        assert_eq!(bus.z80.psg_log, vec![0x2A], "and 0x7F11 is the PSG");
+        // The power-on latch is channel 0's tone register, and a data byte is the
+        // top six bits of it (SMS Power, "SN76489", register writes).
+        assert_eq!(
+            bus.audio.psg.tone_period(0),
+            0x2A << 4,
+            "and 0x7F11 is the PSG"
+        );
     }
 
     #[test]
@@ -705,8 +706,8 @@ mod tests {
             assert_eq!(Z80View::new(&mut bus).io_read(port), 0xFF);
             Z80View::new(&mut bus).io_write(port, 0x00);
         }
-        assert_eq!(bus.z80.ym_log, Vec::new());
-        assert!(bus.z80.psg_log.is_empty());
+        assert!(psg_untouched(&bus), "and the PSG saw none of it");
+        assert_eq!(bus.audio.ym_read_status(), 0, "nor did the YM2612");
         assert_eq!(bus.z80.ram[0x0000], 0x00);
     }
 }
