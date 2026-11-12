@@ -461,6 +461,87 @@ mod tests {
         }
     }
 
+    /// A `&22` write that *lowers* the LFO frequency part-way through a swing must
+    /// not leave the divider counting towards a period it no longer has.
+    ///
+    /// `&22` bits 2-0 can be rewritten at any moment, and a driver moving from a
+    /// slow tremolo to a fast one leaves [`Lfo::step`] past the new, smaller
+    /// period. Counting on equality there is no way back: `step` can never reach
+    /// the period again, so it climbs to 255 and `+= 1` overflows the `u8`. That
+    /// is the #349 panic, which took out 403 ROMs of the M6-05 compatibility
+    /// sweep.
+    #[test]
+    fn lfo_freq_lowered_mid_swing_keeps_dividing() {
+        let mut lfo = Lfo::new();
+        write(&mut lfo, regs::REG_LFO, LFO_ON);
+        for _ in 0..120 {
+            lfo.tick();
+        }
+        // 120 samples of the 108-sample frequency is one step plus 12 samples of
+        // the next one.
+        assert_eq!((lfo.counter(), lfo.step), (1, 12));
+
+        // `&22` to the fastest frequency: a 5-sample period, well short of where
+        // the divider already is.
+        write(&mut lfo, regs::REG_LFO, LFO_ON | 0x07);
+        let period = lfo.period();
+        assert!(period < lfo.step, "the whole point: {period} < 12");
+
+        // First of all, simply not panicking. There is deliberately no assertion in
+        // this loop, so on the unfixed divider the overflow is what reports the bug.
+        for _ in 0..5000 {
+            lfo.tick();
+        }
+
+        // And recovered rather than merely surviving: the divider is never left
+        // sitting at or above the period in force, and the counter is still
+        // turning at that period - 1000 samples of a 5-sample divider is 200 steps.
+        let mut steps = 0;
+        for _ in 0..1000 {
+            let before = lfo.counter();
+            lfo.tick();
+            assert!(
+                lfo.step < period,
+                "step {} parked above the {period}-sample period",
+                lfo.step
+            );
+            if lfo.counter() != before {
+                steps += 1;
+            }
+        }
+        assert_eq!(steps, 200, "5000 more samples of the new frequency");
+    }
+
+    /// The phase a lowered `&22` lands on is pinned, so the fix cannot regress
+    /// into a divider that recirculates every sample instead of every period.
+    ///
+    /// The divider is a counter, so the requirement is only that it recirculates
+    /// once it has reached the period that is now programmed: the very next sample
+    /// in this case, since it is already 12 past a 5-sample period, and every
+    /// fifth sample after that. Nothing else about the counter moves - the 7-bit
+    /// counter of [`COUNTER_MASK`] keeps its place from before the write.
+    #[test]
+    fn lfo_freq_lowered_mid_swing_restarts_the_divider_at_once() {
+        let mut lfo = Lfo::new();
+        write(&mut lfo, regs::REG_LFO, LFO_ON);
+        for _ in 0..120 {
+            lfo.tick();
+        }
+        write(&mut lfo, regs::REG_LFO, LFO_ON | 0x07);
+
+        let advancing: Vec<usize> = (0..40)
+            .filter(|&i| {
+                let before = lfo.counter();
+                lfo.tick();
+                (usize::from(lfo.counter()) + 128 - usize::from(before)) % 128 == 1
+            })
+            .collect();
+        assert_eq!(
+            advancing, vec![0, 5, 10, 15, 20, 25, 30, 35],
+            "one step of the new 5-sample period, immediately, and then every 5"
+        );
+    }
+
     /// The AM triangle spans 0..126 and nothing outside it: 11.8 dB at the peak
     /// of the 1024 of a 96 dB attenuation scale, and silence at the bottom is not
     /// the LFO's to give (YM2608 application manual `&22`, AM output figure).
