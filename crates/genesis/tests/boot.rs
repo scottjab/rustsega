@@ -356,7 +356,7 @@ fn drain_audio_mixes_and_the_state_stubs_answer() {
     machine.drain_audio(&mut samples);
     let mixed = samples.len() - 8;
     assert!(
-        mixed > 1_400 && mixed % 2 == 0 && mixed < 2_000,
+        mixed > 1_400 && mixed.is_multiple_of(2) && mixed < 2_000,
         "one NTSC raster mixed {mixed} halves, which is not about 801 stereo samples"
     );
 

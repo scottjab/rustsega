@@ -70,11 +70,11 @@ pub struct Genesis {
     /// for [`Genesis::drain_audio`] - the resampler, the levels, the DC blocker
     /// and the board's low-pass (M5-14, #119).
     ///
-    /// It lives here rather than on [`Bus`] because it is the host's audio set-up
-    /// - rate, PSG level and filter come from [`Config`] - and the bus is built
-    /// from a version byte with no [`Config`] in sight. Its clock position is
-    /// the mixer's own and is never wound back, so a reset of the chips does not
-    /// make the mixer ask for samples it has already had.
+    /// It lives here rather than on [`Bus`] because its rate, its PSG level and
+    /// its filter are the host's choice, out of [`Config`], and the bus is built
+    /// from a version byte with no [`Config`] in sight. Its clock position is the
+    /// mixer's own and is never wound back, so a reset of the chips does not make
+    /// the mixer ask for samples it has already had.
     mixer: Mixer,
 }
 

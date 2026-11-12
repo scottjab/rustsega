@@ -566,9 +566,10 @@ impl Stream {
     /// pass so that the two channels of one sample stay together.
     fn push_stereo(&mut self, new: &[(i16, i16)], at: u64) {
         let skip = self.align(at, new.len());
-        self.samples.extend(new[skip..].iter().flat_map(|&(left, right)| {
-            [f32::from(left) * self.gain, f32::from(right) * self.gain]
-        }));
+        self.samples
+            .extend(new[skip..].iter().flat_map(|&(left, right)| {
+                [f32::from(left) * self.gain, f32::from(right) * self.gain]
+            }));
     }
 
     /// The kernel row for output position `pos`, and the absolute index of the
@@ -626,11 +627,7 @@ impl Stream {
             total += self.sample(index, channel) * weight;
             held += weight;
         }
-        if held == 0.0 {
-            0.0
-        } else {
-            total / held
-        }
+        if held == 0.0 { 0.0 } else { total / held }
     }
 
     /// Is the input sample at `index` held? Only ever false at the two ends of a
