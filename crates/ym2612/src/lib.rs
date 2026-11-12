@@ -18,8 +18,10 @@
 //! one is terse.
 
 mod envelope;
+mod operator;
 mod phase;
 mod regs;
+mod tables;
 mod timers;
 
 use envelope::EnvelopeGen;
