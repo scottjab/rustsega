@@ -30,6 +30,7 @@ compiled at all by the workspace run: `just check` adds the clippy and nextest o
 | Chip tests | `crates/vdp/tests/`, audio crates | Register writes in, pixels/samples out. Golden values. |
 | Test ROMs | `crates/genesis/tests/` | Homebrew accuracy ROMs run headless; frame hashes and on-screen pass/fail checked. |
 | Commercial smoke | `crates/genesis/tests/commercial.rs` | Boot real games N frames, assert no panic, non-blank output, golden frame hash. The games and what they say are in [`compat-commercial.md`](compat-commercial.md). |
+| Commercial gameplay | `crates/genesis/tests/gameplay.rs` | Replay a committed input movie (`tests/movies`, [`movie-format.md`](movie-format.md)) into the first level of five games and golden three frames of it plus the audio of the run. `cargo nextest run -p genesis --run-ignored only gameplay`. |
 | Collection sweep | `headless sweep <ROM DIR>` | Run every ROM in the local collection in a child process and report what happened. `cargo` runs none of it; the report is a committed artifact, [`compat.md`](compat.md) over [`compat.csv`](compat.csv). |
 | Frontend | `crates/web` with `wasm-bindgen-test` | Input mapping, settings, pure logic. Keep logic out of components so it is testable natively. |
 

@@ -1,0 +1,42 @@
+rustsega-movie 1
+rom-hash 0xdc59ab108468bfad
+region usa
+pads 2
+# frame: pad1 pad2  (buttons as letters UDLRABCSXYZM, '.' for none)
+899 S .
+901 . .
+1199 S .
+1201 . .
+1399 RA RA
+1402 R R
+1474 RA RA
+1477 R R
+1549 RA RA
+1552 R R
+1624 RA RA
+1627 R R
+1699 RA RA
+1702 R R
+1774 RA RA
+1777 R R
+1849 RA RA
+1852 R R
+1924 RA RA
+1927 R R
+1999 RA RA
+2002 R R
+2074 RA RA
+2077 R R
+2149 RA RA
+2152 R R
+2224 RA RA
+2227 R R
+2299 RA RA
+2302 R R
+2374 RA RA
+2377 R R
+2449 RA RA
+2452 R R
+2524 RA RA
+2527 R R
+2590 . .
