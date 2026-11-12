@@ -9,16 +9,19 @@
 //! flags, timer A and timer B (`timers`), the F-Num, block, detune, multiple and
 //! key-on behind the 24 phase counters (`phase`), and the attack, decay, sustain
 //! and release behind the 24 attenuations (`envelope`). `clock` is the sample
-//! step those timers, counters and envelopes run in and still returns silence:
-//! what the operators answer with is here - the quarter-wave log sine, the
-//! exponent and the sign of one operator's output (`operator` and `tables`) -
-//! but nothing sums them into a channel until the algorithms of M5-07a (#111).
+//! step those timers, counters and envelopes run in, and the operators answer in
+//! it - the quarter-wave log sine, the exponent and the sign of one operator's
+//! output (`operator` and `tables`), wired through the eight algorithms and the
+//! feedback of `&B0` and summed into the six channel mixes of M5-07a (#111)
+//! (`channel`). The mix still does not reach the pins: the DAC output stage of
+//! M5-07b (#112) is what turns a channel sum into a sample.
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
 //! the Genesis part shares, and plutiedev's "YM2612 registers" page where that
 //! one is terse.
 
+mod channel;
 mod envelope;
 mod operator;
 mod phase;
@@ -26,8 +29,9 @@ mod regs;
 mod tables;
 mod timers;
 
+use channel::FmChannel;
 use envelope::EnvelopeGen;
-use phase::PhaseGen;
+use phase::{CHANNELS, PhaseGen};
 use regs::{PART_I, PART_II};
 
 /// Port 0: address, part I.
@@ -82,6 +86,9 @@ pub struct Ym2612 {
     /// The 24 envelopes of the operators, driven by the writes to `&28` and
     /// `&40`-`&80` and stepped a third as often as the phase counters.
     envelopes: EnvelopeGen,
+    /// The six channels' operator sums: the algorithm and the feedback of the
+    /// `&B0` group, and the mix those leave behind (M5-07a, #111).
+    channels: [FmChannel; CHANNELS],
     /// Internal cycles left of the BUSY flag: any positive value reads as busy,
     /// and a write refills it with [`BUSY_INTERNAL_CYCLES`].
     busy: u32,
@@ -96,6 +103,7 @@ impl Ym2612 {
             timers: timers::Timers::new(),
             phases: PhaseGen::new(),
             envelopes: EnvelopeGen::new(),
+            channels: std::array::from_fn(|_| FmChannel::new()),
             busy: 0,
         }
     }
@@ -137,6 +145,12 @@ impl Ym2612 {
         self.envelopes
             .register_written(&self.phases, part, register, value);
 
+        if let Some(channel) =
+            regs::channel_of_register(part, regs::REG_ALGORITHM_FEEDBACK, register)
+        {
+            self.channels[channel].register_written(value);
+        }
+
         self.busy = BUSY_INTERNAL_CYCLES;
     }
 
@@ -169,15 +183,28 @@ impl Ym2612 {
     /// right)` sample.
     ///
     /// Both are 0 for now: the FM sum goes left and the DAC of M5-11 (#116)
-    /// goes right, and turning the 24 envelopes into a sample is the slot output
-    /// of the next ticket. What the step does today is run the two timers,
-    /// advance the 24 phase counters, step the envelopes - once every three
-    /// samples - and let BUSY run down.
+    /// goes right, and the output stage of M5-07b (#112) is what turns the six
+    /// channel sums into a sample. What the step does today is run the two
+    /// timers, advance the 24 phase counters, step the envelopes - once every
+    /// three samples - mix the four operators of each channel into the algorithm
+    /// `&B0` names, and let BUSY run down.
+    ///
+    /// The order is the chip's own: an operator is read at the phase the phase
+    /// generator has just arrived at and at the attenuation the envelope
+    /// generator has just arrived at, so a `&B0`, `&40` or `&A0` write is heard
+    /// from the very next sample (`crate::channel`).
     pub fn clock(&mut self) -> (i16, i16) {
         let config = self.regs.timer_config();
         self.timers.tick(&config);
         self.phases.tick();
         self.envelopes.tick(&self.phases);
+
+        for channel in 0..CHANNELS {
+            let phase = std::array::from_fn(|slot| self.phases.phase(channel, slot));
+            let att = std::array::from_fn(|slot| self.envelopes.envelope(channel, slot).output());
+            self.channels[channel].step(phase, att);
+        }
+
         self.busy = self.busy.saturating_sub(INTERNAL_CYCLES_PER_SAMPLE);
         (0, 0)
     }

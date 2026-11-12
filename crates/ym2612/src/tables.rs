@@ -13,9 +13,8 @@
 //! anywhere near the sample path. `tables_match_formula` recomputes them from
 //! the closed form in a test, so a paste error cannot pass.
 //!
-//! [`crate::operator`] is the only reader, and it is not read by the chip until
-//! the algorithm sum of M5-07a (#111); the `allow(dead_code)` that keeps that
-//! quiet in a release build is on that module.
+//! [`crate::operator`] is the only reader, and the chip reads it from the
+//! algorithm sum of M5-07a (#111) onwards (`crate::channel`).
 
 /// The quarter-wave log sine: `-log2(sin((2i + 1) * PI / 1024)) * 256`, rounded,
 /// for the 256 slices of a quarter wave.

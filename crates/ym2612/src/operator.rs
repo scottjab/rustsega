@@ -11,11 +11,9 @@
 //!
 //! What is not here is the sum of the operators of a channel, the channel
 //! feedback of `&B0`, and the DAC: an operator's modulation arrives as an
-//! argument, and [`crate::Ym2612::clock`] still returns silence. That is
-//! M5-07a (#111), which is what calls [`angle`] and [`output`] for a living -
-//! hence the module-wide `allow`, and the same for the two tables of
-//! [`crate::tables`].
-#![allow(dead_code)] // first caller is the algorithm sum of M5-07a (#111)
+//! argument, and `crate::channel` is what supplies it - the eight algorithms and
+//! the feedback of M5-07a (#111), which is the first caller of [`angle`] and
+//! [`output`] and the reason neither needs a `dead_code` allow any more.
 
 use crate::tables::{EXP, LOGSIN};
 
