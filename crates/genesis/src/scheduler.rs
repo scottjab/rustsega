@@ -34,6 +34,17 @@
 //!
 //! ## Waiting, which is also clocked
 //!
+//! ## The sound chips are a third pair of positions
+//!
+//! [`Bus::audio`] holds the YM2612 and the PSG, and neither of them runs on the
+//! master clock or on either CPU's: one YM2612 sample is 1008 master clocks and
+//! one PSG tick 240 of them ([`crate::audio::YM_SAMPLE_MCLK`],
+//! [`crate::audio::PSG_TICK_MCLK`]). They are not stepped from here beyond being
+//! told what time it is - [`crate::Audio::set_now`] before each slice, clamped to
+//! the end of the line, and [`crate::Audio::advance_to`] at the end of every line -
+//! because each chip runs itself up to that time when it is written to. See
+//! [`crate::audio`] for why catching up is exact rather than an approximation.
+//!
 //! Three of the bus's timing effects are a chip being held rather than running: a
 //! 68k -> VDP DMA, a data port write to a full FIFO, and an access on the wrong
 //! side of the arbitration between the two CPUs. None of them changes what the

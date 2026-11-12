@@ -547,7 +547,11 @@ mod tests {
         // 0x5FFD is port 1, part I's data port: the chip is busy with it, and the
         // only thing that made it so is a write that decoded to a data port.
         write(&mut bus, 0x5FFD, 0x22);
-        assert_ne!(read(&mut bus, 0x4000) & YM_BUSY, 0, "a mirrored data port is a write");
+        assert_ne!(
+            read(&mut bus, 0x4000) & YM_BUSY,
+            0,
+            "a mirrored data port is a write"
+        );
     }
 
     #[test]

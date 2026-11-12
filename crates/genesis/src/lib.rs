@@ -184,9 +184,12 @@ impl Genesis {
     /// Append the audio mixed since the last call to `out`, interleaved stereo at
     /// `config.sample_rate`.
     ///
-    /// A stub that appends nothing: nothing is mixed yet.
+    /// A stub that appends nothing: nothing is mixed yet. The raw material is
+    /// there already - the [`crate::audio`] buffers hold the frame that has just
+    /// run, the YM2612's at one sample per 1008 master clocks and the PSG's at one
+    /// per 240.
     /// TODO(M5-14 #119): the mixer, the band-limited resampler and the Model 1
-    /// low-pass filter that fill this in.
+    /// low-pass filter that fill this in, and that will drain those buffers.
     pub fn drain_audio(&mut self, _out: &mut Vec<i16>) {}
 
     /// Say what the pad on port `port` is reporting: [`Buttons`], one bit per

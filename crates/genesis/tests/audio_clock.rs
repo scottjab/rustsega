@@ -91,11 +91,10 @@ fn z80_ym_status(bus: &mut Bus) -> u8 {
     Z80View::new(bus).read(YM_PORT)
 }
 
-
 /// One NTSC frame is 262 lines of 3420 master clocks and the YM2612 is asked once
-/// every 1008 of them (144 68000 clocks at 7 master clocks each, so about 53267 Hz
-/// - docs/ARCHITECTURE.md, "Clocks and timing"). 896040 / 1008 is 888.9, so a
-/// frame holds 888 or 889 samples and never either a fixed 888 or a fixed 889.
+/// every 1008 of them (144 68000 clocks at 7 master clocks each, so about 53267 Hz;
+/// docs/ARCHITECTURE.md, "Clocks and timing"). 896040 / 1008 is 888.9, so a frame
+/// holds 888 or 889 samples and never either a fixed 888 or a fixed 889.
 ///
 /// What matters over more than one frame is that the fraction is carried rather
 /// than rounded away: nine frames are 8000 samples, which is the frame total
@@ -253,7 +252,11 @@ fn z80_ym_write_works() {
 fn ym_status_read_catches_the_chip_up() {
     let mut bus = Bus::new(Vec::new(), VERSION);
     bus.audio.set_now(0);
-    assert_eq!(z80_ym_status(&mut bus) & STATUS_BUSY, 0, "idle to start with");
+    assert_eq!(
+        z80_ym_status(&mut bus) & STATUS_BUSY,
+        0,
+        "idle to start with"
+    );
 
     z80_ym_write(&mut bus, 0, REG_TIMER_A_LOW);
     z80_ym_write(&mut bus, 1, 0x30);
@@ -308,4 +311,41 @@ fn both_cpus_write_the_same_chips() {
         15,
         "and the 68k's PSG port reaches the PSG"
     );
+}
+
+/// The frame buffers are reserved once and reused, which is the acceptance
+/// criterion "no allocation per frame" turned into something a run can fail.
+///
+/// `Vec::clear` keeps capacity, so a buffer whose capacity moves after the first
+/// frame is a buffer that was `Vec::new`ed or grown inside the frame loop
+/// (docs/ARCHITECTURE.md: "Core crates must not allocate per frame in hot paths.
+/// Allocate buffers once."). The capacities asserted for are the preallocation
+/// [`genesis::audio::Audio::new`] takes for a PAL frame, the longest one.
+#[test]
+fn frame_buffers_are_reused_not_reallocated() {
+    let (mut cpu, mut z80, mut bus) = machine();
+    let mut scheduler = Scheduler::new(Region::Usa);
+    scheduler.run_frame(&mut cpu, &mut z80, &mut bus);
+
+    let ym_capacity = bus.audio.ym_samples.capacity();
+    let psg_capacity = bus.audio.psg_samples.capacity();
+    assert!(
+        ym_capacity >= 889 && psg_capacity >= 3734,
+        "the first frame found room for a whole raster of samples: {ym_capacity}, \
+         {psg_capacity}"
+    );
+
+    for _ in 0..8 {
+        scheduler.run_frame(&mut cpu, &mut z80, &mut bus);
+        assert_eq!(
+            bus.audio.ym_samples.capacity(),
+            ym_capacity,
+            "the YM2612 buffer was cleared, not rebuilt"
+        );
+        assert_eq!(
+            bus.audio.psg_samples.capacity(),
+            psg_capacity,
+            "and so was the PSG's"
+        );
+    }
 }

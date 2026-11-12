@@ -53,10 +53,10 @@
 //! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`], the Z80's control
 //! lines and - since M3-09 (#69) put one here - [`Bus::vdp`].
 
+use crate::audio::Audio;
 use crate::cart::{Eeprom, Mapper, Sram, eeprom, mapper, sram};
 use crate::config::version_is_pal;
 use crate::io::Io;
-use crate::audio::Audio;
 use crate::z80_bus::{self, Z80Side};
 use m68k::ADDR_MASK;
 use vdp::Vdp;
@@ -2621,7 +2621,11 @@ mod tests {
         // whole area - and that is part II's *address* port, which is not a write to
         // a register and so does not hold the chip busy. `0xA04007` is the data port
         // beside it, and does.
-        assert_eq!(bus.read_byte(0xA04000) & YM_BUSY, 0, "idle before any write");
+        assert_eq!(
+            bus.read_byte(0xA04000) & YM_BUSY,
+            0,
+            "idle before any write"
+        );
         bus.write_byte(0xA04006, 0x27);
         assert_eq!(
             bus.read_byte(0xA04000) & YM_BUSY,
