@@ -51,6 +51,29 @@ pub(crate) const REG_KEY_ON: u8 = 0x28;
 /// slot - are not decoded (YM2608 application manual `&30`).
 pub(crate) const REG_DT_MUL: u8 = 0x30;
 
+/// Register `&40`, the first of the total level group: one per operator, at
+/// `&40` + slot offset + channel (YM2608 application manual `&40`).
+pub(crate) const REG_TOTAL_LEVEL: u8 = 0x40;
+
+/// Register `&50`, the first of the key scaling and attack rate group: bits 7-6
+/// the rate scaling and bits 4-0 the attack rate (YM2608 application manual
+/// `&50`).
+pub(crate) const REG_KEY_SCALE_ATTACK: u8 = 0x50;
+
+/// Register `&60`, the first of the AM and decay 1 rate group: bit 7 the
+/// amplitude modulation of M5-08 (#113) and bits 4-0 the decay 1 rate (YM2608
+/// application manual `&60`).
+pub(crate) const REG_AM_DECAY_1: u8 = 0x60;
+
+/// Register `&70`, the first of the decay 2 rate group: bits 4-0 the rate the
+/// envelope decays at once it is sustaining (YM2608 application manual `&70`).
+pub(crate) const REG_DECAY_2: u8 = 0x70;
+
+/// Register `&80`, the first of the sustain level and release rate group: bits
+/// 7-4 the sustain level and bits 3-0 the release rate (YM2608 application
+/// manual `&80`).
+pub(crate) const REG_LEVEL_RELEASE: u8 = 0x80;
+
 /// Register `&A0`, the first of the F-Num low group: `&A0` + channel, bits 7-0
 /// of the 11-bit F-Num. This is also the write that applies a channel's pending
 /// `&A4` (YM2608 application manual `&A0`).
@@ -115,11 +138,20 @@ pub(crate) const RESET_B_BIT: u8 = 0x20;
 /// part in bits 1-0, which the part carries over into the global channel number
 /// (YM2608 application manual "3. Register descriptions").
 ///
-/// Only the detune group is decoded, being the only per-operator group anything
-/// acts on yet, so `None` also covers `&33`, `&37`, `&3B` and `&3F`: the
+/// The detune group only, that is: [`operator_of_group`] is the same decode at
+/// another `first`. Either way `None` covers `&33`, `&37`, `&3B` and `&3F`, the
 /// undecoded fourth channel of each slot.
 pub(crate) fn operator_of(part: usize, register: u8) -> Option<(usize, usize)> {
-    let offset = register.checked_sub(REG_DT_MUL)?;
+    operator_of_group(part, REG_DT_MUL, register)
+}
+
+/// The `(channel, operator)` a register of the per-operator group starting at
+/// `first` addresses, the same `first` + slot offset + channel layout as the
+/// detune group of [`REG_DT_MUL`]: the five envelope groups `&40`, `&50`, `&60`,
+/// `&70` and `&80` are laid out exactly like it (YM2608 application manual "3.
+/// Register descriptions").
+pub(crate) fn operator_of_group(part: usize, first: u8, register: u8) -> Option<(usize, usize)> {
+    let offset = register.checked_sub(first)?;
     if offset >= OPERATOR_GROUP_WIDTH {
         return None;
     }
