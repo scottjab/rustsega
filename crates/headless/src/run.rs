@@ -29,7 +29,7 @@ const DEFAULT_FRAMES: u32 = 60;
 /// has, plus `auto` for "read it off the cartridge".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum RegionArg {
-    /// Decide from the header at 0x1F0, as [`Config::resolve_region`] does.
+    /// Read the region off the cartridge header at 0x1F0.
     Auto,
     /// Run as a Mega Drive / Genesis from the Americas whatever the header says.
     Usa,
@@ -65,7 +65,7 @@ fn region_name(region: Region) -> &'static str {
 #[derive(Debug, Clone, Args)]
 pub struct RunArgs {
     /// ROM image to run. Raw `.bin`/`.md` and interleaved `.smd` are both fine:
-    /// [`genesis::cart::normalize_rom`] inside `Genesis::new` sorts them out.
+    /// `Genesis::new` deinterleaves what needs it.
     #[arg(value_name = "ROM")]
     pub rom: PathBuf,
     /// Frames to run before stopping.
@@ -83,10 +83,10 @@ pub struct RunArgs {
     /// Hold buttons on port 1 at given frames: `START@120,LEFT+A@121`.
     ///
     /// Frame numbers are 1-based - `A@1` is held during the first frame this
-    /// command runs - and the buttons of one entry are joined with `+`. A frame
-    /// with no entry is run with the pad released. This is the scripting a test
-    /// needs to get past a title screen, and nothing more: the movie format is
-    /// M6-09 (#129).
+    /// command runs - and one entry's buttons are joined with `+`. A frame with
+    /// no entry is run with the pad released. The 3-button pad's names only: UP
+    /// DOWN LEFT RIGHT A B C START. Scripting a test needs, nothing more - the
+    /// movie format is M6-09 (#129).
     #[arg(long = "pad1", value_name = "SCRIPT")]
     pub pad1: Option<String>,
 }
@@ -131,7 +131,8 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     eprintln!(
         "{summary} frames={} time={:.3}s",
-        args.frames, elapsed.as_secs_f64()
+        args.frames,
+        elapsed.as_secs_f64()
     );
     Ok(())
 }
@@ -144,30 +145,34 @@ fn read_rom(path: &Path) -> Result<Vec<u8>> {
 
 /// The first half of the summary line: `title="SONIC THE HEDGEHOG" region=usa`.
 ///
-/// The title is the export one at 0x150, falling back to the Japanese one at
-/// 0x120, because that is the one an English-language ROM carries and a header
-/// often fills only one of the two. The region is `Config::resolve_region`'s
-/// answer, i.e. what the console is actually running as - the same order
-/// `Genesis::new` goes through (docs/ARCHITECTURE.md, "genesis").
+/// The region is `Config::resolve_region`'s answer, i.e. what the console is
+/// actually running as, and `describe` walks the same three steps
+/// [`genesis::Genesis::new`] does - normalize, header, region - so the line
+/// cannot disagree with the machine (docs/ARCHITECTURE.md, "genesis").
 fn describe(rom: &[u8], config: &Config) -> Result<String> {
     let rom = genesis::cart::normalize_rom(rom);
     let header = genesis::cart::parse_header(&rom).context("ROM has no usable header")?;
-    let title = trim(&header.overseas_title).unwrap_or("unknown");
+    let title = title_of(&header).unwrap_or_else(|| "unknown".to_string());
     let region = config.resolve_region(&header);
-    Ok(format!(
-        "title={title:?} region={}",
-        region_name(region)
-    ))
+    Ok(format!("title={title:?} region={}", region_name(region)))
 }
 
-/// A header field with its padding gone, or `None` if it was all padding.
+/// The cartridge's title for the summary line, or `None` when neither title
+/// field says anything.
 ///
-/// Header strings are space padded and some ROMs leave a field at zeroes
-/// instead; both mean "no title here" ([`genesis::cart::RomHeader`] keeps the
-/// bytes as they were written).
-fn trim(field: &str) -> Option<&str> {
-    let trimmed = field.trim_matches(|c: char| c == ' ' || c == '\0');
-    (!trimmed.is_empty()).then_some(trimmed)
+/// The export field at 0x150 first and the domestic one at 0x120 as the
+/// fallback, because an English-language ROM usually fills only one of the two
+/// (plutiedev, "Game title"). Runs of padding collapse to one space:
+/// `cart::header::text` trims a field's ends but Sega mandated a fixed-width
+/// one, and a publisher may fill it a 16-byte block at a time, which is how
+/// `SONIC THE HEDGEHOG` reaches us as `SONIC THE<15 spaces>HEDGEHOG`. The
+/// summary is for a person to read, so it is shown the way it was meant.
+fn title_of(header: &genesis::cart::RomHeader) -> Option<String> {
+    let readable = |field: &str| {
+        let collapsed = field.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!collapsed.is_empty()).then_some(collapsed)
+    };
+    readable(&header.overseas_title).or_else(|| readable(&header.domestic_title))
 }
 
 /// A path in quotes, so a name with spaces in it still reads as one item.
@@ -341,6 +346,25 @@ mod tests {
     fn summary_survives_a_header_with_no_title() {
         let text = describe(&rom_with(""), &Config::default()).expect("header parses");
         assert_eq!(text, "title=\"unknown\" region=usa");
+    }
+
+    #[test]
+    fn summary_falls_back_to_the_domestic_title() {
+        let mut rom = rom_with("");
+        rom[0x120..0x12A].copy_from_slice(b"GREAT GAME");
+        let text = describe(&rom, &Config::default()).expect("header parses");
+        assert_eq!(text, "title=\"GREAT GAME\" region=usa");
+    }
+
+    #[test]
+    fn summary_collapses_a_title_written_in_16_byte_blocks() {
+        // The shape a shipped Sonic has: the export field is space-padded and
+        // the publisher wrote the second word at the next 16-byte boundary.
+        let mut rom = rom_with("");
+        rom[0x150..0x159].copy_from_slice(b"SONIC THE");
+        rom[0x160..0x168].copy_from_slice(b"HEDGEHOG");
+        let text = describe(&rom, &Config::default()).expect("header parses");
+        assert_eq!(text, "title=\"SONIC THE HEDGEHOG\" region=usa");
     }
 
     #[test]
