@@ -26,6 +26,9 @@
 //! bandwidth figures the slot costs below reproduce are ticket-stated rather
 //! than quoted from the Sega manual, and #305 is checking them.
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::DmaMode;
 use crate::Vdp;
 use crate::ports::{DataTarget, data_target, increment};
@@ -134,6 +137,7 @@ const fn slots_per_unit(mode: DmaMode, target: DataTarget) -> u8 {
 /// The three differ by what a unit of theirs is, what it costs
 /// ([`slots_per_unit`]) and what it writes ([`Vdp::dma_move_unit`]).
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) enum Running {
     /// A 68k to VDP transfer.
     ///

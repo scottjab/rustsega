@@ -29,6 +29,7 @@
 //! and where the sources disagree, is `docs/eeprom-games.md`.
 
 use super::header::parse_header;
+use serde::{Deserialize, Serialize};
 
 /// The extra-memory type byte of a cart whose save is a serial EEPROM
 /// (segaretro "ROM header", and [`super::sram`], which leaves `$E8` to this
@@ -51,7 +52,7 @@ const DEFAULT_BASE: u32 = 0x20_0000;
 /// `mapper_i2c_sega_init`, `mapper_i2c_ea_init`, `mapper_i2c_acclaim_16M_init`
 /// and `mapper_i2c_acclaim_32M_init`, and `mapper_acclaim_32M_write8` for the
 /// split).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Lane {
     /// Either half: the board ignores `/LWR` and `/UWR`.
     Both,
@@ -63,7 +64,7 @@ pub enum Lane {
 
 /// One of the two lines of a cart board: which half of an access carries it and
 /// which bit of that half.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pin {
     lane: Lane,
     bit: u8,
@@ -90,7 +91,7 @@ impl Pin {
 }
 
 /// How a cart's board wires the clock and the data line to the cartridge bus.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Board {
     /// The clock, which the 68k drives.
     pub scl: Pin,
@@ -134,7 +135,7 @@ impl Board {
 
 /// A chip's shape: how much it holds, how its first byte is read, and how
 /// writes wrap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Chip {
     /// Bytes of storage.
     pub size: usize,
@@ -215,7 +216,7 @@ impl Chip {
 
 /// What a cart's EEPROM is: where its two lines are, which board wires them,
 /// and what chip is behind them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EepromInfo {
     /// Even address of the pair the lines live on: the chip answers at `base`
     /// and `base + 1`, which is the whole of what a cart declares - the usual
@@ -245,7 +246,7 @@ impl EepromInfo {
 }
 
 /// Where the transfer has got to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum State {
     /// Nothing to do: no start condition since the last stop, and no clocks
     /// either.
@@ -270,7 +271,7 @@ const ACK: u8 = 8;
 
 /// One cart's serial EEPROM: the array, the state of the two lines, and the byte
 /// in progress.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Eeprom {
     pub info: EepromInfo,
     /// The array, which is what [`crate::Bus::sram`] hands a front end.

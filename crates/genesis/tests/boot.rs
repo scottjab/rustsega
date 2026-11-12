@@ -8,7 +8,7 @@
 //! because CI has no commercial ROMs, and is the only place any of this is
 //! proved against software nobody wrote for it.
 
-use genesis::{Buttons, Config, Genesis, LoadError, StateError};
+use genesis::{Buttons, Config, Genesis, LoadError};
 use testkit::require_data;
 
 /// Where the fake ROMs put their program: past the 0x200 bytes a load needs, so
@@ -334,15 +334,16 @@ fn reset_restarts_the_68k_and_the_vdp_and_keeps_work_ram() {
     );
 }
 
-/// The audio path answers, and the save-state stubs that are still stubs answer
-/// with nothing rather than with a `todo!()` panic, so a front end can call them
-/// all on a build that has no save states yet.
+/// The audio path answers with a frame of host audio.
 ///
-/// `drain_audio` used to be one of the stubs and asserted here as appending
-/// nothing; M5-14 (#119) filled it in, and what it has to append is a frame of
-/// host audio - 801 stereo samples for one 16.7 ms NTSC raster at 48 kHz.
+/// `drain_audio` used to be one of the API's stubs and asserted here as
+/// appending nothing; M5-14 (#119) filled it in, and what it has to append is a
+/// frame of host audio - 801 stereo samples for one 16.7 ms NTSC raster at
+/// 48 kHz. The save-state stubs this test used to assert alongside it are a
+/// format now (M6-07, #127) and have a test file of their own,
+/// `tests/save_state.rs`.
 #[test]
-fn drain_audio_mixes_and_the_state_stubs_answer() {
+fn drain_audio_mixes_a_frame_of_host_audio() {
     let mut machine = Genesis::new(&fake_rom(&[0x60FE]), Config::default()).expect("loads");
 
     let mut samples = vec![1_i16; 8];
@@ -359,9 +360,6 @@ fn drain_audio_mixes_and_the_state_stubs_answer() {
         mixed > 1_400 && mixed.is_multiple_of(2) && mixed < 2_000,
         "one NTSC raster mixed {mixed} halves, which is not about 801 stereo samples"
     );
-
-    assert_eq!(machine.save_state().err(), Some(StateError::Unsupported));
-    assert_eq!(machine.load_state(&[0, 1, 2]), Err(StateError::Unsupported));
 }
 
 /// The real thing: Sonic 1 runs, the VDP draws it, and nothing panics on the way.

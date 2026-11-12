@@ -49,6 +49,8 @@
 //! port - the mouse, the multitap, the light guns - is out of scope too, and
 //! [`Device`] stays the place one of them would go.
 
+use serde::{Deserialize, Serialize};
+
 /// Data port 1: the pin latch of the player 1 port (plutiedev "I/O ports",
 /// `IoData1`).
 const DATA_1: u32 = 0xA10003;
@@ -154,7 +156,7 @@ impl Register {
 /// `X`, `Y`, `Z` and `MODE` are the ones the 6-button pad adds (plutiedev
 /// "Controllers", "Button layout"), read out of the same `Buttons` by
 /// [`Device::Pad6`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Buttons {
     bits: u16,
 }
@@ -216,7 +218,7 @@ impl std::ops::BitOrAssign for Buttons {
 }
 
 /// What is plugged into a port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Device {
     /// Nothing. The port reads as an idle one.
     None,
@@ -398,7 +400,7 @@ fn pad6_extra_pin_values(buttons: Buttons) -> u8 {
 
 /// What a 6-button pad adds to a port: the buttons, and the state of the counter
 /// that `TH` clocks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Pad6State {
     /// The buttons as the front end reports them, `X`/`Y`/`Z`/`Mode` included.
     buttons: Buttons,
@@ -485,7 +487,7 @@ impl Pad6State {
 
 /// One controller port: the two registers of the I/O chip that drive it, and
 /// whatever is plugged into it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Port {
     /// The data register: the level the console drives on each pin, and the
     /// latch bit 7 reads back.
@@ -537,7 +539,7 @@ impl Port {
 }
 
 /// The I/O chip.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Io {
     /// Ports 1, 2 and the expansion port, in that order.
     ports: [Port; 3],

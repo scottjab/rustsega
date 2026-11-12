@@ -20,6 +20,7 @@
 
 use super::header::parse_header;
 use crate::bus::OPEN_BUS;
+use serde::{Deserialize, Serialize};
 
 /// The bit of the type byte that says the extra RAM is battery backed.
 ///
@@ -59,7 +60,7 @@ const MAP_BIT: u8 = 1;
 const WRITE_PROTECT_BIT: u8 = 2;
 
 /// Which half of the 16-bit cartridge bus a cart's save RAM answers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SramKind {
     /// 8-bit save RAM in the odd bytes: `start`, `start + 2`, `start + 4`, ...
     /// of the window is storage, and the even bytes in between are nothing.
@@ -73,7 +74,7 @@ pub enum SramKind {
 
 /// Where a cart's save RAM is and how wide it is: the twelve raw extra-memory
 /// bytes of a header, decoded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SramInfo {
     /// First address of the window, inclusive: 0x200001 for the usual cart.
     pub start: u32,
@@ -174,7 +175,7 @@ impl SramInfo {
 
 /// One cart's save RAM: the storage, the two `0xA130F1` bits, and whether the
 /// front end still has to persist it.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Sram {
     /// What the header declared - the window and its width, which is what anything
     /// reading [`Self::contents`] needs to make sense of it.

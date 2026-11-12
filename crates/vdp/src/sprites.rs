@@ -32,6 +32,9 @@
 //! priority resolution against the planes, which is M4-17 (#95), nor the X = 1
 //! masking mode 2 of genvdp.txt section 15, which is #292.
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::pattern::{NameEntry, read_word, tile_row};
 use crate::planes::{CELL_WIDTH, PRIORITY_SHIFT};
 use crate::{InterlaceMode, Vdp, WIDTH_H32, WIDTH_H40};
@@ -223,9 +226,14 @@ fn sprite_of(vram: &[u8], entry: usize, y: u16, size: u16) -> Sprite {
 /// TODO(#103): pin the size of the cache, the width of the window and what a link
 /// past the 80 entries reads with the sprite ROM of M6-06.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct SpriteCache {
     /// One line per entry, holding `line[0..2]` the y word and `line[2..4]` the
     /// size/link word as big-endian bytes.
+    ///
+    /// Saved as a sequence: eighty lines is past the thirty-two entries `serde`
+    /// derives, see [`crate::big_array`].
+    #[cfg_attr(feature = "serde", serde(with = "crate::big_array"))]
     lines: [[u8; ENTRY_CACHE_BYTES]; CACHE_ENTRIES],
 }
 
@@ -275,6 +283,7 @@ impl SpriteCache {
 /// fetches them: [`crate::latch`] and #103's split of the entry both leave those two
 /// to the line that draws the sprite, which is why this holds the SAT `index`.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 struct SpriteLineEntry {
     /// The entry of the table this, 0..=127 as the 7-bit link field numbers them.
     index: u8,
@@ -315,12 +324,17 @@ const NO_LINE: u16 = u16::MAX;
 /// [`Vdp::display_line`] has not moved to yet (#98). The answer is the same either
 /// way, because the y here and the line there both belong to the same line.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct SpriteLine {
     /// The beam line this list belongs to: the one that draws it, and [`NO_LINE`]
     /// of a slot that has never been searched. [`Vdp::line_sprites`] is what reads
     /// it, and it is the same rule [`crate::latch::LineState`] gives the registers.
     line: u16,
     /// The list, in draw order: the first [`count`] entries of it.
+    ///
+    /// Saved as a sequence, as the sprite cache is: eighty entries is past what
+    /// `serde` derives.
+    #[cfg_attr(feature = "serde", serde(with = "crate::big_array"))]
     entries: [SpriteLineEntry; MAX_SPRITES_H40],
     /// How many entries the walk filled, `..=` [`MAX_SPRITES_H40`].
     count: usize,

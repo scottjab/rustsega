@@ -53,6 +53,8 @@
 //! [`m68k::Bus::reset_devices`] is implemented for [`Bus::io`], the Z80's control
 //! lines and - since M3-09 (#69) put one here - [`Bus::vdp`].
 
+use serde::{Deserialize, Serialize};
+
 use crate::audio::Audio;
 use crate::cart::{Eeprom, Mapper, Sram, eeprom, mapper, sram};
 use crate::config::version_is_pal;
@@ -477,7 +479,15 @@ impl vdp::DmaBus for VdpDmaSource<'_> {
 /// word differently from two bytes.
 ///
 /// `Debug` prints all 64 KiB of RAM, so assert on `&bus.ram[a..b]` slices.
-#[derive(Debug)]
+///
+/// `Serialize`/`Deserialize` are for the save state of M6-07 (#127), which is
+/// every field of the bus **except [`Bus::rom`]**: a state names the cartridge
+/// by checksum rather than carrying it (docs/save-state-format.md), so the ROM
+/// is already loaded when a state is read and [`crate::Genesis::load_state`]
+/// puts the bytes back on the bus it has just replaced. A `Bus` that came out of
+/// a deserializer therefore has an empty `rom` for exactly one moment, and
+/// `state::decode` is the only thing that constructs one.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Bus {
     /// Cartridge ROM in address order, mapped at 0x000000.
     ///
@@ -485,6 +495,10 @@ pub struct Bus {
     /// ([`crate::cart::deinterleave`]) and header decoding are steps of
     /// [`crate::cart`], and the code that turns a file into a `Bus` is a later
     /// ticket.
+    ///
+    /// Left out of a save state, which names the cartridge by checksum instead
+    /// of carrying it - see the note on [`Bus`] and `docs/save-state-format.md`.
+    #[serde(skip)]
     pub rom: Vec<u8>,
     /// The cart's save RAM, from [`crate::cart::sram::detect`] on [`Bus::rom`],
     /// or `None` for a cart that declares none.
@@ -529,6 +543,10 @@ pub struct Bus {
     /// mapped to $200000-$20ffff" to put back later).
     mapper: Mapper,
     /// 64 KiB of work RAM, mapped at 0xE00000 and mirrored every 0x10000.
+    ///
+    /// Saved as a sequence of its bytes: 64 KiB is past the thirty-two entries
+    /// `serde` derives, see `crate::big_array`.
+    #[serde(with = "crate::big_array")]
     pub ram: Box<[u8; 0x10000]>,
     /// The byte 0xA10001 reports: [`crate::Region::version_register`] for the
     /// region [`crate::Config::resolve_region`] picked, with that config's TMSS

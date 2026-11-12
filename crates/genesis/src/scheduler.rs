@@ -55,6 +55,8 @@
 //! skip it, because a chip that is owed the time will be paid it back as a burst
 //! of instructions the moment it is let go.
 
+use serde::{Deserialize, Serialize};
+
 use crate::bus::Bus;
 use crate::config::Region;
 use crate::z80_bus::Z80View;
@@ -86,6 +88,11 @@ const LINES_PER_FRAME_NTSC: u16 = 262;
 pub(crate) const LINES_PER_FRAME_PAL: u16 = 313;
 
 /// The line loop of the console: `docs/ARCHITECTURE.md`, "Clocks and timing".
+///
+/// `Serialize`/`Deserialize` are for the save state of M6-07 (#127): the four
+/// clocks are the machine's position in its own frame, and a state that did not
+/// carry them would resume a frame from its start.
+#[derive(Serialize, Deserialize)]
 pub struct Scheduler {
     /// Scanline now running, 0 at the top of the frame.
     pub line: u16,
