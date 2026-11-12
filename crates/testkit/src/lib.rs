@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 mod tmp;
 
 pub mod golden;
-pub use golden::{Golden, assert_golden, dump_png, frame_hash};
+pub use golden::{Golden, assert_golden, dump_png, fnv1a_64, frame_hash};
 
 /// Public test suites and homebrew test ROMs, fetched by
 /// `scripts/fetch-test-data.sh`.

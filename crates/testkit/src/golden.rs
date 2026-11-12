@@ -20,10 +20,31 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 /// recording. Only a ticket may say to use it.
 const BLESS_ENV: &str = "RUSTSEGA_BLESS";
 
+/// FNV-1a 64 over `bytes`, the hash every golden value in the repo is built
+/// from - exposed for callers that hash something other than a frame, e.g.
+/// `headless --audio-hash` over a run's PCM bytes (M6-02, #121).
+///
+/// Fowler-Noll-Vo "The FNV non-cryptographic hash algorithm", 32-bit offset
+/// basis and prime widened to 64: per byte, `hash ^= byte` then
+/// `hash = hash.wrapping_mul(FNV_PRIME)`.
+pub fn fnv1a_64(bytes: &[u8]) -> u64 {
+    fnv1a_64_from(FNV_OFFSET, bytes.iter().copied())
+}
+
+/// The loop behind [`fnv1a_64`], starting from `hash` so [`frame_hash`] can run
+/// several byte streams through one hash without buffering them together.
+fn fnv1a_64_from(mut hash: u64, bytes: impl Iterator<Item = u8>) -> u64 {
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
 /// Stable 64-bit hash of a frame, for comparing against a golden file.
 ///
-/// FNV-1a over the width and height (each `u32` little endian) and then the
-/// pixel bytes in order. The size is in the hash so two frames with the same
+/// [`fnv1a_64`] over the width and height (each `u32` little endian) and then
+/// the pixel bytes in order. The size is in the hash so two frames with the same
 /// pixels in a different geometry, e.g. 4x2 and 8x1, cannot collide.
 ///
 /// Pixels are `0xAABBGGRR`, so `to_le_bytes` yields R, G, B, A.
@@ -35,21 +56,17 @@ pub fn frame_hash(pixels: &[u32], width: usize, height: usize) -> u64 {
         width * height,
         pixels.len()
     );
-    let mut hash = FNV_OFFSET;
     // Width and height go in as u32, not usize, so the hash is the same on
     // every target.
     let header = (width as u32).to_le_bytes();
     let footer = (height as u32).to_le_bytes();
-    for byte in header
-        .iter()
-        .chain(footer.iter())
-        .copied()
-        .chain(pixels.iter().flat_map(|pixel| pixel.to_le_bytes()))
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    fnv1a_64_from(
+        FNV_OFFSET,
+        header
+            .into_iter()
+            .chain(footer)
+            .chain(pixels.iter().flat_map(|pixel| pixel.to_le_bytes())),
+    )
 }
 
 /// Parse a golden value: `0x`-prefixed hex, or decimal if there is no prefix,
@@ -225,6 +242,17 @@ mod tests {
             0x1234_5678,
             0x9ABC_DEF0,
         ]
+    }
+
+    /// The published FNV-1a 64 test vectors, so the hash the audio hash reuses
+    /// is the real FNV-1a and not something that merely looks like it.
+    #[test]
+    fn fnv1a_64_matches_the_reference_vectors() {
+        // Computed independently of this file, straight from the FNV-1a 64
+        // definition: 0xcbf29ce484222325 offset, 0x100000001b3 prime.
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     #[test]

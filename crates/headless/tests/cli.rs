@@ -238,6 +238,148 @@ fn dump_png_to_a_directory_errors_nicely() {
     );
 }
 
+/// A WAV file header as the `wav` module writes it, parsed back for a test to
+/// check. Only the fields `--dump-wav` promises are kept; a malformed or short
+/// file is a panic with the bytes that caused it.
+struct WavHeader {
+    format: u16,
+    channels: u16,
+    rate: u32,
+    byte_rate: u32,
+    block_align: u16,
+    bits: u16,
+    data_len: u32,
+    file_len: usize,
+}
+
+/// Parse a RIFF/WAVE file down to [`WavHeader`], failing the test on any tag or
+/// size that is not where the format says it is (Microsoft "New Wave Form").
+fn wav_header(path: &Path) -> WavHeader {
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("{} should exist: {e}", path.display()));
+    assert!(
+        bytes.len() >= 44,
+        "{} is only {} bytes",
+        path.display(),
+        bytes.len()
+    );
+    let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().expect("2 bytes"));
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"));
+    assert_eq!(
+        &bytes[0..4],
+        b"RIFF",
+        "{} is not a RIFF file",
+        path.display()
+    );
+    assert_eq!(
+        &bytes[8..12],
+        b"WAVE",
+        "{} is not a WAVE file",
+        path.display()
+    );
+    assert_eq!(&bytes[12..16], b"fmt ", "no fmt chunk");
+    assert_eq!(u32_at(16), 16, "fmt chunk must be the 16-byte PCM form");
+    assert_eq!(&bytes[36..40], b"data", "no data chunk after fmt");
+    WavHeader {
+        format: u16_at(20),
+        channels: u16_at(22),
+        rate: u32_at(24),
+        byte_rate: u32_at(28),
+        block_align: u16_at(32),
+        bits: u16_at(34),
+        data_len: u32_at(40),
+        file_len: bytes.len(),
+    }
+}
+
+/// `--dump-wav` is how anyone listens to what the emulator made, so the file has
+/// to exist and really be a valid 16-bit stereo PCM WAV at the console's rate
+/// (M6-02, #121).
+#[test]
+fn cli_dump_wav_creates_file() {
+    let dir = TempDir::new("wav");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+    let wav = dir.join("out.wav");
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "2",
+        "--dump-wav",
+        wav.to_str().expect("utf-8 path"),
+    ]);
+    assert!(
+        out.status.success(),
+        "run failed: {:?}\nstderr: {}",
+        out.status.code(),
+        stderr(&out)
+    );
+    let header = wav_header(&wav);
+    assert_eq!(header.format, 1, "PCM");
+    assert_eq!(header.channels, 2, "stereo");
+    assert_eq!(header.rate, 48_000, "the console's default sample rate");
+    assert_eq!(header.block_align, 4);
+    assert_eq!(header.bits, 16);
+    assert_eq!(header.byte_rate, 48_000 * 4);
+    // Two frames of an NTSC raster is about 801 stereo samples' worth of audio
+    // apiece (docs/ARCHITECTURE.md via `Genesis::drain_audio`), so the data
+    // chunk is well past the header and its length matches the file on disk.
+    assert!(
+        header.data_len as usize + 44 == header.file_len,
+        "data chunk ({}) and file ({}) must agree",
+        header.data_len,
+        header.file_len
+    );
+    assert!(header.data_len > 0, "two frames must produce audio samples");
+}
+
+/// `--audio-hash` is the machine-readable half of `--dump-wav`: one line on
+/// stdout, shaped like `frame_hash=0x...` so a script can read either.
+#[test]
+fn audio_hash_flag() {
+    let dir = TempDir::new("audio-hash");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+    let args = [
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "2",
+        "--audio-hash",
+    ];
+
+    let out = run(&args);
+    assert!(
+        out.status.success(),
+        "run failed: {:?}\nstderr: {}",
+        out.status.code(),
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("audio_hash=0x"))
+        .unwrap_or_else(|| panic!("no audio_hash line in stdout: {text}"));
+    let value = line.trim().trim_start_matches("audio_hash=0x");
+    assert_eq!(value.len(), 16, "hash must be 16 hex digits, got {line:?}");
+    assert!(
+        value.chars().all(|c| c.is_ascii_hexdigit()),
+        "hash must be hex, got {line:?}"
+    );
+
+    // The same machine run twice is the same audio: the property every golden
+    // value in the repo rests on (`docs/TESTING.md`, "Golden files").
+    let again = run(&args);
+    assert!(again.status.success());
+    let other = stdout(&again);
+    let other_line = other
+        .lines()
+        .find(|line| line.starts_with("audio_hash=0x"))
+        .unwrap_or_else(|| panic!("no audio_hash line in stdout: {other}"));
+    assert_eq!(line, other_line.trim(), "the same run must hash the same");
+}
+
 /// Two runs of the same ROM for the same number of frames are the same machine
 /// state, so they must print the same hash: the property every golden frame
 /// hash in the repo rests on (`docs/TESTING.md`, "Golden files").

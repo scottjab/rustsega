@@ -5,7 +5,10 @@
 //! file records (`docs/TESTING.md`, "Golden files", via [`testkit::frame_hash`])
 //! and `--dump-png` writes the same bytes [`testkit::dump_png`] writes, so what
 //! this command says about a frame and what the test suite says about it cannot
-//! disagree.
+//! disagree. `--dump-wav` and `--audio-hash` do the same for the sound of the
+//! whole run: the WAV is [`crate::wav::write_wav`] over what
+//! [`genesis::Genesis::drain_audio`] hands out, and the hash is over the same
+//! PCM bytes the `data` chunk holds (M6-02, #121).
 //!
 //! Everything is `Genesis`' own public API: [`genesis::Genesis::new`], then one
 //! [`genesis::Genesis::run_frame`] per frame, then [`genesis::Genesis::frame`]
@@ -20,6 +23,8 @@ use std::time::Instant;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, ValueEnum};
 use genesis::{Buttons, Config, Genesis, Region, RegionSetting};
+
+use crate::wav;
 
 /// Frames for `--frames` when the caller does not say: one second of NTSC, the
 /// shortest run that gets a real game past its reset and into something on screen.
@@ -74,9 +79,22 @@ pub struct RunArgs {
     /// Write the last frame to `PATH` as an RGBA PNG.
     #[arg(long, value_name = "PATH")]
     pub dump_png: Option<PathBuf>,
+    /// Write the run's audio to `PATH` as a 16-bit stereo PCM WAV.
+    ///
+    /// The audio of the whole run, from the first frame to the last, at
+    /// `Config::sample_rate` (48 kHz unless the caller changed it in code).
+    /// M6-02, #121.
+    #[arg(long, value_name = "PATH")]
+    pub dump_wav: Option<PathBuf>,
     /// Print `frame_hash=0x...` for the last frame on stdout.
     #[arg(long)]
     pub hash: bool,
+    /// Print `audio_hash=0x...` for the run's audio on stdout.
+    ///
+    /// FNV-1a 64 over the same PCM bytes `--dump-wav` writes as the WAV's
+    /// `data` chunk, so a hash and a file describe the same audio.
+    #[arg(long)]
+    pub audio_hash: bool,
     /// Force a region instead of reading the header.
     #[arg(long, value_enum, default_value_t = RegionArg::Auto)]
     pub region: RegionArg,
@@ -98,8 +116,9 @@ pub struct RunArgs {
 /// for a command line tool.
 pub fn run(args: RunArgs) -> Result<()> {
     let rom = read_rom(&args.rom)?;
-    // `Config::default()` is TMSS off, 48 kHz and the Model 1 low-pass: audio is
-    // unused until M6-02 (#121), and nothing else here is a host choice.
+    // `Config::default()` is TMSS off, 48 kHz and the Model 1 low-pass: the
+    // 48 kHz is the rate `--dump-wav` and `--audio-hash` report at, and nothing
+    // else here is a host choice.
     let config = Config {
         region: args.region.setting(),
         ..Config::default()
@@ -107,8 +126,15 @@ pub fn run(args: RunArgs) -> Result<()> {
     let summary = describe(&rom, &config)?;
     let pads = parse_pad_script(args.pad1.as_deref())?;
 
+    let sample_rate = config.sample_rate;
     let mut machine = Genesis::new(&rom, config)
         .with_context(|| format!("cannot run ROM {}", quote(&args.rom)))?;
+
+    // Audio is only collected when someone asked for it: `drain_audio` mixes and
+    // resamples every call, and a `--hash`-only run has nowhere to put the
+    // answer (`Genesis::drain_audio` hands a frame's sound out once).
+    let want_audio = args.dump_wav.is_some() || args.audio_hash;
+    let mut audio: Vec<i16> = Vec::new();
 
     let started = Instant::now();
     // 1-based, so that a script written as `START@1` means the first frame. The
@@ -116,6 +142,11 @@ pub fn run(args: RunArgs) -> Result<()> {
     for frame in 1..=args.frames {
         machine.set_pad(0, pads.get(&frame).copied().unwrap_or_else(Buttons::empty));
         machine.run_frame();
+        if want_audio {
+            // After the frame, so the buffer holds the raster the machine just
+            // ran through rather than the one before it.
+            machine.drain_audio(&mut audio);
+        }
     }
     let elapsed = started.elapsed();
 
@@ -134,6 +165,14 @@ pub fn run(args: RunArgs) -> Result<()> {
         let hash = testkit::frame_hash(pixels, frame.width, frame.height);
         println!("frame_hash=0x{hash:016x}");
     }
+    if let Some(path) = &args.dump_wav {
+        wav::write_wav(path, sample_rate, &audio)
+            .with_context(|| format!("cannot write WAV {}", quote(path)))?;
+    }
+    if args.audio_hash {
+        let hash = audio_hash(&audio);
+        println!("audio_hash=0x{hash:016x}");
+    }
 
     eprintln!(
         "{summary} frames={} time={:.3}s",
@@ -147,6 +186,18 @@ pub fn run(args: RunArgs) -> Result<()> {
 /// or directory" on its own says nothing about which of the arguments it means.
 fn read_rom(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("cannot read ROM {}", quote(path)))
+}
+
+/// `--audio-hash`: [`testkit::fnv1a_64`] over the run's audio as PCM bytes,
+/// i.e. over exactly the bytes `--dump-wav` writes into the `data` chunk, so
+/// `audio_hash` and `out.wav` cannot disagree about what was heard
+/// (M6-02, #121).
+fn audio_hash(samples: &[i16]) -> u64 {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    testkit::fnv1a_64(&bytes)
 }
 
 /// The first half of the summary line: `title="SONIC THE HEDGEHOG" region=usa`.
@@ -299,6 +350,16 @@ mod tests {
         let err =
             parse_pad_script(Some("Z@3")).expect_err("Z is not reachable through the CLI's pad");
         assert!(err.to_string().contains("6-button"), "unhelpful: {err}");
+    }
+
+    /// `--audio-hash` hashes the run's audio as little-endian PCM bytes: the
+    /// expected values are FNV-1a 64 over `01 00 FF 7F` and over nothing,
+    /// computed independently in Python from the FNV definition, so this pins
+    /// the byte order and the offset basis rather than restating the code.
+    #[test]
+    fn audio_hash_is_fnv_over_the_pcm_bytes() {
+        assert_eq!(audio_hash(&[1, -1]), 0xab59_b177_460d_9ada);
+        assert_eq!(audio_hash(&[]), 0xcbf2_9ce4_8422_2325);
     }
 
     #[test]
