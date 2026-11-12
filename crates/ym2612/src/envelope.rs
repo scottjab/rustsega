@@ -16,14 +16,26 @@
 //!
 //! The amplitude modulation enable of `&60` bit 7 is kept here, because that is
 //! the register group it lives in, for `crate::lfo` to gate its AM with (M5-08,
-//! #113); the SSG-EG of `&90` is M5-10 (#115) and is not read here. So what
-//! [`Envelope::output`] gives is the operator's attenuation before the LFO adds
-//! to it.
+//! #113). So what [`Envelope::output`] gives is the operator's attenuation
+//! before the LFO adds to it.
+//!
+//! The SSG-EG of `&90` is here too (M5-10, #115). Enabled, it takes the
+//! envelope away from the four states above: the decay, sustain and release
+//! increments are four times as big up to half the range, and nothing at all
+//! past it; and what happens at that halfway point is the `&90` hold/alternate
+//! table of [`Envelope::ssg_restarting`], which is the repeated saw and the
+//! triangle on one side and the four one-shot holds on the other. The output of
+//! [`Envelope::output`] may then be the mirror of the envelope's own attenuation
+//! about [`SSG_HALF`], which is why the channel reads its envelope there and not
+//! the field. What is not modelled is the phase-generator reset the chip asks
+//! for at the same moment in the two non-holding modes - Nuked-OPN2's
+//! `eg_ssg_pgrst_latch` - because the envelopes cannot reach the phase generator
+//! from here; the follow-up issue filed with this PR covers it.
 
 use crate::phase::{self, CHANNELS, PhaseGen, SLOTS};
 use crate::regs::{
-    REG_AM_DECAY_1, REG_DECAY_2, REG_KEY_ON, REG_KEY_SCALE_ATTACK, REG_LEVEL_RELEASE,
-    REG_SSG_EG, REG_TOTAL_LEVEL, operator_of_group,
+    REG_AM_DECAY_1, REG_DECAY_2, REG_KEY_ON, REG_KEY_SCALE_ATTACK, REG_LEVEL_RELEASE, REG_SSG_EG,
+    REG_TOTAL_LEVEL, operator_of_group,
 };
 
 /// The attenuation of a silent operator: 10 bits, and the other end from it is
@@ -454,9 +466,7 @@ impl Envelope {
     /// is on - Nuked's `eg_ssg_inv`, `(direction ^ (attack & enable)) &
     /// eg_kon` (`&90`).
     fn ssg_mirrored(&self) -> bool {
-        self.ssg_enabled()
-            && self.key_on
-            && (self.ssg_direction != (self.ssg_eg & SSG_ATTACK != 0))
+        self.ssg_enabled() && self.key_on && (self.ssg_direction != (self.ssg_eg & SSG_ATTACK != 0))
     }
 
     /// What the operator contributes to the channel: its own attenuation plus
@@ -699,7 +709,7 @@ impl Field {
 mod tests {
     use super::*;
     use crate::phase::PhaseGen;
-    use crate::phase::SLOT_S1;
+    use crate::phase::{SLOT_S1, SLOT_S2, SLOT_S3, SLOT_S4};
     use crate::regs::{PART_I, REG_SSG_EG};
 
     /// `&28` bit 4: key on operator 1, the operator the tests here work on.
@@ -1050,7 +1060,10 @@ mod tests {
         // `inc <<= 2` inside `!eg_off`).
         let mut plain = ssg_at_full_level(0);
         drive(&mut plain, 8, 0);
-        assert_eq!(plain.att, 8, "without SSG-EG, one step an update at rate 48");
+        assert_eq!(
+            plain.att, 8,
+            "without SSG-EG, one step an update at rate 48"
+        );
 
         let mut ssg = ssg_at_full_level(SSG_ENABLE);
         drive(&mut ssg, 8, 0);
@@ -1064,13 +1077,19 @@ mod tests {
         released.release_rate = 5;
         released.set_key(false, 0);
         drive(&mut released, 64, 0);
-        assert_eq!(released.att, 1, "one update point of one step in 64 updates");
+        assert_eq!(
+            released.att, 1,
+            "one update point of one step in 64 updates"
+        );
 
         let mut ssg_released = ssg_at_full_level(SSG_ENABLE);
         ssg_released.release_rate = 5;
         ssg_released.set_key(false, 0);
         drive(&mut ssg_released, 64, 0);
-        assert_eq!(ssg_released.att, 4, "and the SSG-EG release is four of those");
+        assert_eq!(
+            ssg_released.att, 4,
+            "and the SSG-EG release is four of those"
+        );
 
         // Four times nothing, past halfway: 0x1FC is two updates short of 0x200
         // and 0x200 is where the envelope stops rather than the point it slows
@@ -1078,7 +1097,10 @@ mod tests {
         let mut past = ssg_at_full_level(SSG_ENABLE | SSG_ALTERNATE | SSG_HOLD);
         past.att = 0x1FC;
         drive(&mut past, 8, 0);
-        assert_eq!(past.att, 0x200, "the increment stops at 0x200, not after it");
+        assert_eq!(
+            past.att, 0x200,
+            "the increment stops at 0x200, not after it"
+        );
     }
 
     #[test]
@@ -1168,11 +1190,9 @@ mod tests {
         );
         assert_eq!(&swings[..4], &[false, true, false, true]);
         assert!(
-            levels
-                .iter()
-                .any(|(att, out, mirrored)| {
-                    *mirrored && *att < SSG_HALF && *out == mirror(*att) && mirror(*att) != *att
-                }),
+            levels.iter().any(|(att, out, mirrored)| {
+                *mirrored && *att < SSG_HALF && *out == mirror(*att) && mirror(*att) != *att
+            }),
             "and it is the output that moves, below the halfway point"
         );
     }
@@ -1210,7 +1230,11 @@ mod tests {
         assert_eq!(envelope.output(), 0, "which the mirror reads as full level");
 
         drive(&mut envelope, 4 * u32::from(COUNTER_MAX), 0);
-        assert_eq!(envelope.level(), 0x200, "the level stays at the halfway point");
+        assert_eq!(
+            envelope.level(),
+            0x200,
+            "the level stays at the halfway point"
+        );
         assert_eq!(envelope.output(), 0, "and so does the output");
     }
 
@@ -1273,15 +1297,11 @@ mod tests {
         eg.register_written(&phases, PART_I, REG_SSG_EG + 0x03, SSG_ENABLE);
 
         assert_eq!(eg.envelopes[0][SLOT_S1].ssg_eg, SSG_ENABLE);
+        assert_eq!(eg.envelopes[0][SLOT_S3].ssg_eg, SSG_ENABLE | SSG_HOLD);
+        assert_eq!(eg.envelopes[0][SLOT_S2].ssg_eg, 0);
         assert_eq!(
-            eg.envelopes[0][crate::phase::SLOT_S3].ssg_eg,
-            SSG_ENABLE | SSG_HOLD
-        );
-        assert_eq!(eg.envelopes[0][crate::phase::SLOT_S2].ssg_eg, 0);
-        assert_eq!(
-            eg.envelopes[0][crate::phase::SLOT_S4].ssg_eg, 0,
+            eg.envelopes[0][SLOT_S4].ssg_eg, 0,
             "`&93` is the undecoded fourth channel of the group"
         );
     }
 }
-
