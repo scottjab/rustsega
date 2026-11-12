@@ -14,6 +14,17 @@ use crate::cart::{Regions, RomHeader};
 /// docs/ARCHITECTURE.md ("Audio chips").
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 
+/// Master clock of the NTSC machine, Hz: 53_693_175, the number the whole timing
+/// model divides (docs/ARCHITECTURE.md, "Clocks and timing").
+const MASTER_CLOCK_NTSC_HZ: u64 = 53_693_175;
+/// The same for PAL, a little slower: 53_203_424 (docs/ARCHITECTURE.md, "Clocks
+/// and timing").
+const MASTER_CLOCK_PAL_HZ: u64 = 53_203_424;
+
+/// The default for [`Config::psg_level`]: the PSG at its reference level, which
+/// is the balance documented on `crate::audio::PSG_LEVEL_REFERENCE`.
+pub const DEFAULT_PSG_LEVEL: u32 = 100;
+
 /// Version register bit 7, MODE: 1 = overseas (Americas or Europe), 0 = the
 /// domestic Japanese machine (plutiedev "Using the Sub-CPU in mode 1" calls the
 /// register `HwVersion`; the bit names and meanings are Charles MacDonald's
@@ -72,6 +83,22 @@ impl Region {
         matches!(self, Self::Europe)
     }
 
+    /// The master clock this console runs on, in Hz: 53_693_175 for NTSC and
+    /// 53_203_424 for PAL (docs/ARCHITECTURE.md, "Clocks and timing").
+    ///
+    /// Nothing in the timing model needs this - a scanline is 3420 master clocks
+    /// in either region, and the region only decides how many of them a frame has
+    /// ([`crate::Scheduler::new`]) - but the mixer has to turn master clocks into
+    /// seconds to produce `config.sample_rate` of them, and that conversion is
+    /// the one place the two crystals are different ([`crate::audio::Mixer`]).
+    pub fn master_clock_hz(self) -> u64 {
+        if self.is_pal() {
+            MASTER_CLOCK_PAL_HZ
+        } else {
+            MASTER_CLOCK_NTSC_HZ
+        }
+    }
+
     /// The byte that 0xA10001 reports for this region.
     ///
     /// The register layout (plutiedev "Using the Sub-CPU in mode 1" names the
@@ -103,6 +130,30 @@ impl Region {
     }
 }
 
+/// The console's own output low-pass, which the mixer applies at the host rate
+/// after the two chips have been summed (docs/ARCHITECTURE.md, "Audio chips").
+///
+/// This is the board's filter rather than the chips': the summed audio leaves the
+/// motherboard through a resistor and a capacitor, and a Model 1's is low enough
+/// that a 10 kHz tone is a third of what it was. The shape is the one Genesis
+/// Plus GX has always used - `audio_update` of `core/system.c` runs
+/// `l = l * factora + out * factorb` over the finished buffer, which is exactly
+/// `y += a * (x - y)` (read 2026-07-31), and its own default coefficient is
+/// `0x9999` (`libretro/libretro.c`, `config.lp_range = 0x9999`, 0.6 in 16.16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LowPass {
+    /// No filtering: the mixed chips straight to the host.
+    Off,
+    /// The first-order low-pass of a Model 1 board, about 3.39 kHz.
+    ///
+    /// The corner is the ticket's figure for a VA3-ish board. It is not
+    /// independent of Genesis Plus GX's default coefficient: `a = 0.6` at 48 kHz
+    /// is a corner of about 3.9 kHz (`-ln(1 - a) * fs / 2 PI`), so the two agree
+    /// to within half a kilohertz on where the board rolls off and on it being
+    /// one pole.
+    Model1,
+}
+
 /// The host's region setting: follow the cartridge, or ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionSetting {
@@ -126,9 +177,22 @@ pub struct Config {
     /// the version register claims TMSS.
     pub tmss: bool,
     /// Audio output rate in Hz for the mixing docs/ARCHITECTURE.md describes
-    /// ("Audio chips", "48 kHz default"). Nothing reads it yet, and nothing here
-    /// resamples or buffers: owning audio is a later ticket.
+    /// ("Audio chips", "48 kHz default"). [`crate::audio::Mixer`] resamples to
+    /// it, and the output really is this rate: the master clock is what decides
+    /// how many samples a second of machine time is worth.
     pub sample_rate: u32,
+    /// The console's own output low-pass, [`LowPass::Model1`], the Model 1 board
+    /// filter most hosts want; [`LowPass::Off`] for a clean capture of the chips.
+    pub lowpass: LowPass,
+    /// The PSG's volume relative to the FM's, in percent: 100 is the balance of a
+    /// VA4 Model 1 that `crate::audio::PSG_LEVEL_REFERENCE` is drawn from, 0 is
+    /// the FM alone and 200 is the PSG twice as loud as that balance.
+    ///
+    /// A host turns this up when a game's sound effects sit under its music and
+    /// down when the PSG chokes the FM; it is a mix control rather than a
+    /// correction, which is why the default is the hardware's own balance and not
+    /// something louder.
+    pub psg_level: u32,
     /// Auto-detect order for a header that claims more than one region, most
     /// preferred first: [`Config::default`] is the ticket's order, USA, then
     /// Europe, then Japan. A host that prefers a European machine puts Europe
@@ -142,6 +206,8 @@ impl Default for Config {
             region: RegionSetting::Auto,
             tmss: false,
             sample_rate: DEFAULT_SAMPLE_RATE,
+            lowpass: LowPass::Model1,
+            psg_level: DEFAULT_PSG_LEVEL,
             prefer: [Region::Usa, Region::Europe, Region::Japan],
         }
     }
@@ -288,6 +354,17 @@ mod tests {
         assert_eq!(config.region, RegionSetting::Auto);
         assert!(!config.tmss);
         assert_eq!(config.sample_rate, 48_000);
+        assert_eq!(config.lowpass, LowPass::Model1);
+        assert_eq!(config.psg_level, DEFAULT_PSG_LEVEL);
         assert_eq!(config.prefer, [Region::Usa, Region::Europe, Region::Japan]);
+    }
+
+    /// The two crystals, and only the two of them: NTSC for the two NTSC regions
+    /// and PAL for Europe (docs/ARCHITECTURE.md, "Clocks and timing").
+    #[test]
+    fn master_clock_per_region() {
+        assert_eq!(Region::Usa.master_clock_hz(), 53_693_175);
+        assert_eq!(Region::Japan.master_clock_hz(), 53_693_175);
+        assert_eq!(Region::Europe.master_clock_hz(), 53_203_424);
     }
 }
