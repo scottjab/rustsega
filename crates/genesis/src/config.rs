@@ -367,5 +367,4 @@ mod tests {
         assert_eq!(Region::Japan.master_clock_hz(), 53_693_175);
         assert_eq!(Region::Europe.master_clock_hz(), 53_203_424);
     }
-    }
 }
