@@ -29,6 +29,12 @@ test:
 test-all:
     cargo nextest run --workspace --no-tests=pass --run-ignored all
 
+# Commercial ROM smoke tests (M6-04, #123): local only, they read $RUSTSEGA_ROM_DIR,
+# which CI does not have. The name filter is what `--run-ignored only` needs: it
+# picks the one #[ignore]d test of tests/commercial.rs out of the genesis crate.
+test-commercial:
+    cargo nextest run -p genesis --run-ignored only commercial
+
 # Public CPU conformance suites -> test-roms/ (pinned, idempotent).
 fetch:
     scripts/fetch-test-data.sh

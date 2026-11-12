@@ -1,0 +1,151 @@
+# The commercial games run by `tests/commercial.rs` (M6-04, #123).
+#
+# `prefix` is the exact file name of the cartridge under `$RUSTSEGA_ROM_DIR`
+# without its extension - `testkit::commercial_rom` takes an exact name. It is
+# not a prefix lookup: `testkit::find_commercial_rom` does prefix matching and
+# lands on a Beta build sitting under the same stem, which is not the game
+# under test.
+#
+# `key` names the golden key, which is `<key>_<frames>` in
+# `tests/golden/commercial.toml`, and the picture of the last frame in
+# `target/test-output/commercial/`.
+#
+# `start_press` is a list of 1-based frame numbers on which port 1 holds START
+# (`common::run_frames`, `crates/headless/src/run.rs`), which is how a game that
+# waits on "PRESS START" gets past it into a picture worth hashing.
+#
+# The list is deliberately wider than "Sonic and see if it crashes". These
+# entries cover SRAM (Phantasy Star II/IV), EEPROM (NBA Jam), the Super Street
+# Fighter II cart mapper, and a banked/mega cartridge (Sonic 3D Blast).
+
+[[game]]
+key = "sonic1"
+prefix = "Sonic The Hedgehog (USA, Europe)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "sonic2"
+prefix = "Sonic The Hedgehog 2 (World)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "sonic3d"
+prefix = "Sonic 3D Blast (USA, Europe, Korea) (En)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "sor2"
+prefix = "Streets of Rage 2 (USA)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "gunstar"
+prefix = "Gunstar Heroes (Europe)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "psiv"
+prefix = "Phantasy Star IV (USA)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "psii"
+prefix = "Phantasy Star II (USA, Europe)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "aladdin"
+prefix = "Aladdin (USA)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "earthworm"
+prefix = "Earthworm Jim (USA)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "contrahc"
+prefix = "Contra - Hard Corps (USA, Korea) (En)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "thunderforce4"
+prefix = "Thunder Force IV (Europe)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "castlevania"
+prefix = "Castlevania - Bloodlines (USA)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "shinobi3"
+prefix = "Shinobi III - Return of the Ninja Master (USA)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "vectorman"
+prefix = "Vectorman (USA, Europe)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "ecco"
+prefix = "Ecco the Dolphin (USA, Europe, Korea) (En)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "comixzone"
+prefix = "Comix Zone (USA)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "mk2"
+prefix = "Mortal Kombat II (World)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "nbajam"
+prefix = "NBA Jam (USA, Europe)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "ssf2"
+prefix = "Super Street Fighter II (USA)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "roadrash2"
+prefix = "Road Rash II (USA, Europe)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "ristar"
+prefix = "Ristar (USA, Europe)"
+frames = 600
+start_press = [300]
+
+[[game]]
+key = "toystory"
+prefix = "Toy Story (USA)"
+frames = 600
+start_press = [300]
