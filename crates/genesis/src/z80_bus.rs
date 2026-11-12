@@ -36,6 +36,7 @@
 
 use crate::bus::{Bus, OPEN_BUS};
 use m68k::Bus as _;
+use serde::{Deserialize, Serialize};
 use z80::Z80Bus;
 
 /// Sound RAM: 8 KiB, at 0x0000-0x1FFF and mirrored at 0x2000-0x3FFF.
@@ -139,12 +140,15 @@ impl Region {
 /// that it outlives every [`Z80View`] - see the module docs for why that matters.
 ///
 /// `Debug` prints 8 KiB of sound RAM, so assert on `&bus.z80.ram[a..b]` slices.
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Z80Side {
     /// 8 KiB of sound RAM at 0x0000-0x1FFF, mirrored at 0x2000-0x3FFF.
     ///
     /// Zeroed, like [`Bus::ram`]: a real console starts with undefined contents
     /// and nothing depends on it yet.
+    ///
+    /// Saved as a sequence of its bytes, as [`crate::Bus::ram`] is.
+    #[serde(with = "crate::big_array")]
     pub ram: Box<[u8; ZRAM_SIZE]>,
     /// The bank shift register: 68k address bits 15-23, nine bits wide.
     ///

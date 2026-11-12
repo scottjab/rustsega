@@ -45,6 +45,7 @@
 //! [`crate::Genesis::drain_audio`] runs them through, and the mixer's own buffers
 //! are reserved once for the same reason: a frame of audio must not allocate.
 
+use serde::{Deserialize, Serialize};
 use sn76489::Sn76489;
 use ym2612::Ym2612;
 
@@ -86,6 +87,7 @@ const PSG_FRAME_CAPACITY: usize =
 /// register readback of its own - `ym2612::Ym2612` deliberately keeps what state
 /// it can show behind `#[cfg(test)]`, so the chip itself is the only thing left
 /// to look at.
+#[derive(Serialize, Deserialize)]
 pub struct Audio {
     /// The FM synthesizer, reached by both CPUs' four YM ports.
     pub ym: Ym2612,

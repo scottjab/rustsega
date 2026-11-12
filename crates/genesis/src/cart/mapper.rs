@@ -66,6 +66,7 @@
 //! there were.
 
 use super::header::parse_header;
+use serde::{Deserialize, Serialize};
 
 /// Bytes in one page of the image, and in one slot of the cartridge area: the
 /// 512 KiB that plutiedev "Going beyond 4MB" splits both of them into.
@@ -118,7 +119,7 @@ const REALTEC_REGISTERS_COUNT: usize = 3;
 
 /// What turns a cartridge address into an offset in the image: nothing, or the
 /// Sega mapper's seven bank registers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mapper {
     /// A cart small enough for the cartridge area, or one that says nothing
     /// about being bigger: the image answers in address order, which is what

@@ -9,14 +9,28 @@ publish.workspace = true
 # The bus in `bus.rs` implements `m68k::Bus`. Chip crates never depend on each
 # other, but `genesis` composing them is the point of the crate
 # (docs/ARCHITECTURE.md).
-m68k = { path = "../m68k" }
+#
+# The `serde` feature of each is named rather than left to defaults because
+# `state.rs` derives a save state out of these types: a build that turned a
+# chip's default features off must not be able to build a `Genesis` whose
+# `save_state` does not compile (M6-07, #127).
+m68k = { path = "../m68k", features = ["serde"] }
 # `bus.rs` answers the 68k's VDP ports from the chip itself (M3-09, #69).
-vdp = { path = "../vdp" }
+vdp = { path = "../vdp", features = ["serde"] }
 # `z80_bus.rs` implements `z80::Z80Bus` for the sound CPU's view of the system.
-z80 = { path = "../z80" }
+z80 = { path = "../z80", features = ["serde"] }
 # The two sound chips the bus clocks and writes (M5-13, #118).
-sn76489 = { path = "../sn76489" }
-ym2612 = { path = "../ym2612" }
+sn76489 = { path = "../sn76489", features = ["serde"] }
+ym2612 = { path = "../ym2612", features = ["serde"] }
+# The state of every device behind the bus, and of the machine, derives serde
+# for `state.rs` (#127). Not optional: unlike the chip crates this one is
+# allowed a dependency - `postcard` below is the ticket's own allowance - and a
+# `genesis` without serde has no save states to have them for.
+serde = { workspace = true }
+# The payload of a save state (#127). `alloc` is what a `Vec` payload needs;
+# `use-std` is on by default and is what makes `postcard::to_allocvec` and
+# `postcard::from_bytes` exist.
+postcard = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
 # Only tests: the core itself keeps no dependencies, per docs/ARCHITECTURE.md.

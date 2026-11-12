@@ -22,12 +22,16 @@
 //! number and the plutiedev "VDP register reference" pages by the port address
 //! of the register (`$83xx` is R3), which is how each is usually quoted.
 
+#[cfg(feature = "serde")]
+mod big_array;
 pub mod color;
 mod compose;
 #[cfg(feature = "debug-views")]
 pub mod debug;
 mod dma;
 mod fifo;
+#[cfg(feature = "serde")]
+mod frame_state;
 mod framebuffer;
 mod hv;
 mod latch;
@@ -40,6 +44,9 @@ mod sprites;
 mod status;
 mod timing;
 mod window;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 pub use color::{ColorLut, Intensity};
 pub use dma::DmaBus;
@@ -67,7 +74,19 @@ pub const LINES_V30: usize = 240;
 ///
 /// `Debug` is for the `genesis` bus, which owns a `Vdp` and derives its own
 /// (docs/ARCHITECTURE.md: "`genesis` ... Depends on all chip crates").
+///
+/// `Serialize`/`Deserialize` are for the save state of M6-07 (#127), behind the
+/// `serde` feature this crate enables by default. Two fields are stored as less
+/// than they are, because both are pure functions of the rest of the chip:
+/// [`Vdp::color_lut`] is the fixed CRAM-to-pixel table, so it is rebuilt on the
+/// way in, and [`Vdp::frame_buffer`] is the picture, so only its size is kept
+/// and the pixels are drawn again - see `frame_state`. Everything else - the
+/// three memories, the registers, the port state, the write FIFO, a DMA in
+/// flight, the latch of the line being drawn and the sprite list of the line
+/// after it - is in there, and `tests/state_roundtrip.rs` runs a restored chip
+/// beside the saved one to prove it.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Vdp {
     /// VRAM, 64 KiB, holding the pattern, name and sprite tables
     /// (genvdp.txt section 8).
@@ -84,6 +103,10 @@ pub struct Vdp {
     ///
     /// These are the colours as the game wrote them; [`color::color`] and
     /// [`ColorLut`] turn one into a pixel.
+    ///
+    /// Saved as a sequence: sixty-four words is past the thirty-two entries
+    /// `serde` derives, see `big_array`.
+    #[cfg_attr(feature = "serde", serde(with = "crate::big_array"))]
     pub cram: [u16; CRAM_WORDS],
     /// VSRAM: 40 words of vertical scroll values (genvdp.txt section 10).
     ///
@@ -92,6 +115,9 @@ pub struct Vdp {
     /// the data port masks a write to 11 bits rather than 10 (`ports`, and
     /// SpritesMind "Interlace mode (LSMx=3)": "VSRAM width is 11-bit but bit0
     /// is ignored in interlaced mode 2").
+    ///
+    /// Saved as a sequence, as [`Vdp::cram`] is.
+    #[cfg_attr(feature = "serde", serde(with = "crate::big_array"))]
     pub vsram: [u16; VSRAM_WORDS],
     /// The VDP's internal copy of the first four bytes of every entry of the
     /// sprite attribute table (`sprites::SpriteCache`, M4-23b #103).
@@ -298,14 +324,36 @@ pub struct Vdp {
     /// Boxed for the same reason [`Vdp::vram`] is: 3 x 512 `u32` is 6 KiB, and
     /// a `Vdp` value is meant to stay a few hundred bytes, which the
     /// `vdp_values_stay_off_the_stack` test keeps true.
+    ///
+    /// Left out of a save state and rebuilt by [`new_color_lut`]: the table is a
+    /// function of the CRAM encoding and of nothing else - `Vdp::new` builds it
+    /// and nothing in the chip writes it - so storing it would be 6 KiB of a
+    /// constant in every state file.
+    #[cfg_attr(feature = "serde", serde(skip, default = "new_color_lut"))]
     color_lut: Box<ColorLut>,
     /// The frame the renderer draws into. Read through [`Vdp::frame`].
+    ///
+    /// Saved as its size and none of its pixels, which is what
+    /// [`frame_state`] is for: 600 KiB of the picture the beam has already
+    /// painted is the largest thing in the chip, is a function of the state that
+    /// *is* saved, and is overwritten by the next frame anyway.
+    #[cfg_attr(feature = "serde", serde(with = "frame_state"))]
     frame_buffer: FrameBuffer,
     /// Which crystal the chip is clocked by: `true` for PAL, which can drive a
     /// 240-line display, `false` for NTSC (the `PAL` pin of the VDP,
     /// genvdp.txt section 18 "VDP Pinout"). `genesis` knows it from the console
     /// configuration.
     pal: bool,
+}
+
+/// The [`Vdp::color_lut`] of a chip being read back from a save state.
+///
+/// The `default` the derive uses for that skipped field: the table is the CRAM
+/// encoding, not machine state, so a restored chip builds the one `Vdp::new`
+/// builds (M6-07, #127).
+#[cfg(feature = "serde")]
+fn new_color_lut() -> Box<ColorLut> {
+    Box::new(ColorLut::new())
 }
 
 impl Vdp {

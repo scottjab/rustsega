@@ -310,7 +310,7 @@ impl Genesis {
     pub fn frame(&self) -> &FrameBuffer;
     pub fn drain_audio(&mut self, out: &mut Vec<i16>); // interleaved stereo at config.sample_rate
     pub fn set_pad(&mut self, port: usize, buttons: Buttons); // bitflags: UP DOWN LEFT RIGHT A B C START X Y Z MODE
-    pub fn save_state(&self) -> Result<Vec<u8>, StateError>;
+    pub fn save_state(&self) -> Vec<u8>;   // the container of docs/save-state-format.md
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), StateError>;
     pub fn sram(&self) -> Option<&[u8]>;
     pub fn load_sram(&mut self, data: &[u8]);
@@ -323,8 +323,13 @@ the rest of the raster as well, so that one call is one frame and takes exactly
 one of those flags with it; ending at VBlank start would make the first call 224
 lines and every later one 262. See `Scheduler::run_frame`.
 
-`save_state` returns a `Result` because saying "no save-state format in this
-build" is not something a `Vec<u8>` can say (M6-07 #127 fills it in).
+`save_state` cannot fail and so returns the bytes: the machine is made of buffers
+and integers, and encoding one is total. `load_state` is the half that can be
+handed a stranger's bytes, and `StateError` is what it answers them with -
+wrong magic, wrong format version, wrong cartridge, or a payload that does not
+decode. The format itself, including what a state does not carry (the ROM, the
+frame buffer) and what that means after a load, is
+[`docs/save-state-format.md`](save-state-format.md) (M6-07, #127).
 
 ### web
 

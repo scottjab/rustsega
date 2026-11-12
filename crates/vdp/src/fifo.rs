@@ -28,6 +28,8 @@
 
 use crate::Vdp;
 use crate::ports::{DataTarget, data_target};
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// Entries the write FIFO holds.
 ///
@@ -43,6 +45,7 @@ pub(crate) const FIFO_DEPTH: usize = 4;
 /// last word is away, so both registers have moved on long before the first
 /// word lands.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Entry {
     /// The code register as the write left it: which memory the word is for.
     pub(crate) code: u8,
@@ -83,6 +86,7 @@ impl Entry {
 /// [`Vdp::fifo_clock`] tells this how many of them a run of master clocks
 /// covered.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Fifo {
     /// The queue, `queue[head]` being the entry next in line. `len` is kept
     /// alongside rather than read from the slots, so nothing looks at the

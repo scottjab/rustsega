@@ -15,6 +15,7 @@
 //! which is the one thing no single one of them can do for itself.
 
 pub mod audio;
+mod big_array;
 pub mod bus;
 pub mod cart;
 pub mod config;
@@ -251,22 +252,43 @@ impl Genesis {
         self.bus.load_sram(data);
     }
 
-    /// The console as a save state.
+    /// The console as a save state: the versioned container of
+    /// `docs/save-state-format.md`, ready to keep or to hand to
+    /// [`Genesis::load_state`].
     ///
-    /// A stub that reports [`StateError::Unsupported`].
-    /// TODO(M6-07 #127): the versioned state format, `serde` on the chip state,
-    /// and this function.
-    pub fn save_state(&self) -> Result<Vec<u8>, StateError> {
-        Err(StateError::Unsupported)
+    /// The machine is everything the running game is - the 68000, the sound CPU,
+    /// the bus with the VDP, the I/O chip, both working RAMs and the cartridge's
+    /// save and bank state, and the scheduler's clock position - and it is in
+    /// there even in the middle of a line, a FIFO or a DMA. Two things are not:
+    ///
+    /// * the **ROM**, which the header names by checksum instead of duplicating.
+    ///   A state is therefore only ever loadable on the cartridge it was written
+    ///   for, and [`Genesis::load_state`] answers anything else with
+    ///   [`StateError::WrongRom`] rather than loading a save into the wrong game.
+    /// * the **picture**, which the next [`Genesis::run_frame`] draws again; see
+    ///   `vdp::frame_state` for why a save state does not carry 600 KiB of it.
+    ///
+    /// The audio mixer is the host's output path rather than the machine, so a
+    /// state neither saves nor restores it: a state written at 44.1 kHz does not
+    /// change the settings of a machine now running at 48.
+    pub fn save_state(&self) -> Vec<u8> {
+        state::encode(self)
     }
 
-    /// Put the console back from a save state.
+    /// Put the console back from a save state written by
+    /// [`Genesis::save_state`] on this cartridge.
     ///
-    /// A stub that reports [`StateError::Unsupported`] whatever `data` is,
-    /// leaving `self` alone.
-    /// TODO(M6-07 #127): see [`Genesis::save_state`].
-    pub fn load_state(&mut self, _data: &[u8]) -> Result<(), StateError> {
-        Err(StateError::Unsupported)
+    /// The ROM has to be loaded already - a state carries no ROM bytes, only the
+    /// checksum it was written against - and the version and the payload have to
+    /// be this build's, or the state is refused with a [`StateError`] and
+    /// `self` is left exactly as it was: every check is answered before any of
+    /// the machine is replaced.
+    ///
+    /// The cartridge's battery-backed save is part of the state, because the
+    /// game's idea of where it is is machine state like any other; a front end
+    /// that also keeps [`Genesis::sram`] separately will find the two agree.
+    pub fn load_state(&mut self, data: &[u8]) -> Result<(), StateError> {
+        state::decode(data, self)
     }
 
     /// The 68000, as the machine left it after the last [`Genesis::run_frame`].

@@ -53,6 +53,9 @@
 //! written on; `latch_point` below names the clock so there is one place to
 //! change.
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 use crate::planes::Plane;
 use crate::{VSRAM_WORDS, Vdp, regs};
 
@@ -66,6 +69,7 @@ use crate::{VSRAM_WORDS, Vdp, regs};
 /// (docs/ARCHITECTURE.md: "Core crates must not allocate per frame in hot
 /// paths. Allocate buffers once.").
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct LineState {
     /// The beam line this was latched for: [`Vdp::line`] at the time, and how
     /// [`Vdp::begin_line`] knows a `render_line` call is drawing this line
@@ -75,6 +79,10 @@ pub(crate) struct LineState {
     /// getter of the renderer answers from - see [`Vdp::line_reg`].
     regs: [u8; regs::NUM_REGISTERS],
     /// VSRAM as it stood at the latch point - see [`Vdp::latched_vsram`].
+    ///
+    /// Saved as a sequence: forty words is past the thirty-two entries `serde`
+    /// derives, see [`crate::big_array`].
+    #[cfg_attr(feature = "serde", serde(with = "crate::big_array"))]
     vsram: [u16; VSRAM_WORDS],
     /// The line's two horizontal scroll values, read out of the table at the
     /// latch point: `hscroll[0]` for plane A and `hscroll[1]` for plane B, the
