@@ -147,22 +147,37 @@ const fn two(first: Tap, second: Tap) -> Taps {
 /// its column is empty in every row and its only modulation is the feedback.
 const MODULATORS: [[Taps; SLOTS]; ALGORITHMS] = [
     //           S1                                    S3                                        S2                              S4
-    /* 0 */ [NONE, one(before(SLOT_S2)), one(now(SLOT_S1)), one(now(SLOT_S3))],
-    /* 1 */ [
+    /* 0 */
+    [
+        NONE,
+        one(before(SLOT_S2)),
+        one(now(SLOT_S1)),
+        one(now(SLOT_S3)),
+    ],
+    /* 1 */
+    [
         NONE,
         two(before(SLOT_S1), before(SLOT_S2)),
         NONE,
         one(now(SLOT_S3)),
     ],
-    /* 2 */ [
+    /* 2 */
+    [
         NONE,
         one(before(SLOT_S2)),
         NONE,
         two(before(SLOT_S1), now(SLOT_S3)),
     ],
-    /* 3 */ [NONE, NONE, one(now(SLOT_S1)), two(before(SLOT_S2), now(SLOT_S3))],
+    /* 3 */
+    [
+        NONE,
+        NONE,
+        one(now(SLOT_S1)),
+        two(before(SLOT_S2), now(SLOT_S3)),
+    ],
     /* 4 */ [NONE, NONE, one(now(SLOT_S1)), one(now(SLOT_S3))],
-    /* 5 */ [
+    /* 5 */
+    [
         NONE,
         one(before(SLOT_S1)),
         one(now(SLOT_S1)),
@@ -270,7 +285,11 @@ impl FmChannel {
         let taps = MODULATORS[usize::from(self.algorithm)][slot];
         let mut modulation = 0;
         for tap in taps.into_iter().flatten() {
-            let value = if tap.before { self.was[tap.slot] } else { self.out[tap.slot] };
+            let value = if tap.before {
+                self.was[tap.slot]
+            } else {
+                self.out[tap.slot]
+            };
             modulation += i32::from(value) >> MODULATION_SHIFT;
         }
         if slot == SLOT_S1 {
@@ -287,7 +306,8 @@ impl FmChannel {
         if self.feedback == 0 {
             return 0;
         }
-        (i32::from(self.feed[0]) + i32::from(self.feed[1])) >> (FEEDBACK_SHIFT - u32::from(self.feedback))
+        (i32::from(self.feed[0]) + i32::from(self.feed[1]))
+            >> (FEEDBACK_SHIFT - u32::from(self.feedback))
     }
 
     /// The sum of the carriers of this channel's algorithm, clamped to the
@@ -346,19 +366,20 @@ mod tests {
         chip.write(DATA_1, ATTACK_NOW);
     }
 
-    /// Channel 1 at block 0, F-Num 0x210, all four operators at the `levels`
+    /// Channel 1 at block 4, F-Num 0x210, all four operators at the `levels`
     /// given in [`SLOT_S1`] order, and a key-on of all four: the fixed patch of
     /// every test here, less the `&B0` write [`patch`] adds.
     ///
-    /// The increment of every operator is then `(0x210 << 0) >> 1` = 528, so the
-    /// angle moves just over half a step a sample and 1024 samples are two and a
-    /// half cycles of it - enough to see and to hash.
+    /// The increment of every operator is then `(0x210 << 4) >> 1` = 4224, a
+    /// cycle every 248 samples: 1024 samples are a little over four cycles of it,
+    /// so a run both crosses the peak of the wave and is short enough to hash
+    /// (`&30`, `&A0`, `&A4`).
     fn patch_operators(chip: &mut Ym2612, levels: [u8; SLOTS]) {
-        for slot in 0..SLOTS {
-            operator_patch(chip, slot, levels[slot]);
+        for (slot, level) in levels.iter().enumerate() {
+            operator_patch(chip, slot, *level);
         }
         chip.write(ADDR_1, 0xA4);
-        chip.write(DATA_1, 0);
+        chip.write(DATA_1, 0x22);
         chip.write(ADDR_1, 0xA0);
         chip.write(DATA_1, 0x10);
         chip.write(ADDR_1, 0x28);
@@ -485,10 +506,14 @@ mod tests {
         let phase = [0x0_0400; SLOTS];
         let att = [0; SLOTS];
 
+        // Only `feed` is dirtied, because that is all FB 0 claims: `was` is the
+        // previous-step delay of the connection table, which algorithm 0 reads
+        // from S2 to S3 whatever the feedback says, and dirtying it here would be
+        // a test of the tap of `alg0_modulates_s3_with_the_previous_s2` rather
+        // than of `feedback_modulation`.
         let mut empty = FmChannel::new();
         let mut dirty = FmChannel::new();
         dirty.feed = [4096, -3000];
-        dirty.was = [5000, -5000, 4000, -4000];
 
         let mut quiet = Vec::new();
         let mut noisy = Vec::new();
@@ -514,6 +539,43 @@ mod tests {
             samples(&mut written, 64),
             samples(&mut untouched, 64),
             "the default `&B0` is algorithm 0 with no feedback"
+        );
+    }
+
+    /// The other side of that: the previous-step outputs of the connection table
+    /// are a real delay line, and they are read even with FB 0. An algorithm 0
+    /// channel whose S2 comes into the first step holding garbage is therefore
+    /// wrong for the first sample only - S3 taps it, S4 taps S3, and by the next
+    /// step every slot has produced a value of its own (`FmChannel::modulation`,
+    /// and the module docs for which taps are a step behind).
+    #[test]
+    fn previous_step_outputs_are_read_for_one_step() {
+        let phase = [0x0_0400; SLOTS];
+        let att = [0; SLOTS];
+
+        let mut empty = FmChannel::new();
+        let mut dirty = FmChannel::new();
+        dirty.feed = [4096, -3000];
+        dirty.was = [5000, -5000, 4000, -4000];
+
+        let mut quiet = Vec::new();
+        let mut noisy = Vec::new();
+        for step in 0u32..64 {
+            let phase = phase.map(|p| p + step * 600);
+            empty.step(phase, att);
+            dirty.step(phase, att);
+            quiet.push(empty.output());
+            noisy.push(dirty.output());
+        }
+
+        assert_ne!(
+            quiet[0], noisy[0],
+            "the first step has to feel the stale S2"
+        );
+        assert_eq!(
+            &quiet[1..],
+            &noisy[1..],
+            "and one step is all of it: the delay line is refilled from here on"
         );
     }
 
@@ -610,14 +672,14 @@ mod tests {
     #[test]
     fn golden_alg_hash() {
         const GOLDEN: [u64; ALGORITHMS] = [
-            0x0000_0000_0000_0000,
-            0x0000_0000_0000_0000,
-            0x0000_0000_0000_0000,
-            0x0000_0000_0000_0000,
-            0x0000_0000_0000_0000,
-            0x0000_0000_0000_0000,
-            0x0000_0000_0000_0000,
-            0x0000_0000_0000_0000,
+            0x6239_f805_2323_0c7e,
+            0xcf18_2442_1539_79ac,
+            0x5724_efc7_b40f_d4d2,
+            0xadfd_e7b8_660b_a181,
+            0xcc89_7651_7443_a364,
+            0xb567_89a3_8bc6_6cea,
+            0xe744_3358_b2e3_8089,
+            0x38f3_d43a_dcf5_eb6f,
         ];
 
         for (algorithm, expected) in GOLDEN.iter().enumerate() {
@@ -626,7 +688,6 @@ mod tests {
             let wave = samples(&mut chip, 1024);
             let actual = hash(&wave);
             assert_ne!(actual, 0, "algorithm {algorithm} is silent");
-            eprintln!("ALG {algorithm:#04.1x} {}", format!("{actual:#018x}"));
             assert_eq!(actual, *expected, "algorithm {algorithm}");
         }
     }

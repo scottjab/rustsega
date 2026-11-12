@@ -181,15 +181,28 @@ impl Ym2612 {
     /// right)` sample.
     ///
     /// Both are 0 for now: the FM sum goes left and the DAC of M5-11 (#116)
-    /// goes right, and turning the 24 envelopes into a sample is the slot output
-    /// of the next ticket. What the step does today is run the two timers,
-    /// advance the 24 phase counters, step the envelopes - once every three
-    /// samples - and let BUSY run down.
+    /// goes right, and the output stage of M5-07b (#112) is what turns the six
+    /// channel sums into a sample. What the step does today is run the two
+    /// timers, advance the 24 phase counters, step the envelopes - once every
+    /// three samples - mix the four operators of each channel into the algorithm
+    /// `&B0` names, and let BUSY run down.
+    ///
+    /// The order is the chip's own: an operator is read at the phase the phase
+    /// generator has just arrived at and at the attenuation the envelope
+    /// generator has just arrived at, so a `&B0`, `&40` or `&A0` write is heard
+    /// from the very next sample (`crate::channel`).
     pub fn clock(&mut self) -> (i16, i16) {
         let config = self.regs.timer_config();
         self.timers.tick(&config);
         self.phases.tick();
         self.envelopes.tick(&self.phases);
+
+        for channel in 0..CHANNELS {
+            let phase = std::array::from_fn(|slot| self.phases.phase(channel, slot));
+            let att = std::array::from_fn(|slot| self.envelopes.envelope(channel, slot).output());
+            self.channels[channel].step(phase, att);
+        }
+
         self.busy = self.busy.saturating_sub(INTERNAL_CYCLES_PER_SAMPLE);
         (0, 0)
     }
