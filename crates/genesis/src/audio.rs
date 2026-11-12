@@ -422,13 +422,12 @@ impl Audio {
 /// sample past the last one held, which is 0.9 of an output sample), whose
 /// missing weights are the smallest in the window.
 struct Stream {
-    /// One output sample of master clocks - the stream's `period` (`YM_SAMPLE_MCLK`
-    /// or `PSG_TICK_MCLK`) times the host rate - in the units [`Mixer`] counts
-    /// time in. A whole number because the host rate is a whole number of samples
-    /// per second and the master clock is counted in whole ticks: this is the
-    /// integer rate bookkeeping that keeps `output_count_exact_over_one_second`
-    /// exact instead of nearly.
-    step: u64,
+    /// Master clocks between two input samples: [`YM_SAMPLE_MCLK`] for the FM,
+    /// [`PSG_TICK_MCLK`] for the PSG.
+    period: u64,
+    /// The host's rate, which with `period` says where the output samples are:
+    /// one every `period * rate` of the units [`Stream::tap_row`] counts time in.
+    rate: u32,
     /// Kernel length in input samples.
     taps: usize,
     /// Gain applied to every input sample as it arrives, so that by the time the
@@ -461,7 +460,8 @@ impl Stream {
         frame: usize,
     ) -> Self {
         Self {
-            step: period * u64::from(rate),
+            period,
+            rate,
             taps,
             gain,
             channels,
@@ -528,10 +528,12 @@ impl Stream {
         self.samples.len() / self.channels
     }
 
-    /// The master-clock position of the first input sample that is *not* held, in
-    /// the units [`Mixer`] times by: this is how far the mixer is allowed to mix.
-    fn end_num(&self) -> u64 {
-        (self.first as u64 + self.count() as u64) * self.step
+    /// The master clock of the first input sample that is *not* held: this is how
+    /// far the mixer is allowed to mix. Whole master clocks, so this and
+    /// [`Mixer::out_clock`] last as long as the scheduler's own clock does
+    /// (docs/ARCHITECTURE.md, "Clocks and timing").
+    fn end_clock(&self) -> u64 {
+        (self.first as u64 + self.count() as u64) * self.period
     }
 
     /// Make the stream ready for `count` samples whose first is absolute index
@@ -547,7 +549,10 @@ impl Stream {
     fn align(&mut self, at: u64, count: usize) -> usize {
         let next = self.first as u64 + self.count() as u64;
         if at >= next {
-            let gap = usize::try_from(at - next).unwrap_or(usize::MAX) * self.channels;
+            let gap = (at - next)
+                .checked_mul(self.channels as u64)
+                .and_then(|n| usize::try_from(n).ok())
+                .unwrap_or(usize::MAX);
             self.samples.resize(self.samples.len() + gap, 0.0);
             0
         } else {
@@ -578,9 +583,15 @@ impl Stream {
     /// Split out of [`Stream::sum`] because the FM's two channels share one row:
     /// the position is worked out once per output sample per stream rather than
     /// once per channel.
-    fn tap_row(&self, pos: u64) -> (&[f32], i64) {
-        let index = pos / self.step;
-        let phase = (pos % self.step * PHASES as u64 / self.step) as usize;
+    fn tap_row(&self, clock: u64, frac: u32) -> (&[f32], i64) {
+        let step = self.period * u64::from(self.rate);
+        let index = clock / self.period;
+        // Where the output is inside its input sample: the whole master clocks
+        // since that sample plus the fraction of one the mixer is carrying, over
+        // the clocks one output sample is worth. Under `step * PHASES`, which is
+        // 2.6 billion at the PSG's worst, so this is exact without a wider type.
+        let inside = clock % self.period * u64::from(self.rate) + u64::from(frac);
+        let phase = (inside * PHASES as u64 / step) as usize;
         (
             &self.kernel[phase * self.taps..phase * self.taps + self.taps],
             index as i64 - (self.taps / 2) as i64,
@@ -683,12 +694,14 @@ struct FilterState {
 /// ## Time, and why it is counted in master clocks
 ///
 /// Both streams and the output are positions on the same master clock, and the
-/// mixer keeps time as one number: `out_pos` is the master clock of the
-/// next output sample, in units of `1 / sample_rate` so that it stays whole. The
-/// output rate is therefore exactly `sample_rate` of the host's clock by
-/// construction rather than by averaging, and a frame produces however many
-/// samples the master clock it ran says it produces - which is not the same
-/// number every frame, and is not supposed to be.
+/// mixer keeps time as two numbers: the whole master clocks of the next output
+/// sample and how far into the last one it sits, which together say
+/// `n * master_hz / sample_rate` without ever multiplying a master clock by the
+/// rate and overflowing sooner than the scheduler would. The output rate is
+/// therefore exactly `sample_rate` of the host's clock by construction rather
+/// than by averaging, and a frame produces however many samples the master clock
+/// it ran says it produces - which is not the same number every frame, and is not
+/// supposed to be.
 ///
 /// ## Allocation
 ///
@@ -696,11 +709,23 @@ struct FilterState {
 /// then only `extend`ed and `drain`ed; the kernels are built once. The output
 /// `Vec` belongs to the caller and grows by whatever `Vec` growth means.
 pub struct Mixer {
-    /// The machine's master clock, Hz: the console's `Region::master_clock_hz`.
-    master_hz: u64,
-    /// The master clock of the next output sample to produce, in units of
-    /// `1 / sample_rate`, so that it is a whole number.
-    out_pos: u64,
+    /// The host's rate, which the two steps below divide the master clock by.
+    rate: u32,
+    /// The whole master clocks of the next output sample to produce. Together
+    /// with [`Mixer::out_frac`] this is the same exact position as `n *
+    /// master_hz / sample_rate`, held in two pieces so that neither of them is
+    /// ever `master clocks * sample_rate` and wraps in a hundred thousandths of
+    /// the time the scheduler's own clock does.
+    out_clock: u64,
+    /// How far into [`Mixer::out_clock`] the next output sample is, in units of
+    /// `1 / sample_rate`: always less than the rate, and the reason the output
+    /// rate is exact rather than nearly.
+    out_frac: u32,
+    /// What an output sample adds to [`Mixer::out_clock`]: `master_hz / rate`.
+    clock_step: u64,
+    /// What it adds to [`Mixer::out_frac`]: `master_hz % rate`, carried into
+    /// `out_clock` whenever `out_frac` reaches the rate.
+    frac_step: u32,
     /// The FM's two channels.
     ym: Stream,
     /// The PSG's one.
@@ -725,9 +750,13 @@ impl Mixer {
     /// that has been decided.
     pub fn new(master_hz: u64, config: &Config) -> Self {
         let rate = config.sample_rate.max(1);
+        let rate64 = u64::from(rate);
         Self {
-            master_hz,
-            out_pos: 0,
+            rate,
+            out_clock: 0,
+            out_frac: 0,
+            clock_step: master_hz / rate64,
+            frac_step: (master_hz % rate64) as u32,
             ym: Stream::new(
                 YM_SAMPLE_MCLK,
                 YM_TAPS,
@@ -769,20 +798,30 @@ impl Mixer {
         self.ym.push_stereo(frame.ym, frame.ym_first);
         self.psg.push_mono(frame.psg, frame.psg_first);
 
-        let end = self.ym.end_num().min(self.psg.end_num());
-        while self.out_pos < end {
-            let (ym_row, ym_oldest) = self.ym.tap_row(self.out_pos);
-            let (psg_row, psg_oldest) = self.psg.tap_row(self.out_pos);
+        let end = self.ym.end_clock().min(self.psg.end_clock());
+        while self.out_clock < end {
+            let (ym_row, ym_oldest) = self.ym.tap_row(self.out_clock, self.out_frac);
+            let (psg_row, psg_oldest) = self.psg.tap_row(self.out_clock, self.out_frac);
             let psg = self.psg.sum(psg_row, psg_oldest, 0);
             let left = self.ym.sum(ym_row, ym_oldest, 0) + psg;
             let right = self.ym.sum(ym_row, ym_oldest, 1) + psg;
             out.push(self.shape(0, left));
             out.push(self.shape(1, right));
-            self.out_pos += self.master_hz;
+
+            // The next output sample is `master_hz / rate` further on, exactly:
+            // whole master clocks plus a fraction of one, with the fraction
+            // carrying. Rounding that step, or the number of samples a frame is
+            // worth, is what this file exists to avoid.
+            self.out_clock += self.clock_step;
+            self.out_frac += self.frac_step;
+            if self.out_frac >= self.rate {
+                self.out_frac -= self.rate;
+                self.out_clock += 1;
+            }
         }
 
-        self.ym.trim(self.out_pos / self.ym.step);
-        self.psg.trim(self.out_pos / self.psg.step);
+        self.ym.trim(self.out_clock / self.ym.period);
+        self.psg.trim(self.out_clock / self.psg.period);
     }
 
     /// One mixed sample of one channel through the console's two filters and into
