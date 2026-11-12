@@ -80,6 +80,13 @@ pub(crate) const REG_DECAY_2: u8 = 0x70;
 /// manual `&80`).
 pub(crate) const REG_LEVEL_RELEASE: u8 = 0x80;
 
+/// Register `&90`, the first of the SSG-EG group: bits 3-0 of one operator's
+/// SSG-EG mode - bit 3 the enable, bit 2 the attack inversion, bit 1 the
+/// alternate and bit 0 the hold - and one register per operator like `&40` to
+/// `&80` (YM2608 application manual "3. Register descriptions", `&90`, and see
+/// `crate::envelope`).
+pub(crate) const REG_SSG_EG: u8 = 0x90;
+
 /// Register `&A0`, the first of the F-Num low group: `&A0` + channel, bits 7-0
 /// of the 11-bit F-Num. This is also the write that applies a channel's pending
 /// `&A4` (YM2608 application manual `&A0`).
