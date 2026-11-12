@@ -342,7 +342,11 @@ impl Mapper {
 /// answerable, which is what every other reading of the register does.
 fn realtec_slice(regs: &[u8; REALTEC_REGISTERS_COUNT]) -> (usize, usize) {
     let size = (usize::from(regs[1] & 7)) << 17;
-    let size = if size == 0 || size > SLOT_SIZE { SLOT_SIZE } else { size };
+    let size = if size == 0 || size > SLOT_SIZE {
+        SLOT_SIZE
+    } else {
+        size
+    };
     let start = ((usize::from(regs[2]) & 7) << 17) | ((usize::from(regs[0]) & 6) << 19);
     (start, size)
 }
@@ -366,7 +370,7 @@ pub fn realtec_register(addr: u32) -> Option<usize> {
         return None;
     }
     let block = (addr & (REALTEC_REGISTER_MIRROR - 1)) / (REALTEC_REGISTER_MIRROR / 4);
-    (block < REALTEC_REGISTERS_COUNT as u32).then(|| block as usize)
+    (block < REALTEC_REGISTERS_COUNT as u32).then_some(block as usize)
 }
 
 /// Which bank register's slot `addr` names, or `None` when `addr` is not one of
@@ -665,7 +669,11 @@ mod tests {
         // `detect_enables_on_size_or_on_the_system_type`.
         let mut plain = realtec_rom();
         plain[REALTEC_SIGNATURE..REALTEC_SIGNATURE + 4].copy_from_slice(b"sega");
-        assert_eq!(Mapper::detect(&plain), Mapper::None, "lower-case is not a signature");
+        assert_eq!(
+            Mapper::detect(&plain),
+            Mapper::None,
+            "lower-case is not a signature"
+        );
 
         // Signature present, wrong size: the address is just data.
         let mut double = vec![0u8; 2 * SLOT_SIZE];
@@ -701,7 +709,12 @@ mod tests {
     #[test]
     fn the_realtec_registers_are_the_first_three_blocks_of_every_32k() {
         for addr in [
-            0x40_0000u32, 0x40_0002, 0x40_1F_FE, 0x40_8000, 0x7F_8000, 0x7F_9FFC,
+            0x40_0000u32,
+            0x40_0002,
+            0x40_1F_FE,
+            0x40_8000,
+            0x7F_8000,
+            0x7F_9FFC,
         ] {
             assert_eq!(realtec_register(addr), Some(0), "{addr:#010x}");
         }
@@ -713,10 +726,18 @@ mod tests {
         }
 
         for addr in [0x40_2001u32, 0x40_4003, 0x40_6000, 0x40_7FFF] {
-            assert_eq!(realtec_register(addr), None, "{addr:#010x} is not a register");
+            assert_eq!(
+                realtec_register(addr),
+                None,
+                "{addr:#010x} is not a register"
+            );
         }
         for addr in [0x3F_FFFE, 0x80_0000, 0xA1_30F3, 0] {
-            assert_eq!(realtec_register(addr), None, "{addr:#010x} is not Realtec's");
+            assert_eq!(
+                realtec_register(addr),
+                None,
+                "{addr:#010x} is not Realtec's"
+            );
         }
     }
 
@@ -733,8 +754,16 @@ mod tests {
         mapper.set_realtec_register(1, 1); // 1 * 128 KiB
         mapper.set_realtec_register(2, 2); // 2 * 128 KiB == 256 KiB
         assert_eq!(realtec_byte(&rom, &mapper, 0), 32);
-        assert_eq!(realtec_byte(&rom, &mapper, 0x1_FFFF), 47, "and nothing in between");
-        assert_eq!(realtec_byte(&rom, &mapper, 0x2_0000), 32, "mirrored a second time");
+        assert_eq!(
+            realtec_byte(&rom, &mapper, 0x1_FFFF),
+            47,
+            "and nothing in between"
+        );
+        assert_eq!(
+            realtec_byte(&rom, &mapper, 0x2_0000),
+            32,
+            "mirrored a second time"
+        );
     }
 
     /// The slice wraps around the end of the image, and a `start` the cart cannot
@@ -750,7 +779,11 @@ mod tests {
         mapper.set_realtec_register(0, 6);
         mapper.set_realtec_register(2, 7);
         assert_eq!(realtec_byte(&rom, &mapper, 0), 48, "0x60000 is block 48");
-        assert_eq!(realtec_byte(&rom, &mapper, 0x2_0000), 0, "and it wraps to block 0");
+        assert_eq!(
+            realtec_byte(&rom, &mapper, 0x2_0000),
+            0,
+            "and it wraps to block 0"
+        );
     }
 
     /// A nonsense register value is a translation, never a panic and never open

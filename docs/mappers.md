@@ -39,9 +39,12 @@ The evidence used, in order of how much it is worth:
 2. **Does mirroring the image change the outcome?** Every sub-4 MiB candidate was
    padded to 4 MiB by repeating the image and re-run. If a cart were reading
    addresses the dump does not have, filling those addresses would say so.
-   **It changed nothing** — all twelve candidates produced the same one- and
-   two-colour frames padded and unpadded. So these carts are not failing because
-   the emulator cannot reach their data.
+   **It changed nothing.** Eight candidates were run raw and mirrored at the same
+   frame count (300), because a comparison at different frame counts proves
+   nothing: King of Fighters 98' 2 vs 2, Lion King III 1 vs 1, Super Mario Bros.
+   2 vs 2, Rockman X3 2 vs 2, Sonic Jam 6 1 vs 1, Onslaught 1 vs 1, Turrican 1 vs
+   1, Exodus 2 vs 2. Identical in every case, so these carts are not failing
+   because the emulator cannot reach their data.
 3. **What is the current failure, according to the sweep?** `Panic` rows name
    themselves, and the names are the strongest signal available:
    unimplemented m68k opcodes and the `frame_done` watchdog, both already filed.
@@ -112,12 +115,26 @@ worth recording because they are the surprising parts:
 - The slice is `size` bytes at `start`, and `size` is mirrored repeatedly to fill
   the window, wrapping around the end of the image. It is not a single bank swap.
 
-The honest result of implementing this: **no sweep number moves.** Three of the
-four already reach a picture without the mapper, and `Tom Clown` panics on
-`not implemented: m68k opcode 0AC6`, which is #355 and unaffected by a mapper.
-It is implemented because it is the one pirate board here whose hardware is
-actually identified, and because reading the image without its paging is wrong in
-a way a future audio or save-state test would have to undo.
+Measured on all four carts at the sweep's own 600-frame checkpoint, before this
+change and after it:
+
+| Cart | `main` | with the mapper |
+|---|---|---|
+| Earth Defense | 24 colours | 24 colours |
+| Funny World & Balloon Boy | 26 colours | **31** |
+| Whac-a-Critter | 7 colours | **22** |
+| Tom Clown | **Panic** (`not implemented: m68k opcode 0AC6`) | **30 colours** |
+
+So the mapper fixes one cart outright: `Tom Clown` goes `Panic` → drawing, because
+with the image paged correctly the cart stops executing the bytes that held the
+unimplemented opcode. The two colour-count rises are the paging delivering the
+bytes the carts were asking for; `Earth Defense` holding flat at 24 is the control
+that says this is not just noise painting over a blank screen.
+
+That is the whole yield: **one cart out of 2775**, plus more-correct behaviour on
+three others. The premise that a large pirate-mapper population was waiting behind
+this work did not survive counting, and saying so plainly is the ticket's real
+deliverable.
 
 ### 2. The 2 MB and 4 MB Taiwan/China group — no mapper evidence
 
