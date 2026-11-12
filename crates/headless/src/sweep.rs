@@ -633,8 +633,30 @@ pub fn write_csv(path: &Path, rows: &[RomResult]) -> Result<()> {
     Ok(())
 }
 
-/// One CSV field, quoted if it has to be (RFC 4180).
+/// A header field as text a report may hold.
+///
+/// The title of an unlicensed or badly dumped cartridge is frequently not a title
+/// but the raw bytes that happen to sit at 0x150, and
+/// [`genesis::cart::parse_header`] keeps a field as it is given. A CSV and a
+/// markdown table may not contain control characters, and a committed report must
+/// not contain a run of cartridge bytes, so anything that is not printable ASCII
+/// becomes `.`: the row then says "this cartridge had nothing readable here",
+/// which is true, instead of shipping the bytes (M6-05, #124).
+fn sanitize(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '.'
+            }
+        })
+        .collect()
+}
+
+/// One CSV field, sanitized and quoted if it has to be (RFC 4180).
 fn csv_field(text: &str) -> String {
+    let text = sanitize(text);
     if text.contains(['"', ',', '\n', '\r']) {
         format!("\"{}\"", text.replace('"', "\"\""))
     } else {
@@ -695,12 +717,9 @@ pub fn markdown(rows: &[RomResult], frames: u32, timeout_secs: u64) -> String {
     out
 }
 
-/// One markdown table cell: no pipe, no newline, whatever the ROM said.
+/// One markdown table cell: sanitized, no pipe, no newline, whatever the ROM said.
 fn markdown_cell(text: &str) -> String {
-    text.replace('|', "\\|")
-        .replace('\n', " ")
-        .trim()
-        .to_string()
+    sanitize(text).replace('|', "\\|").trim().to_string()
 }
 
 #[cfg(test)]
@@ -807,6 +826,15 @@ mod tests {
         assert_eq!(parse_report(stdout), (Some(0x0001020304050607), Some(42)));
         assert_eq!(parse_report(""), (None, None));
         assert_eq!(parse_report("nonsense\n"), (None, None));
+    }
+
+    #[test]
+    fn sanitize_turns_a_header_of_garbage_into_readable_text() {
+        assert_eq!(sanitize("Sonic"), "Sonic");
+        // What an unlicensed cart's 0x150 field actually looked like in the sweep.
+        assert_eq!(sanitize("a\u{8}b\u{0}c\n"), "a.b.c.");
+        assert_eq!(csv_field("a\u{8}b"), "a.b");
+        assert_eq!(markdown_cell("a|b\u{1}c"), "a\\|b.c");
     }
 
     #[test]
