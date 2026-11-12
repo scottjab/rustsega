@@ -13,6 +13,10 @@
 //! and the Z80's undocumented behaviour is part of what the conformance suite
 //! checks, so they are first-class bits here, not padding.
 
+// Part of the saved CPU state of M6-07a (#126): `IntMode` is a field of `Z80`.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Sign: set when the result is negative (bit 7 of the result).
 pub const FLAG_S: u8 = 0x80;
 /// Zero: set when the result is zero.
@@ -88,6 +92,7 @@ pub const SZXY_PARITY: [u8; 256] = {
 /// things on interrupt acceptance, and a mode that cannot be named cannot be
 /// silently misspelled by a later instruction ticket.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum IntMode {
     /// Vectored interrupt: the device puts a restart instruction on the bus.
     Mode0,

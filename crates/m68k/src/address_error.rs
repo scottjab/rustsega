@@ -97,6 +97,11 @@ use crate::cpu::BUS_CYCLE_CLOCKS;
 use crate::cpu::M68k;
 use crate::sr::{SR_S, SR_T};
 
+// A pending fault is part of [`M68k`]'s state, so it travels with the save state
+// of M6-07a (#126); see the note on [`crate::cpu::M68k`] for the feature gate.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Address error, the group 0 exception.
 ///
 /// `$00000C` under the suite's numbering — see the module docs for why this is
@@ -153,6 +158,7 @@ const ADDRESS_ERROR_EXTRA_CLOCKS: u64 =
 /// The kind of access that faulted, which decides the status word's low five
 /// bits and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) enum AccessKind {
     /// A data read: a `read_w` / `read_l` from an instruction handler.
     DataRead,
@@ -181,6 +187,7 @@ impl AccessKind {
 /// instruction has moved `pc` on, and the access address is not remembered
 /// anywhere else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct PendingFault {
     /// The address as the instruction asked for it — **not** masked with
     /// [`ADDR_MASK`], which the frame preserves (see the module docs).

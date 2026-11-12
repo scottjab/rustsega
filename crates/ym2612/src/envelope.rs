@@ -38,6 +38,12 @@ use crate::regs::{
     REG_TOTAL_LEVEL, operator_of_group,
 };
 
+// Serialising this chip state for save states (M6-07a, #126). Gated on the
+// crate's `serde` feature so `cargo build --no-default-features` keeps the
+// core with no dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// The attenuation of a silent operator: 10 bits, and the other end from it is
 /// 0 (YM2608 application manual `&40`).
 pub(crate) const SILENT: u16 = 0x3FF;
@@ -234,6 +240,7 @@ fn attack_step(att: u16, inc: u8) -> u16 {
 /// Where an operator's envelope is: the four states of a YM2612 envelope, in
 /// the order a held key takes it (YM2608 application manual `&50` to `&80`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) enum State {
     /// Rising towards full level, exponentially.
     Attack,
@@ -248,6 +255,7 @@ pub(crate) enum State {
 /// One operator's envelope: the state machine, and the register fields of the
 /// five groups `&40` to `&80` that drive it.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Envelope {
     /// Where in the four states it is.
     state: State,
@@ -516,6 +524,7 @@ impl Envelope {
 /// The envelopes of the 24 operators, and the counter they all read their update
 /// points off.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct EnvelopeGen {
     /// `[channel][slot]`, the channels of [`crate::regs::PART_I`] first and the
     /// slot order of [`phase::SLOT_S1`].

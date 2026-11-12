@@ -14,6 +14,12 @@
 //! 315-5313 integrated PSG - the part the Genesis carries - where it differs
 //! from a discrete SN76489AN.
 
+// Serialising the chip state for save states (M6-07a, #126). Gated on the
+// crate's `serde` feature so `cargo build --no-default-features` keeps the core
+// with no dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// The four channels of the chip: three tone, plus the noise channel that
 /// shares channel 3's output.
 const CHANNELS: usize = 4;
@@ -70,6 +76,7 @@ const VOLUME_TABLE: [i16; 16] = [
 /// One channel: the tone generator and the attenuation applied to its output
 /// bit.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 struct Channel {
     /// The 10-bit tone period as written by the register interface. Channel 3
     /// shares this one register with the noise control of #106.
@@ -148,6 +155,7 @@ impl Channel {
 /// The noise generator: a 16-bit shift register clocked by its own divider, and
 /// the three-bit control register that sets its feedback and its shift rate.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 struct Noise {
     /// The noise control register: bit 2 = 1 white / 0 periodic, bits 1-0 =
     /// shift rate, as written by `1 1 0 dddd`.
@@ -216,6 +224,7 @@ impl Noise {
 
 /// Which register a data byte belongs to: the one the last latch byte named.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 struct Latch {
     /// Channel the next data byte writes, 0-3.
     channel: usize,
@@ -240,7 +249,13 @@ impl Latch {
 /// psg.write(0x0F); // and the high six
 /// let sample = psg.clock(); // one /16 clock tick
 /// ```
+///
+/// The `serde` derive carries every field below, so a restored chip resumes
+/// mid-tick rather than restarting a channel's divider (M6-07a, #126). Nothing
+/// is `#[serde(skip)]` here: the one table the chip has, `VOLUME_TABLE`, is a
+/// constant rather than state, so there is nothing to rebuild on restore.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Sn76489 {
     channels: [Channel; CHANNELS],
     latch: Latch,

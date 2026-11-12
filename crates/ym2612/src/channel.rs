@@ -71,6 +71,12 @@
 use crate::operator;
 use crate::phase::{SLOT_S1, SLOT_S2, SLOT_S3, SLOT_S4, SLOTS};
 
+// Serialising this chip state for save states (M6-07a, #126). Gated on the
+// crate's `serde` feature so `cargo build --no-default-features` keeps the
+// core with no dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Connection modes of `&B0` bits 2-0.
 const ALGORITHMS: usize = 8;
 
@@ -208,6 +214,7 @@ const CARRIERS: [u8; ALGORITHMS] = [
 /// step it is in, the values the delayed taps and the feedback read from the
 /// steps before, and the mix.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct FmChannel {
     /// `&B0` bits 2-0. Zero is algorithm 0, which is also what a chip that has
     /// never been written to `&B0` does.

@@ -24,6 +24,12 @@
 
 use crate::regs;
 
+// Serialising this chip state for save states (M6-07a, #126). Gated on the
+// crate's `serde` feature so `cargo build --no-default-features` keeps the
+// core with no dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Channels on the chip: three in part I and three in part II.
 pub(crate) const CHANNELS: usize = 6;
 
@@ -182,6 +188,7 @@ pub(crate) fn key_on_channel(field: u8) -> Option<usize> {
 /// One operator's phase state: the per-operator half of a channel, which is what
 /// a write to `&30` and `&28` leaves behind.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Operator {
     /// `&30` bits 6-4, the detune.
     pub(crate) dt: u8,
@@ -198,6 +205,7 @@ pub(crate) struct Operator {
 /// special mode is the exception to the shared half, and reads [`Special`] for
 /// three of its operators instead (M5-09, #114).
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Channel {
     /// The F-Num in force, 11 bits: `&A4` bits 2-0 over `&A0` bits 7-0.
     pub(crate) fnum: u16,
@@ -239,6 +247,7 @@ pub(crate) const CHANNEL3: usize = 2;
 /// mode and in CSM: the `&A8`-`&AE` registers of the chip (YM2608 application
 /// manual `&A8`, and M5-09 #114).
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Special {
     /// The F-Num of each operator, at the slot index of the operator it drives.
     /// [`SLOT_S4`] is neither written nor read: special mode leaves operator 4 on
@@ -284,6 +293,7 @@ impl Special {
 /// The phase counters of all 24 operators, and the register writes that drive
 /// them.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct PhaseGen {
     /// `channels[0]` to `channels[2]` are part I's, `channels[3]` to
     /// `channels[5]` part II's.

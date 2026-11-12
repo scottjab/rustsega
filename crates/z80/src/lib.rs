@@ -32,6 +32,12 @@ pub use regs::{
     SZXY_PARITY, incremented_r, parity, szxy_flags,
 };
 
+// Serialising the CPU state for save states (M6-07a, #126). Gated on the crate's
+// `serde` feature so `cargo build --no-default-features` keeps the core with no
+// dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// The memory and I/O side of a Z80.
 ///
 /// The Z80 has two address spaces and this keeps them separate: `IN`/`OUT` use
@@ -54,7 +60,13 @@ pub trait Z80Bus {
 /// Register pairs are stored as `u16` and the 8-bit halves are views on them.
 /// That is how the chip is wired too, so no instruction can leave a half and
 /// its pair out of step.
+///
+/// The `serde` derive carries every field below, the hidden `WZ`/`q`/`p` state
+/// and the interrupt latches included: a save state that restored only the
+/// visible registers would resume a program that the Z80 cannot continue (M6-07a,
+/// #126).
 #[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Z80 {
     af: u16,
     bc: u16,

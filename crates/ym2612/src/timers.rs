@@ -20,6 +20,12 @@
 
 use crate::regs;
 
+// Serialising this chip state for save states (M6-07a, #126). Gated on the
+// crate's `serde` feature so `cargo build --no-default-features` keeps the
+// core with no dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Timer A is a 10-bit counter: it overflows on the tick that would take it to
 /// 1024 (YM2608 application manual "3. Register descriptions", `&24` and `&25`).
 const TIMER_A_TOP: u16 = 1024;
@@ -51,6 +57,7 @@ pub(crate) struct TimerConfig {
 
 /// The two counters, their overflow flags and the prescaler between them.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Timers {
     /// Status bit 0, timer A overflow.
     flag_a: bool,
