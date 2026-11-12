@@ -7,5 +7,6 @@
 //! `main.rs` is the argument parsing and the exit status and nothing else.
 
 pub mod run;
+pub mod sweep;
 pub mod vgm;
 pub mod wav;

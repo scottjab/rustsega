@@ -16,7 +16,8 @@
 //! 600, so the next change that moves a pixel is visible. Each game's picture
 //! is written to `target/test-output/commercial/` before its value is compared,
 //! the per-game table of what is in the list and what is held out of it is
-//! `docs/compat.md`, and blessing follows `docs/TESTING.md` ("Golden files").
+//! `docs/compat-commercial.md`, and blessing follows `docs/TESTING.md`
+//! ("Golden files").
 //!
 //! # Why it is one test, and why it collects
 //!
