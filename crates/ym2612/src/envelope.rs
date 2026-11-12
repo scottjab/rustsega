@@ -14,10 +14,11 @@
 //! is the source of that counter, of the increment table and of the attack
 //! formula; the rates, the sustain level and the total level are the manual's.
 //!
-//! The amplitude modulation of `&60` bit 7 is LFO work and comes in M5-08
-//! (#113), and the SSG-EG of `&90` in M5-10 (#115). Neither is read here, so
-//! what [`Envelope::output`] gives is the operator's attenuation as far as this
-//! ticket takes it.
+//! The amplitude modulation enable of `&60` bit 7 is kept here, because that is
+//! the register group it lives in, for `crate::lfo` to gate its AM with (M5-08,
+//! #113); the SSG-EG of `&90` is M5-10 (#115) and is not read here. So what
+//! [`Envelope::output`] gives is the operator's attenuation before the LFO adds
+//! to it.
 
 use crate::phase::{self, CHANNELS, PhaseGen, SLOTS};
 use crate::regs::{
@@ -219,6 +220,10 @@ pub(crate) struct Envelope {
     attack_rate: u8,
     /// `&60` bits 4-0, the decay 1 rate.
     decay1_rate: u8,
+    /// `&60` bit 7: whether the LFO's amplitude modulation reaches this operator
+    /// at all, whatever its channel's AMS says (YM2608 application manual `&60`,
+    /// and [`crate::lfo`]).
+    am_enable: bool,
     /// `&70` bits 4-0, the decay 2 rate.
     decay2_rate: u8,
     /// `&80` bits 7-4, the sustain level.
@@ -239,6 +244,7 @@ impl Envelope {
             key_scale: 0,
             attack_rate: 0,
             decay1_rate: 0,
+            am_enable: false,
             decay2_rate: 0,
             sustain_level: 0,
             release_rate: 0,
@@ -317,6 +323,13 @@ impl Envelope {
     /// (#113) is added on top there, not here.
     pub(crate) fn output(&self) -> u16 {
         (self.att + (u16::from(self.total_level) << 3)).min(SILENT)
+    }
+
+    /// Whether the LFO's amplitude modulation reaches this operator at all: bit 7
+    /// of the `&60` write (YM2608 application manual `&60`). Read with
+    /// [`Envelope::output`] by `crate::lfo`'s caller in `crate::Ym2612::clock`.
+    pub(crate) fn am_enable(&self) -> bool {
+        self.am_enable
     }
 
     /// The state of this envelope, for the model's own tests and for
@@ -439,8 +452,8 @@ enum Field {
     TotalLevel,
     /// `&50` bits 7-6 the rate scaling and 4-0 the attack rate.
     KeyScaleAttack,
-    /// `&60` bits 4-0 the decay 1 rate; bit 7 is the amplitude modulation of
-    /// M5-08 (#113) and is not read here.
+    /// `&60` bits 4-0 the decay 1 rate and bit 7 the amplitude modulation enable,
+    /// which [`Envelope`] keeps for [`crate::lfo`] to gate its AM with.
     Decay1Rate,
     /// `&70` bits 4-0 the decay 2, sustaining, rate.
     Decay2Rate,
@@ -484,7 +497,10 @@ impl Field {
                 envelope.key_scale = value >> 6;
                 envelope.attack_rate = value & 0x1F;
             }
-            Self::Decay1Rate => envelope.decay1_rate = value & 0x1F,
+            Self::Decay1Rate => {
+                envelope.decay1_rate = value & 0x1F;
+                envelope.am_enable = value & 0x80 != 0;
+            }
             Self::Decay2Rate => envelope.decay2_rate = value & 0x1F,
             Self::LevelRelease => {
                 envelope.sustain_level = (value >> 4) & 0x0F;

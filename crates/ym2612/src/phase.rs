@@ -9,10 +9,11 @@
 //! and `&28`, with the manual's own key scale and detune tables).
 //!
 //! Only the counting is here: the envelope that decides whether an operator is
-//! heard at all is M5-05 (#109), the LFO that wobbles the phase is M5-08, and
-//! the channel 3 mode that gives a channel four independent F-Nums is M5-09
-//! (#114). So a channel holds one F-Num and one block, shared by its four
-//! operators.
+//! heard at all is M5-05 (#109), and the channel 3 mode that gives a channel four
+//! independent F-Nums is M5-09 (#114). So a channel holds one F-Num and one
+//! block, shared by its four operators. The LFO of M5-08 (#113) is the one
+//! exception to "only the counting": it reaches [`PhaseGen::tick`] as a PMS per
+//! channel and a phase, and [`increment`] is where its offset is added.
 //!
 //! The frequency path is pure - [`keycode`] and [`increment`] - and is tested
 //! as such. [`PhaseGen`] holds the state the writes leave behind: the F-Num and
@@ -29,6 +30,11 @@ pub(crate) const SLOTS: usize = 4;
 
 /// The F-Num is 11 bits (YM2608 application manual `&A0`, `&A4`).
 const FNUM_MASK: u16 = 0x07FF;
+
+/// The doubled F-Num the LFO's phase modulation is added to is 12 bits, and the
+/// adder wraps there rather than saturating (YM2608 application manual `&B4` and
+/// [`increment`]).
+const FNUM_LFO_MASK: i32 = 0x0FFF;
 
 /// Width of the phase increment before the multiple: 17 bits, so a detune below
 /// zero comes back at the top. See [`detune`].
@@ -114,9 +120,24 @@ pub(crate) fn keycode(fnum: u16, block: u8) -> u8 {
 /// finishes it, where multiple 0 is x0.5 (YM2608 application manual `&30`,
 /// `&A0`, `&A4`). Detuning comes before the multiple, so detuning a channel
 /// with a multiple on moves the frequency by `detune * multiple`.
-pub(crate) fn increment(fnum: u16, block: u8, dt: u8, mul: u8) -> u32 {
-    let base = (u32::from(fnum & FNUM_MASK) << u32::from(block & 0x07)) >> 1;
-    let detuned = detune(base, dt, keycode(fnum, block));
+///
+/// `pm` is the LFO's phase modulation of M5-08 (#113): the signed offset of
+/// [`crate::lfo::pm_offset`], in halves of an F-Num, and 0 for a channel with no
+/// PMS. The F-Num reaches this path doubled, which is what makes the
+/// `(F-Num << Block) >> 1` above the same shift the chip makes from its 12-bit
+/// F-Num, and `pm` is added there and masked back to those 12 bits, so the
+/// offset reaches the bottom of the increment rather than only whole F-Nums
+/// (Nuked-OPN2's `OPN2_PhaseCalcIncrement`, and ymfm's `compute_phase_step`
+/// agrees on the doubling, the offset and the mask).
+///
+/// What the offset does not reach is the key code: the detune row and the key
+/// scaling of the envelope are still read at the key code of the F-Num that was
+/// written, so PM is pitch and nothing else (YM2608 application manual `&B4`).
+pub(crate) fn increment(fnum: u16, block: u8, dt: u8, mul: u8, pm: i32) -> u32 {
+    let written = fnum & FNUM_MASK;
+    let offset = ((i32::from(written) << 1) + pm) & FNUM_LFO_MASK;
+    let base = ((offset as u32) << u32::from(block & 0x07)) >> 2;
+    let detuned = detune(base, dt, keycode(written, block));
     let mul = u32::from(mul & 0x0F);
     let scaled = if mul == 0 {
         detuned >> 1
@@ -285,11 +306,18 @@ impl PhaseGen {
     /// INFERRED: nothing gates the counter on the key state. The envelope of
     /// M5-05 (#109) is what decides whether an operator is heard, and an
     /// operator that has never been keyed on only has a phase nothing can see.
-    pub(crate) fn tick(&mut self) {
-        for channel in &mut self.channels {
+    ///
+    /// `pms` is each channel's `&B4` bits 2-0 and `pm_phase` the LFO's current PM
+    /// phase, which together offset the F-Num before it is turned into an
+    /// increment ([`crate::lfo`] and [`increment`]). The LFO stops its work by
+    /// holding `pm_phase` at 0 and a PMS of 0 offsets nothing, so a chip with no
+    /// LFO ticks exactly as it did before either existed.
+    pub(crate) fn tick(&mut self, pms: &[u8; CHANNELS], pm_phase: u8) {
+        for (index, channel) in self.channels.iter_mut().enumerate() {
             let (fnum, block) = (channel.fnum, channel.block);
+            let pm = crate::lfo::pm_offset(fnum, pms[index], pm_phase);
             for operator in &mut channel.operators {
-                let increment = increment(fnum, block, operator.dt, operator.mul);
+                let increment = increment(fnum, block, operator.dt, operator.mul, pm);
                 operator.phase = (operator.phase + increment) & PHASE_MASK;
             }
         }
@@ -361,22 +389,25 @@ mod tests {
     #[test]
     fn increment_mul1_dt0() {
         // The plain case: (0x269 << 4) >> 1.
-        assert_eq!(increment(0x269, 4, 0, 1), (0x269 << 4) >> 1);
-        assert_eq!(increment(0x269, 4, 0, 1), 0x1348);
+        assert_eq!(increment(0x269, 4, 0, 1, 0), (0x269 << 4) >> 1);
+        assert_eq!(increment(0x269, 4, 0, 1, 0), 0x1348);
         // Block 0 still shifts right by one, so the smallest F-Nums stop.
-        assert_eq!(increment(0x001, 0, 0, 1), 0);
-        assert_eq!(increment(0x002, 0, 0, 1), 1);
+        assert_eq!(increment(0x001, 0, 0, 1, 0), 0);
+        assert_eq!(increment(0x002, 0, 0, 1, 0), 1);
     }
 
     #[test]
     fn mul0_halves() {
         // MUL 0 is x0.5, which is the same shift the base increment does again.
-        assert_eq!(increment(0x269, 4, 0, 0), 0x09A4);
-        assert_eq!(increment(0x269, 4, 0, 0), increment(0x269, 4, 0, 1) >> 1);
-        assert_eq!(increment(0x001, 0, 0, 0), 0);
+        assert_eq!(increment(0x269, 4, 0, 0, 0), 0x09A4);
+        assert_eq!(
+            increment(0x269, 4, 0, 0, 0),
+            increment(0x269, 4, 0, 1, 0) >> 1
+        );
+        assert_eq!(increment(0x001, 0, 0, 0, 0), 0);
         // And the other multiples really multiply.
-        assert_eq!(increment(0x269, 4, 0, 2), 0x2690);
-        assert_eq!(increment(0x269, 4, 0, 15), 0x1348 * 15);
+        assert_eq!(increment(0x269, 4, 0, 2, 0), 0x2690);
+        assert_eq!(increment(0x269, 4, 0, 15, 0), 0x1348 * 15);
     }
 
     #[test]
@@ -385,9 +416,9 @@ mod tests {
         // is row 3 taken negative with DETUNE[3][kc 0] = 2. A real chip has no
         // sign bit on the 17-bit increment, so it wraps to 0x1FFFE instead of
         // clamping at 0: the detune overflow, which is kept on purpose.
-        assert_eq!(increment(1, 0, 7, 1), 0x1FFFE);
+        assert_eq!(increment(1, 0, 7, 1, 0), 0x1FFFE);
         // Row 1 is 0 at kc 0, so there is nothing to subtract and no wrap.
-        assert_eq!(increment(1, 0, 5, 1), 0);
+        assert_eq!(increment(1, 0, 5, 1, 0), 0);
     }
 
     #[test]
@@ -395,20 +426,20 @@ mod tests {
         // block 4, fnum 0x300: kc = 0b10000 = 16 and the base increment is
         // (0x300 << 4) >> 1 = 0x1800 = 6144.
         let base: u32 = 0x1800;
-        assert_eq!(increment(0x300, 4, 0, 1), base);
-        assert_eq!(increment(0x300, 4, 1, 1), base + 2);
-        assert_eq!(increment(0x300, 4, 2, 1), base + 5);
-        assert_eq!(increment(0x300, 4, 3, 1), base + 8);
+        assert_eq!(increment(0x300, 4, 0, 1, 0), base);
+        assert_eq!(increment(0x300, 4, 1, 1, 0), base + 2);
+        assert_eq!(increment(0x300, 4, 2, 1, 0), base + 5);
+        assert_eq!(increment(0x300, 4, 3, 1, 0), base + 8);
         // Bit 2 is the sign, and the rows do not move when it is set alone.
-        assert_eq!(increment(0x300, 4, 4, 1), base);
-        assert_eq!(increment(0x300, 4, 5, 1), base - 2);
-        assert_eq!(increment(0x300, 4, 6, 1), base - 5);
-        assert_eq!(increment(0x300, 4, 7, 1), base - 8);
+        assert_eq!(increment(0x300, 4, 4, 1, 0), base);
+        assert_eq!(increment(0x300, 4, 5, 1, 0), base - 2);
+        assert_eq!(increment(0x300, 4, 6, 1, 0), base - 5);
+        assert_eq!(increment(0x300, 4, 7, 1, 0), base - 8);
         // The row is read at the key code, not at a fixed index: kc 17 is the
         // next entry of the FD=1 row.
-        assert_eq!(increment(0x380, 4, 1, 1), 0x1C00 + 3);
+        assert_eq!(increment(0x380, 4, 1, 1, 0), 0x1C00 + 3);
         // Detuning comes before the multiple, so the offset is scaled too.
-        assert_eq!(increment(0x300, 4, 1, 2), (base + 2) * 2);
+        assert_eq!(increment(0x300, 4, 1, 2, 0), (base + 2) * 2);
     }
 
     #[test]
@@ -416,6 +447,6 @@ mod tests {
         // The widest the frequency side can ask for: (0x7FF << 7) >> 1 =
         // 0x1FFC0, times 15 is 0x1DFC40, and the increment is 20 bits, so the
         // top bits fall off.
-        assert_eq!(increment(0x7FF, 7, 0, 15), 0xDFC40);
+        assert_eq!(increment(0x7FF, 7, 0, 15, 0), 0xDFC40);
     }
 }
