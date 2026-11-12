@@ -29,6 +29,13 @@ test:
 test-all:
     cargo nextest run --workspace --no-tests=pass --run-ignored all
 
+# Milliseconds per `Genesis::run_frame` (M6-11, #131): a synthetic full-screen
+# scene, and Sonic 1 when that cartridge is on disk. `cargo bench` builds with
+# the release profile. It is a measurement rather than a gate, so it is not part
+# of `check`; see crates/genesis/benches/frame.rs for how to read the numbers.
+bench:
+    cargo bench -p genesis --bench frame
+
 # Commercial ROM smoke tests (M6-04, #123): local only, they read $RUSTSEGA_ROM_DIR,
 # which CI does not have. The name filter is what `--run-ignored only` needs: it
 # picks the one #[ignore]d test of tests/commercial.rs out of the genesis crate.
