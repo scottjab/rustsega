@@ -68,6 +68,10 @@ pub(crate) struct Timers {
     /// starting a timer can be seen.
     running_a: bool,
     running_b: bool,
+    /// Whether the last [`Timers::tick`] was an overflow of timer A: the CSM
+    /// trigger of M5-09 (#114), which does not wait for [`TimerConfig::a_enable`]
+    /// the way the status flag does.
+    overflow_a: bool,
 }
 
 impl Timers {
@@ -81,6 +85,7 @@ impl Timers {
             divider: 0,
             running_a: false,
             running_b: false,
+            overflow_a: false,
         }
     }
 
@@ -127,6 +132,7 @@ impl Timers {
     /// timer B is started, so a started timer B always gets a whole 16 samples
     /// before its first tick.
     pub(crate) fn tick(&mut self, config: &TimerConfig) {
+        self.overflow_a = false;
         if self.running_a {
             self.tick_a(config);
         }
@@ -147,12 +153,22 @@ impl Timers {
         let next = self.counter_a + 1;
         if next >= TIMER_A_TOP {
             self.counter_a = config.a_value;
+            // The overflow is remembered whether or not the status flag is wanted:
+            // CSM of M5-09 (#114) strikes on it either way.
+            self.overflow_a = true;
             if config.a_enable {
                 self.flag_a = true;
             }
         } else {
             self.counter_a = next;
         }
+    }
+
+    /// Whether the last [`Timers::tick`] overflowed timer A, whatever `&27` bit 2
+    /// says about the status flag: the key trigger of CSM, channel 3's mode 10
+    /// (YM2608 application manual `&27`, and M5-09 #114).
+    pub(crate) fn overflowed_a(&self) -> bool {
+        self.overflow_a
     }
 
     /// One timer B tick, the 8-bit version of [`Timers::tick_a`].

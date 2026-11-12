@@ -9,9 +9,11 @@
 //! and `&28`, with the manual's own key scale and detune tables).
 //!
 //! Only the counting is here: the envelope that decides whether an operator is
-//! heard at all is M5-05 (#109), and the channel 3 mode that gives a channel four
-//! independent F-Nums is M5-09 (#114). So a channel holds one F-Num and one
-//! block, shared by its four operators. The LFO of M5-08 (#113) is the one
+//! heard at all is M5-05 (#109). So a channel holds one F-Num and one block,
+//! shared by its four operators - except for channel 3 in one of its special modes,
+//! the M5-09 (#114) half of this module, where [`Special`] gives operators 1 to 3
+//! F-Nums of their own and [`PhaseGen::frequency`] is what picks between the two.
+//! The LFO of M5-08 (#113) is the one
 //! exception to "only the counting": it reaches [`PhaseGen::tick`] as a PMS per
 //! channel and a phase, and [`increment`] is where its offset is added.
 //!
@@ -192,7 +194,9 @@ pub(crate) struct Operator {
 }
 
 /// One channel: the F-Num and block its four operators share, the `&A4` latch
-/// waiting for the next `&A0` write, and the operators themselves.
+/// waiting for the next `&A0` write, and the operators themselves. Channel 3 in a
+/// special mode is the exception to the shared half, and reads [`Special`] for
+/// three of its operators instead (M5-09, #114).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Channel {
     /// The F-Num in force, 11 bits: `&A4` bits 2-0 over `&A0` bits 7-0.
@@ -226,6 +230,57 @@ impl Channel {
     }
 }
 
+/// Channel index of channel 3, the one with the special modes of M5-09 (#114):
+/// part I's third channel, `&A2`/`&A6` of its operator 4 and `&A8`-`&AE` of the
+/// other three.
+pub(crate) const CHANNEL3: usize = 2;
+
+/// The three extra frequency generators of channel 3, in the special frequency
+/// mode and in CSM: the `&A8`-`&AE` registers of the chip (YM2608 application
+/// manual `&A8`, and M5-09 #114).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Special {
+    /// The F-Num of each operator, at the slot index of the operator it drives.
+    /// [`SLOT_S4`] is neither written nor read: special mode leaves operator 4 on
+    /// the channel's own `&A2`.
+    fnum: [u16; SLOTS],
+    /// The block of each operator, as [`Special::fnum`].
+    block: [u8; SLOTS],
+    /// `&AC` bits 2-0, waiting for one of `&A8`-`&AA` to apply it. One latch for
+    /// the whole group, because the chip has one register there: `&AC`, `&AD` and
+    /// `&AE` are the same write ([`regs::ch3_frequency_of`]).
+    latched_fnum: u16,
+    /// `&AC` bits 5-3, with [`Special::latched_fnum`].
+    latched_block: u8,
+}
+
+impl Special {
+    /// The state of the `&A8`-`&AE` group before anything wrote it: every operator
+    /// at F-Num 0 and block 0, and the latch empty.
+    fn new() -> Self {
+        Self {
+            fnum: [0; SLOTS],
+            block: [0; SLOTS],
+            latched_fnum: 0,
+            latched_block: 0,
+        }
+    }
+
+    /// A `&A8`-`&AE` write of `value` to operator `slot`: the half the `high` flag
+    /// names. A high write fills the latch of the group and a low write applies
+    /// it, the same order `&A4` and `&A0` make the channel F-Num take
+    /// ([`regs::ch3_frequency_of`], and #108's rule for `&A0`).
+    fn register_written(&mut self, slot: usize, high: bool, value: u8) {
+        if high {
+            self.latched_fnum = u16::from(value & 0x07);
+            self.latched_block = (value >> 3) & 0x07;
+        } else {
+            self.fnum[slot] = (self.latched_fnum << 8) | u16::from(value);
+            self.block[slot] = self.latched_block;
+        }
+    }
+}
+
 /// The phase counters of all 24 operators, and the register writes that drive
 /// them.
 #[derive(Clone, Debug)]
@@ -233,6 +288,12 @@ pub(crate) struct PhaseGen {
     /// `channels[0]` to `channels[2]` are part I's, `channels[3]` to
     /// `channels[5]` part II's.
     channels: [Channel; CHANNELS],
+    /// `&27` bits 7-6 as [`regs::RegFile::ch3_mode`] gives them: whether channel 3
+    /// is in one of the two modes that give it its own frequency generators.
+    mode: u8,
+    /// The `&A8`-`&AE` frequencies, in force for channel 3 while [`PhaseGen::mode`]
+    /// is not [`regs::CH3_MODE_NORMAL`].
+    ch3: Special,
 }
 
 impl PhaseGen {
@@ -241,12 +302,16 @@ impl PhaseGen {
     pub(crate) fn new() -> Self {
         Self {
             channels: [Channel::new(); CHANNELS],
+            mode: regs::CH3_MODE_NORMAL,
+            ch3: Special::new(),
         }
     }
 
     /// A data port write of `value` to `register` of `part`, for the registers
-    /// the phase generator reads: `&28` key on/off, `&30`-`&3E` detune and
-    /// multiple, and `&A0`-`&A6` the F-Num and block.
+    /// the phase generator reads: `&27`'s channel 3 mode, `&28` key on/off, `&30`-
+    /// `&3E` detune and multiple, `&A0`-`&A6` the F-Num and block, and `&A8`-`&AE`
+    /// the three extra F-Nums of channel 3's special modes, decoded by
+    /// [`regs::ch3_frequency_of`] for M5-09 (#114).
     ///
     /// `&28` is decoded from either part: the channel field of the write is
     /// already an absolute channel number, and both halves of the chip route
@@ -269,6 +334,10 @@ impl PhaseGen {
             let channel = &mut self.channels[channel];
             channel.latched_fnum = u16::from(value & 0x07);
             channel.latched_block = (value >> 3) & 0x07;
+        } else if part == regs::PART_I && register == regs::REG_CONTROL {
+            self.mode = value >> regs::CH3_MODE_SHIFT;
+        } else if let Some((slot, high)) = regs::ch3_frequency_of(part, register) {
+            self.ch3.register_written(slot, high, value);
         }
     }
 
@@ -313,25 +382,53 @@ impl PhaseGen {
     /// holding `pm_phase` at 0 and a PMS of 0 offsets nothing, so a chip with no
     /// LFO ticks exactly as it did before either existed.
     pub(crate) fn tick(&mut self, pms: &[u8; CHANNELS], pm_phase: u8) {
+        // Every frequency of the chip first, since reading one needs `self` and the
+        // counters below are being moved. A normal channel has one F-Num for its four
+        // operators and only channel 3 of the two special modes differs (#114).
+        let frequency: [[(u16, u8); SLOTS]; CHANNELS] = std::array::from_fn(|channel| {
+            std::array::from_fn(|slot| self.frequency(channel, slot))
+        });
         for (index, channel) in self.channels.iter_mut().enumerate() {
-            let (fnum, block) = (channel.fnum, channel.block);
-            let pm = crate::lfo::pm_offset(fnum, pms[index], pm_phase);
-            for operator in &mut channel.operators {
+            for (slot, operator) in channel.operators.iter_mut().enumerate() {
+                let (fnum, block) = frequency[index][slot];
+                let pm = crate::lfo::pm_offset(fnum, pms[index], pm_phase);
                 let increment = increment(fnum, block, operator.dt, operator.mul, pm);
                 operator.phase = (operator.phase + increment) & PHASE_MASK;
             }
         }
     }
 
-    /// What one channel holds right now: the F-Num and block its four operators
-    /// share, and each operator's detune, multiple, key state and phase counter.
+    /// The F-Num and block one operator counts at: its channel's `&A0`/`&A4`,
+    /// except for operators 1 to 3 of channel 3 while one of the special modes is
+    /// on, which read the `&A8`-`&AE` pair of their own. Operator 4 of that channel
+    /// is the exception to the exception and stays on `&A2`/`&A6` (YM2608
+    /// application manual `&A8`, and M5-09 #114).
+    fn frequency(&self, channel: usize, slot: usize) -> (u16, u8) {
+        if channel == CHANNEL3 && self.mode != regs::CH3_MODE_NORMAL && slot != SLOT_S4 {
+            return (self.ch3.fnum[slot], self.ch3.block[slot]);
+        }
+        (self.channels[channel].fnum, self.channels[channel].block)
+    }
+
+    /// The key code of one operator as its own F-Num and block stand now: what the
+    /// key scaling of the envelope generator reads it for, and therefore per
+    /// operator rather than per channel - the two are the same thing until channel 3
+    /// goes into a special mode and gives three of its operators frequencies of
+    /// their own ([`PhaseGen::frequency`], YM2608 application manual key scale
+    /// table, and `crate::envelope`).
+    pub(crate) fn keycode(&self, channel: usize, slot: usize) -> u8 {
+        let (fnum, block) = self.frequency(channel, slot);
+        keycode(fnum, block)
+    }
+
+    /// The `&28` key state of one operator: what the chip was last told to hold,
+    /// with nothing of CSM in it. CSM reads it to know whether a driver is holding
+    /// channel 3 on through the end of its own key pulse (M5-09, #114).
     ///
-    /// The key code of `channel` as its F-Num and block stand now: what the key
-    /// scaling of the envelope generator reads it for (YM2608 application manual
-    /// key scale table, and `crate::envelope`).
-    pub(crate) fn keycode(&self, channel: usize) -> u8 {
-        let channel = &self.channels[channel];
-        keycode(channel.fnum, channel.block)
+    /// `key_state` rather than `key_on`, since [`PhaseGen::key_on`] is the `&28`
+    /// write that puts the state there.
+    pub(crate) fn key_state(&self, channel: usize, slot: usize) -> bool {
+        self.channels[channel].operators[slot].key_on
     }
 
     /// What one channel holds right now: the F-Num and block its four operators

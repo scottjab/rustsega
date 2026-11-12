@@ -404,8 +404,8 @@ impl EnvelopeGen {
         let Some(channel) = phase::key_on_channel(value & 0x07) else {
             return;
         };
-        let keycode = phases.keycode(channel);
         for &(mask, slot) in &phase::KEY_ON_BITS {
+            let keycode = phases.keycode(channel, slot);
             self.envelopes[channel][slot].set_key(value & mask != 0, keycode);
         }
     }
@@ -428,11 +428,30 @@ impl EnvelopeGen {
             self.counter + 1
         };
 
+        // The key code per operator, since the two are one thing in a normal
+        // channel and separate ones in the special mode of channel 3 (#114).
         for channel in 0..CHANNELS {
-            let keycode = phases.keycode(channel);
             for slot in 0..SLOTS {
+                let keycode = phases.keycode(channel, slot);
                 self.envelopes[channel][slot].update(self.counter, keycode);
             }
+        }
+    }
+
+    /// The CSM key of channel 3: `on` is the pulse of a timer A overflow, held for
+    /// the one sample it overflows on, and the `false` that follows it on the next
+    /// sample is what releases the four operators again - unless `&28` is holding
+    /// one of them, which is why this reads the key state of the phase generator
+    /// rather than the pulse alone (YM2608 application manual `&27`, M5-09 #114,
+    /// and [`crate::phase::PhaseGen::key_state`]).
+    ///
+    /// The pulse says nothing to the phase counters: it is the envelope of channel
+    /// 3 that CSM strikes, and the counters keep counting through it.
+    pub(crate) fn csm_key(&mut self, phases: &PhaseGen, on: bool) {
+        for slot in 0..SLOTS {
+            let keycode = phases.keycode(phase::CHANNEL3, slot);
+            let held = on || phases.key_state(phase::CHANNEL3, slot);
+            self.envelopes[phase::CHANNEL3][slot].set_key(held, keycode);
         }
     }
 
