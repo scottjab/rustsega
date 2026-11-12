@@ -179,6 +179,33 @@ mod tests {
         }
     }
 
+    /// The two tables really are inverses of each other: at full level an
+    /// operator outputs its own sine, to within 32 of an 8168-strong full scale,
+    /// which is what the rounding of the log sine to eight bits, the mantissa to
+    /// eleven and the octave shift to a truncation add up to (28 at its worst).
+    /// The log domain of [`crate::tables`] does come back out again.
+    ///
+    /// What the curve cannot go under is the `0x859` at the bottom of
+    /// [`crate::tables::LOGSIN`]: that is a large attenuation rather than minus
+    /// infinity, so at a zero crossing an operator says 25 and not 0. The chip's
+    /// own DC offset, and the reason a wave made of one operator is a fat one.
+    #[test]
+    fn op_output_is_the_sine_of_its_angle() {
+        for angle in 0..=0x3ff {
+            let wave = (2.0 * std::f64::consts::PI * f64::from(angle) / 1024.0).sin();
+            let error = (f64::from(output(angle, 0)) - wave * 8168.0).abs();
+            assert!(
+                error <= 32.0,
+                "angle {angle:#04x} is {error:.1} off its sine"
+            );
+        }
+        assert_eq!(
+            output(0, 0),
+            25,
+            "the zero crossing sits on the floor of the log sine, not on 0"
+        );
+    }
+
     /// No angle and no attenuation takes an output outside the range the
     /// pipeline is built on: the top of the exponent table at one corner and
     /// silence at the other, so the i16 every answer comes back in cannot
