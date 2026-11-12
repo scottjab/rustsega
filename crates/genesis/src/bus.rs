@@ -1633,11 +1633,32 @@ impl Bus {
         OPEN_BUS_WORD
     }
 
-    /// Undecoded byte write. Placeholder for [`Region::Unmapped`].
-    fn write_unmapped_byte(&mut self, _addr: u32, _value: u8) {}
+    /// Undecoded byte write: nothing but a Realtec cart's paging registers.
+    ///
+    /// The expansion slot at `0x400000-0x7FFFFF` is otherwise nothing's, but a
+    /// Realtec board keeps the three registers that page its image out there rather
+    /// than in the `0xA13000` block of [`crate::cart::mapper`] - see
+    /// [`mapper::realtec_register`] for the decode, and
+    /// [`Mapper::set_realtec_register`] for what a write to one does. A cart that is
+    /// not a Realtec cart drops the write, exactly as [`Bus::write_cart_extra_byte`]
+    /// drops a bank write on a cart with no Sega mapper.
+    fn write_unmapped_byte(&mut self, addr: u32, value: u8) {
+        if let Some(reg) = mapper::realtec_register(addr) {
+            self.mapper.set_realtec_register(reg, value);
+        }
+    }
 
-    /// Undecoded word write. Placeholder for [`Region::Unmapped`].
-    fn write_unmapped_word(&mut self, _addr: u32, _value: u16) {}
+    /// Undecoded word write: the high byte, which is the byte at the even lane.
+    ///
+    /// The opposite way round from [`Bus::write_cart_extra_word`], and deliberately:
+    /// the Realtec registers live on the even lane and take a word write from its own
+    /// byte (BlastEm's `realtec_write_w` hands `realtec_write_b` the value shifted
+    /// right by 8, and `realtec_write_b` then rejects odd addresses outright), while
+    /// the `0xA13000` block keeps its registers on the odd lane. Reusing one decode
+    /// for the other would take every Realtec write one byte late.
+    fn write_unmapped_word(&mut self, addr: u32, value: u16) {
+        self.write_unmapped_byte(addr, (value >> 8) as u8);
+    }
 }
 
 /// Is `addr`, masked and already decoded as [`Region::Io`], one of the two bytes
