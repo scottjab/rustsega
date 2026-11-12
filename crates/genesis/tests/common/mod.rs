@@ -29,6 +29,10 @@
 //! cartridges - so a test file full of ROM regressions stays green there and says
 //! `SKIPPED:` on the way past each one (see [`read_rom`]).
 //!
+//! Which games to run is `commercial_list.toml`'s business, read by [`load_games`],
+//! so every commercial suite starts from the same cartridges with the same START
+//! presses.
+//!
 //! # Reuse
 //!
 //! Each integration-test binary compiles its own copy of this module and only
@@ -41,6 +45,23 @@
 use std::path::{Path, PathBuf};
 
 use genesis::{Buttons, Config, Genesis};
+
+/// The game list: the configuration shared by the commercial suites, sitting next
+/// to the test files in `crates/genesis/tests` (see [`load_games`]).
+pub const LIST_FILE: &str = "commercial_list.toml";
+
+/// The message of a caught panic, for a suite that runs the list game by game and
+/// reports every game rather than aborting on the first one.
+pub fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "panicked with a non-string payload".to_string())
+    }
+}
 
 /// A scratch directory that deletes itself, so a test can put a ROM where a ROM
 /// goes without littering `/tmp`.
@@ -149,7 +170,7 @@ pub fn run_frames(rom: &Path, frames: u32, inputs: &[(u32, Buttons)]) -> Genesis
 
 /// The run behind [`run_frames`] and [`run_and_check`], for a caller that already
 /// has the image - which is what makes a skip and a run share one path.
-fn run_bytes(bytes: &[u8], frames: u32, inputs: &[(u32, Buttons)]) -> Genesis {
+pub fn run_bytes(bytes: &[u8], frames: u32, inputs: &[(u32, Buttons)]) -> Genesis {
     let mut machine = Genesis::new(bytes, Config::default())
         .unwrap_or_else(|e| panic!("cannot load ROM image: {e:?}"));
     for frame in 1..=frames {
@@ -207,4 +228,183 @@ pub fn run_and_check(run: RomRun<'_>) {
 
     let hash = testkit::frame_hash(pixels, frame.width, frame.height);
     testkit::assert_golden(&golden_path(run.golden_file), run.key, hash);
+}
+
+// ---------------------------------------------------------------------------\n
+// The game list of `commercial_list.toml`.\n
+//\n
+// It lives here rather than in `commercial.rs` because it is the configuration\n
+// of more than one suite: the smoke test of `commercial.rs` and the save-state\n
+// determinism test of `save_state.rs` (M6-08, #128) both run the same games with\n
+// the same START presses, and two parsers for one file is two ways for the two\n
+// suites to disagree about what the list said.\n
+// ---------------------------------------------------------------------------\n
+/// One `[[game]]` block of [`LIST_FILE`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Game {
+    /// The exact file name of the cartridge under `$RUSTSEGA_ROM_DIR`, without
+    /// its extension. Exact, not a prefix: [`testkit::commercial_rom`] takes a
+    /// whole name, and [`testkit::find_commercial_rom`] - which does prefix
+    /// matching - answers with a Beta build under the same stem.
+    pub prefix: String,
+    /// Short name for the golden key and the PNG: `"sonic1"`.
+    pub key: String,
+    /// Frames to run; the golden is the last of them.
+    pub frames: u32,
+    /// 1-based frames on which port 1 holds START - see [`run_frames`].
+    pub start_press: Vec<u32>,
+}
+
+impl Game {
+    /// A field this entry still needs, if any: `Some("frames")` for a block that
+    /// did not say how long to run. Empty values stand for "absent", so
+    /// `frames = 0` is refused by the same arm.
+    pub fn missing_field(&self) -> Option<&'static str> {
+        if self.key.is_empty() {
+            Some("key")
+        } else if self.prefix.is_empty() {
+            Some("prefix")
+        } else if self.frames == 0 {
+            Some("frames")
+        } else {
+            None
+        }
+    }
+}
+
+/// Path of [`LIST_FILE`].
+pub fn list_path() -> PathBuf {
+    crate_dir().join("tests").join(LIST_FILE)
+}
+
+/// The three shapes a value of a `[[game]]` block takes in [`LIST_FILE`].
+enum Field {
+    Text(String),
+    Number(u32),
+    Numbers(Vec<u32>),
+}
+
+/// `value` as an integer, or an error naming the line and the field.
+fn parse_number(name: &str, value: &str, line: usize) -> Result<u32, String> {
+    value.parse::<u32>().map_err(|e| {
+        format!("line {line}: {name} = {value}: expected a quoted string or a number: {e}")
+    })
+}
+
+/// A `name = value` right-hand side: a quoted string, an integer, or an inline
+/// array of integers.
+///
+/// Anything else is an error naming the line. A value this test cannot read has
+/// to be loud: a game dropped from the list is a smaller suite that still
+/// reports green.
+fn parse_value(name: &str, value: &str, line: usize) -> Result<Field, String> {
+    let value = value.trim();
+    if let Some(rest) = value.strip_prefix('"') {
+        let text = rest.strip_suffix('"').ok_or_else(|| {
+            format!("line {line}: {name} = {value}: expected a quoted string ending in `\"`")
+        })?;
+        if text.contains('"') {
+            return Err(format!(
+                "line {line}: {name} = {value}: no escaped quotes in the list, please"
+            ));
+        }
+        return Ok(Field::Text(text.to_string()));
+    }
+    if let Some(rest) = value.strip_prefix('[') {
+        let inner = rest
+            .strip_suffix(']')
+            .ok_or_else(|| format!("line {line}: {name} = {value}: expected `]`"))?;
+        let mut numbers = Vec::new();
+        for item in inner
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            numbers.push(parse_number(name, item, line)?);
+        }
+        return Ok(Field::Numbers(numbers));
+    }
+    Ok(Field::Number(parse_number(name, value, line)?))
+}
+
+/// One line of a `[[game]]` block, applied to `current`.
+fn apply_line(line: usize, text: &str, current: &mut Game) -> Result<(), String> {
+    let (name, value) = text.split_once('=').ok_or_else(|| {
+        format!("line {line}: expected `name = value` or `[[game]]`, got `{text}`")
+    })?;
+    let name = name.trim();
+    match parse_value(name, value, line)? {
+        Field::Text(text) => match name {
+            "key" => current.key = text,
+            "prefix" => current.prefix = text,
+            _ => return Err(format!("line {line}: unknown list field `{name}`")),
+        },
+        Field::Number(number) => match name {
+            "frames" => current.frames = number,
+            _ => return Err(format!("line {line}: unknown list field `{name}`")),
+        },
+        Field::Numbers(frames) => match name {
+            "start_press" => current.start_press = frames,
+            _ => return Err(format!("line {line}: unknown list field `{name}`")),
+        },
+    }
+    Ok(())
+}
+
+/// Parse the `[[game]]` blocks of [`LIST_FILE`].
+///
+/// `genesis` depends on its chips and on nothing else, tests included
+/// (`crates/genesis/Cargo.toml`), so these lines of TOML reading stand in for
+/// adding the `toml` crate to it. The accepted shape is exactly what the file
+/// uses, and `parse_games_rejects_what_it_cannot_read` covers the ways a
+/// hand-edited list can be wrong.
+pub fn parse_games(text: &str) -> Result<Vec<Game>, String> {
+    let mut games: Vec<Game> = Vec::new();
+    let mut current = Game::default();
+    let mut open = false;
+
+    for (index, raw) in text.lines().enumerate() {
+        let line = index + 1;
+        let text = raw.trim();
+        if text.is_empty() || text.starts_with('#') {
+            continue;
+        }
+        if text == "[[game]]" {
+            if open {
+                if let Some(field) = current.missing_field() {
+                    return Err(format!("line {line}: [[game]] block has no `{field}`"));
+                }
+                games.push(current.clone());
+            }
+            current = Game::default();
+            open = true;
+            continue;
+        }
+        if !open {
+            return Err(format!(
+                "line {line}: `{name}` before any `[[game]]`",
+                name = text
+            ));
+        }
+        apply_line(line, text, &mut current)?;
+    }
+
+    if open {
+        if let Some(field) = current.missing_field() {
+            return Err(format!("last [[game]] block has no `{field}`"));
+        }
+        games.push(current);
+    }
+    Ok(games)
+}
+
+/// The list as committed, parsed and checked.
+///
+/// Panics with the file and the line on the table when it is wrong: a broken list
+/// is a broken suite, not a list of skips.
+pub fn load_games() -> Vec<Game> {
+    let path = list_path();
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: cannot read the game list: {e}", path.display()));
+    parse_games(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
