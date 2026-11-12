@@ -20,6 +20,7 @@ pub mod bus;
 pub mod cart;
 pub mod config;
 pub mod io;
+pub mod movie;
 pub mod scheduler;
 pub mod state;
 pub mod z80_bus;

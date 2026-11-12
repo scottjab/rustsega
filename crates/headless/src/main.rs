@@ -17,7 +17,8 @@ use headless::{run, sweep, vgm};
 
 /// The whole command line: `headless run <ROM> [--frames N] [--dump-png PATH]
 /// [--dump-wav PATH] [--hash] [--audio-hash] [--region auto|usa|japan|europe]
-/// [--pad1 BUTTONS@FRAME,...]`, or `headless vgm <VGM> [--out PATH]`.
+/// [--pad1 BUTTONS@FRAME,...] [--movie PATH] [--record PATH]`, or
+/// `headless vgm <VGM> [--out PATH]`.
 #[derive(Parser)]
 #[command(
     name = "headless",

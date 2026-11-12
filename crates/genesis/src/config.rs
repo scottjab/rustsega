@@ -71,6 +71,21 @@ pub enum Region {
 }
 
 impl Region {
+    /// The lower-case name of this region, as `headless` prints it in its summary
+    /// line and as `region` is spelled in a movie
+    /// (`docs/movie-format.md`).
+    ///
+    /// One spelling for the three names on purpose: `--region` takes them, the
+    /// summary prints them, and a movie records one, and all three have to agree
+    /// for `headless run --movie x.rsm` to mean what it says.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Japan => "japan",
+            Self::Usa => "usa",
+            Self::Europe => "europe",
+        }
+    }
+
     /// Is this the PAL machine? Only Europe is: the header's Europe bit is the
     /// PAL one (plutiedev "Region support", segaretro "Regional compatiblity"),
     /// and docs/ARCHITECTURE.md "Clocks and timing" gives 313 lines for PAL

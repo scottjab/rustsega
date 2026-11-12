@@ -405,3 +405,307 @@ fn hash_is_deterministic() {
         "the same ROM run twice must hash the same"
     );
 }
+/// A cartridge image whose backdrop colour is the byte it reads from port 1, so a
+/// frame hash says what the pad was doing and a `--movie` that was parsed but
+/// never played cannot pass one of the tests below.
+///
+/// ```text
+///        move.w #$8140, ($C00004).L   R1: display on
+///        move.w #$8705, ($C00004).L   R7: backdrop colour 5
+///        move.w #$C00A, ($C00004).L   a CRAM write code for word 5
+///        move.w #$0000, ($C00004).L   ...and its second half
+/// loop:  move.b ($A10003).L, d0       port 1's pin levels, TH high
+///        move.w d0, ($C00000).L       straight into CRAM word 5
+///        bra    loop
+/// ```
+///
+/// The `MOVE` encodings are `33FC imm16 addr32`, `33C0 addr32` and `1039 addr32`
+/// (M68000UM section 8 "MOVE", destination field first), the `BRA.B` displacement
+/// is taken from the address after the branch word, and the VDP register command
+/// shape is the one `crates/genesis/tests/save_state.rs` uses.
+fn pad_reader_rom() -> Vec<u8> {
+    const STACK: u32 = 0x00FF_0000;
+    const CODE: u32 = 0x1000;
+    let program: Vec<u16> = [
+        0x33FC_u16, 0x8140, 0x00C0, 0x0004, 0x33FC, 0x8705, 0x00C0, 0x0004, 0x33FC, 0xC00A, 0x00C0,
+        0x0004, 0x33FC, 0x0000, 0x00C0, 0x0004, 0x1039, 0x00A1,
+        0x0003, // loop: move.b ($A10003).L, d0
+        0x33C0, 0x00C0, 0x0000, //         move.w d0, ($C00000).L
+        0x60F2, //         bra.b -14, back to the move
+    ]
+    .into_iter()
+    .collect();
+
+    let mut rom = vec![0_u8; (CODE as usize + 2 * program.len()).max(0x200)];
+    rom[0..4].copy_from_slice(&STACK.to_be_bytes());
+    rom[4..8].copy_from_slice(&CODE.to_be_bytes());
+    for (word, at) in program.iter().zip(0..) {
+        let at = CODE as usize + 2 * at;
+        rom[at..at + 2].copy_from_slice(&word.to_be_bytes());
+    }
+    rom[0x150..0x158].copy_from_slice(b"PAD ROM ");
+    rom
+}
+
+/// Write `bytes` as a ROM at `path` and give them back, so the caller can also
+/// name the ROM's movie hash.
+fn write_rom(path: &Path, bytes: &[u8]) -> Vec<u8> {
+    fs::write(path, bytes).expect("write rom");
+    bytes.to_vec()
+}
+
+/// The text of a one-pad movie for `rom_hash`, with `frames` as its change list.
+fn movie_text(rom_hash: u64, region: &str, frames: &[(u32, &str)]) -> String {
+    let mut text =
+        format!("rustsega-movie 1\nrom-hash 0x{rom_hash:016x}\nregion {region}\npads 1\n");
+    for (frame, buttons) in frames {
+        text.push_str(&format!("{frame} {buttons}\n"));
+    }
+    text
+}
+
+/// The lines of a movie file that mean something: what [`movie_text`] and what a
+/// `--record` file agree on, without the comment line `Movie::format` writes.
+fn movie_lines(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+        .collect()
+}
+
+/// The point of M6-09 from the command line: `--record` turns a `--pad1` script
+/// into a movie file, `--movie` plays that file back, and the run it plays is the
+/// run that was recorded - frame for frame, not just without crashing.
+#[test]
+fn record_then_movie_hashes_the_same_run() {
+    let dir = TempDir::new("movie-record");
+    let rom = dir.join("pad.md");
+    let bytes = write_rom(&rom, &pad_reader_rom());
+    let rom_hash = genesis::movie::rom_hash(&bytes);
+    let movie = dir.join("run.rsm");
+    let rom = rom.to_str().expect("utf-8 path");
+    let movie = movie.to_str().expect("utf-8 path");
+
+    // Record: UP on the third frame, DOWN on the last, nothing on the rest. The
+    // last frame has to be one of them because `--hash` reports the last frame,
+    // and that is the frame whose colour this ROM took from the pad.
+    let script = "UP@3,DOWN@6";
+    let recorded = run(&[
+        "run", rom, "--frames", "6", "--pad1", script, "--record", movie,
+    ]);
+    assert!(
+        recorded.status.success(),
+        "record failed: {:?}\nstderr: {}",
+        recorded.status.code(),
+        stderr(&recorded)
+    );
+
+    // `--pad1` counts frames from 1 and a movie counts them from 0, and the press
+    // is momentary, so the file is a press on frame 2 and a release on frame 3.
+    let text = fs::read_to_string(movie).expect("the movie was written");
+    assert_eq!(
+        movie_lines(&text),
+        [
+            "rustsega-movie 1",
+            &format!("rom-hash 0x{rom_hash:016x}"),
+            "region usa",
+            "pads 1",
+            "2 U",
+            "3 .",
+            "5 D"
+        ],
+        "the recorded movie is the script, 0-based: {text}"
+    );
+
+    // Replay it and hash: the same run, from the file rather than the script.
+    let replayed = run(&["run", rom, "--frames", "6", "--movie", movie, "--hash"]);
+    assert!(
+        replayed.status.success(),
+        "replay failed: {:?}\nstderr: {}",
+        replayed.status.code(),
+        stderr(&replayed)
+    );
+    let scripted = run(&["run", rom, "--frames", "6", "--pad1", script, "--hash"]);
+    assert!(scripted.status.success());
+    assert_eq!(
+        frame_hash_line(&replayed),
+        frame_hash_line(&scripted),
+        "replaying the recording must reproduce the run it came from"
+    );
+
+    // And the hash really is the pad's, not a constant: the same ROM run with
+    // nobody holding anything is a different picture.
+    let idle = run(&["run", rom, "--frames", "6", "--hash"]);
+    assert!(idle.status.success());
+    assert_ne!(
+        frame_hash_line(&replayed),
+        frame_hash_line(&idle),
+        "a run with a frame of UP held cannot hash the same as one with nothing held"
+    );
+}
+
+/// `headless run --movie in.rsm --hash` is the ticket's own CLI case: a movie
+/// written by hand, held for several frames, plays and hashes.
+#[test]
+fn hand_written_movie_runs_and_hashes() {
+    let dir = TempDir::new("movie-run");
+    let rom = dir.join("pad.md");
+    let bytes = write_rom(&rom, &pad_reader_rom());
+    let rom_hash = genesis::movie::rom_hash(&bytes);
+    let movie = dir.join("in.rsm");
+    fs::write(&movie, movie_text(rom_hash, "usa", &[(0, "."), (1, "U")])).expect("write movie");
+
+    let args = [
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "4",
+        "--movie",
+        movie.to_str().expect("utf-8 path"),
+        "--hash",
+    ];
+    let out = run(&args);
+    assert!(
+        out.status.success(),
+        "run failed: {:?}\nstderr: {}",
+        out.status.code(),
+        stderr(&out)
+    );
+    let line = frame_hash_line(&out);
+    // The input holds until the next listed frame, so this is UP held from frame
+    // 1 to the end of the run - and twice round the same file it is the same hash.
+    let again = run(&args);
+    assert!(again.status.success());
+    assert_eq!(line, frame_hash_line(&again), "the same movie twice");
+}
+
+/// A movie for another cartridge is refused rather than replayed into a game it
+/// was not written for, the way a save state is (`docs/save-state-format.md`).
+#[test]
+fn movie_for_another_rom_is_refused() {
+    let dir = TempDir::new("movie-wrong-rom");
+    let rom = dir.join("pad.md");
+    write_rom(&rom, &pad_reader_rom());
+    let movie = dir.join("other.rsm");
+    fs::write(
+        &movie,
+        movie_text(0x0123_4567_89ab_cdef, "usa", &[(0, ".")]),
+    )
+    .expect("write movie");
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "2",
+        "--movie",
+        movie.to_str().expect("utf-8 path"),
+    ]);
+    assert!(!out.status.success(), "a foreign movie must not run");
+    assert!(
+        stderr(&out).contains("different cartridge"),
+        "the error must say what is wrong: {}",
+        stderr(&out)
+    );
+}
+
+/// A movie written for a different region is a different run of the machine, and
+/// `--movie` says so instead of replaying it on the wrong frame rate.
+#[test]
+fn movie_for_another_region_is_refused() {
+    let dir = TempDir::new("movie-wrong-region");
+    let rom = dir.join("pad.md");
+    let bytes = write_rom(&rom, &pad_reader_rom());
+    let movie = dir.join("pal.rsm");
+    fs::write(
+        &movie,
+        movie_text(genesis::movie::rom_hash(&bytes), "europe", &[(0, ".")]),
+    )
+    .expect("write movie");
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "2",
+        "--movie",
+        movie.to_str().expect("utf-8 path"),
+    ]);
+    assert!(
+        !out.status.success(),
+        "a PAL movie on an NTSC run must fail"
+    );
+    let text = stderr(&out);
+    assert!(
+        text.contains("region") && text.contains("europe"),
+        "the error must name the region problem: {text}"
+    );
+}
+
+/// A movie file that is not there names the path, and a file that is not a movie
+/// says what the parser rejected - the two mistakes a person makes with a
+/// hand-edited file.
+#[test]
+fn movie_file_mistakes_are_reported() {
+    let dir = TempDir::new("movie-mistakes");
+    let rom = dir.join("pad.md");
+    write_rom(&rom, &pad_reader_rom());
+    let missing = dir.join("nope.rsm");
+    let not_a_movie = dir.join("junk.rsm");
+    fs::write(&not_a_movie, "rustsega-movie 1\nregion usa\npads 1\n").expect("write junk");
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--movie",
+        missing.to_str().expect("utf-8 path"),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains(&missing.to_string_lossy().into_owned()),
+        "the error must name the path: {}",
+        stderr(&out)
+    );
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--movie",
+        not_a_movie.to_str().expect("utf-8 path"),
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("rom-hash"),
+        "the parse error must be the CLI's answer: {}",
+        stderr(&out)
+    );
+}
+
+/// `--movie` is the input and `--pad1` is the input: holding both would mean one
+/// of them is being ignored, so the CLI says which one it refused to guess.
+#[test]
+fn movie_and_pad1_do_not_mix() {
+    let dir = TempDir::new("movie-both");
+    let rom = dir.join("pad.md");
+    let bytes = write_rom(&rom, &pad_reader_rom());
+    let movie = dir.join("in.rsm");
+    fs::write(
+        &movie,
+        movie_text(genesis::movie::rom_hash(&bytes), "usa", &[(0, ".")]),
+    )
+    .expect("write movie");
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--movie",
+        movie.to_str().expect("utf-8 path"),
+        "--pad1",
+        "A@2",
+    ]);
+    assert!(!out.status.success(), "both inputs at once is a mistake");
+    assert!(
+        stderr(&out).contains("--pad1"),
+        "the error must say what cannot be combined: {}",
+        stderr(&out)
+    );
+}
