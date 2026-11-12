@@ -369,7 +369,7 @@ fn one(
     };
     let title = run::title_of(&header).unwrap_or_else(|| "unknown".to_string());
     let serial = header.serial.clone();
-    let region = run::region_name(Config::default().resolve_region(&header)).to_string();
+    let region = Config::default().resolve_region(&header).name().to_string();
     if let Some(reason) = skip_reason(&header.system_type, size) {
         let mut row = RomResult::new(file, Status::Skipped, seconds(), reason.to_string());
         row.title = title;

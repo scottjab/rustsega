@@ -10,6 +10,13 @@
 //! [`genesis::Genesis::drain_audio`] hands out, and the hash is over the same
 //! PCM bytes the `data` chunk holds (M6-02, #121).
 //!
+//! `--pad1` holds buttons for the run, `--movie` plays a recorded movie instead
+//! of holding a script, and `--record` writes what the run held out to one: the
+//! `.rsm` format of [`genesis::movie`], documented in `docs/movie-format.md`
+//! (M6-09, #129).
+//! Reading and writing the file is this command's job - the format's own parser
+//! never sees a path.
+//!
 //! Everything is `Genesis`' own public API: [`genesis::Genesis::new`], then one
 //! [`genesis::Genesis::run_frame`] per frame, then [`genesis::Genesis::frame`]
 //! for the picture. Nothing here reaches into the machine, which is the check
@@ -22,6 +29,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, ValueEnum};
+use genesis::movie::{self, Movie};
 use genesis::{Buttons, Config, Genesis, Region, RegionSetting};
 
 use crate::wav;
@@ -29,6 +37,11 @@ use crate::wav;
 /// Frames for `--frames` when the caller does not say: one second of NTSC, the
 /// shortest run that gets a real game past its reset and into something on screen.
 const DEFAULT_FRAMES: u32 = 60;
+
+/// How many pads `--record` writes: one, because `--pad1` is the only pad the CLI
+/// can hold. A two-pad movie is written by hand or by a front end with two live
+/// pads to take input from (M6-09, #129).
+const RECORDED_PADS: usize = 1;
 
 /// The region the caller asked for: the same three choices [`genesis::Region`]
 /// has, plus `auto` for "read it off the cartridge".
@@ -53,16 +66,6 @@ impl RegionArg {
             Self::Japan => RegionSetting::Force(Region::Japan),
             Self::Europe => RegionSetting::Force(Region::Europe),
         }
-    }
-}
-
-/// Lower-case name a region is printed as, matching `--region` so a caller can
-/// feed one back into the other.
-pub(crate) fn region_name(region: Region) -> &'static str {
-    match region {
-        Region::Japan => "japan",
-        Region::Usa => "usa",
-        Region::Europe => "europe",
     }
 }
 
@@ -110,10 +113,25 @@ pub struct RunArgs {
     /// Frame numbers are 1-based - `A@1` is held during the first frame this
     /// command runs - and one entry's buttons are joined with `+`. A frame with
     /// no entry is run with the pad released. The 3-button pad's names only: UP
-    /// DOWN LEFT RIGHT A B C START. Scripting a test needs, nothing more - the
-    /// movie format is M6-09 (#129).
+    /// DOWN LEFT RIGHT A B C START. `X`, `Y`, `Z` and `Mode` belong to a 6-button
+    /// pad, which this command cannot attach, so they are refused rather than
+    /// silently dropped - a movie holds them fine (`--movie`, `--record`).
     #[arg(long = "pad1", value_name = "SCRIPT")]
     pub pad1: Option<String>,
+    /// Replay the pad input of a `.rsm` movie instead of holding `--pad1`.
+    ///
+    /// The movie of `docs/movie-format.md` (M6-09, #129). Its ROM hash and its
+    /// region have to match this run, and the pads then follow the movie frame by
+    /// frame instead of the script. Cannot be combined with `--pad1`.
+    #[arg(long, value_name = "PATH")]
+    pub movie: Option<PathBuf>,
+    /// Write the run's port 1 input to `PATH` as a `.rsm` movie.
+    ///
+    /// What gets recorded is what the run actually held - a `--pad1` script, or
+    /// nothing held at all - and replaying the file with `--movie` gives the same
+    /// frames back.
+    #[arg(long, value_name = "PATH")]
+    pub record: Option<PathBuf>,
 }
 
 /// Run the machine `args` describes and report it.
@@ -131,7 +149,23 @@ pub fn run(args: RunArgs) -> Result<()> {
         ..Config::default()
     };
     let summary = describe(&rom, &config)?;
+    if args.movie.is_some() && args.pad1.is_some() {
+        bail!(
+            "--movie is this run's input; drop --pad1, or use --record to turn a script into a movie"
+        );
+    }
+    if args.movie.is_some() && args.record.is_some() {
+        bail!("--movie replays and --record writes: naming both asks which one to do to one file");
+    }
+    let region = resolved_region(&rom, &config)?;
+    let movie = read_movie(args.movie.as_deref(), &rom, region)?;
     let pads = parse_pad_script(args.pad1.as_deref())?;
+    // The recorder records what the machine is handed, frame by frame; it starts
+    // empty and `Movie::record` keeps only the frames that change.
+    let mut recorder = args
+        .record
+        .as_ref()
+        .map(|_| Movie::new(movie::rom_hash(&rom), region, RECORDED_PADS));
 
     let sample_rate = config.sample_rate;
     let mut machine = Genesis::new(&rom, config)
@@ -147,7 +181,17 @@ pub fn run(args: RunArgs) -> Result<()> {
     // 1-based, so that a script written as `START@1` means the first frame. The
     // pad is set before the frame runs: a button is held *during* a frame.
     for frame in 1..=args.frames {
-        machine.set_pad(0, pads.get(&frame).copied().unwrap_or_else(Buttons::empty));
+        let held = pads.get(&frame).copied().unwrap_or_else(Buttons::empty);
+        if let Some(movie) = &movie {
+            // Movie frames are 0-based and this loop is 1-based: `--pad1 A@1` and
+            // a movie's frame 0 are the same, first, frame.
+            movie.set_pads(&mut machine, frame - 1);
+        } else {
+            machine.set_pad(0, held);
+        }
+        if let Some(recorder) = &mut recorder {
+            recorder.record(frame - 1, &[held]);
+        }
         machine.run_frame();
         if want_audio {
             // After the frame, so the buffer holds the raster the machine just
@@ -156,6 +200,11 @@ pub fn run(args: RunArgs) -> Result<()> {
         }
     }
     let elapsed = started.elapsed();
+    if let Some(path) = &args.record {
+        let recorder = recorder.expect("--record is what makes a recorder");
+        fs::write(path, recorder.format())
+            .with_context(|| format!("cannot write movie {}", quote(path)))?;
+    }
 
     let frame = machine.frame();
     let pixels = &frame.pixels[..frame.width * frame.height];
@@ -198,6 +247,42 @@ fn read_rom(path: &Path) -> Result<Vec<u8>> {
     fs::read(path).with_context(|| format!("cannot read ROM {}", quote(path)))
 }
 
+/// The movie to replay: read from `path`, its ROM hash checked against `rom` and
+/// its region against the region this run resolved to.
+///
+/// The two checks are this command's rather than `genesis::movie`'s: the machine
+/// on the other end of the replay is the one [`run`] is about to build, and a
+/// movie for another cartridge or another region is a different run rather than a
+/// broken file (`docs/movie-format.md`).
+fn read_movie(path: Option<&Path>, rom: &[u8], region: Region) -> Result<Option<Movie>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let name = quote(path);
+    let text = fs::read_to_string(path).with_context(|| format!("cannot read movie {name}"))?;
+    let movie = movie::parse(&text).with_context(|| format!("cannot read movie {name}"))?;
+    movie
+        .check_rom(rom)
+        .with_context(|| format!("movie {name}"))?;
+    if movie.region() != region {
+        bail!(
+            "movie {name} is for region {}, and this run is {}",
+            movie.region().name(),
+            region.name()
+        );
+    }
+    Ok(Some(movie))
+}
+
+/// The region [`genesis::Genesis::new`] runs `rom` as under `config`: the same
+/// three steps [`describe`] walks, for the caller that wants the region and not
+/// the summary line.
+fn resolved_region(rom: &[u8], config: &Config) -> Result<Region> {
+    let rom = genesis::cart::normalize_rom(rom);
+    let header = genesis::cart::parse_header(&rom).context("ROM has no usable header")?;
+    Ok(config.resolve_region(&header))
+}
+
 /// `--audio-hash`: [`testkit::fnv1a_64`] over the run's audio as PCM bytes,
 /// i.e. over exactly the bytes `--dump-wav` writes into the `data` chunk, so
 /// `audio_hash` and `out.wav` cannot disagree about what was heard
@@ -221,7 +306,7 @@ fn describe(rom: &[u8], config: &Config) -> Result<String> {
     let header = genesis::cart::parse_header(&rom).context("ROM has no usable header")?;
     let title = title_of(&header).unwrap_or_else(|| "unknown".to_string());
     let region = config.resolve_region(&header);
-    Ok(format!("title={title:?} region={}", region_name(region)))
+    Ok(format!("title={title:?} region={}", region.name()))
 }
 
 /// Distinct pixels of a frame, as `--colours` prints them.
@@ -302,8 +387,9 @@ const BUTTONS: [(&str, Buttons); 8] = [
 ///
 /// `Genesis::set_pad` attaches a 3-button pad, which cannot report `X`, `Y`, `Z`
 /// or `MODE`, so a script that asked for one would be holding a button no game
-/// can see. A 6-button pad is a front-end setting (plutiedev, "Controllers",
-/// "6-button controller") and comes with the movie work, M6-09 (#129).
+/// can see (plutiedev, "Controllers", "6-button controller"). A movie records and
+/// replays those letters all the same; what it cannot do until the console grows a
+/// 6-button `set_pad` is show them to the game (`docs/movie-format.md`).
 fn parse_button(name: &str) -> Result<Buttons> {
     const SIX_BUTTON_ONLY: [&str; 4] = ["X", "Y", "Z", "MODE"];
     let wanted = name.trim().to_ascii_uppercase();
