@@ -13,9 +13,9 @@
 //! write-only, so there is no read decode to write, and a register that nothing
 //! acts on yet is still stored, because the register file *is* the observable
 //! state of a write-only chip. Of the global registers the timer group of
-//! [`RegFile::timer_config`] and the key-on of [`REG_KEY_ON`] mean something
-//! now; the LFO (`&22`) and the DAC enable and DAC value (`&2A`, `&2B`) are only
-//! stored, for M5-08 and M5-11 (#116).
+//! [`RegFile::timer_config`], the key-on of [`REG_KEY_ON`] and the LFO of
+//! [`REG_LFO`] and [`REG_AMS_PMS`] mean something now; the DAC enable and DAC
+//! value (`&2A`, `&2B`) are only stored, for M5-11 (#116).
 
 use crate::timers::TimerConfig;
 
@@ -36,6 +36,11 @@ const REGISTERS: usize = 256;
 /// only meaningful with its part (YM2608 application manual "3. Register
 /// descriptions": part I is slots 1 to 3, part II slots 4 to 6).
 pub(crate) const CHANNELS_PER_PART: usize = 3;
+
+/// Register `&22`, the LFO: bit 3 the AM/PM enable and bits 2-0 the frequency
+/// (YM2608 application manual "3. Register descriptions", `&22`). A part I
+/// register like the timers: the LFO is one per chip.
+pub(crate) const REG_LFO: u8 = 0x22;
 
 /// Register `&28`, key on/off: bits 7-4 the operators S4, S3, S2, S1 and bits
 /// 2-0 the channel, 0-2 the part I channels and 4-6 the part II ones.
@@ -88,9 +93,19 @@ pub(crate) const REG_BLOCK_FNUM: u8 = 0xA4;
 /// Register `&B0`, the first of the algorithm and feedback group: `&B0` +
 /// channel, bits 5-3 the feedback of operator 1 and bits 2-0 the connection mode
 /// of the channel's four operators. One register per channel rather than one per
-/// operator, so `&B0`-`&B2` and `&B4`-`&B6` are decoded and `&B3` and `&B7` are
-/// not (YM2608 application manual "3. Register descriptions", `&B0`).
+/// operator, so `&B0`-`&B2` are decoded and `&B3` is not - and `&B4` to `&B6` are
+/// the [next channel group](`REG_AMS_PMS`), not more of this one (YM2608
+/// application manual "3. Register descriptions", `&B0`).
 pub(crate) const REG_ALGORITHM_FEEDBACK: u8 = 0xB0;
+
+/// Register `&B4`, the first of the amplitude and phase modulation group: `&B4` +
+/// channel, bits 5-4 the AMS - how far down the LFO's AM triangle that channel's
+/// amplitude-modulated operators are read at - and bits 2-0 the PMS, its PM depth.
+/// Bits 7-6 of `&B6` are the channel 6 DAC panning of M5-11 (#116). Like
+/// [`REG_ALGORITHM_FEEDBACK`], three of a part are decoded and the fourth, `&B7`,
+/// is not (YM2608 application manual "3. Register descriptions", `&B4`; see
+/// `crate::lfo`).
+pub(crate) const REG_AMS_PMS: u8 = 0xB4;
 
 /// Registers in one per-operator group: the four slot offsets of a channel
 /// group, `&30` to `&3F` for the detune and multiple of [`REG_DT_MUL`].

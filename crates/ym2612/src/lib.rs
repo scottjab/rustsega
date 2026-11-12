@@ -14,7 +14,10 @@
 //! output (`operator` and `tables`), wired through the eight algorithms and the
 //! feedback of `&B0` and summed into the six channel mixes of M5-07a (#111)
 //! (`channel`), and turned into the sample `clock` answers with by the 9-bit DAC
-//! and the ladder of M5-07b (#112) (`output`).
+//! and the ladder of M5-07b (#112) (`output`). The LFO of M5-08 (#113) is the
+//! wobble underneath all of it: one 7-bit counter of `&22`'s making (`lfo`), read
+//! out once as an attenuation added to the envelopes and once as an offset on the
+//! F-Nums behind the phase counters.
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
@@ -23,6 +26,7 @@
 
 mod channel;
 mod envelope;
+mod lfo;
 mod operator;
 mod output;
 mod phase;
@@ -34,6 +38,7 @@ pub use output::ChipModel;
 
 use channel::FmChannel;
 use envelope::EnvelopeGen;
+use lfo::Lfo;
 use phase::{CHANNELS, PhaseGen};
 use regs::{PART_I, PART_II};
 
@@ -89,6 +94,10 @@ pub struct Ym2612 {
     /// The 24 envelopes of the operators, driven by the writes to `&28` and
     /// `&40`-`&80` and stepped a third as often as the phase counters.
     envelopes: EnvelopeGen,
+    /// The LFO of `&22`, and the per-channel AMS and PMS of `&B4` that decide how
+    /// far its triangle reaches the envelopes and the phase increments (M5-08,
+    /// #113).
+    lfo: Lfo,
     /// The six channels' operator sums: the algorithm and the feedback of the
     /// `&B0` group, and the mix those leave behind (M5-07a, #111).
     channels: [FmChannel; CHANNELS],
@@ -109,6 +118,7 @@ impl Ym2612 {
             timers: timers::Timers::new(),
             phases: PhaseGen::new(),
             envelopes: EnvelopeGen::new(),
+            lfo: Lfo::new(),
             channels: std::array::from_fn(|_| FmChannel::new()),
             model: ChipModel::Ym2612,
             busy: 0,
@@ -148,6 +158,7 @@ impl Ym2612 {
             self.timers.register_written(register, value, &config);
         }
 
+        self.lfo.register_written(part, register, value);
         self.phases.register_written(part, register, value);
         self.envelopes
             .register_written(&self.phases, part, register, value);
@@ -212,15 +223,20 @@ impl Ym2612 {
     /// generator has just arrived at and at the attenuation the envelope
     /// generator has just arrived at, so a `&B0`, `&40` or `&A0` write is heard
     /// from the very next sample (`crate::channel`).
+    ///
+    /// The LFO steps first, so the phase modulation it applies to `&A0` and the
+    /// amplitude modulation it applies to `&40` are the ones that belong to this
+    /// sample rather than the one before (M5-08, #113, and `crate::lfo`).
     pub fn clock(&mut self) -> (i16, i16) {
         let config = self.regs.timer_config();
         self.timers.tick(&config);
-        self.phases.tick();
+        self.lfo.tick();
+        self.phases.tick(self.lfo.pms(), self.lfo.pm_phase());
         self.envelopes.tick(&self.phases);
 
         for channel in 0..CHANNELS {
             let phase = std::array::from_fn(|slot| self.phases.phase(channel, slot));
-            let att = std::array::from_fn(|slot| self.envelopes.envelope(channel, slot).output());
+            let att = std::array::from_fn(|slot| self.attenuation(channel, slot));
             self.channels[channel].step(phase, att);
         }
 
@@ -228,6 +244,21 @@ impl Ym2612 {
         let mix = std::array::from_fn(|channel| self.channels[channel].output());
         let sample = output::mix(mix, self.model);
         (sample, sample)
+    }
+
+    /// What one operator is attenuated by as the channel mix reads it: its
+    /// envelope, plus the LFO's AM attenuation for this channel when this
+    /// operator's `&60` bit 7 asks for it (M5-08, #113, and [`crate::lfo`]).
+    ///
+    /// The AM joins outside [`crate::envelope::Envelope::output`] and is clamped
+    /// at silence again. The chip adds it before the total level and clamps once;
+    /// the two come to the same number, since an envelope already at silence
+    /// stays there whatever the LFO does to it, and the envelope does not know
+    /// the LFO exists (`&60`, `&40`).
+    fn attenuation(&self, channel: usize, slot: usize) -> u16 {
+        let envelope = self.envelopes.envelope(channel, slot);
+        let am = self.lfo.amplitude(channel, envelope.am_enable());
+        (envelope.output() + u16::from(am)).min(envelope::SILENT)
     }
 }
 
@@ -879,5 +910,161 @@ mod tests {
         assert_eq!(discrete.clock(), (0, 0));
         discrete.set_model(ChipModel::Ym2612);
         assert_eq!(discrete.clock(), (24, 24));
+    }
+
+    /// Register `&22`, the LFO: bit 3 the AM/PM enable and bits 2-0 the frequency
+    /// (YM2608 application manual `&22`).
+    const REG_LFO: u8 = 0x22;
+    /// Register `&B4`, the first of the amplitude and phase modulation group:
+    /// bits 5-4 AMS and bits 2-0 PMS (`&B4`, and `crate::lfo`).
+    const REG_AMS_PMS: u8 = 0xB4;
+    /// `&22` bit 3: the LFO runs.
+    const LFO_ON: u8 = 0x08;
+    /// `&60` bit 7: this operator takes part in the amplitude modulation.
+    const AM_ENABLE: u8 = 0x80;
+
+    /// Width of the phase counter, for reading an increment off two samples of it
+    /// even when it wrapped in between (`crate::phase`).
+    const PHASE_MASK: u32 = 0x000F_FFFF;
+
+    /// Channel 1 held at full level with nothing moving: total level 0, an attack
+    /// fast enough to be instant at key code 0, and decay 1 at rate 0, so its
+    /// envelope attenuation is 0 and stays there and anything that moves the
+    /// operator's attenuation afterwards moved it for a reason (`&40`, `&50`,
+    /// `&60`).
+    fn hold_channel_one_open(chip: &mut Ym2612) {
+        write_reg(chip, ADDR_1, DATA_1, 0x40, 0x00);
+        write_reg(chip, ADDR_1, DATA_1, 0x50, 0x1F);
+        write_reg(chip, ADDR_1, DATA_1, 0x60, 0x00);
+        write_reg(chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1);
+    }
+
+    /// Channel 1 at multiple 1, block 1 and F-Num 0x400, which is a phase
+    /// increment of (0x400 << 1) >> 1 = 1024 a sample, and a PM offset therefore
+    /// has somewhere obvious to move it from (`&30`, `&A4`, `&A0`).
+    fn tune_channel_one(chip: &mut Ym2612) {
+        write_reg(chip, ADDR_1, DATA_1, 0x30, 0x01);
+        write_reg(chip, ADDR_1, DATA_1, 0xA4, 0x0C);
+        write_reg(chip, ADDR_1, DATA_1, 0xA0, 0x00);
+    }
+
+    /// Operator 1's attenuation over four cycles of the LFO at `&22` 7 - a
+    /// 5-sample step, so a reading every 20 samples is a reading every fourth
+    /// step, which covers both halves of the triangle (`crate::lfo`).
+    fn attenuation_over_cycles(chip: &mut Ym2612) -> Vec<u16> {
+        (0..512)
+            .map(|_| {
+                clock_for(chip, 20);
+                chip.attenuation(0, phase::SLOT_S1)
+            })
+            .collect()
+    }
+
+    /// Operator 1's phase increment over four cycles of the LFO at `&22` 7, one
+    /// value per PM phase: 20 samples of a 5-sample step is four steps, which is
+    /// exactly how often `crate::lfo` reads the counter for PM, so each reading is
+    /// one PM phase and each of the 20 samples in the group ran at it.
+    fn increment_over_cycles(chip: &mut Ym2612) -> Vec<u32> {
+        let mut steps = vec![];
+        let mut before = operator(chip, 0, phase::SLOT_S1).phase;
+        for _ in 0..512 {
+            clock_for(chip, 20);
+            let after = operator(chip, 0, phase::SLOT_S1).phase;
+            steps.push((after.wrapping_sub(before) & PHASE_MASK) / 20);
+            before = after;
+        }
+        steps
+    }
+
+    /// AMS 3 - the deepest - with the operator's `&60` bit 7 clear is not amplitude
+    /// modulation: the attenuation does not move over four cycles of the LFO, and
+    /// the same channel with the bit set does move (`&60`, `&B4`, and #113).
+    #[test]
+    fn am_off_when_bit_clear() {
+        let mut chip = Ym2612::new();
+        hold_channel_one_open(&mut chip);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_AMS_PMS, 0x30);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_LFO, LFO_ON);
+
+        let off = attenuation_over_cycles(&mut chip);
+        assert!(
+            off.iter().all(|att| *att == 0),
+            "AMS 3 with `&60` bit 7 clear is silence from the LFO: {off:?}"
+        );
+
+        // The same operator, and the same decay rate: only the AM enable moved.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x60, AM_ENABLE);
+        let on = attenuation_over_cycles(&mut chip);
+        assert!(
+            on.iter().any(|att| *att != 0),
+            "`&60` bit 7 set, and the LFO still reaches nothing: {on:?}"
+        );
+    }
+
+    /// AMS 3 is 126 of attenuation at the peak of the triangle and nothing at the
+    /// bottom: 11.8 dB of the 1024 of the envelope's range, which is the depth the
+    /// YM2608 application manual's AM table gives AMS 3 (`&B4`, and #113).
+    #[test]
+    fn am_max_depth() {
+        let mut chip = Ym2612::new();
+        hold_channel_one_open(&mut chip);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x60, AM_ENABLE);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_AMS_PMS, 0x30);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_LFO, LFO_ON);
+
+        let on = attenuation_over_cycles(&mut chip);
+        let deepest = *on.iter().max().expect("a cycle of readings");
+        let shallowest = *on.iter().min().expect("a cycle of readings");
+        assert_eq!(
+            shallowest, 0,
+            "the bottom of the triangle is the envelope alone"
+        );
+        assert_eq!(
+            deepest, 126,
+            "and the top is 126 of attenuation on top of it"
+        );
+    }
+
+    /// PMS 0 leaves the phase increment alone: a channel with the LFO running at
+    /// full speed and PMS 0 counts at exactly the rate it would with no LFO at all
+    /// (`&B4`, and #113).
+    #[test]
+    fn pms_zero_no_vibrato() {
+        let mut chip = Ym2612::new();
+        tune_channel_one(&mut chip);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_AMS_PMS, 0x00);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_LFO, LFO_ON | 0x07);
+
+        let steps = increment_over_cycles(&mut chip);
+        assert!(
+            steps.iter().all(|step| *step == 1024),
+            "PMS 0 is a depth of zero, so nothing moves: {steps:?}"
+        );
+    }
+
+    /// PMS 7 - the deepest - moves the increment over the LFO cycle, and it moves
+    /// it symmetrically about the increment of PMS 0: the top of the swing is as
+    /// far above 1024 as the bottom is below it, because PM offsets the F-Num
+    /// rather than replacing it (`&B4`, `crate::lfo::pm_offset`, and #113).
+    #[test]
+    fn pm_changes_increment() {
+        let mut chip = Ym2612::new();
+        tune_channel_one(&mut chip);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_AMS_PMS, 0x07);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_LFO, LFO_ON | 0x07);
+
+        let steps = increment_over_cycles(&mut chip);
+        let highest = *steps.iter().max().expect("a cycle of readings");
+        let lowest = *steps.iter().min().expect("a cycle of readings");
+        assert!(
+            highest > 1024 && lowest < 1024,
+            "PMS 7 is not still: {steps:?}"
+        );
+        assert_eq!(
+            highest - 1024,
+            1024 - lowest,
+            "the swing is symmetric about the F-Num that was written"
+        );
+        assert_eq!((highest, lowest), (1024 + 48, 1024 - 48));
     }
 }
