@@ -479,13 +479,17 @@ impl Stream {
     /// nothing above its own Nyquist anyway and there is no sense paying for a
     /// pass band that ends at a frequency the chip cannot reach.
     ///
-    /// Tap `k` of phase `p` reads the input sample `1 - k - p / PHASES` away
-    /// from the output position, which is why the ideal response is evaluated
-    /// there: the kernel is causal, so the sample the output lies in is the
-    /// `k = 0` tap and not the middle of the window. Each row is then normalised
-    /// to sum to 1, which makes the filter exactly unity at DC - a constant in
-    /// has to be a constant out, and that is what lets [`Mixer`] put the
-    /// DC-blocking high-pass after it and still call it a DC blocker.
+    /// Tap `k` of phase `p` sits `k - taps / 2 - p / PHASES` samples away from
+    /// the output position, which is what makes the window and the sinc share a
+    /// centre: the samples the output needs straddle it, half before and half
+    /// after, and a window that is not centred on the sinc it is cutting makes a
+    /// filter that is not a low-pass at all. [`Stream::sum`] walks the row and
+    /// the samples in the same order, oldest sample against `row[0]`.
+    ///
+    /// Each row is then normalised to sum to 1, which makes the filter exactly
+    /// unity at DC: a constant in has to be a constant out, and that is what
+    /// lets [`Mixer`] put the DC-blocking high-pass after the resampler and still
+    /// call it a DC blocker.
     fn build_kernel(period: u64, taps: usize, rate: u32, master_hz: u64) -> Vec<f32> {
         let in_rate = master_hz as f64 / period as f64;
         let cutoff = (f64::from(rate) * 0.45 / in_rate).min(0.45);
@@ -495,7 +499,11 @@ impl Stream {
             let row = &mut kernel[phase * taps..phase * taps + taps];
             let mut sum = 0.0;
             for (k, tap) in row.iter_mut().enumerate() {
-                let distance = 1.0 - k as f64 - offset;
+                // Tap `k` reads the input sample `oldest + k`, and `oldest` is
+                // `taps / 2` before the sample the output position lies in, so
+                // this tap is `k - taps / 2` along from that sample and the
+                // output is `offset` further on still.
+                let distance = k as f64 - (taps / 2) as f64 - offset;
                 let ideal = if distance == 0.0 {
                     2.0 * cutoff
                 } else {
@@ -572,7 +580,7 @@ impl Stream {
         let phase = (pos % self.step * PHASES as u64 / self.step) as usize;
         (
             &self.kernel[phase * self.taps..phase * self.taps + self.taps],
-            index as i64 - self.taps as i64 + 2,
+            index as i64 - (self.taps / 2) as i64,
         )
     }
 
@@ -594,12 +602,40 @@ impl Stream {
 
     /// One channel's contribution to one output sample: the window of input
     /// samples from `oldest` on, weighted by `row`.
+    ///
+    /// A window that runs off either end of what the stream holds is divided back
+    /// up by the weight it did get. Zero-padding alone would be right at the
+    /// start of time, where there genuinely is nothing before sample 0, and wrong
+    /// at the end of a frame, where the samples simply have not been made yet:
+    /// half the weights of a kernel centred on the output are missing there, so
+    /// an uncorrected window would lose 6 dB of level on the last few output
+    /// samples of every frame - a click 60 times a second, and the reason a
+    /// band-limited resampler has to say what it does at a boundary. Dividing by
+    /// the surviving weight keeps the gain at 1 and costs only a wider
+    /// transition, for the fraction of a millisecond it applies to.
     fn sum(&self, row: &[f32], oldest: i64, channel: usize) -> f32 {
         let mut total = 0.0;
+        let mut held = 0.0;
         for (k, &weight) in row.iter().enumerate() {
-            total += self.sample(oldest + k as i64, channel) * weight;
+            let index = oldest + k as i64;
+            if !self.held(index) {
+                continue;
+            }
+            total += self.sample(index, channel) * weight;
+            held += weight;
         }
-        total
+        if held == 0.0 {
+            0.0
+        } else {
+            total / held
+        }
+    }
+
+    /// Is the input sample at `index` held? Only ever false at the two ends of a
+    /// frame, which is what lets [`Stream::sum`] ask once per tap.
+    fn held(&self, index: i64) -> bool {
+        let offset = index - self.first;
+        offset >= 0 && (offset as usize) < self.count()
     }
 
     /// Drop the input samples up to `to` that no future output sample can reach,
@@ -609,7 +645,7 @@ impl Stream {
     /// growing for ever: `Vec::drain` moves the tail down and keeps the
     /// capacity, so after the first frame no call to this file allocates.
     fn trim(&mut self, to: u64) {
-        let keep_from = to as i64 - self.taps as i64 + 2;
+        let keep_from = to as i64 - (self.taps / 2) as i64;
         if keep_from <= self.first {
             return;
         }
@@ -672,8 +708,10 @@ pub struct Mixer {
     psg: Stream,
     /// The `a` of the board's low-pass, or `None` for [`LowPass::Off`].
     low_pass: Option<f32>,
-    /// The `a` of the DC-blocking high-pass.
-    dc_gain: f32,
+    /// What the DC-blocking high-pass keeps of its own previous output: one less
+    /// the `a` of the same one-pole the low-pass uses, because the blocker is
+    /// that filter's other zero - see [`Mixer::shape`].
+    dc_keep: f32,
     /// One filter state per output channel.
     state: [FilterState; 2],
 }
@@ -713,7 +751,7 @@ impl Mixer {
                 LowPass::Off => None,
                 LowPass::Model1 => Some(one_pole(MODEL1_LOW_PASS_HZ, rate)),
             },
-            dc_gain: one_pole(DC_BLOCK_HZ, rate),
+            dc_keep: 1.0 - one_pole(DC_BLOCK_HZ, rate),
             state: [FilterState::default(); 2],
         }
     }
@@ -754,10 +792,11 @@ impl Mixer {
     /// The DC blocker goes first and the board's low-pass second: the offsets it
     /// is there for are at 0 Hz, where the low-pass is doing nothing, and taking
     /// them out before the low-pass means its pole never holds a level that is
-    /// not sound. Both are the `y += a * (x - y)` one-pole form (
-    /// [`one_pole`]); the blocker is that form in the transposed way that gives a
-    /// zero at DC, `y = a * (y_prev + x - x_prev)`, which is the same filter with
-    /// the same `a` to the precision this is all specified to.
+    /// not sound. The low-pass is the `y += a * (x - y)` one-pole form of
+    /// [`one_pole`]; the blocker is the same pole with the difference of the
+    /// input in place of the input, `y = (1 - a) * y_prev + x - x_prev`, which is
+    /// the backward-Euler discretisation of `s / (s + wc)` - unity where the
+    /// low-pass is unity and zero at DC, which is the whole of what it is for.
     ///
     /// The sum of six FM channels and four PSG channels can ask for more than an
     /// `i16` can say - Genesis Plus GX, whose levels this copies, has the same
@@ -765,16 +804,20 @@ impl Mixer {
     /// `core/system.c` clamps to 32767 and -32768 after filtering) - so the
     /// answer is clamped rather than wrapped.
     fn shape(&mut self, channel: usize, value: f32) -> i16 {
-        let (low_pass, dc_gain) = (self.low_pass, self.dc_gain);
+        let (low_pass, dc_keep) = (self.low_pass, self.dc_keep);
         let state = &mut self.state[channel];
 
-        let blocked = dc_gain * (state.blocked + value - state.previous);
+        let blocked = dc_keep * state.blocked + value - state.previous;
         state.previous = value;
         state.blocked = blocked;
 
         let mut shaped = blocked;
         if let Some(a) = low_pass {
-            shaped += a * (state.low - shaped);
+            // `y += a * (x - y)`: the new level moves `a` of the way from the
+            // level it was towards the one it is being told. Doing this the other
+            // way round - `x + a * (y - x)` - is a filter with `1 - a`, a corner
+            // three times higher, and it is very easy to write by accident.
+            shaped = state.low + a * (blocked - state.low);
             state.low = shaped;
         }
         shaped.clamp(-32_768.0, 32_767.0).round() as i16
@@ -809,6 +852,11 @@ mod tests {
     const NTSC_FRAME: u64 = 262 * MASTER_CLOCKS_PER_LINE;
     /// The default host rate every test mixes to.
     const RATE: u32 = 48_000;
+    /// The samples at the end of a mixed run that [`steady`] does not measure:
+    /// the last few output samples of a mix are read from a kernel that runs off
+    /// the end of the frame, which is the right thing to do and the wrong place
+    /// to measure a filter from.
+    const TAIL_GUARD: usize = 32;
 
     /// A mixer on the NTSC master clock with `config`.
     fn mixer(config: Config) -> Mixer {
@@ -864,6 +912,16 @@ mod tests {
     /// `x` relative to `reference`, in decibels.
     fn decibels(x: f64, reference: f64) -> f64 {
         20.0 * (x / reference).log10()
+    }
+
+    /// A window of `want` samples from the steady state: past the first half,
+    /// where the DC blocker is still settling after the first sample of machine
+    /// time, and off the last samples, where the resampler is reading past the
+    /// end of the frame it has been given (see [`Stream::sum`]).
+    fn steady(signal: &[f64], want: usize) -> &[f64] {
+        let end = signal.len() - TAIL_GUARD;
+        assert!(end > want, "the signal is shorter than the window");
+        &signal[end - want..end]
     }
 
     /// The root mean square of `signal`.
@@ -937,7 +995,7 @@ mod tests {
     /// [`lowpass_attenuates_10khz`] is the board filter's own test.
     #[test]
     fn sine_through_resampler_keeps_amplitude() {
-        let (ym_count, psg_count) = counts(2);
+        let (ym_count, psg_count) = counts(4);
         let amplitude = 400.0;
         let ym: Vec<(i16, i16)> = sine(ym_count, YM_SAMPLE_MCLK, 1_000.0, amplitude)
             .into_iter()
@@ -962,10 +1020,13 @@ mod tests {
             &mut out,
         );
 
-        // Past the kernel's leading edge, and measured as a peak because the
-        // signal is at 48 of the host's samples per cycle.
+        // Measured in the steady state, and as a peak because the signal is at 48
+        // of the host's samples per cycle. The first half of a mixed run is not
+        // steady: a DC blocker with a 20 Hz corner takes eight milliseconds to
+        // settle after the first sample of machine time, and the measurement is
+        // of the filter, not of that.
         let signal = left(&out);
-        let peak = signal[64..]
+        let peak = steady(&signal, 1_024)
             .iter()
             .fold(0.0_f64, |best, &v| best.max(v.abs()));
         let want = amplitude * YM_OUTPUT_GAIN as f64;
@@ -1067,11 +1128,13 @@ mod tests {
         })
         .mix(&frame, &mut bypassed);
 
-        // The last 0.064 s of each: 640 whole cycles of the tone, past the
-        // resampler's leading edge and past the transient of the DC blocker.
+        // 640 whole cycles of the tone each, out of the steady state for the same
+        // reason as [`sine_through_resampler_keeps_amplitude`]: the start of a
+        // mixed run is full of the DC blocker's own settling, which is not the
+        // board's low-pass and would be counted as part of its answer.
         let window = 3_072;
-        let with = rms(&left(&through)[through.len() / 2 - window..through.len() / 2]);
-        let without = rms(&left(&bypassed)[bypassed.len() / 2 - window..bypassed.len() / 2]);
+        let with = rms(steady(&left(&through), window));
+        let without = rms(steady(&left(&bypassed), window));
         let loss = decibels(with, without);
         assert!(loss <= -9.0, "Model 1 left {loss:.2} dB on a 10 kHz tone");
     }
