@@ -9,10 +9,13 @@
 //! or leave alone (Nemesis, "YM2612 FM operator" research on SpritesMind, and
 //! the same pipeline as Nuked-OPN2's `OPN2_FMGenerate`).
 //!
-//! What is not here is the sum of the operators of a channel, the feedback of
-//! `&2B`, and the DAC: an operator's modulation arrives as an argument, and
-//! [`crate::Ym2612::clock`] still returns silence. That is M5-07a (#111), which
-//! is what calls [`angle`] and [`output`] for a living.
+//! What is not here is the sum of the operators of a channel, the channel
+//! feedback of `&B0`, and the DAC: an operator's modulation arrives as an
+//! argument, and [`crate::Ym2612::clock`] still returns silence. That is
+//! M5-07a (#111), which is what calls [`angle`] and [`output`] for a living -
+//! hence the module-wide `allow`, and the same for the two tables of
+//! [`crate::tables`].
+#![allow(dead_code)] // first caller is the algorithm sum of M5-07a (#111)
 
 use crate::tables::{EXP, LOGSIN};
 
@@ -38,9 +41,11 @@ const MIRROR_BIT: u16 = 0x0100;
 /// The low eight angle bits: the index into the quarter wave.
 const INDEX_MASK: u16 = 0x00FF;
 
-/// The total attenuation is a log-domain number in 256ths of an octave - the
-/// `4.8` of the ticket - so its low byte is the fraction the exponent reads and
-/// the rest is how many octaves down the answer is.
+/// The low byte of the total attenuation, the fraction of an octave.
+///
+/// A total attenuation is a log-domain number in 256ths of an octave, so this
+/// byte is what the exponent table indexes and the bits above it are the whole
+/// octaves the mantissa gets shifted back down by.
 const FRACTION_MASK: u32 = 0x00FF;
 
 /// The octave of the total attenuation: the shift that turns 256ths into whole
@@ -51,13 +56,13 @@ const OCTAVE_BITS: u32 = 8;
 const MANTISSA_TOP: u16 = 0x0400;
 
 /// How far down the total attenuation has to be for the exponent to leave
-/// nothing: the largest magnitude is `0x7ff << 2 = 8188` and that shifted down
-/// by 13 octaves is 0, so at 13 and beyond the answer is silence either way.
+/// nothing at all: the largest magnitude the pipeline can make is `0x7ff << 2`
+/// = 8188, and 8188 twelve octaves down is 1, thirteen down is 0.
 ///
-/// The shift is not a saturating one, so the bound is what keeps this a shift
-/// rather than a modulo-32 shift: a 13-bit total attenuation tops out at 0x1fff,
-/// 31 octaves, and the check is what makes 24 of those octaves return 0 rather
-/// than come back as a shift of 0.
+/// It is a shortcut rather than a guard. A total attenuation reaches at most
+/// `0x859 + (0x3ff << 2) = 0x1855`, so the shift it is read against is at most
+/// 24 and is a legal shift either way; saying it here is what makes the bottom
+/// eleven octaves of the range an explicit silence rather than a fall-through.
 const SILENT_OCTAVES: u32 = 13;
 
 /// The ten-bit angle one operator reads its waveform at: the top ten bits of its
@@ -72,9 +77,10 @@ const SILENT_OCTAVES: u32 = 13;
 /// chip does and what makes a feedback level too loud for a slot sound like
 /// metallic noise rather than like a volume reduction.
 pub(crate) fn angle(counter: u32, modulation: i32) -> u16 {
-    let counter = i32::try_from(counter >> ANGLE_SHIFT).expect("the phase counter is 20 bits");
-    // The wrap is the hardware: ten bits, both ends, negatives included.
-    (counter.wrapping_add(modulation) as u32 & ANGLE_MASK) as u16
+    // The wrap is the hardware, and `as u32` is the two's complement cast, which
+    // is what keeps a negative modulation negative in the ten bits that remain.
+    let counter = counter >> ANGLE_SHIFT;
+    (counter.wrapping_add(modulation as u32) & ANGLE_MASK) as u16
 }
 
 /// What one operator outputs at angle `angle` with a total envelope attenuation
@@ -88,7 +94,7 @@ pub(crate) fn angle(counter: u32, modulation: i32) -> u16 {
 /// the largest value it can reach is `8168` rather than the 8191 of 13 bits: the
 /// exponent table tops out at a mantissa of 2042, not 2048, because a table of
 /// `2^(-(i + 1) / 256)` has no entry for a whole octave of nothing removed.
-/// See [`crate::tables::EXP`] and `operator_zero_att_peak_is_the_top_of_the_table`.
+/// See [`crate::tables::EXP`] and `op_output_zero_att_peak`.
 pub(crate) fn output(angle: u16, att: u16) -> i16 {
     // The mirror is what makes the second quarter of a half wave: an angle of
     // 0x100 + n reads the same table entry as n does, and 0x100 is the peak.
@@ -109,7 +115,11 @@ pub(crate) fn output(angle: u16, att: u16) -> i16 {
     // octaves back down: at most 8188, so the cast to i16 cannot change it.
     let magnitude = ((u32::from(mantissa) << 2) >> octaves) as i16;
 
-    if angle & SIGN_BIT == 0 { magnitude } else { -magnitude }
+    if angle & SIGN_BIT == 0 {
+        magnitude
+    } else {
+        -magnitude
+    }
 }
 
 #[cfg(test)]
@@ -126,11 +136,10 @@ mod tests {
     /// reach it. The ticket's own formula for the exponent table -
     /// `round(2^(1 - (i + 1) / 256) * 1024) - 1024`, which is what Nuked-OPN2's
     /// `exprom` holds - puts its entry 0 at `0x3fa`, a mantissa of 2042, and
-    /// 2042 * 4 is 8168. Nuked-OPN2 agrees against hardware: its
-    /// `OPN2_FMGenerate` gives `((exprom[0xff] | 0x400) << 2) >> 0` at this
-    /// exact angle and attenuation, which is the same 8168.
+    /// 2042 * 4 is 8168. Nuked-OPN2's own operator step gives the same number at
+    /// this angle and attenuation: `((exprom[0xff] | 0x400) << 2) >> 0`.
     #[test]
-    fn op_output_zero_att_peak_is_the_top_of_the_table() {
+    fn op_output_zero_att_peak() {
         assert_eq!(output(0x100, 0), 8168);
     }
 
@@ -170,15 +179,19 @@ mod tests {
         }
     }
 
-    /// An angle never leaves its 14 bits: the largest magnitude is the peak of
-    /// the table, and the smallest non-zero one is a single step, so nothing
-    /// here can overflow the i16 it returns.
+    /// No angle and no attenuation takes an output outside the range the
+    /// pipeline is built on: the top of the exponent table at one corner and
+    /// silence at the other, so the i16 every answer comes back in cannot
+    /// overflow.
     #[test]
     fn op_output_stays_in_range() {
         for angle in 0..=0x3ff {
             for att in 0..=0x3ff {
                 let out = output(angle, att);
-                assert!((-8168..=8168).contains(&out), "angle {angle:#04x} att {att:#x}");
+                assert!(
+                    (-8168..=8168).contains(&out),
+                    "angle {angle:#04x} att {att:#x}"
+                );
             }
         }
     }
@@ -190,17 +203,33 @@ mod tests {
     fn angle_is_the_top_ten_bits_plus_the_modulation() {
         assert_eq!(angle(0x0_0000, 0), 0);
         assert_eq!(angle(0x0_00400, 0), 1);
-        assert_eq!(angle(0x0_03FF, 0), 0, "the low ten bits of the counter are dropped");
+        assert_eq!(
+            angle(0x0_03FF, 0),
+            0,
+            "the low ten bits of the counter are dropped"
+        );
         assert_eq!(angle(0xF_FFFF, 0), 0x3FF, "the top of a 20-bit counter");
         assert_eq!(angle(0x1_2345, 0), 0x048);
-        assert_eq!(angle(0x0_00400, 0xFF), 0x100, "the modulation is added, not ored");
+        assert_eq!(
+            angle(0x0_00400, 0xFF),
+            0x100,
+            "the modulation is added, not ored"
+        );
 
         // Modulo ten bits, in both directions: the same wrap Nuked does with
         // `(fm_mod + (pg_phase >> 10)) & 0x3ff`.
         assert_eq!(angle(0, 0x400), 0, "a whole cycle of modulation is nothing");
         assert_eq!(angle(0, 0x401), 1);
-        assert_eq!(angle(0, -1), 0x3FF, "and one below nothing is the top of the cycle");
+        assert_eq!(
+            angle(0, -1),
+            0x3FF,
+            "and one below nothing is the top of the cycle"
+        );
         assert_eq!(angle(0x0_00400, -0x401), 0);
-        assert_eq!(angle(0xF_FFFF, 0x200), 0x1FF, "still modulo, at the top end");
+        assert_eq!(
+            angle(0xF_FFFF, 0x200),
+            0x1FF,
+            "still modulo, at the top end"
+        );
     }
 }
