@@ -189,6 +189,14 @@ const V_JUMP_NTSC: u8 = 0xE5;
 /// 259 lines and 0xCA..=0xFF is the last 54, which is 313 lines (genvdp.txt
 /// section 5 for the shape, nothing for the numbers). TODO(M6-06 #125): confirm
 /// against hardware; treat as inferred until then.
+///
+/// Not inferred from the arithmetic alone any more: Kabuto's hardware notes,
+/// "Timing table - General", gives the PAL V counter progression as
+/// `0x000-0x102, 0x1CA-0x1FF` in V28, which is 259 lines and a jump to `0xCA`
+/// as here, and `0x000-0x10A, 0x1D2-0x1FF` in V30, which is 267 and `0xD2` -
+/// both of the two tables below and the 313 lines of the frame they count.
+/// Found for M6-12 (#132); the TODO stays open for the hardware check #125
+/// asked for.
 const V_JUMP_PAL_V28_LINE: u16 = 259;
 /// Value the V counter jumps to, PAL in V28 (see [`V_JUMP_PAL_V28_LINE`]).
 const V_JUMP_PAL_V28: u8 = 0xCA;
