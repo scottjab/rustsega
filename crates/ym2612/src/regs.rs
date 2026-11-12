@@ -12,10 +12,10 @@
 //! The banks are raw bytes and stay that way: the chip's registers are
 //! write-only, so there is no read decode to write, and a register that nothing
 //! acts on yet is still stored, because the register file *is* the observable
-//! state of a write-only chip. Of the global registers only the timer group of
-//! [`RegFile::timer_config`] means anything at this stage; the LFO (`0x22`), the
-//! key-on (`0x28`) and the DAC enable and value (`0x2A`, `0x2B`) are stored for
-//! the sound tickets M5-04 (#108) and M5-11 (#116).
+//! state of a write-only chip. Of the global registers the timer group of
+//! [`RegFile::timer_config`] and the key-on of [`REG_KEY_ON`] mean something
+//! now; the LFO (`&22`) and the DAC enable and DAC value (`&2A`, `&2B`) are only
+//! stored, for M5-08 and M5-11 (#116).
 
 use crate::timers::TimerConfig;
 
@@ -31,6 +31,40 @@ const PARTS: usize = 2;
 /// Registers per bank: the address port is 8 bits wide, so a part has 256 of
 /// them whether or not every number in the range is decoded.
 const REGISTERS: usize = 256;
+
+/// Channels per part: a part carries three of the six, so a channel number is
+/// only meaningful with its part (YM2608 application manual "3. Register
+/// descriptions": part I is slots 1 to 3, part II slots 4 to 6).
+pub(crate) const CHANNELS_PER_PART: usize = 3;
+
+/// Register `&28`, key on/off: bits 7-4 the operators S4, S3, S2, S1 and bits
+/// 2-0 the channel, 0-2 the part I channels and 4-6 the part II ones.
+///
+/// The channel field is an absolute channel number rather than a part-relative
+/// one, so `&28` of either part reaches the same operators (YM2608 application
+/// manual `&28`).
+pub(crate) const REG_KEY_ON: u8 = 0x28;
+
+/// Register `&30`, the first of the detune and multiple group: one register per
+/// operator, at `&30` + slot offset + channel, so a part's three channels fill
+/// `&30`-`&3E` and `&33`, `&37`, `&3B` and `&3F` - the fourth channel of each
+/// slot - are not decoded (YM2608 application manual `&30`).
+pub(crate) const REG_DT_MUL: u8 = 0x30;
+
+/// Register `&A0`, the first of the F-Num low group: `&A0` + channel, bits 7-0
+/// of the 11-bit F-Num. This is also the write that applies a channel's pending
+/// `&A4` (YM2608 application manual `&A0`).
+pub(crate) const REG_FNUM_LOW: u8 = 0xA0;
+
+/// Register `&A4`, the first of the block and F-Num high group: `&A4` +
+/// channel, block in bits 5-3 and F-Num 10-8 in bits 2-0. `&A8`-`&AE` are the
+/// channel 3 special mode of M5-09 (#114), not another channel (YM2608
+/// application manual `&A4`).
+pub(crate) const REG_BLOCK_FNUM: u8 = 0xA4;
+
+/// Registers in one per-operator group: the four slot offsets of a channel
+/// group, `&30` to `&3F` for the detune and multiple of [`REG_DT_MUL`].
+const OPERATOR_GROUP_WIDTH: u8 = 0x10;
 
 /// Register `&24`, timer A loader bits A0-A7: the low eight of its 10.
 ///
@@ -72,6 +106,42 @@ pub(crate) const ENABLE_B_BIT: u8 = 0x08;
 pub(crate) const RESET_A_BIT: u8 = 0x10;
 /// `&27` bit 5: a write with this bit set clears status bit 1.
 pub(crate) const RESET_B_BIT: u8 = 0x20;
+
+/// The `(channel, operator)` a per-operator register number of `part` addresses.
+///
+/// The number is `group + slot offset + channel`: the detune and multiple group
+/// of [`REG_DT_MUL`], the slot offset in bits 3-2 of the low nibble in the chip's
+/// S1, S3, S2, S4 order (see `crate::phase::SLOT_S1`), and the channel within the
+/// part in bits 1-0, which the part carries over into the global channel number
+/// (YM2608 application manual "3. Register descriptions").
+///
+/// Only the detune group is decoded, being the only per-operator group anything
+/// acts on yet, so `None` also covers `&33`, `&37`, `&3B` and `&3F`: the
+/// undecoded fourth channel of each slot.
+pub(crate) fn operator_of(part: usize, register: u8) -> Option<(usize, usize)> {
+    let offset = register.checked_sub(REG_DT_MUL)?;
+    if offset >= OPERATOR_GROUP_WIDTH {
+        return None;
+    }
+    let slot = usize::from((offset & 0x0C) >> 2);
+    Some((channel_of(part, offset & 0x03)?, slot))
+}
+
+/// The channel of `part` that a channel-level register addresses: `first` +
+/// channel, with the part's fourth address - `&A3`, `&A7` and everything above
+/// `&A8` - not decoded (YM2608 application manual `&A0`, `&A4`).
+pub(crate) fn channel_of_register(part: usize, first: u8, register: u8) -> Option<usize> {
+    channel_of(part, register.checked_sub(first)?)
+}
+
+/// The global channel number of a part's channel 0-2: part I is channels 0-2 and
+/// part II channels 3-5.
+fn channel_of(part: usize, channel: u8) -> Option<usize> {
+    if channel >= CHANNELS_PER_PART as u8 {
+        return None;
+    }
+    Some(part * CHANNELS_PER_PART + usize::from(channel))
+}
 
 /// The register file of one YM2612: two banks and the address each of the two
 /// address ports last latched.
