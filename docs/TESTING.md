@@ -29,7 +29,7 @@ compiled at all by the workspace run: `just check` adds the clippy and nextest o
 | CPU conformance | `crates/m68k/tests/`, `crates/z80/tests/` | SingleStepTests JSON suites, zexdoc/zexall. |
 | Chip tests | `crates/vdp/tests/`, audio crates | Register writes in, pixels/samples out. Golden values. |
 | Test ROMs | `crates/genesis/tests/` | Homebrew accuracy ROMs run headless; frame hashes and on-screen pass/fail checked. |
-| Commercial smoke | `crates/genesis/tests/commercial.rs` | Boot real games N frames, assert no panic, non-blank output, golden frame hash. |
+| Commercial smoke | `crates/genesis/tests/commercial.rs` | Boot real games N frames, assert no panic, non-blank output, golden frame hash. The games and what they say are in [`compat.md`](compat.md). |
 | Frontend | `crates/web` with `wasm-bindgen-test` | Input mapping, settings, pure logic. Keep logic out of components so it is testable natively. |
 
 `wasm-bindgen-test` runs the wasm tests in a real browser: the dev shell pins
@@ -120,6 +120,12 @@ the log ([#186](https://github.com/scottjab/rustsega/issues/186) tracks making
 `just test-all` do the same for every passing test). See
 [`m68k-conformance.md`](m68k-conformance.md) and
 [`z80-conformance.md`](z80-conformance.md).
+
+The commercial smoke tests of `crates/genesis/tests/commercial.rs` are ignored
+for a second reason, which no CI flag undoes: CI has no cartridges. They skip
+there and run locally with `just test-commercial`, which is
+`cargo nextest run -p genesis --run-ignored only commercial` - the name filter is
+what picks the ignored test out of the crate.
 
 ## Known public test data
 

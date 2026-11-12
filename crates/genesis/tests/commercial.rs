@@ -13,14 +13,15 @@
 //!
 //! `tests/golden/commercial.toml` is a regression baseline, not a claim that a
 //! game is emulated correctly: it records what this emulator produced at frame
-//! 600, so the next change that moves a pixel is visible. Each PNG in
-//! `target/test-output/commercial/` was looked at before its value was blessed,
-//! and what looked wrong is written up in `docs/compat.md`.
+//! 600, so the next change that moves a pixel is visible. Each game's picture
+//! is written to `target/test-output/commercial/` before its value is compared,
+//! the per-game table of what is in the list and what is held out of it is
+//! `docs/compat.md`, and blessing follows `docs/TESTING.md` ("Golden files").
 //!
 //! # Why it is one test, and why it collects
 //!
 //! The list is long and a run is slow, so this is one `#[ignore]`d test rather
-//! than one per game: nextest runs tests in parallel, and twenty-two writers of
+//! than one per game: nextest runs tests in parallel, and twenty-odd writers of
 //! one golden file is a race, not a suite. So every game's result is collected
 //! instead of asserted as it goes, because "which of these games broke" is the
 //! question and the first answer alone does not settle it. A panic is caught per
@@ -42,7 +43,7 @@
 mod common;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use genesis::Buttons;
 
@@ -54,13 +55,15 @@ const LIST_FILE: &str = "commercial_list.toml";
 /// Golden file for the whole list, in `crates/genesis/tests/golden`.
 const GOLDEN_FILE: &str = "commercial.toml";
 
-/// A frame with at most this many distinct colours is a blank screen.
+/// A frame with this many distinct colours or fewer is a blank screen: the
+/// compare is `>`, so a game has to clear this to count as drawing.
 ///
 /// Four rather than one, because a game that has got as far as a title card is
 /// showing tens or hundreds of colours, while a backdrop and a border - what the
 /// chip's reset state and a renderer that draws nothing leave behind - sit well
-/// under it.
-const MIN_COLOURS: usize = 4;
+/// under it. The thinnest picture in the list at its checkpoint is five
+/// (`nbajam_600`, an attract screen); the fullest is ninety-six.
+const BLANK_COLOUR_LIMIT: usize = 4;
 
 /// The acceptance floor of the ticket: below this the suite is testing one
 /// cartridge, not the emulator.
@@ -105,7 +108,7 @@ fn crate_dir() -> &'static Path {
 }
 
 /// Path of [`LIST_FILE`].
-fn list_path() -> std::path::PathBuf {
+fn list_path() -> PathBuf {
     crate_dir().join("tests").join(LIST_FILE)
 }
 
@@ -117,7 +120,7 @@ fn golden_key(game: &Game) -> String {
     format!("{}_{}", game.key, game.frames)
 }
 
-/// One parsed value of [`parse_line`]: the three shapes [`LIST_FILE`] uses.
+/// The three shapes a value of a `[[game]]` block takes in [`LIST_FILE`].
 enum Field {
     Text(String),
     Number(u32),
@@ -155,7 +158,11 @@ fn parse_value(name: &str, value: &str, line: usize) -> Result<Field, String> {
             .strip_suffix(']')
             .ok_or_else(|| format!("line {line}: {name} = {value}: expected `]`"))?;
         let mut numbers = Vec::new();
-        for item in inner.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        for item in inner
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
             numbers.push(parse_number(name, item, line)?);
         }
         return Ok(Field::Numbers(numbers));
@@ -217,7 +224,10 @@ fn parse_games(text: &str) -> Result<Vec<Game>, String> {
             continue;
         }
         if !open {
-            return Err(format!("line {line}: `{name}` before any `[[game]]`", name = text));
+            return Err(format!(
+                "line {line}: `{name}` before any `[[game]]`",
+                name = text
+            ));
         }
         apply_line(line, text, &mut current)?;
     }
@@ -234,7 +244,7 @@ fn parse_games(text: &str) -> Result<Vec<Game>, String> {
 /// The list as committed, parsed and checked.
 ///
 /// Panics with the file and the line on the table when it is wrong: a broken list
-/// is a broken suite, not twenty-two skips.
+/// is a broken suite, not a list of skips.
 fn load_games() -> Vec<Game> {
     let path = list_path();
     let text = std::fs::read_to_string(&path)
@@ -269,9 +279,8 @@ fn smoke(game: &Game, rom: &Path) {
 
     let colours: HashSet<u32> = pixels.iter().copied().collect();
     assert!(
-        colours.len() > MIN_COLOURS,
-        "{}: frame {} is {} colours, which is a blank screen",
-        game.key,
+        colours.len() > BLANK_COLOUR_LIMIT,
+        "frame {} is {} distinct colours, which is a blank screen",
         game.frames,
         colours.len()
     );
@@ -468,7 +477,10 @@ fn parse_games_rejects_what_it_cannot_read() {
             "missing prefix",
             "[[game]]\nkey = \"g\"\nframes = 1\n".to_string(),
         ),
-        ("missing key", "[[game]]\nprefix = \"P\"\nframes = 1\n".to_string()),
+        (
+            "missing key",
+            "[[game]]\nprefix = \"P\"\nframes = 1\n".to_string(),
+        ),
         ("unknown field", format!("{good}colour = \"blue\"\n")),
         ("no equals sign", "[[game]]\nframes 600\n".to_string()),
         (
@@ -487,6 +499,9 @@ fn parse_games_rejects_what_it_cannot_read() {
 
     for (what, text) in cases {
         let outcome = parse_games(&text);
-        assert!(outcome.is_err(), "{what}: expected an error, got {outcome:?}");
+        assert!(
+            outcome.is_err(),
+            "{what}: expected an error, got {outcome:?}"
+        );
     }
 }
