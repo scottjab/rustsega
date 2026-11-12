@@ -275,3 +275,342 @@ impl std::fmt::Debug for Audio {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, LowPass, Region};
+    use std::f64::consts::PI;
+
+    /// The NTSC master clock, which every mixer test runs on
+    /// (docs/ARCHITECTURE.md, "Clocks and timing").
+    const NTSC_HZ: u64 = 53_693_175;
+    /// Master clocks in one NTSC raster: 262 lines of [`MASTER_CLOCKS_PER_LINE`].
+    const NTSC_FRAME: u64 = 262 * MASTER_CLOCKS_PER_LINE;
+    /// The default host rate every test mixes to.
+    const RATE: u32 = 48_000;
+
+    /// A mixer on the NTSC master clock with `config`.
+    fn mixer(config: Config) -> Mixer {
+        assert_eq!(Region::Usa.master_clock_hz(), NTSC_HZ);
+        Mixer::new(NTSC_HZ, &config)
+    }
+
+    /// How many samples each chip produces in `frames` NTSC rasters.
+    fn counts(frames: u64) -> (usize, usize) {
+        let mclk = frames * NTSC_FRAME;
+        (
+            (mclk / YM_SAMPLE_MCLK) as usize,
+            (mclk / PSG_TICK_MCLK) as usize,
+        )
+    }
+
+    /// The `i`th master clock of a stream whose samples are `period` apart.
+    fn mclk_of(index: usize, period: u64) -> f64 {
+        index as f64 * period as f64 / NTSC_HZ as f64
+    }
+
+    /// A `value` Hz sine at `rate` sampled every `period` master clocks, at
+    /// `amplitude` and phase-aligned so that it reaches its peak on a sample.
+    fn sine(count: usize, period: u64, value: f64, amplitude: f64) -> Vec<i16> {
+        (0..count)
+            .map(|i| {
+                let phase = 2.0 * PI * value * mclk_of(i, period);
+                (amplitude * phase.sin()).round() as i16
+            })
+            .collect()
+    }
+
+    /// The left channel of an interleaved output buffer.
+    fn left(out: &[i16]) -> Vec<f64> {
+        out.iter().step_by(2).map(|&v| f64::from(v)).collect()
+    }
+
+    /// The magnitude of the `value` Hz component of `signal`, as a Hann-windowed
+    /// DFT, over a signal that holds a whole number of cycles of it.
+    fn bin(signal: &[f64], value: f64) -> f64 {
+        let n = signal.len() as f64;
+        let step = 2.0 * PI * value / RATE as f64;
+        let (mut re, mut im, mut weight) = (0.0, 0.0, 0.0);
+        for (i, sample) in signal.iter().enumerate() {
+            let window = 0.5 - 0.5 * (2.0 * PI * i as f64 / n).cos();
+            re += sample * window * (i as f64 * step).cos();
+            im -= sample * window * (i as f64 * step).sin();
+            weight += window;
+        }
+        (re * re + im * im).sqrt() * 2.0 / weight
+    }
+
+    /// `x` relative to `reference`, in decibels.
+    fn decibels(x: f64, reference: f64) -> f64 {
+        20.0 * (x / reference).log10()
+    }
+
+    /// The root mean square of `signal`.
+    fn rms(signal: &[f64]) -> f64 {
+        (signal.iter().map(|v| v * v).sum::<f64>() / signal.len() as f64).sqrt()
+    }
+
+    /// The one test that goes through the real [`Audio`] rather than through
+    /// samples made in this file: 60 NTSC rasters of silence have to come out as
+    /// exactly the number of output samples that much master clock is worth.
+    ///
+    /// The count is the whole of what "no drift" means: an output rate that is
+    /// right on average but wrong on one frame either gaps or duplicates a frame
+    /// of host audio every time it runs, and a rate that is kept by rounding the
+    /// per-frame count is off by the fraction it threw away every frame for ever.
+    #[test]
+    fn output_count_exact_over_one_second() {
+        let mut audio = Audio::new();
+        let mut mixer = mixer(Config::default());
+        let mut out: Vec<i16> = Vec::new();
+        let mut clock = 0_u64;
+        for _ in 0..60 {
+            audio.start_frame();
+            for _ in 0..262 {
+                clock += MASTER_CLOCKS_PER_LINE;
+                audio.advance_to(clock);
+            }
+            mixer.mix(&audio.frame(), &mut out);
+        }
+
+        let got = (out.len() / 2) as f64;
+        let want = 60.0 * NTSC_FRAME as f64 / NTSC_HZ as f64 * RATE as f64;
+        assert!(
+            (got - want).abs() <= 1.0,
+            "{} output frames for {} frames of master clock ({want} expected)",
+            got,
+            clock,
+        );
+    }
+
+    /// Nothing goes in, nothing comes out - including no `NaN`, no DC from the
+    /// filters and no first-frame transient.
+    #[test]
+    fn silence_in_silence_out() {
+        let (ym_count, psg_count) = counts(4);
+        let ym = vec![(0_i16, 0_i16); ym_count];
+        let psg = vec![0_i16; psg_count];
+        let mut mixer = mixer(Config::default());
+        let mut out = Vec::new();
+        mixer.mix(
+            &ChipFrame {
+                ym: &ym,
+                ym_first: 0,
+                psg: &psg,
+                psg_first: 0,
+            },
+            &mut out,
+        );
+        assert!(out.iter().all(|&v| v == 0), "{:?}", &out[..8.min(out.len())]);
+        assert!(!out.is_empty(), "four frames have to produce something");
+    }
+
+    /// A 1 kHz sine at the FM's own rate keeps its amplitude through the
+    /// resampler: within 1%.
+    ///
+    /// Mixed with the low-pass off, because what is under test is the resampler;
+    /// [`lowpass_attenuates_10khz`] is the board filter's own test.
+    #[test]
+    fn sine_through_resampler_keeps_amplitude() {
+        let (ym_count, psg_count) = counts(2);
+        let amplitude = 400.0;
+        let ym: Vec<(i16, i16)> = sine(ym_count, YM_SAMPLE_MCLK, 1_000.0, amplitude)
+            .into_iter()
+            .map(|v| (v, v))
+            .collect();
+        let psg = vec![0_i16; psg_count];
+        let config = Config {
+            lowpass: LowPass::Off,
+            ..Config::default()
+        };
+        assert_eq!(config.sample_rate, RATE);
+
+        let mut mixer = mixer(config);
+        let mut out = Vec::new();
+        mixer.mix(
+            &ChipFrame {
+                ym: &ym,
+                ym_first: 0,
+                psg: &psg,
+                psg_first: 0,
+            },
+            &mut out,
+        );
+
+        // Past the kernel's leading edge, and measured as a peak because the
+        // signal is at 48 of the host's samples per cycle.
+        let signal = left(&out);
+        let peak = signal[64..]
+            .iter()
+            .fold(0.0_f64, |best, &v| best.max(v.abs()));
+        let want = amplitude * YM_OUTPUT_GAIN as f64;
+        let error = (peak / want - 1.0).abs();
+        assert!(
+            error <= 0.01,
+            "peak {peak} against {want}: {:.2}% off",
+            error * 100.0
+        );
+    }
+
+    /// A PSG square wave does not alias down into the output.
+    ///
+    /// The square is at 2.5 kHz rather than the 3 kHz of the ticket because at
+    /// 3 kHz every alias of an odd harmonic lands exactly on another odd harmonic
+    /// (48000 / 3000 is a whole number), so the test could not tell an alias from
+    /// the signal. At 2.5 kHz the harmonics are at 2.5, 7.5, 12.5, 17.5 and 22.5
+    /// kHz, and the alias of the 11th, 13th, 15th and 17th land on 20.5, 15.5,
+    /// 10.5 and 5.5 kHz where nothing else is. Those four bins are what
+    /// naive interpolation leaves ringing, and they have to sit at least 40 dB
+    /// under the fundamental.
+    #[test]
+    fn square_wave_aliasing_low() {
+        let (ym_count, psg_count) = counts(8);
+        let square = |t: f64| -> i16 {
+            if (t * 2_500.0).fract() < 0.5 {
+                8_191
+            } else {
+                -8_191
+            }
+        };
+        let psg: Vec<i16> = (0..psg_count)
+            .map(|i| square(mclk_of(i, PSG_TICK_MCLK)))
+            .collect();
+        let ym = vec![(0_i16, 0_i16); ym_count];
+        let config = Config {
+            lowpass: LowPass::Off,
+            ..Config::default()
+        };
+        let mut mixer = mixer(config);
+        let mut out = Vec::new();
+        mixer.mix(
+            &ChipFrame {
+                ym: &ym,
+                ym_first: 0,
+                psg: &psg,
+                psg_first: 0,
+            },
+            &mut out,
+        );
+
+        // A window of exactly 0.064 s is 160 cycles of the fundamental and 3072
+        // host samples, so every bin below is an exact bin of it.
+        let signal = left(&out);
+        let window = &signal[signal.len() - 3_072..];
+        let fundamental = bin(window, 2_500.0);
+        assert!(fundamental > 1.0, "the square did not come through at all");
+        for alias in [5_500.0, 10_500.0, 15_500.0, 20_500.0] {
+            let level = decibels(bin(window, alias), fundamental);
+            assert!(
+                level <= -40.0,
+                "{alias} Hz holds {level:.1} dB against the fundamental"
+            );
+        }
+    }
+
+    /// The Model 1 low-pass does what it is there for, and `LowPass::Off` does
+    /// not do it.
+    ///
+    /// A first-order filter at 3.39 kHz is 9.4 dB down at 10 kHz, and that is
+    /// what a VA3-ish board's output resistor and capacitor are. Measured against
+    /// the same signal through `Off` so that the resampler's own answer at 10 kHz
+    /// cancels out of the comparison.
+    #[test]
+    fn lowpass_attenuates_10khz() {
+        let (ym_count, psg_count) = counts(8);
+        let ym: Vec<(i16, i16)> = sine(ym_count, YM_SAMPLE_MCLK, 10_000.0, 400.0)
+            .into_iter()
+            .map(|v| (v, v))
+            .collect();
+        let psg = vec![0_i16; psg_count];
+        let frame = ChipFrame {
+            ym: &ym,
+            ym_first: 0,
+            psg: &psg,
+            psg_first: 0,
+        };
+
+        let mut through = Vec::new();
+        mixer(Config {
+            lowpass: LowPass::Model1,
+            ..Config::default()
+        })
+        .mix(&frame, &mut through);
+        let mut bypassed = Vec::new();
+        mixer(Config {
+            lowpass: LowPass::Off,
+            ..Config::default()
+        })
+        .mix(&frame, &mut bypassed);
+
+        // The last 0.064 s of each: 640 whole cycles of the tone, past the
+        // resampler's leading edge and past the transient of the DC blocker.
+        let window = 3_072;
+        let with = rms(&left(&through)[through.len() / 2 - window..through.len() / 2]);
+        let without = rms(&left(&bypassed)[bypassed.len() / 2 - window..bypassed.len() / 2]);
+        let loss = decibels(with, without);
+        assert!(
+            loss <= -9.0,
+            "Model 1 left {loss:.2} dB on a 10 kHz tone"
+        );
+    }
+
+    /// A constant is not a sound: the ladder's offset and the PSG's are gone by
+    /// the end of a tenth of a second.
+    #[test]
+    fn dc_removed() {
+        let (ym_count, psg_count) = counts(10);
+        let ym = vec![(500_i16, 500_i16); ym_count];
+        let psg = vec![0_i16; psg_count];
+        let mut mixer = mixer(Config::default());
+        let mut out = Vec::new();
+        mixer.mix(
+            &ChipFrame {
+                ym: &ym,
+                ym_first: 0,
+                psg: &psg,
+                psg_first: 0,
+            },
+            &mut out,
+        );
+
+        let signal = left(&out);
+        let peak = signal.iter().fold(0.0_f64, |best, &v| best.max(v.abs()));
+        assert!(
+            peak > 8_000.0,
+            "the DC level never reached the output: {peak}"
+        );
+        let tail = signal[signal.len() - 8..]
+            .iter()
+            .fold(0.0_f64, |best, &v| best.max(v.abs()));
+        assert!(
+            tail < peak / 100.0,
+            "tail {tail} against a peak of {peak}: the DC is still there"
+        );
+    }
+
+    /// Mixing the same frame twice is the caller's mistake and must not
+    /// duplicate the frame: what `mix` consumed is what it consumed.
+    #[test]
+    fn a_frame_is_mixed_once() {
+        let (ym_count, psg_count) = counts(2);
+        let ym = vec![(0_i16, 0_i16); ym_count];
+        let psg = vec![0_i16; psg_count];
+        let frame = ChipFrame {
+            ym: &ym,
+            ym_first: 0,
+            psg: &psg,
+            psg_first: 0,
+        };
+        let mut mixer = mixer(Config::default());
+        let mut once = Vec::new();
+        mixer.mix(&frame, &mut once);
+        let mut twice = Vec::new();
+        mixer.mix(&frame, &mut twice);
+        assert!(
+            twice.is_empty(),
+            "the second call mixed {} halves again",
+            twice.len()
+        );
+    }
+}

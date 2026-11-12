@@ -334,18 +334,30 @@ fn reset_restarts_the_68k_and_the_vdp_and_keeps_work_ram() {
     );
 }
 
-/// The API stubs that the audio and save-state tickets have to fill answer with
-/// nothing rather than with a `todo!()` panic, so a front end can call them on a
-/// build that has no audio or save states yet.
+/// The audio path answers, and the save-state stubs that are still stubs answer
+/// with nothing rather than with a `todo!()` panic, so a front end can call them
+/// all on a build that has no save states yet.
+///
+/// `drain_audio` used to be one of the stubs and asserted here as appending
+/// nothing; M5-14 (#119) filled it in, and what it has to append is a frame of
+/// host audio - 801 stereo samples for one 16.7 ms NTSC raster at 48 kHz.
 #[test]
-fn stubs_answer_without_panicking() {
+fn drain_audio_mixes_and_the_state_stubs_answer() {
     let mut machine = Genesis::new(&fake_rom(&[0x60FE]), Config::default()).expect("loads");
 
     let mut samples = vec![1_i16; 8];
     machine.drain_audio(&mut samples);
     assert_eq!(
         samples, [1_i16; 8],
-        "nothing is mixed yet, so nothing is appended: M5-14 (#119) owns the mixer"
+        "no frame has run, so there is nothing to mix yet"
+    );
+
+    machine.run_frame();
+    machine.drain_audio(&mut samples);
+    let mixed = samples.len() - 8;
+    assert!(
+        mixed > 1_400 && mixed % 2 == 0 && mixed < 2_000,
+        "one NTSC raster mixed {mixed} halves, which is not about 801 stereo samples"
     );
 
     assert_eq!(machine.save_state().err(), Some(StateError::Unsupported));
