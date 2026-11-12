@@ -204,7 +204,9 @@ pub(crate) struct Lfo {
     freq: u8,
     /// The counter, 0..127.
     counter: u8,
-    /// Samples taken of the current [`STEP_PERIOD`], 0 to one short of it.
+    /// Samples taken of the current [`STEP_PERIOD`], 0 to one short of it after
+    /// every [`Lfo::tick`] - a lowered `&22` can leave it above the new period for
+    /// one sample, which is what [`Lfo::tick`]'s `>=` is for.
     step: u8,
     /// `&B4` bits 5-4 per channel: how far down the AM triangle that channel's
     /// amplitude-modulated operators are read at.
@@ -248,9 +250,25 @@ impl Lfo {
 
     /// Advance by one output sample: one [`STEP_PERIOD`] at a time, and the
     /// counter does not run past its 128 steps.
+    ///
+    /// The recirculate compares `>=` rather than `==`, because `&22` bits 2-0 can
+    /// be rewritten while [`Lfo::step`] is already past the new, smaller period -
+    /// and an equality that can then never fire again leaves the divider counting
+    /// forever: `step` climbs to 255 and the increment overflows the `u8`, which
+    /// is a panic in a debug build and a permanently out-of-phase LFO in a
+    /// release one (the #349 panic, 403 ROMs of the M6-05 compatibility sweep).
+    /// The divider is a counter that recirculates, so the observable requirement
+    /// is only that it never runs past the period in force and keeps stepping at
+    /// it, with no way to get stuck: `>=` recovers on the first sample at or after
+    /// the newly programmed period and the 7-bit counter keeps its place.
+    ///
+    /// `wrapping_add` on its own would not do. It silences the panic but leaves
+    /// `step` to climb the rest of the old swing first - up to another 255 samples
+    /// before the LFO moves again, against a 5-sample period at the fastest
+    /// frequency - which is the same out-of-phase fault, made quiet.
     pub(crate) fn tick(&mut self) {
         self.step += 1;
-        if self.step == self.period() {
+        if self.step >= self.period() {
             self.step = 0;
             self.counter = (self.counter + 1) & COUNTER_MASK;
         }
@@ -509,7 +527,7 @@ mod tests {
                 steps += 1;
             }
         }
-        assert_eq!(steps, 200, "5000 more samples of the new frequency");
+        assert_eq!(steps, 200, "1000 samples of the new 5-sample frequency");
     }
 
     /// The phase a lowered `&22` lands on is pinned, so the fix cannot regress
@@ -529,15 +547,20 @@ mod tests {
         }
         write(&mut lfo, regs::REG_LFO, LFO_ON | 0x07);
 
-        let advancing: Vec<usize> = (0..40)
-            .filter(|&i| {
-                let before = lfo.counter();
-                lfo.tick();
-                (usize::from(lfo.counter()) + 128 - usize::from(before)) % 128 == 1
-            })
-            .collect();
+        let mut advancing = Vec::new();
+        for i in 0..40usize {
+            let before = usize::from(lfo.counter());
+            lfo.tick();
+            let after = usize::from(lfo.counter());
+            let delta = (after + 128 - before) % 128;
+            assert!(delta <= 1, "one sample of a 5-sample divider moved {delta}");
+            if delta == 1 {
+                advancing.push(i);
+            }
+        }
         assert_eq!(
-            advancing, vec![0, 5, 10, 15, 20, 25, 30, 35],
+            advancing,
+            vec![0, 5, 10, 15, 20, 25, 30, 35],
             "one step of the new 5-sample period, immediately, and then every 5"
         );
     }
