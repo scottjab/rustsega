@@ -14,6 +14,7 @@
 //! is the order they are started in - normalize, header, region, bus, reset -
 //! which is the one thing no single one of them can do for itself.
 
+pub mod audio;
 pub mod bus;
 pub mod cart;
 pub mod config;

@@ -14,6 +14,9 @@ m68k = { path = "../m68k" }
 vdp = { path = "../vdp" }
 # `z80_bus.rs` implements `z80::Z80Bus` for the sound CPU's view of the system.
 z80 = { path = "../z80" }
+# The two sound chips the bus clocks and writes (M5-13, #118).
+sn76489 = { path = "../sn76489" }
+ym2612 = { path = "../ym2612" }
 
 [dev-dependencies]
 # Only tests: the core itself keeps no dependencies, per docs/ARCHITECTURE.md.

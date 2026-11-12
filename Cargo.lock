@@ -60,8 +60,10 @@ name = "genesis"
 version = "0.1.0"
 dependencies = [
  "m68k",
+ "sn76489",
  "testkit",
  "vdp",
+ "ym2612",
  "z80",
 ]
 

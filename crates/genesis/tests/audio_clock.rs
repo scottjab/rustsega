@@ -39,7 +39,6 @@ const Z80_RESET: u32 = 0xA11_200;
 /// data then part II address / data (plutiedev, "YM2612 register reference").
 const YM_PORT: u16 = 0x4000;
 /// The PSG port, from the Z80 (plutiedev, "Memory map").
-const Z80_PSG_PORT: u16 = 0x7F11;
 /// The same PSG port from the 68k: `$C00011`, the odd lane of the VDP's PSG pair.
 const PSG_PORT: u32 = 0xC0_0011;
 /// Status bit 7: the chip is still busy with its last write.
@@ -92,24 +91,6 @@ fn z80_ym_status(bus: &mut Bus) -> u8 {
     Z80View::new(bus).read(YM_PORT)
 }
 
-/// The sample count of each frame of `frames` whole rasters, run in order.
-///
-/// [`genesis::Audio`] holds the samples of the frame that has just run - the
-/// buffers are cleared when a frame starts and are what M5-14 (#119) will drain -
-/// so one entry here is one frame's output.
-fn frame_counts(
-    frames: u32,
-    bus: &mut Bus,
-    run: impl Fn(&mut Bus),
-    read: impl Fn(&Bus) -> usize,
-) -> Vec<usize> {
-    (0..frames)
-        .map(|_| {
-            run(bus);
-            read(bus).len()
-        })
-        .collect()
-}
 
 /// One NTSC frame is 262 lines of 3420 master clocks and the YM2612 is asked once
 /// every 1008 of them (144 68000 clocks at 7 master clocks each, so about 53267 Hz
@@ -125,10 +106,13 @@ fn frame_counts(
 fn ym_sample_count_per_frame_ntsc() {
     let (mut cpu, mut z80, mut bus) = machine();
     let mut scheduler = Scheduler::new(Region::Usa);
-    let ym = |bus: &Bus| bus.audio.ym_samples.len();
-    let run = |bus: &mut Bus| scheduler.run_frame(&mut cpu, &mut z80, bus);
 
-    let counts = frame_counts(9, &mut bus, run, ym);
+    let counts = (0..9)
+        .map(|_| {
+            scheduler.run_frame(&mut cpu, &mut z80, &mut bus);
+            bus.audio.ym_samples.len()
+        })
+        .collect::<Vec<_>>();
     for &count in &counts {
         assert!(
             (888..=889).contains(&count),
@@ -155,10 +139,13 @@ fn ym_sample_count_per_frame_ntsc() {
 fn psg_tick_count_per_frame() {
     let (mut cpu, mut z80, mut bus) = machine();
     let mut scheduler = Scheduler::new(Region::Usa);
-    let psg = |bus: &Bus| bus.audio.psg_samples.len();
-    let run = |bus: &mut Bus| scheduler.run_frame(&mut cpu, &mut z80, bus);
 
-    let counts = frame_counts(2, &mut bus, run, psg);
+    let counts = (0..2)
+        .map(|_| {
+            scheduler.run_frame(&mut cpu, &mut z80, &mut bus);
+            bus.audio.psg_samples.len()
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
         counts,
         vec![3733, 3734],
