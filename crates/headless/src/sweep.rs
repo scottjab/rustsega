@@ -17,8 +17,10 @@
 //! triage (M6-13), it does not diagnose them. `Boots` means the machine ran the
 //! whole run and the last frame had more than [`BLANK_COLOUR_LIMIT`] distinct
 //! colours; it says nothing about whether the picture is *right*, which is the
-//! same claim [`docs/compat.md`](../../../../docs/compat.md) makes about the
-//! commercial smoke suite.
+//! same claim
+//! [`docs/compat-commercial.md`](../../../docs/compat-commercial.md) makes about
+//! the commercial smoke suite. What this command writes is `docs/compat.md` (the
+//! problems, grouped) and `docs/compat.csv` (every ROM, one row each).
 //!
 //! Nothing here reads like a ROM: no cartridge byte is ever printed, and the only
 //! ROM content a row carries is the title, serial and region of its header.

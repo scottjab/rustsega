@@ -1,5 +1,8 @@
 # Commercial game compatibility
 
+> The whole-collection sweep - every ROM in the local set, run and classified - is
+> [`compat.md`](compat.md). This page is the smaller, hand-blessed list below.
+
 Which real games boot, and what the suite says about them. The tests are
 `crates/genesis/tests/commercial.rs` and the list they read is
 `crates/genesis/tests/commercial_list.toml`; the ROMs are the owner's own set
