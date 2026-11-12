@@ -11,6 +11,25 @@ from, what it actually checks, how it reports, and its licence. Two rules:
 
 See `docs/TESTING.md` section 7 for the directory layout and `just fetch`.
 
+## Automated status
+
+What M6-06 (#125) automated, and what is deliberately not automated. "pass" is
+the state of the ROM under this emulator as of the PR that added the row; a
+failing ROM gets an issue number instead of "pass" and an `#[ignore]` naming it,
+and there are none: every ROM that could be automated passes.
+
+| ROM / suite | Test | Status |
+|---|---|---|
+| `md-test-pack` (15 ROMs) | `crates/genesis/tests/hw_test_roms.rs`, goldens in `tests/golden/hw-test-roms.toml` | pass, 15 of 15. Per-file rows in the table below |
+| `overdrive2` | `hw_test_roms.rs`: `overdrive2_runs_without_crashing_and_is_deterministic` | pass. No golden: it is a stress case, and its picture legitimately differs between VDP revisions |
+| `zexall-cpm` | the Z80 conformance gate (`crates/z80/tests/`, M2-16/M2-17) | pass. It runs as a loaded `.com` image against a BDOS stub, not on the Genesis Z80 |
+| 240p Test Suite, Genesis build | - | not automated: no fetchable file. itch.io has no stable download URL and the source repo ships no Genesis ROM; the licence is GPL-with-no-root-`LICENSE` (`NOASSERTION`). Pinning it means adding a release artifact upstream first |
+| Nemesis's VDP FIFO, sprite masking and YM2612 ROMs; r57shell's VDP and pad tests; MoD's `gen_test_z80_bus` | - | not automated: SpritesMind attachments need a forum login, so there is nothing for `fetch-test-data.sh` to pin. See the manual table below |
+| Sega's MD Soft Checker | - | not automated: a proprietary Sega cart dump, not ours to download |
+| `pcm.bin`, `out.bin` + `z80driver.bin`, `gentest` | - | not automated: no licence, or source-only with no prebuilt ROM |
+| `ZEXALL-SMS-0.21.zip` | - | not automated by design: an SMS cartridge image, which cannot boot on a Mega Drive bus. Reference only |
+| MCD-Verificator | - | not automated by design: Sega CD hardware, out of scope |
+
 ## Fetched by `scripts/fetch-test-data.sh`
 
 Run `nix develop -c scripts/fetch-test-data.sh` (or `just fetch`). A second run
@@ -33,38 +52,44 @@ date the URLs were last checked. When you bump a pin, update that date.
   original file:
   `https://web.archive.org/web/20150610093059if_/http://genplus-gx.googlecode.com/files/md_test.zip`
 - **Contents:** 15 files, 407,498 B unpacked. No readme and no licence text
-  came with the pack, so the "what it tests" column below is the usual reading
-  of these names plus what the code sizes and dates suggest. Treat it as a
-  starting guess: the harness ticket (M6-03) should run each one and record
-  what it really does before a golden is pinned to it.
-- **Some are bare 68000 images without the `SEGA Genesis` header** (the 1 KiB
-  PAL ones especially), so they may need a header stubbed on to boot.
+  came with the pack, so the "what it tests" column was originally the usual
+  reading of these names plus what the code sizes and dates suggest. M6-06
+  (#125) ran all fifteen and replaced that guess with what each one actually
+  puts on screen; two of the old guesses were wrong, and the table says so.
+- **Every one of them boots as it is.** They all carry a header - eight say
+  `SEGA GENESIS    (C)SEGA 2000.DEC` with a blank or `GM MK-0000` license code,
+  so `genesis::parse_header` reports the title as unknown - and none of them
+  needed a header stubbed on to run (M6-06 ran all fifteen).
 - **Tickets:** M4-04 (status register), M4-05 (HV counter/latch), M4-06
   (interrupts), M4-07/M4-08 (DMA), M4-16 (sprite limits), M4-18
   (shadow/highlight), M4-19 (H32/H40, V28/V30), M6-03, M6-06.
 
-| File | Size | SHA-256 | Notes |
-|---|---:|---|---|
-| `512PAL.BIN` | 1,024 | `21e44f11a072bdbd07e956892124ce65697b5a55de24da2a4dcfb58dd02cf2a4` | PAL 512px-wide screen test |
-| `PAL512.bin` | 4,642 | `b004a288e5dc5770e59d109e07f04265a9f61b0983aaf1acb9997b07e1237105` | second 512px PAL variant |
-| `960PAL.bin` | 1,024 | `b0363e3f52fa8eb2f4bf786c5f55b38bfeeb6fda606b3a28799c9e675e5b7f99` | PAL 960px (H40 double-width) test |
-| `MD1536.bin` | 16,384 | `4bffb2e5ec2661bcb618e71a17358f530dc218a35a3397a9a558041334d15d0d` | walks all 1536 CRAM colours: palette and priority check |
-| `mdtrans.bin` | 16,384 | `8bb1e85ec1cd45f2e9819f73c1b17f2f138ababbc40b51272ce89594a0c0a580` | transparency / priority |
-| `memtest_68k.bin` | 16,384 | `6d58e6768b2d02e432101844e88787922cfffb923ea83cb3b229d82b4dfcb20a` | 68000 work RAM (and probably MCM/IO) test |
-| `SHLTEST.BIN` | 3,796 | `3686e021f6f1199a0865ad25f947573659fbe1e72357873804d3d63f7cf058c9` | shadow/highlight modes, 2010 |
-| `SHLTEST2.BIN` | 3,796 | `8c9a7b0980b616488235408f44784264e0b82b8f670651c0b9e8e52332167cd3` | same, second variant |
-| `stetest.bin` | 131,072 | `0c7729d63bc193ce96851c3e3fad78dceab495b4fe6a04444180346cdd3088d4` | sprite table test, 2000 |
-| `STETEST2.bin` | 131,072 | `811b762c9f45c783f474f6fcc1183c8c8c94cc2a885441bfd5bbf970b41ff252` | same, second variant |
-| `vctest.bin` | 16,384 | `085115ec3e82ed4cbf4a2db5eac8bf35f7381da01a7619a88cab92388d9f0b12` | VDP colour test, 2001 |
-| `wtest.bin` | 16,384 | `160927b5a9f23efcea9bb72702932aea48a7e07e9c2d365927ef62906bee7419` | VDP write timing / busy behaviour, 2001 |
-| `wtest_i1.bin` | 16,384 | `e0d1369ed5157dbb6b9599895340edbe5337ef2a50120e6d4863ab996f6aefa8` | `wtest` with interrupts enabled, variant 1 |
-| `wtest_i2.bin` | 16,384 | `489e27f09f7d876064a1b5e2f1cedb510ed93232fd82e596ea44391adb843d5a` | `wtest` with interrupts enabled, variant 2 |
-| `wbug.bin` | 16,384 | `b5a984ba0aa3dd7a2a58a1576c0bed7047018dd9eb018528965d51c24e46145c` | write-timing bug repro, 2001 |
+| File | Size | SHA-256 | What it does, read off the screen it draws | Status |
+|---|---:|---|---|---|
+| `512PAL.BIN` | 1,024 | `21e44f11a072bdbd07e956892124ce65697b5a55de24da2a4dcfb58dd02cf2a4` | TmEE's 512-colour test, "50Hz only": walks the whole 9-bit palette with mid-line CRAM writes. 449 colours in a settled frame, H40 320x224 | pass (`md_test_pack_512pal`) |
+| `PAL512.bin` | 4,642 | `b004a288e5dc5770e59d109e07f04265a9f61b0983aaf1acb9997b07e1237105` | a second 512-colour test, in H32: 256x240, 244 colours in repeating palette blocks | pass (`md_test_pack_pal512`) |
+| `960PAL.bin` | 1,024 | `b0363e3f52fa8eb2f4bf786c5f55b38bfeeb6fda606b3a28799c9e675e5b7f99` | "960 color test - Is it possible to get more colors ???": 960 colours on screen, which needs three palette pages per frame. 872 distinct pixels in one frame, 256x240 | pass (`md_test_pack_960pal`) |
+| `MD1536.bin` | 16,384 | `4bffb2e5ec2661bcb618e71a17358f530dc218a35a3397a9a558041334d15d0d` | walks all 1536 CRAM colours (512 x 3): a colour sweep over a plane/sprite field, animating on a 240-frame cycle, 1407 distinct colours in one frame | pass (`md_test_pack_md1536_frame_60`) |
+| `mdtrans.bin` | 16,384 | `8bb1e85ec1cd45f2e9819f73c1b17f2f138ababbc40b51272ce89594a0c0a580` | transparency and plane priority over a scrolling field, 19 colours, animating | pass (`md_test_pack_mdtrans_frame_60`) |
+| `memtest_68k.bin` | 16,384 | `6d58e6768b2d02e432101844e88787922cfffb923ea83cb3b229d82b4dfcb20a` | the 68000 memory test. Prints "68000 memory test" and a table of the ranges where a write is *not* expected to land - cartridge, I/O, the write-only VDP ports - as "range : value written (value read back)", ending "RAM, ROM, mirrored VDP addresses, and locations that lock up the machine are not tested." Work RAM is absent, i.e. it passed | pass (`md_test_pack_memtest_68k`) |
+| `SHLTEST.BIN` | 3,796 | `3686e021f6f1199a0865ad25f947573659fbe1e72357873804d3d63f7cf058c9` | TmEE's shadow/highlight mode test, 2010: 16-colour ramps drawn in the four shadow/highlight modes, 17 colours | pass (`md_test_pack_shltest`) |
+| `SHLTEST2.BIN` | 3,796 | `8c9a7b0980b616488235408f44784264e0b82b8f670651c0b9e8e52332167cd3` | same test, modes in another order | pass (`md_test_pack_shltest2`) |
+| `stetest.bin` | 131,072 | `0c7729d63bc193ce96851c3e3fad78dceab495b4fe6a04444180346cdd3088d4` | Paul Lee sprite-table test ("DEMO PROGRAM 6", 1996): sprite shapes over solid plane bands, 256x224, settles in a few frames | pass (`md_test_pack_stetest`) |
+| `STETEST2.bin` | 131,072 | `811b762c9f45c783f474f6fcc1183c8c8c94cc2a885441bfd5bbf970b41ff252` | the other one ("DEMO PROGRAM 1"), animated on a 240-frame cycle | pass (`md_test_pack_stetest2_frame_60`) |
+| `vctest.bin` | 16,384 | `085115ec3e82ed4cbf4a2db5eac8bf35f7381da01a7619a88cab92388d9f0b12` | **not a colour test**: Charles MacDonald's "V counter test program" ("by Charles MacDonald, E-mail: cgfm2@hotmail.com"). A menu of the nine display modes, then the V counter values it measured per mode, driven by the pad (START runs a test, A toggles 262/312 lines, B/C page) | pass (`md_test_pack_vctest_menu`, `md_test_pack_vctest_after_start`) |
+| `wtest.bin` | 16,384 | `160927b5a9f23efcea9bb72702932aea48a7e07e9c2d365927ef62906bee7419` | VDP write-timing test: a colour-block field plus the position it is writing at ("X:04 Y:08") | pass (`md_test_pack_wtest`) |
+| `wtest_i1.bin` | 16,384 | `e0d1369ed5157dbb6b9599895340edbe5337ef2a50120e6d4863ab996f6aefa8` | `wtest` with interrupts enabled, variant 1 | pass (`md_test_pack_wtest_i1`) |
+| `wtest_i2.bin` | 16,384 | `489e27f09f7d876064a1b5e2f1cedb510ed93232fd82e596ea44391adb843d5a` | `wtest` with interrupts enabled, variant 2, in 320x448 interlace | pass (`md_test_pack_wtest_i2`) |
+| `wbug.bin` | 16,384 | `b5a984ba0aa3dd7a2a58a1576c0bed7047018dd9eb018528965d51c24e46145c` | write-timing bug repro: a block of single-pixel marks near the top-left, one per attempted VDP write, walking sideways on a 240-frame cycle | pass (`md_test_pack_wbug_frame_60`) |
 
 **Reporting:** these are eye tests. They draw patterns or print text on screen;
-there is no machine-readable pass/fail. For goldens (M6-06) the plan is
-`testkit::frame_hash` on a fixed frame, which is exactly what they were never
-designed for, so pick ROMs whose output is static by then.
+there is no machine-readable pass/fail. M6-06 pinned them anyway, at 60 frames,
+in `crates/genesis/tests/hw_test_roms.rs` over
+`crates/genesis/tests/golden/hw-test-roms.toml`: every ROM whose output settles
+has settled by then, the four that animate have a numbered frame pinned, and
+every golden was checked against the screen the ROM itself prints - the pack's
+text is the ROMs' own font, so the dumps were read back tile by tile against
+the tile data in the ROM image rather than eyeballed.
 
 ### `overdrive2` (TiTAN, Overdrive 2, 2017)
 
@@ -84,6 +109,9 @@ designed for, so pick ROMs whose output is static by then.
   hangs, and as a long-run determinism check (same input, same frame hashes).
 - **Licence:** no licence text ships with it; it is a freely distributed scene
   release. We only ever fetch it into the gitignored `test-roms/`.
+- **Status:** pass, as a crash/determinism case only
+  (`overdrive2_runs_without_crashing_and_is_deterministic`: 60 frames finish,
+  the frame is non-blank, and two runs of it leave the same frame hash).
 - **Tickets:** M6-03, M6-06 (as a crash/determinism case, not a golden), and as
   a stress test for M4-21a (FIFO), M4-22 (DMA timing), M3-16 (bus timing),
   M6-07 (save states).
