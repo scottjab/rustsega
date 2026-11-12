@@ -276,6 +276,526 @@ impl std::fmt::Debug for Audio {
     }
 }
 
+// The mixer: two chips, one host rate ---------------------------------------
+
+use crate::config::{Config, LowPass};
+use std::f32::consts::PI;
+
+/// What an FM sample is multiplied by on its way into the mix.
+///
+/// `ym2612::output` adds six converters' 9-bit codes, so one channel at full
+/// scale is 255 there, where the PSG's own volume table puts one channel at full
+/// scale at 8191 and says the mixer scales later. The 32 is the `>> 5` of
+/// `ym2612`'s output stage put back: it lands the FM in the 14-bit-per-channel domain
+/// that Genesis Plus GX sums its `out_fm` in (its own `core/sound/ym2612.c`
+/// clamps each channel to +-8191 and adds those, read 2026-07-31), which is the
+/// domain [`PSG_LEVEL_REFERENCE`] was measured against.
+const YM_OUTPUT_GAIN: f32 = 32.0;
+
+/// What a PSG sample is multiplied by at `Config::psg_level` 100: 4200/8191.
+///
+/// Genesis Plus GX's PSG core puts attenuation code 0 at `PSG_MAX_VOLUME` of
+/// 2800 (`core/sound/psg.c`, read 2026-07-31), a number whose own comment in
+/// that file says is "roughly adjusted to match VA4 MD1 PSG/FM balance with 1.5x
+/// amplification of PSG output", and that core's default preamp is 150 percent
+/// against the FM's 100 (`libretro/libretro.c`: `config.psg_preamp = 150` and
+/// `config.fm_preamp = 100`). So the balance being copied here is 2800 * 1.5 =
+/// 4200 where an FM channel at full scale is 8191, and this is that ratio.
+///
+/// Verified rather than trusted, at both ends: the PSG's table in this repository
+/// does reach 8191 per channel at attenuation 0, so four channels at full tilt
+/// arrive as 4 * 8191 * 0.5128 = 16 797 against Genesis Plus GX's 4 * 4200 =
+/// 16 800; and its FM at full tilt arrives as 6 * 255 * 32 = 48 960 against that
+/// core's 6 * 8191 = 49 146, both of which clip in an `i16` and both of which
+/// clip at the same place.
+const PSG_LEVEL_REFERENCE: f32 = 4_200.0 / 8_191.0;
+
+/// The PSG resampler's kernel length, in PSG ticks: 64.
+///
+/// The ticket offers 16 to 32 taps, and for the FM that is about right; at the
+/// PSG's 223722 Hz it is not enough to hold up `square_wave_aliasing_low`, and
+/// the arithmetic is worth writing down because it is the reason the PSG gets
+/// twice the FM. A windowed sinc of `taps` taps at `fs` has a transition band
+/// about `4 * fs / taps` wide (the Hamming main lobe), so 32 taps at 223722 Hz
+/// is a transition of 28 kHz: such a filter is still passing 27 kHz, and 27 kHz
+/// is exactly the frequency that folds down onto 20.5 kHz when the output is 48
+/// kHz, which is the bin that test reads. 64 taps bring the transition to 14 kHz
+/// and put 27.5 kHz - the PSG's first harmonic above the output's Nyquist, and
+/// the loudest of the aliased ones at a twelfth of the fundamental - far enough
+/// into the stop band for the Hamming window's own 43 dB.
+const PSG_TAPS: usize = 64;
+/// The FM's kernel length, in FM samples: 24, which is the same 9 kHz transition
+/// at its own rate. The FM is only being taken from 53267 Hz to 48000 Hz, so what
+/// has to be suppressed is the image of its own sampling rate, which starts at
+/// 26634 Hz and is past this filter's stop band.
+const YM_TAPS: usize = 24;
+
+/// Kernel rows per stream: one for each position of an output sample inside one
+/// input sample.
+///
+/// The ratio of the two rates is not a whole number and never repeats, so there
+/// is no exact polyphase grid to build; 256 rows is the quantisation the kernel
+/// is cut into instead. The error is a phase error of at most half a row, a
+/// five-hundredth of an input sample, which is 0.2 % of a period at the top of
+/// the pass band and 46 dB down - well under everything else this file is
+/// measuring, and cheap enough to keep in one 256-coefficient row per output
+/// sample.
+const PHASES: usize = 256;
+
+/// The corner of the DC-blocking high-pass, in Hz: 20.
+///
+/// The two chips do not sit at zero. The discrete YM2612's ladder gives a silent
+/// chip a level of six converters' worth of offset (`ym2612`'s output stage, the
+/// `+4`/`-3` step) and the PSG's own sum is bipolar around zero but not centred
+/// when a channel is held at one level. 20 Hz is below the bottom of the music
+/// and far above the rate the filters have to run at to get rid of it in a frame
+/// or two.
+const DC_BLOCK_HZ: f32 = 20.0;
+
+/// The corner of [`LowPass::Model1`], in Hz: 3390.
+///
+/// The Model 1's output stage is a resistor and a capacitor, and this is the
+/// corner the ticket gives for a VA3-ish board. It agrees with the only other
+/// number available: Genesis Plus GX's default one-pole coefficient is 0.6 at
+/// 48 kHz (`libretro/libretro.c`, `config.lp_range = 0x9999`), which is a corner
+/// of `-ln(1 - 0.6) * 48000 / 2 PI` = 3.9 kHz, so the two sources put the same
+/// board's roll-off within half a kilohertz of each other and on it being one
+/// pole.
+const MODEL1_LOW_PASS_HZ: f32 = 3_390.0;
+
+/// One frame's worth of what the two chips made, and where in each chip's own
+/// sample count it starts.
+///
+/// Made by [`Audio::frame`] and read once by [`Mixer::mix`]. The positions
+/// matter as much as the samples: the mixer lays both streams on the master
+/// clock, and it can only do that if it knows the absolute number of the first
+/// entry of the frame it has been handed. A caller that has just run a frame
+/// takes this from [`Audio`] and does not build it.
+pub struct ChipFrame<'a> {
+    /// The FM's `(left, right)` pairs, one every [`YM_SAMPLE_MCLK`].
+    pub ym: &'a [(i16, i16)],
+    /// The absolute index of `ym[0]`.
+    pub ym_first: u64,
+    /// The PSG's one-pin sums, one every [`PSG_TICK_MCLK`].
+    pub psg: &'a [i16],
+    /// The absolute index of `psg[0]`.
+    pub psg_first: u64,
+}
+
+impl Audio {
+    /// This frame's chip output, ready for [`Mixer::mix`].
+    ///
+    /// The two positions are read off the clocks rather than from a counter of
+    /// what has been drained: `ym_pos` is the master clock the *next* FM sample
+    /// is due at, so it is the count of samples the chip has ever made times
+    /// their spacing, and the first sample of the frame is that count less what
+    /// the frame still holds.
+    pub fn frame(&self) -> ChipFrame<'_> {
+        ChipFrame {
+            ym: &self.ym_samples,
+            ym_first: self.ym_pos / YM_SAMPLE_MCLK - self.ym_samples.len() as u64,
+            psg: &self.psg_samples,
+            psg_first: self.psg_pos / PSG_TICK_MCLK - self.psg_samples.len() as u64,
+        }
+    }
+}
+
+/// One chip's path from its own clock onto the host's: the samples it has made
+/// that the mixer has not spent yet, and the kernel that puts them on a grid they
+/// are not on.
+///
+/// Every position here is absolute and every one of them is a master clock:
+/// input sample `i` belongs to master clock `i * period`, and an output sample at
+/// master clock `t` reads the `taps` input samples that end at the one it falls
+/// in. Nothing is rounded once a frame, because there is nothing per frame to
+/// round - the count of output samples a stretch of master clock is worth
+/// follows from the two step sizes, which is what makes
+/// `output_count_exact_over_one_second` exact rather than close.
+///
+/// The kernel is causal - it reads the sample the output lies in and the ones
+/// before it, never the ones after - so a frame can be mixed as soon as it is
+/// complete and the mixer never has to wait for input it does not have. The cost
+/// is that the last output sample of a frame is short of the taps that would
+/// belong to it, and it is one output sample (the kernel of the FM spans one FM
+/// sample past the last one held, which is 0.9 of an output sample), whose
+/// missing weights are the smallest in the window.
+struct Stream {
+    /// One output sample of master clocks - the stream's `period` (`YM_SAMPLE_MCLK`
+    /// or `PSG_TICK_MCLK`) times the host rate - in the units [`Mixer`] counts
+    /// time in. A whole number because the host rate is a whole number of samples
+    /// per second and the master clock is counted in whole ticks: this is the
+    /// integer rate bookkeeping that keeps `output_count_exact_over_one_second`
+    /// exact instead of nearly.
+    step: u64,
+    /// Kernel length in input samples.
+    taps: usize,
+    /// Gain applied to every input sample as it arrives, so that by the time the
+    /// two streams are added they are in one domain.
+    gain: f32,
+    /// 1 for the PSG's single output pin, 2 for the FM's left and right.
+    channels: usize,
+    /// `PHASES` rows of `taps` coefficients, oldest tap first, one row per
+    /// position of an output sample inside one input sample. See
+    /// [`Stream::build_kernel`].
+    kernel: Vec<f32>,
+    /// The samples themselves, interleaved by channel, oldest first.
+    samples: Vec<f32>,
+    /// The absolute index of `samples[0]`, which [`Stream::trim`] moves along.
+    first: i64,
+}
+
+impl Stream {
+    /// An empty stream of `channels` channels, samples `period` master clocks
+    /// apart, `taps` long, at `gain`, resampled to `rate` from `master_hz`, and
+    /// reserved for `frame` samples of one frame so that no frame ever
+    /// reallocates it.
+    fn new(
+        period: u64,
+        taps: usize,
+        gain: f32,
+        channels: usize,
+        rate: u32,
+        master_hz: u64,
+        frame: usize,
+    ) -> Self {
+        Self {
+            step: period * u64::from(rate),
+            taps,
+            gain,
+            channels,
+            kernel: Self::build_kernel(period, taps, rate, master_hz),
+            samples: Vec::with_capacity((frame + taps) * channels),
+            first: 0,
+        }
+    }
+
+    /// The resampling kernel: `PHASES` Hamming-windowed sinc low-passes of
+    /// `taps` taps, one for each of the `PHASES` places an output sample can sit
+    /// inside an input sample.
+    ///
+    /// The corner is 0.45 of whichever rate is lower. Of the output, because that
+    /// is what would alias: anything above half the output rate folds down on top
+    /// of the band being kept. Of the input, because a sampled stream carries
+    /// nothing above its own Nyquist anyway and there is no sense paying for a
+    /// pass band that ends at a frequency the chip cannot reach.
+    ///
+    /// Tap `k` of phase `p` reads the input sample `1 - k - p / PHASES` away
+    /// from the output position, which is why the ideal response is evaluated
+    /// there: the kernel is causal, so the sample the output lies in is the
+    /// `k = 0` tap and not the middle of the window. Each row is then normalised
+    /// to sum to 1, which makes the filter exactly unity at DC - a constant in
+    /// has to be a constant out, and that is what lets [`Mixer`] put the
+    /// DC-blocking high-pass after it and still call it a DC blocker.
+    fn build_kernel(period: u64, taps: usize, rate: u32, master_hz: u64) -> Vec<f32> {
+        let in_rate = master_hz as f64 / period as f64;
+        let cutoff = (f64::from(rate) * 0.45 / in_rate).min(0.45);
+        let mut kernel = vec![0.0_f32; PHASES * taps];
+        for phase in 0..PHASES {
+            let offset = phase as f64 / PHASES as f64;
+            let row = &mut kernel[phase * taps..phase * taps + taps];
+            let mut sum = 0.0;
+            for (k, tap) in row.iter_mut().enumerate() {
+                let distance = 1.0 - k as f64 - offset;
+                let ideal = if distance == 0.0 {
+                    2.0 * cutoff
+                } else {
+                    let angle = PI64 * distance;
+                    (2.0 * cutoff * angle).sin() / angle
+                };
+                let window = 0.54 - 0.46 * (2.0 * PI64 * k as f64 / (taps - 1) as f64).cos();
+                *tap = (ideal * window) as f32;
+                sum += f64::from(*tap);
+            }
+            for tap in row.iter_mut() {
+                *tap /= sum as f32;
+            }
+        }
+        kernel
+    }
+
+    /// How many input samples are held.
+    fn count(&self) -> usize {
+        self.samples.len() / self.channels
+    }
+
+    /// The master-clock position of the first input sample that is *not* held, in
+    /// the units [`Mixer`] times by: this is how far the mixer is allowed to mix.
+    fn end_num(&self) -> u64 {
+        (self.first as u64 + self.count() as u64) * self.step
+    }
+
+    /// Make the stream ready for `count` samples whose first is absolute index
+    /// `at`, and say how many of them the stream already has.
+    ///
+    /// Time may not run backwards and may not jump. Backwards is the harmless
+    /// case of the same frame being offered twice - a `drain_audio` call with no
+    /// `run_frame` in front of it - and those samples are dropped here rather
+    /// than mixed twice. A jump means frames ran without being drained at all:
+    /// the gap is filled with silence, which loses exactly the sound of the
+    /// frames that were dropped and nothing else, and keeps every sample after
+    /// it on its own master clock so that the output count stays exact.
+    fn align(&mut self, at: u64, count: usize) -> usize {
+        let next = self.first as u64 + self.count() as u64;
+        if at >= next {
+            let gap = usize::try_from(at - next).unwrap_or(usize::MAX) * self.channels;
+            self.samples.resize(self.samples.len() + gap, 0.0);
+            0
+        } else {
+            usize::try_from(next - at).unwrap_or(usize::MAX).min(count)
+        }
+    }
+
+    /// Add the PSG's frame, `new[0]` being absolute index `at`.
+    fn push_mono(&mut self, new: &[i16], at: u64) {
+        let skip = self.align(at, new.len());
+        self.samples
+            .extend(new[skip..].iter().map(|&v| f32::from(v) * self.gain));
+    }
+
+    /// Add the FM's frame, `new[0]` being absolute index `at`, both pins in one
+    /// pass so that the two channels of one sample stay together.
+    fn push_stereo(&mut self, new: &[(i16, i16)], at: u64) {
+        let skip = self.align(at, new.len());
+        self.samples.extend(new[skip..].iter().flat_map(|&(left, right)| {
+            [f32::from(left) * self.gain, f32::from(right) * self.gain]
+        }));
+    }
+
+    /// The kernel row for output position `pos`, and the absolute index of the
+    /// oldest input sample it reads.
+    ///
+    /// Split out of [`Stream::sum`] because the FM's two channels share one row:
+    /// the position is worked out once per output sample per stream rather than
+    /// once per channel.
+    fn tap_row(&self, pos: u64) -> (&[f32], i64) {
+        let index = pos / self.step;
+        let phase = (pos % self.step * PHASES as u64 / self.step) as usize;
+        (
+            &self.kernel[phase * self.taps..phase * self.taps + self.taps],
+            index as i64 - self.taps as i64 + 2,
+        )
+    }
+
+    /// The input sample at absolute index `index` of `channel`, or silence
+    /// outside what is held.
+    ///
+    /// Silence at both ends and for the same reason: before the first sample
+    /// there is genuinely nothing - the machine had not been clocked - and
+    /// [`Stream::tap_row`] never asks for a sample past the last one, because
+    /// the mixer does not mix past the end of what is held.
+    fn sample(&self, index: i64, channel: usize) -> f32 {
+        let offset = index - self.first;
+        if offset < 0 {
+            return 0.0;
+        }
+        let i = (offset as usize) * self.channels + channel;
+        self.samples.get(i).copied().unwrap_or(0.0)
+    }
+
+    /// One channel's contribution to one output sample: the window of input
+    /// samples from `oldest` on, weighted by `row`.
+    fn sum(&self, row: &[f32], oldest: i64, channel: usize) -> f32 {
+        let mut total = 0.0;
+        for (k, &weight) in row.iter().enumerate() {
+            total += self.sample(oldest + k as i64, channel) * weight;
+        }
+        total
+    }
+
+    /// Drop the input samples up to `to` that no future output sample can reach,
+    /// keeping the `taps - 2` before `to` that the next one still reads.
+    ///
+    /// This is what keeps the buffer one frame plus a kernel wide rather than
+    /// growing for ever: `Vec::drain` moves the tail down and keeps the
+    /// capacity, so after the first frame no call to this file allocates.
+    fn trim(&mut self, to: u64) {
+        let keep_from = to as i64 - self.taps as i64 + 2;
+        if keep_from <= self.first {
+            return;
+        }
+        let drop = (keep_from - self.first) as usize * self.channels;
+        self.samples.drain(..drop.min(self.samples.len()));
+        self.first = keep_from;
+    }
+}
+
+/// One output channel's half-remembered past: what the DC blocker held, the
+/// sample before it, and what the board's low-pass held.
+#[derive(Clone, Copy, Default)]
+struct FilterState {
+    /// The blocker's pole.
+    blocked: f32,
+    /// The blocker's previous input, the one it subtracts.
+    previous: f32,
+    /// The low-pass's pole.
+    low: f32,
+}
+
+/// The mixer: the two chips' streams, resampled band-limited onto the host's
+/// sample grid, summed, and put through the console's own output filters.
+///
+/// ## What it is for
+///
+/// The chips run at their own rates - the FM about 53267 Hz and the PSG about
+/// 223722 Hz (docs/ARCHITECTURE.md, "Clocks and timing") - and the host wants
+/// `config.sample_rate`. docs/ARCHITECTURE.md ("Audio chips") asks for a
+/// band-limited resampler rather than an interpolating one, and the difference
+/// is the PSG: a PSG sample is a square wave's edge, whose harmonics run up past
+/// half the output rate and come back down through it when the stream is
+/// decimated by anything less than a filter. Linear interpolation leaves them
+/// there, which is `square_wave_aliasing_low`.
+///
+/// ## Time, and why it is counted in master clocks
+///
+/// Both streams and the output are positions on the same master clock, and the
+/// mixer keeps time as one number: [`Mixer::out_pos`] is the master clock of the
+/// next output sample, in units of `1 / sample_rate` so that it stays whole. The
+/// output rate is therefore exactly `sample_rate` of the host's clock by
+/// construction rather than by averaging, and a frame produces however many
+/// samples the master clock it ran says it produces - which is not the same
+/// number every frame, and is not supposed to be.
+///
+/// ## Allocation
+///
+/// None after the first frame. Both streams are reserved at [`Mixer::new`] and
+/// then only `extend`ed and `drain`ed; the kernels are built once. The output
+/// `Vec` belongs to the caller and grows by whatever `Vec` growth means.
+pub struct Mixer {
+    /// The machine's master clock, Hz: the console's `Region::master_clock_hz`.
+    master_hz: u64,
+    /// The master clock of the next output sample to produce, in units of
+    /// `1 / sample_rate`, so that it is a whole number.
+    out_pos: u64,
+    /// The FM's two channels.
+    ym: Stream,
+    /// The PSG's one.
+    psg: Stream,
+    /// The `a` of the board's low-pass, or `None` for [`LowPass::Off`].
+    low_pass: Option<f32>,
+    /// The `a` of the DC-blocking high-pass.
+    dc_gain: f32,
+    /// One filter state per output channel.
+    state: [FilterState; 2],
+}
+
+impl Mixer {
+    /// A mixer for a machine clocked at `master_hz`, taking its rate, its PSG
+    /// level and its output filter from `config`.
+    ///
+    /// The master clock is a separate argument because `Config` does not carry
+    /// it and cannot: it is a property of the console the cartridge turned out to
+    /// want ([`crate::Config::resolve_region`]), and by the time a mixer is built
+    /// that has been decided.
+    pub fn new(master_hz: u64, config: &Config) -> Self {
+        let rate = config.sample_rate.max(1);
+        Self {
+            master_hz,
+            out_pos: 0,
+            ym: Stream::new(
+                YM_SAMPLE_MCLK,
+                YM_TAPS,
+                YM_OUTPUT_GAIN,
+                2,
+                rate,
+                master_hz,
+                YM_FRAME_CAPACITY,
+            ),
+            psg: Stream::new(
+                PSG_TICK_MCLK,
+                PSG_TAPS,
+                PSG_LEVEL_REFERENCE * config.psg_level as f32 / 100.0,
+                1,
+                rate,
+                master_hz,
+                PSG_FRAME_CAPACITY,
+            ),
+            low_pass: match config.lowpass {
+                LowPass::Off => None,
+                LowPass::Model1 => Some(one_pole(MODEL1_LOW_PASS_HZ, rate)),
+            },
+            dc_gain: one_pole(DC_BLOCK_HZ, rate),
+            state: [FilterState::default(); 2],
+        }
+    }
+
+    /// Mix one frame's chip output and append the result to `out` as interleaved
+    /// stereo `i16`.
+    ///
+    /// Everything the frame holds is mixed - the mixer never holds output back
+    /// for a later frame - and everything it mixes is spent, so handing the same
+    /// frame over twice appends nothing the second time
+    /// (`a_frame_is_mixed_once`). What is not mixed is whatever the streams do
+    /// not have yet: the mix stops at whichever chip is further behind, because
+    /// 1008 and 240 do not divide each other and a frame's two streams end on
+    /// different master clocks.
+    pub fn mix(&mut self, frame: &ChipFrame<'_>, out: &mut Vec<i16>) {
+        self.ym.push_stereo(frame.ym, frame.ym_first);
+        self.psg.push_mono(frame.psg, frame.psg_first);
+
+        let end = self.ym.end_num().min(self.psg.end_num());
+        while self.out_pos < end {
+            let (ym_row, ym_oldest) = self.ym.tap_row(self.out_pos);
+            let (psg_row, psg_oldest) = self.psg.tap_row(self.out_pos);
+            let psg = self.psg.sum(psg_row, psg_oldest, 0);
+            let left = self.ym.sum(ym_row, ym_oldest, 0) + psg;
+            let right = self.ym.sum(ym_row, ym_oldest, 1) + psg;
+            out.push(self.shape(0, left));
+            out.push(self.shape(1, right));
+            self.out_pos += self.master_hz;
+        }
+
+        self.ym.trim(self.out_pos / self.ym.step);
+        self.psg.trim(self.out_pos / self.psg.step);
+    }
+
+    /// One mixed sample of one channel through the console's two filters and into
+    /// an `i16`.
+    ///
+    /// The DC blocker goes first and the board's low-pass second: the offsets it
+    /// is there for are at 0 Hz, where the low-pass is doing nothing, and taking
+    /// them out before the low-pass means its pole never holds a level that is
+    /// not sound. Both are the `y += a * (x - y)` one-pole form (
+    /// [`one_pole`]); the blocker is that form in the transposed way that gives a
+    /// zero at DC, `y = a * (y_prev + x - x_prev)`, which is the same filter with
+    /// the same `a` to the precision this is all specified to.
+    ///
+    /// The sum of six FM channels and four PSG channels can ask for more than an
+    /// `i16` can say - Genesis Plus GX, whose levels this copies, has the same
+    /// headroom problem and clips at the same place (`audio_update` of its
+    /// `core/system.c` clamps to 32767 and -32768 after filtering) - so the
+    /// answer is clamped rather than wrapped.
+    fn shape(&mut self, channel: usize, value: f32) -> i16 {
+        let (low_pass, dc_gain) = (self.low_pass, self.dc_gain);
+        let state = &mut self.state[channel];
+
+        let blocked = dc_gain * (state.blocked + value - state.previous);
+        state.previous = value;
+        state.blocked = blocked;
+
+        let mut shaped = blocked;
+        if let Some(a) = low_pass {
+            shaped += a * (state.low - shaped);
+            state.low = shaped;
+        }
+        shaped.clamp(-32_768.0, 32_767.0).round() as i16
+    }
+}
+
+/// The `a` of a one-pole filter with a corner of `freq` at `rate`.
+///
+/// `1 - exp(-2 PI f / fs)`, the exact discrete-time version of `y += a * (x - y)`
+/// rather than the `2 PI f / fs` it is often written as: at 3.39 kHz of 48 kHz
+/// the two differ by 6 % in `a` and by a third of a decibel at the corner, which
+/// is more than the difference between the two sources for the corner itself.
+fn one_pole(freq: f32, rate: u32) -> f32 {
+    let step = 2.0 * PI * freq / rate.max(1) as f32;
+    1.0 - (-step).exp()
+}
+
+/// `PI` at the width the kernels are built at: they are built in `f64` and
+/// applied in `f32`, and this is what [`Stream::build_kernel`] counts in.
+const PI64: f64 = std::f64::consts::PI;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,7 +922,11 @@ mod tests {
             },
             &mut out,
         );
-        assert!(out.iter().all(|&v| v == 0), "{:?}", &out[..8.min(out.len())]);
+        assert!(
+            out.iter().all(|&v| v == 0),
+            "{:?}",
+            &out[..8.min(out.len())]
+        );
         assert!(!out.is_empty(), "four frames have to produce something");
     }
 
@@ -549,10 +1073,7 @@ mod tests {
         let with = rms(&left(&through)[through.len() / 2 - window..through.len() / 2]);
         let without = rms(&left(&bypassed)[bypassed.len() / 2 - window..bypassed.len() / 2]);
         let loss = decibels(with, without);
-        assert!(
-            loss <= -9.0,
-            "Model 1 left {loss:.2} dB on a 10 kHz tone"
-        );
+        assert!(loss <= -9.0, "Model 1 left {loss:.2} dB on a 10 kHz tone");
     }
 
     /// A constant is not a sound: the ladder's offset and the PSG's are gone by
