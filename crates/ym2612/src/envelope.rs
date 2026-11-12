@@ -23,12 +23,46 @@
 use crate::phase::{self, CHANNELS, PhaseGen, SLOTS};
 use crate::regs::{
     REG_AM_DECAY_1, REG_DECAY_2, REG_KEY_ON, REG_KEY_SCALE_ATTACK, REG_LEVEL_RELEASE,
-    REG_TOTAL_LEVEL, operator_of_group,
+    REG_SSG_EG, REG_TOTAL_LEVEL, operator_of_group,
 };
 
 /// The attenuation of a silent operator: 10 bits, and the other end from it is
 /// 0 (YM2608 application manual `&40`).
 pub(crate) const SILENT: u16 = 0x3FF;
+
+/// `&90` bit 3: the SSG-EG is enabled for this operator, and the four rules of
+/// [`Envelope::ssg_restarting`] and the mirror of [`Envelope::ssg_mirrored`] take
+/// over from the plain ADSR of #109 (YM2608 application manual "3. Register
+/// descriptions", `&90`).
+const SSG_ENABLE: u8 = 0x08;
+
+/// `&90` bit 2, the attack bit: read the output mirrored, so that the operator
+/// starts quiet and gets louder rather than the other way round (`&90`).
+const SSG_ATTACK: u8 = 0x04;
+
+/// `&90` bit 1, the alternate bit: flip the mirror every time the envelope
+/// reaches [`SSG_HALF`] (`&90`).
+const SSG_ALTERNATE: u8 = 0x02;
+
+/// `&90` bit 0, the hold bit: hold the output at [`SSG_HALF`] instead of going
+/// back for another swing (`&90`).
+const SSG_HOLD: u8 = 0x01;
+
+/// Half the envelope range, and the point an SSG-EG envelope is read at: the
+/// chip tests bit 9 of the attenuation, and everything the `&90` bits have to say
+/// is said there (YM2608 application manual `&90`; Nuked-OPN2's
+/// `OPN2_EnvelopeSSGEG` tests `eg_level & 0x200`).
+const SSG_HALF: u16 = 0x200;
+
+/// The 10 bits the mirror wraps through: a level above [`SSG_HALF`] mirrored is
+/// not negative, it is on the way round again - `ssg_level &= 0x3ff` of
+/// Nuked-OPN2.
+const SSG_MIRROR_MASK: u16 = 0x3FF;
+
+/// What SSG-EG multiplies the decay, sustain and release increments by, and the
+/// attack is not one of them (Nuked-OPN2's `inc <<= 2`, which is inside the
+/// decay, sustain and release cases of `OPN2_EnvelopeADSR` and not the attack).
+const SSG_INCREMENT_SCALE: u8 = 4;
 
 /// The highest value of the chip-wide envelope counter, which is 12 bits and
 /// runs 1 to this rather than 0 to it: the counter of Nemesis's description never
@@ -230,6 +264,14 @@ pub(crate) struct Envelope {
     sustain_level: u8,
     /// `&80` bits 3-0, the release rate.
     release_rate: u8,
+    /// `&90` bits 3-0: the SSG-EG mode, enable/attack/alternate/hold (YM2608
+    /// application manual `&90`).
+    ssg_eg: u8,
+    /// Which way round the SSG-EG is reading this operator right now: Nuked-
+    /// OPN2's `eg_ssg_dir`, the one bit of state the alternate and hold rules of
+    /// `&90` leave behind between swings. The output is mirrored when this
+    /// disagrees with the attack bit, and only while the key is on.
+    ssg_direction: bool,
 }
 
 impl Envelope {
@@ -248,6 +290,8 @@ impl Envelope {
             decay2_rate: 0,
             sustain_level: 0,
             release_rate: 0,
+            ssg_eg: 0,
+            ssg_direction: false,
         }
     }
 
@@ -263,6 +307,17 @@ impl Envelope {
         if self.key_on == on {
             return;
         }
+        if !on {
+            // A key off releases an SSG-EG envelope from where its mirror was
+            // reading, and takes the mirror off with it: Nuked-OPN2 does the
+            // first with `if (koff_event) level = ssg_level` of
+            // `OPN2_EnvelopeADSR` and the second with the `& eg_kon[slot]` on
+            // both the direction and the mirror (`&90`).
+            if self.ssg_mirrored() {
+                self.att = SSG_HALF.wrapping_sub(self.att) & SSG_MIRROR_MASK;
+            }
+            self.ssg_direction = false;
+        }
         self.key_on = on;
         self.state = if on { State::Attack } else { State::Release };
         if on && effective_rate(self.attack_rate, self.key_scale, keycode) >= INSTANT_RATE {
@@ -273,6 +328,13 @@ impl Envelope {
     /// One envelope update at key code `keycode`, with the chip-wide counter at
     /// `counter`.
     fn update(&mut self, counter: u16, keycode: u8) {
+        // The SSG-EG reads the attenuation the envelope starts the update with,
+        // which is the order Nuked-OPN2 runs `OPN2_EnvelopeSSGEG` and the ADSR
+        // step in. `off` is its `eg_off`: past halfway an SSG-EG envelope has no
+        // increment at all, and may have stopped being an envelope (`&90`).
+        let off = self.ssg_enabled() && self.att >= SSG_HALF;
+        let holding_loud = self.ssg_holding_loud();
+
         // The states move first: an attack that has reached 0 is decay, and a
         // decay that has reached its sustain level is sustain.
         if self.state == State::Attack && self.att == 0 {
@@ -281,21 +343,51 @@ impl Envelope {
         if self.state == State::Decay && self.att >= sustain_attenuation(self.sustain_level) {
             self.state = State::Sustain;
         }
-
-        let inc = increment(self.rate(keycode), counter);
-        if inc == 0 {
-            return;
+        if self.ssg_restarting() {
+            // A repeat of `&90` is a key on of the envelope: it is the attack
+            // that runs again, from wherever the attenuation has got to, and the
+            // envelope off below has nothing to say about it (Nuked's
+            // `kon_event`, which is `okon && eg_ssg_repeat_latch`).
+            self.state = State::Attack;
         }
 
-        if self.state == State::Attack {
-            self.att = attack_step(self.att, inc);
-            if self.att == 0 {
-                self.state = State::Decay;
+        let mut inc = increment(self.rate(keycode), counter);
+        if self.ssg_enabled() && self.state != State::Attack {
+            // Past the halfway point an SSG-EG envelope adds nothing at all, and
+            // short of it it adds four times what the plain envelope would
+            // (Nuked-OPN2's `if (!eg_off && chip->eg_inc)`, with its `inc <<= 2`
+            // inside). The attack is not one of these states and is not gated:
+            // an SSG-EG envelope that has just turned round attacks from past
+            // halfway, and it has to be able to get back down.
+            inc = if off {
+                0
+            } else {
+                inc.saturating_mul(SSG_INCREMENT_SCALE)
+            };
+        }
+
+        if inc != 0 {
+            if self.state == State::Attack {
+                self.att = attack_step(self.att, inc);
+                if self.att == 0 {
+                    self.state = State::Decay;
+                }
+            } else {
+                // Decay, sustain and release are all linear, and release is not
+                // stopped by the sustain level: it is only ever clamped at
+                // silence.
+                self.att = (self.att + u16::from(inc)).min(SILENT);
             }
-        } else {
-            // Decay, sustain and release are all linear, and release is not
-            // stopped by the sustain level: it is only ever clamped at silence.
-            self.att = (self.att + u16::from(inc)).min(SILENT);
+        }
+
+        // And the envelope off itself: an SSG-EG envelope past halfway that is
+        // not attacking and is not one of the two `&90` modes that hold at full
+        // level goes silent and stays there - Nuked's `nextstate = release,
+        // nextlevel = 0x3ff`, which is what makes 9 and 15 hold silent while 11
+        // and 13 hold loud (`&90`, and the manual's SSG-EG diagram).
+        if off && self.state != State::Attack && !holding_loud {
+            self.state = State::Release;
+            self.att = SILENT;
         }
     }
 
@@ -313,6 +405,60 @@ impl Envelope {
         }
     }
 
+    /// Whether the SSG-EG of `&90` runs this operator at all, which is all the
+    /// plain ADSR of #109 is without it (YM2608 application manual `&90`).
+    fn ssg_enabled(&self) -> bool {
+        self.ssg_eg & SSG_ENABLE != 0
+    }
+
+    /// What the `&90` bits make of an envelope that starts this update at or past
+    /// [`SSG_HALF`], and whether it goes back for another swing:
+    ///
+    /// | hold | alternate | at the halfway point             |
+    /// |------|-----------|----------------------------------|
+    /// | 0    | 0         | back to the attack               |
+    /// | 0    | 1         | flip the mirror, back to attack  |
+    /// | 1    | 1         | mirror on, and stay on           |
+    /// | 1    | 0         | nothing: the output holds        |
+    ///
+    /// The table is the manual's SSG-EG diagram of `&90` 8 to 15 read the other
+    /// way round, and its source is Nuked-OPN2's `OPN2_EnvelopeSSGEG`: the two
+    /// rows that restart are its `eg_ssg_repeat_latch`, `(ssg_eg & 0x01) == 0`,
+    /// and the mirror is its `direction ^= 1` and `direction = 1`. A repeat is a
+    /// key on of the envelope, so the key state gates the lot: a released
+    /// envelope has no attack to go back to.
+    fn ssg_restarting(&mut self) -> bool {
+        if !self.ssg_enabled() || !self.key_on || self.att < SSG_HALF {
+            return false;
+        }
+        let hold = self.ssg_eg & SSG_HOLD != 0;
+        if self.ssg_eg & SSG_ALTERNATE != 0 {
+            self.ssg_direction = if hold { true } else { !self.ssg_direction };
+        }
+        !hold
+    }
+
+    /// The two `&90` modes that hold at full level rather than going silent: the
+    /// hold bit with the attack and the alternate disagreeing, which is Nuked's
+    /// `eg_ssg_hold_up_latch` of `(mask & 7) == 5 || (mask & 7) == 3`. Its key
+    /// is `eg_kon_latch`, so this is a held-key-only rule like the rest of `&90`.
+    fn ssg_holding_loud(&self) -> bool {
+        let mode = self.ssg_eg & (SSG_ATTACK | SSG_ALTERNATE | SSG_HOLD);
+        let alternating = SSG_ALTERNATE | SSG_HOLD;
+        let attacking = SSG_ATTACK | SSG_HOLD;
+        self.key_on && (mode == alternating || mode == attacking)
+    }
+
+    /// Whether the output of this operator is read mirrored: the running
+    /// direction of `&90` and its attack bit disagreeing, and only while the key
+    /// is on - Nuked's `eg_ssg_inv`, `(direction ^ (attack & enable)) &
+    /// eg_kon` (`&90`).
+    fn ssg_mirrored(&self) -> bool {
+        self.ssg_enabled()
+            && self.key_on
+            && (self.ssg_direction != (self.ssg_eg & SSG_ATTACK != 0))
+    }
+
     /// What the operator contributes to the channel: its own attenuation plus
     /// the total level of `&40` at 8 attenuation counts a step, clamped at
     /// silence (YM2608 application manual `&40`).
@@ -322,7 +468,18 @@ impl Envelope {
     /// cannot be made to read it back out. The amplitude modulation of M5-08
     /// (#113) is added on top there, not here.
     pub(crate) fn output(&self) -> u16 {
-        (self.att + (u16::from(self.total_level) << 3)).min(SILENT)
+        (self.attenuation() + (u16::from(self.total_level) << 3)).min(SILENT)
+    }
+
+    /// The envelope's own attenuation as the channel reads it: the level itself,
+    /// or its mirror about [`SSG_HALF`] while an SSG-EG inversion is running -
+    /// Nuked-OPN2's `ssg_level = 512 - level` (`&90`, [`Envelope::ssg_mirrored`]).
+    fn attenuation(&self) -> u16 {
+        if self.ssg_mirrored() {
+            SSG_HALF.wrapping_sub(self.att) & SSG_MIRROR_MASK
+        } else {
+            self.att
+        }
     }
 
     /// Whether the LFO's amplitude modulation reaches this operator at all: bit 7
@@ -478,6 +635,9 @@ enum Field {
     Decay2Rate,
     /// `&80` bits 7-4 the sustain level and 3-0 the release rate.
     LevelRelease,
+    /// `&90` bits 3-0: the SSG-EG mode this operator runs its envelope by
+    /// (YM2608 application manual `&90`).
+    SsgEg,
 }
 
 impl Field {
@@ -492,6 +652,7 @@ impl Field {
             REG_AM_DECAY_1 => Some(Self::Decay1Rate),
             REG_DECAY_2 => Some(Self::Decay2Rate),
             REG_LEVEL_RELEASE => Some(Self::LevelRelease),
+            REG_SSG_EG => Some(Self::SsgEg),
             _ => None,
         }
     }
@@ -505,6 +666,7 @@ impl Field {
             Self::Decay1Rate => REG_AM_DECAY_1,
             Self::Decay2Rate => REG_DECAY_2,
             Self::LevelRelease => REG_LEVEL_RELEASE,
+            Self::SsgEg => REG_SSG_EG,
         }
     }
 
@@ -525,6 +687,10 @@ impl Field {
                 envelope.sustain_level = (value >> 4) & 0x0F;
                 envelope.release_rate = value & 0x0F;
             }
+            // Only the low nibble: `&90` bits 7-4 are not decoded, and the mode
+            // is the whole of what the SSG-EG reads (YM2608 application manual
+            // `&90`). Nuked-OPN2 masks the same 0x0F.
+            Self::SsgEg => envelope.ssg_eg = value & 0x0F,
         }
     }
 }
@@ -534,7 +700,7 @@ mod tests {
     use super::*;
     use crate::phase::PhaseGen;
     use crate::phase::SLOT_S1;
-    use crate::regs::PART_I;
+    use crate::regs::{PART_I, REG_SSG_EG};
 
     /// `&28` bit 4: key on operator 1, the operator the tests here work on.
     const KEY_ON_S1: u8 = 0x10;
@@ -837,4 +1003,285 @@ mod tests {
         }
         assert_eq!(lowest, 1, "the counter wraps to 1, not to 0");
     }
+
+    /// An envelope at full level and in its decay, for the SSG-EG tests: AR, DR
+    /// and D2R 24 are rate 48 at key code 0, which adds exactly one step per
+    /// envelope update, and D1L 15 leaves the decay room to run all the way down
+    /// to the halfway point the SSG-EG reads (`&50`, `&60`, `&70`, `&80`).
+    fn ssg_at_full_level(mode: u8) -> Envelope {
+        let mut envelope = Envelope::new();
+        envelope.attack_rate = 24;
+        envelope.decay1_rate = 24;
+        envelope.decay2_rate = 24;
+        envelope.sustain_level = 15;
+        envelope.ssg_eg = mode;
+        envelope.key_on = true;
+        envelope.att = 0;
+        envelope.state = State::Decay;
+        envelope
+    }
+
+    /// `count` envelope updates for `envelope`, one at a time, recording what the
+    /// channel would read at each: the envelope's own level, the attenuation
+    /// [`Envelope::output`] gives it with the total level at 0, and whether the
+    /// SSG-EG mirror was over that output.
+    fn drive_output(envelope: &mut Envelope, count: u32) -> Vec<(u16, u16, bool)> {
+        (0..count)
+            .map(|step| {
+                let counter =
+                    u16::try_from(1 + step % u32::from(COUNTER_MAX)).expect("12-bit counter");
+                envelope.update(counter, 0);
+                (envelope.att, envelope.output(), envelope.ssg_mirrored())
+            })
+            .collect()
+    }
+
+    /// The mirror the SSG-EG reads through: `512 - level`, 10 bits, of
+    /// Nuked-OPN2's `OPN2_EnvelopeADSR` (YM2608 application manual `&90`).
+    fn mirror(att: u16) -> u16 {
+        SSG_HALF.wrapping_sub(att) & SSG_MIRROR_MASK
+    }
+
+    #[test]
+    fn ssg_increment_x4() {
+        // With SSG-EG enabled the decay, sustain and release increments are four
+        // times the normal ones, and stop dead once the attenuation is past the
+        // halfway point (YM2608 application manual `&90`, and Nuked-OPN2's
+        // `inc <<= 2` inside `!eg_off`).
+        let mut plain = ssg_at_full_level(0);
+        drive(&mut plain, 8, 0);
+        assert_eq!(plain.att, 8, "without SSG-EG, one step an update at rate 48");
+
+        let mut ssg = ssg_at_full_level(SSG_ENABLE);
+        drive(&mut ssg, 8, 0);
+        assert_eq!(ssg.att, 32, "with it, four");
+
+        // The release is one of the quadrupled states too. RR 5 is release rate
+        // 22, whose shift is 6, so of the counters 1 to 64 only the 64th answers
+        // it - at phase 1 of a row that has 1 to give there. One step along in
+        // 64 updates plain, and four with the SSG-EG on.
+        let mut released = ssg_at_full_level(0);
+        released.release_rate = 5;
+        released.set_key(false, 0);
+        drive(&mut released, 64, 0);
+        assert_eq!(released.att, 1, "one update point of one step in 64 updates");
+
+        let mut ssg_released = ssg_at_full_level(SSG_ENABLE);
+        ssg_released.release_rate = 5;
+        ssg_released.set_key(false, 0);
+        drive(&mut ssg_released, 64, 0);
+        assert_eq!(ssg_released.att, 4, "and the SSG-EG release is four of those");
+
+        // Four times nothing, past halfway: 0x1FC is two updates short of 0x200
+        // and 0x200 is where the envelope stops rather than the point it slows
+        // down to. The mode is the holding one, so nothing restarts it here.
+        let mut past = ssg_at_full_level(SSG_ENABLE | SSG_ALTERNATE | SSG_HOLD);
+        past.att = 0x1FC;
+        drive(&mut past, 8, 0);
+        assert_eq!(past.att, 0x200, "the increment stops at 0x200, not after it");
+    }
+
+    #[test]
+    fn ssg_disabled_matches_plain_eg() {
+        // With bit 3 of `&90` clear nothing of the plain envelope of #109
+        // changes: one step an update at rate 48 rather than four, no special
+        // meaning for the halfway point, and a decay that runs all the way down
+        // to silence instead of turning round or freezing there.
+        let mut envelope = ssg_at_full_level(0);
+        let levels = drive_output(&mut envelope, 1024);
+        assert_eq!(levels[7].0, 8, "one step per envelope update");
+        assert!(
+            levels
+                .iter()
+                .all(|(att, out, mirrored)| att == out && !mirrored),
+            "nothing is mirrored with the SSG-EG off"
+        );
+
+        let half = levels
+            .iter()
+            .position(|(att, _, _)| *att == 0x200)
+            .expect("a plain decay passes 0x200 on its way to silence");
+        assert_eq!(
+            levels[half + 1].0,
+            0x201,
+            "and keeps the one-step it has been taking, past the halfway point the SSG-EG would stop at"
+        );
+        assert_eq!(levels.last().expect("1024 updates").0, SILENT);
+    }
+
+    #[test]
+    fn ssg8_repeats() {
+        // `&90` 8 is the enable with neither hold nor alternate: the attenuation
+        // runs up to the halfway point and the envelope goes back to its attack
+        // from there, over and over, rather than on to silence (YM2608
+        // application manual `&90` and its SSG-EG diagram).
+        let mut envelope = ssg_at_full_level(SSG_ENABLE);
+
+        // Four an update, so 128 updates is exactly 0x200, and it is the update
+        // that finds the envelope there which turns it round.
+        drive(&mut envelope, 128, 0);
+        assert_eq!(envelope.att, 0x200, "0x200 in 128 updates of four");
+        assert_eq!(envelope.state, State::Decay);
+        drive(&mut envelope, 1, 0);
+        assert_eq!(envelope.state, State::Attack, "and it restarts on attack");
+
+        // On through a thousand more updates: the top of the envelope is the
+        // halfway point, and the attack brings it back to full level again and
+        // again.
+        let levels = drive_output(&mut envelope, 1000);
+        assert_eq!(
+            levels.iter().map(|(att, _, _)| *att).max().expect("1000"),
+            0x200,
+            "the turn round is at 0x200 and nowhere past it"
+        );
+        let repeats = levels
+            .windows(2)
+            .filter(|window| window[0].0 != 0 && window[1].0 == 0)
+            .count();
+        assert!(repeats >= 3, "back at full level {repeats} times");
+    }
+
+    #[test]
+    fn ssg10_alternates_inversion() {
+        // `&90` 10 is the enable with the alternate bit: every time the envelope
+        // reaches the halfway point the inversion flips, so the output alternates
+        // between the level and its mirror about 0x200 (YM2608 application manual
+        // `&90`, and Nuked-OPN2's `direction ^= 1`).
+        let mut envelope = ssg_at_full_level(SSG_ENABLE | SSG_ALTERNATE);
+        let levels = drive_output(&mut envelope, 1000);
+
+        for (att, out, _) in &levels {
+            assert!(
+                *out == *att || *out == mirror(*att),
+                "{att:#04x} is neither itself nor its mirror, it is {out:#04x}"
+            );
+        }
+
+        // And the mirror really does alternate: on for one swing, off for the
+        // next, from a chip that starts unmirrored.
+        let mut swings: Vec<bool> = levels.iter().map(|(_, _, mirrored)| *mirrored).collect();
+        swings.dedup();
+        assert!(
+            swings.len() >= 4,
+            "the mirror settled into {} swings, not alternation",
+            swings.len()
+        );
+        assert_eq!(&swings[..4], &[false, true, false, true]);
+        assert!(
+            levels
+                .iter()
+                .any(|(att, out, mirrored)| {
+                    *mirrored && *att < SSG_HALF && *out == mirror(*att) && mirror(*att) != *att
+                }),
+            "and it is the output that moves, below the halfway point"
+        );
+    }
+
+    #[test]
+    fn ssg9_holds_silent() {
+        // `&90` 9 is the enable with the hold bit alone: one swing down to the
+        // halfway point and then nothing at all - the envelope is off there, and
+        // off is silence (YM2608 application manual `&90`).
+        let mut envelope = ssg_at_full_level(SSG_ENABLE | SSG_HOLD);
+        drive(&mut envelope, 128, 0);
+        assert_eq!(envelope.att, 0x200, "the swing reaches the halfway point");
+
+        drive(&mut envelope, 1, 0);
+        assert_eq!(envelope.att, SILENT, "and the envelope is off from there");
+        assert_eq!(envelope.state, State::Release);
+        assert_eq!(envelope.output(), SILENT);
+
+        drive(&mut envelope, 4 * u32::from(COUNTER_MAX), 0);
+        assert_eq!(envelope.output(), SILENT, "and it holds there");
+    }
+
+    #[test]
+    fn ssg11_holds_loud() {
+        // `&90` 11 is the enable with the alternate and the hold bits: the swing
+        // to the halfway point, the inversion on, and a hold - which with the
+        // inversion means full level, not silence (YM2608 application manual
+        // `&90`, and Nuked-OPN2's `eg_ssg_hold_up_latch`, which is what keeps
+        // this mode off the silence the plain hold of 9 goes to).
+        let mut envelope = ssg_at_full_level(SSG_ENABLE | SSG_ALTERNATE | SSG_HOLD);
+        // 129, not 128: it is the update that finds the envelope at the halfway
+        // point that switches the mirror on, as it is for the 9 above.
+        drive(&mut envelope, 129, 0);
+        assert_eq!(envelope.att, 0x200, "the swing stops at the halfway point");
+        assert_eq!(envelope.output(), 0, "which the mirror reads as full level");
+
+        drive(&mut envelope, 4 * u32::from(COUNTER_MAX), 0);
+        assert_eq!(envelope.level(), 0x200, "the level stays at the halfway point");
+        assert_eq!(envelope.output(), 0, "and so does the output");
+    }
+
+    #[test]
+    fn ssg13_holds_loud_and_ssg15_holds_silent() {
+        // The other two holding modes are those two seen through the attack bit:
+        // 13 is the inverted 11 and so also ends at full level, and 15 is the
+        // inverted 9 and so ends at silence (YM2608 application manual `&90`).
+        let mut loud = ssg_at_full_level(SSG_ENABLE | SSG_ATTACK | SSG_HOLD);
+        drive(&mut loud, 129, 0);
+        assert_eq!(loud.output(), 0, "13 holds at full level");
+        drive(&mut loud, 4 * u32::from(COUNTER_MAX), 0);
+        assert_eq!(loud.output(), 0, "and holds there");
+
+        let mut silent = ssg_at_full_level(SSG_ENABLE | SSG_ATTACK | SSG_ALTERNATE | SSG_HOLD);
+        drive(&mut silent, 129, 0);
+        assert_eq!(silent.output(), SILENT, "15 holds at silence");
+        drive(&mut silent, 4 * u32::from(COUNTER_MAX), 0);
+        assert_eq!(silent.output(), SILENT, "and holds there");
+    }
+
+    #[test]
+    fn ssg_mirrors_the_output_and_a_key_off_does_not() {
+        // `&90` 12 is the enable with the attack bit, the mirror of the 8 that is
+        // the plain repeated saw: the output is read mirrored about 0x200, which
+        // is what makes a saw of a decay an upward saw of an attack (YM2608
+        // application manual `&90`, and Nuked-OPN2's `ssg_level = 512 - level`).
+        let mut envelope = ssg_at_full_level(SSG_ENABLE | SSG_ATTACK);
+        for (att, out) in [(0, 0x200), (0x100, 0x100), (0x200, 0), (0x300, 0x300)] {
+            envelope.att = att;
+            assert_eq!(envelope.output(), out, "mirrored {att:#04x}");
+        }
+
+        // The total level still adds, and still clamps at silence.
+        envelope.att = 0x200;
+        envelope.total_level = 8;
+        assert_eq!(envelope.output(), 0x40);
+
+        // A key off forces the mirror off, and releases from where the mirror was
+        // reading: Nuked applies `ssg_level` to the level itself on the key off,
+        // so a mode 12 released at full level releases from 0x200.
+        envelope.total_level = 0;
+        envelope.att = 0;
+        envelope.set_key(false, 0);
+        assert_eq!(envelope.att, 0x200, "released from the mirrored level");
+        assert_eq!(envelope.output(), 0x200, "and no longer through the mirror");
+    }
+
+    #[test]
+    fn ssg_eg_register_reaches_its_operator() {
+        // `&90` is a per-operator register laid out like `&40` to `&80`: the slot
+        // offset in bits 3-2 and the channel in bits 1-0, so +0 is operator 1, +4
+        // operator 3, +8 operator 2, +C operator 4 - and `&93`, the fourth address
+        // of a part's group, is not decoded at all (YM2608 application manual
+        // `&90`).
+        let phases = PhaseGen::new();
+        let mut eg = EnvelopeGen::new();
+        eg.register_written(&phases, PART_I, REG_SSG_EG, SSG_ENABLE);
+        eg.register_written(&phases, PART_I, REG_SSG_EG + 0x04, SSG_ENABLE | SSG_HOLD);
+        eg.register_written(&phases, PART_I, REG_SSG_EG + 0x03, SSG_ENABLE);
+
+        assert_eq!(eg.envelopes[0][SLOT_S1].ssg_eg, SSG_ENABLE);
+        assert_eq!(
+            eg.envelopes[0][crate::phase::SLOT_S3].ssg_eg,
+            SSG_ENABLE | SSG_HOLD
+        );
+        assert_eq!(eg.envelopes[0][crate::phase::SLOT_S2].ssg_eg, 0);
+        assert_eq!(
+            eg.envelopes[0][crate::phase::SLOT_S4].ssg_eg, 0,
+            "`&93` is the undecoded fourth channel of the group"
+        );
+    }
 }
+
