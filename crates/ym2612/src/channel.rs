@@ -28,26 +28,27 @@
 //! 7: S1 + S2 + S3 + S4
 //! ```
 //!
-//! ## The chip order, and the three paths that are a step behind
+//! ## The chip order, and the four paths that are a step behind
 //!
 //! The chip has one operator's worth of log-sin and exponent hardware and walks
 //! the 24 slots of the six channels through it in the order the registers are
 //! laid out - [`SLOT_S1`], [`SLOT_S3`], [`SLOT_S2`], [`SLOT_S4`], which is why
 //! the register offsets of a channel run `+00`, `+04`, `+08`, `+0C` and not
-//! S1..S4 (see [`crate::phase`]). A modulation is read at the moment its carrier
-//! is evaluated, so a carrier can only read an operator that has already been
-//! evaluated *this* step; anything else is one step old. Walking the eight
-//! connections through the S1, S3, S2, S4 order, the paths that read a value
-//! from the previous step are exactly:
+//! S1..S4 (see [`crate::phase`]). A carrier can be wired to two things only: the
+//! slot the hardware evaluated immediately before it, whose output is in hand and
+//! therefore fresh, and one of two delay registers holding the last output of S1
+//! and of S2 - the S1 one being the same pair of taps the feedback reads. So a
+//! modulation is fresh exactly when the modulator is the slot in front of its
+//! carrier in the S1, S3, S2, S4 walk, which is S1 to S2 and S3 to S4, and every
+//! other connection in the table is a step old:
 //!
-//! - S2 to S3, in algorithms 0, 1 and 2: S3 is evaluated before S2.
-//! - S1 to S3, in algorithms 1 and 5, and S1 to S4 in algorithms 2 and 5: these
-//!   two read the same slot-delay register the chip keeps for the taps of the
-//!   feedback, which is a step old by the time S3 and S4 come round.
+//! - S2 to S3, in algorithms 0, 1 and 2, where S3 is evaluated before S2 at all.
+//! - S2 to S4, in algorithm 3, where S2 is evaluated before S4 but is not the
+//!   slot immediately in front of it.
+//! - S1 to S3, in algorithms 1 and 5, and S1 to S4, in algorithms 2 and 5, both
+//!   of which come from the delay register the feedback shares.
 //!
-//! Every other modulation - S1 to S2 everywhere it appears, and S3 to S4
-//! everywhere it appears - is read fresh, one evaluation behind its carrier
-//! inside the same step. The set was checked against the connection table of
+//! The set was checked against the connection table of
 //! Nuked-OPN2's `ym3438.c` (`nukeykt/Nuked-OPN2`, read 11 Nov 2026), whose
 //! `fm_algorithm` routes S3 and S4 through `fm_op1`/`fm_op2` delay registers in
 //! exactly those algorithms and through the just-generated `fm_out` of the
@@ -62,10 +63,11 @@
 //! application manual `&B0`; the same shift the YM3812/OPL2 programming manuals
 //! give for the feedback of their first operator, which the OPN core shares).
 //! A modulating operator's 14-bit output, on the other hand, enters the
-//! carrier's ten-bit angle half as wide: it is shifted right by one first, so a
-//! modulator at full swing moves a carrier by a quarter of a cycle at a time
-//! rather than a whole one. Both are added, modulo ten bits, by
-//! [`crate::operator::angle`].
+//! carrier's ten-bit angle half as wide: it is shifted right by one first, so the
+//! loudest modulation one operator can lay on another is 8168 >> 1 = 4084 of the
+//! 1024 of a cycle - just under four cycles of the carrier's own wave, which is
+//! what lets a two-operator algorithm fill out a spectrum so hard. Both are
+//! added, modulo ten bits, by [`crate::operator::angle`].
 
 use crate::operator;
 use crate::phase::{SLOT_S1, SLOT_S2, SLOT_S3, SLOT_S4, SLOTS};
@@ -273,7 +275,7 @@ impl FmChannel {
     ///
     /// `#[allow(dead_code)]` because the chip has nowhere to put it yet: the DAC
     /// output stage of M5-07b (#112) is the first reader, and until then only
-    /// these module's tests ask for it.
+    /// this module's tests ask for it.
     #[allow(dead_code)]
     pub(crate) fn output(&self) -> i16 {
         self.mix
@@ -344,8 +346,8 @@ mod tests {
     /// four operators of a channel all count at the channel's own increment.
     const MUL_1: u8 = 0x01;
 
-    /// The `&50` byte of every operator here: attack rate 31, which is
-    /// [`crate::envelope::INSTANT_RATE`] decoded, so the key-on itself is at
+    /// The `&50` byte of every operator here: rate scaling 0 and attack rate 31,
+    /// which is the 62 the envelope calls instant, so the key-on itself is at
     /// full level and a test does not have to clock an envelope up first.
     const ATTACK_NOW: u8 = 0x1F;
 

@@ -9,10 +9,12 @@
 //! flags, timer A and timer B (`timers`), the F-Num, block, detune, multiple and
 //! key-on behind the 24 phase counters (`phase`), and the attack, decay, sustain
 //! and release behind the 24 attenuations (`envelope`). `clock` is the sample
-//! step those timers, counters and envelopes run in and still returns silence:
-//! what the operators answer with is here - the quarter-wave log sine, the
-//! exponent and the sign of one operator's output (`operator` and `tables`) -
-//! but nothing sums them into a channel until the algorithms of M5-07a (#111).
+//! step those timers, counters and envelopes run in, and the operators answer in
+//! it - the quarter-wave log sine, the exponent and the sign of one operator's
+//! output (`operator` and `tables`), wired through the eight algorithms and the
+//! feedback of `&B0` and summed into the six channel mixes of M5-07a (#111)
+//! (`channel`). The mix still does not reach the pins: the DAC output stage of
+//! M5-07b (#112) is what turns a channel sum into a sample.
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
