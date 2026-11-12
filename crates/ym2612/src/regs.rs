@@ -14,8 +14,8 @@
 //! acts on yet is still stored, because the register file *is* the observable
 //! state of a write-only chip. Of the global registers the timer group of
 //! [`RegFile::timer_config`], the key-on of [`REG_KEY_ON`] and the LFO of
-//! [`REG_LFO`] and [`REG_AMS_PMS`] mean something now; the DAC enable and DAC
-//! value (`&2A`, `&2B`) are only stored, for M5-11 (#116).
+//! [`REG_LFO`] and [`REG_AMS_PMS`] and the channel 6 DAC of [`RegFile::dac_data`]
+//! and [`RegFile::dac_enabled`] mean something now.
 
 use crate::phase::{SLOT_S1, SLOT_S2, SLOT_S3};
 use crate::timers::TimerConfig;
@@ -122,11 +122,29 @@ pub(crate) const REG_ALGORITHM_FEEDBACK: u8 = 0xB0;
 /// Register `&B4`, the first of the amplitude and phase modulation group: `&B4` +
 /// channel, bits 5-4 the AMS - how far down the LFO's AM triangle that channel's
 /// amplitude-modulated operators are read at - and bits 2-0 the PMS, its PM depth.
-/// Bits 7-6 of `&B6` are the channel 6 DAC panning of M5-11 (#116). Like
-/// [`REG_ALGORITHM_FEEDBACK`], three of a part are decoded and the fourth, `&B7`,
-/// is not (YM2608 application manual "3. Register descriptions", `&B4`; see
-/// `crate::lfo`).
+/// Bits 7-6 are the two output enables of the channel, [`PAN_LEFT`] and
+/// [`PAN_RIGHT`], which reach the DACs of [`crate::output`] through
+/// [`RegFile::pan`] (M5-11, #116). Like [`REG_ALGORITHM_FEEDBACK`], three of a part
+/// are decoded and the fourth, `&B7`, is not (YM2608 application manual "3.
+/// Register descriptions", `&B4`; see `crate::lfo`).
 pub(crate) const REG_AMS_PMS: u8 = 0xB4;
+
+/// `&B4`-`&B6` bit 7: this channel's converter is routed to the left output.
+pub(crate) const PAN_LEFT: u8 = 0x80;
+
+/// `&B4`-`&B6` bit 6: this channel's converter is routed to the right output.
+pub(crate) const PAN_RIGHT: u8 = 0x40;
+
+/// Both enables together, the routing a channel starts on.
+///
+/// The two bits together are what a write-only register cannot say, since a chip
+/// wakes with undefined registers and the register file wakes zeroed: every
+/// address of the [`REG_AMS_PMS`] group is therefore initialised to this, so an
+/// untouched chip puts all six channels on both sides. Nuked-OPN2's `YM3438_reset`
+/// does the same for its `pan_l`/`pan_r` (read 12 Nov 2026) and it is what the
+/// drivers of a Genesis assume: FM is mono on the board, so a game that never
+/// writes `&B4` is not a game that expects silence.
+pub(crate) const PAN_BOTH: u8 = PAN_LEFT | PAN_RIGHT;
 
 /// Registers in one per-operator group: the four slot offsets of a channel
 /// group, `&30` to `&3F` for the detune and multiple of [`REG_DT_MUL`].
@@ -172,6 +190,26 @@ pub(crate) const ENABLE_B_BIT: u8 = 0x08;
 pub(crate) const RESET_A_BIT: u8 = 0x10;
 /// `&27` bit 5: a write with this bit set clears status bit 1.
 pub(crate) const RESET_B_BIT: u8 = 0x20;
+
+/// Register `&2A`, the 8-bit sample of the channel 6 PCM DAC: one write per
+/// sample, unsigned, with `&2B` bit 7 deciding whether channel 6 answers with it
+/// at all (YM2608 application manual "3. Register descriptions", `&2A`; and
+/// plutiedev, "YM2612 DAC", for the 0x80 centre that [`crate::output::pcm_sample`]
+/// applies). Part I like [`REG_TIMER_A_LOW`] and [`REG_LFO`]: the DAC is one per
+/// chip, and part II does not decode this address at all.
+///
+/// `&2C` bit 3, the PCM test bit that hardware wires to the bottom bit of the
+/// same converter, is not modelled.
+pub(crate) const REG_DAC_DATA: u8 = 0x2A;
+
+/// Register `&2B`, the DAC control: bit 7 the enable that replaces the FM of
+/// channel 6 with [`REG_DAC_DATA`], the other bits the test mode of a YM2612 that
+/// nothing here models (YM2608 application manual "3. Register descriptions",
+/// `&2B`).
+pub(crate) const REG_DAC_ENABLE: u8 = 0x2B;
+
+/// `&2B` bit 7: 1 puts [`REG_DAC_DATA`] in place of the FM of channel 6.
+pub(crate) const DAC_ENABLE_BIT: u8 = 0x80;
 
 /// Shift from `&27`'s bits 7-6, the channel 3 mode of M5-09 (#114), to their value.
 pub(crate) const CH3_MODE_SHIFT: u8 = 6;
@@ -274,9 +312,10 @@ fn channel_of(part: usize, channel: u8) -> Option<usize> {
 /// address ports last latched.
 #[derive(Clone, Debug)]
 pub(crate) struct RegFile {
-    /// `banks[PART_I]` and `banks[PART_II]`, indexed by register number. Zeroed,
-    /// which is not what a real chip powers up with - a YM2612 wakes with
-    /// undefined registers - but is the only defined thing this model has.
+    /// `banks[PART_I]` and `banks[PART_II]`, indexed by register number. Zeroed
+    /// apart from the exception of [`RegFile::new`], which is not what a real chip
+    /// powers up with - a YM2612 wakes with undefined registers - but is the only
+    /// defined thing this model has.
     banks: [[u8; REGISTERS]; PARTS],
     /// One latch per part: `&27`-style register numbers written to one part's
     /// address port do not move the other part's.
@@ -284,10 +323,20 @@ pub(crate) struct RegFile {
 }
 
 impl RegFile {
-    /// An all-zero register file with both parts latched on register `0x00`.
+    /// An all-zero register file with both parts latched on register `0x00`, and
+    /// the [`REG_AMS_PMS`] group of both parts at [`PAN_BOTH`]: a chip that has
+    /// never been told to pan has all six channels on both sides, which is the one
+    /// register value this model has to start away from zero because a zeroed
+    /// `&B4` would mean a chip that hears nothing at all (see [`PAN_BOTH`]).
     pub(crate) fn new() -> Self {
+        let mut banks = [[0; REGISTERS]; PARTS];
+        for part in 0..PARTS {
+            for channel in 0..CHANNELS_PER_PART {
+                banks[part][usize::from(REG_AMS_PMS) + channel] = PAN_BOTH;
+            }
+        }
         Self {
-            banks: [[0; REGISTERS]; PARTS],
+            banks,
             latched: [0; PARTS],
         }
     }
@@ -355,5 +404,28 @@ impl RegFile {
             a_load: control & LOAD_A_BIT != 0,
             b_load: control & LOAD_B_BIT != 0,
         }
+    }
+
+    /// Whether channel 6 is a PCM DAC right now: `&2B` bit 7, part I like the rest
+    /// of the globals (`&2B`).
+    pub(crate) fn dac_enabled(&self) -> bool {
+        self.read(PART_I, REG_DAC_ENABLE) & DAC_ENABLE_BIT != 0
+    }
+
+    /// The 8-bit PCM sample of `&2A` as written, unsigned and centred on 0x80:
+    /// [`crate::output::pcm_sample`] is what turns it into a channel sum
+    /// (YM2608 application manual `&2A`).
+    pub(crate) fn dac_data(&self) -> u8 {
+        self.read(PART_I, REG_DAC_DATA)
+    }
+
+    /// The routing of channel `channel`: [`PAN_LEFT`] and [`PAN_RIGHT`] as the
+    /// `&B4` + channel of its part were last written, so a channel of part II is
+    /// read out of part II's bank and channel 6 out of `&B6` (YM2608 application
+    /// manual `&B4`, and M5-11 #116).
+    pub(crate) fn pan(&self, channel: usize) -> u8 {
+        let part = channel / CHANNELS_PER_PART;
+        let offset = channel % CHANNELS_PER_PART;
+        self.read(part, REG_AMS_PMS + offset as u8) & PAN_BOTH
     }
 }

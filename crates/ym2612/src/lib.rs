@@ -21,7 +21,11 @@
 //! two exceptions on top of all that: `&27` bits 7-6 either give operators 1 to 3 of
 //! channel 3 F-Nums of their own out of `&A8`-`&AE` (`phase`), or - in CSM mode -
 //! key the four operators of the channel at every timer A overflow of `timers`,
-//! which [`Ym2612::csm_step`] passes to `envelope`.
+//! which [`Ym2612::csm_step`] passes to `envelope`. The channel 6 PCM DAC and the
+//! L/R routing of M5-11 (#116) are the last two steps to the pin: `&2B` bit 7 puts
+//! `&2A` in place of the FM of channel 6 (`Ym2612::channel_sums`), and the two
+//! enable bits of `&B4`-`&B6` decide which of the two output sides each of the six
+//! converters reaches (`regs`, and `output`).
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
@@ -67,6 +71,11 @@ const STATUS_BUSY: u8 = 0x80;
 const STATUS_TIMER_B: u8 = 0x02;
 /// Status bit 0: timer A overflowed with its enable bit set.
 const STATUS_TIMER_A: u8 = 0x01;
+
+/// The channel `&2B` bit 7 turns into a PCM DAC: channel 6, the sixth of the six
+/// and the only one the register means (YM2608 application manual "3. Register
+/// descriptions", `&2B`).
+const DAC_CHANNEL: usize = CHANNELS - 1;
 
 /// Internal YM2612 cycles in one output sample.
 ///
@@ -220,11 +229,12 @@ impl Ym2612 {
     ///
     /// What the step does is run the two timers, advance the 24 phase counters,
     /// step the envelopes - once every three samples - mix the four operators of
-    /// each channel into the algorithm `&B0` names, and let BUSY run down. The
+    /// each channel into the algorithm `&B0` names - channel 6 answered by `&2A`
+    /// instead of its operators while `&2B` bit 7 is set - and let BUSY run down. The
     /// answer is the six channel sums through their DACs and added, in the 9-bit
-    /// LSBs of `crate::output` (M5-07b, #112): both sides get the whole mix,
-    /// because which channel goes to which side is the panning of M5-11 (#116),
-    /// and what the mix is scaled and filtered to is the mixer of M5-14 (#119).
+    /// LSBs of `crate::output` (M5-07b, #112), each side taking the channels its
+    /// `&B4` bits route to it (M5-11, #116) and what the mix is scaled and filtered
+    /// to being the mixer of M5-14 (#119).
     /// A silent chip is therefore not at 0 on a [`ChipModel::Ym2612`] - six
     /// converters at their ladder offset is a DC level of 24.
     ///
@@ -251,9 +261,30 @@ impl Ym2612 {
         }
 
         self.busy = self.busy.saturating_sub(INTERNAL_CYCLES_PER_SAMPLE);
-        let mix = std::array::from_fn(|channel| self.channels[channel].output());
-        let sample = output::mix(mix, self.model);
-        (sample, sample)
+        let sums = self.channel_sums();
+        let pan = std::array::from_fn(|channel| self.regs.pan(channel));
+        output::mix(sums, pan, self.model)
+    }
+
+    /// The six channel sums the output stage reads this sample: the FM of each
+    /// channel, except that `&2B` bit 7 puts the `&2A` sample in place of channel
+    /// 6's (YM2608 application manual `&2A` and `&2B`, M5-11 #116).
+    ///
+    /// Only the sum is replaced. The operators of channel 6 keep their phase
+    /// counters and their envelopes, because the chip walks all 24 slots whatever
+    /// the output stage is listening to - which is how ymfm reads it too, clocking
+    /// all six channels and dropping only the sixth out of the sum - and a driver
+    /// that turns the DAC off again finds the FM of the channel where it left it.
+    fn channel_sums(&self) -> [i16; CHANNELS] {
+        let dac = self.regs.dac_enabled();
+        let sample = output::pcm_sample(self.regs.dac_data());
+        std::array::from_fn(|channel| {
+            if dac && channel == DAC_CHANNEL {
+                sample
+            } else {
+                self.channels[channel].output()
+            }
+        })
     }
 
     /// The CSM key of channel 3, one sample in.
@@ -889,7 +920,7 @@ mod tests {
         );
         assert_eq!(
             left, right,
-            "every channel goes to both sides until the panning of #116"
+            "nothing here is panned off, so both sides are the whole mix (#116)"
         );
         exact
     }
@@ -1476,7 +1507,13 @@ mod tests {
             for data in 0..=255u8 {
                 write_reg(&mut chip, ADDR_1, DATA_1, REG_DAC_DATA, data);
                 let code = (i32::from(data) - 128) * 2;
-                let offset = if code < 0 { -3 } else { ladder };
+                let offset = if model != ChipModel::Ym2612 {
+                    0
+                } else if code < 0 {
+                    -3
+                } else {
+                    4
+                };
                 let want = i16::try_from(5 * ladder + code + offset)
                     .expect("five silent channels and one code");
                 assert_eq!(chip.clock(), (want, want), "{model:?}, `&2A` {data:#04X}");
@@ -1506,10 +1543,11 @@ mod tests {
 
         let after = samples(&mut chip, 64);
         let plain_after = samples(&mut plain, 64);
-        // `&2A` 0x40 is the code -192, so -192 - 3 of ladder plus the +4 of each
-        // of the five silent channels: one level, held for the whole 40 samples.
+        // `&2A` 0x40 is the code (64 - 128) << 1 = -128, so -128 - 3 of ladder,
+        // plus the +4 of each of the five silent channels: one level, held for the
+        // whole 40 samples.
         assert!(
-            during.iter().all(|pair| *pair == (-175, -175)),
+            during.iter().all(|pair| *pair == (-111, -111)),
             "`&2A` 0x40 is a level while the DAC holds: {during:?}"
         );
         assert!(
@@ -1543,16 +1581,13 @@ mod tests {
             all_six_channels_open(&mut both);
             let routed = samples(&mut both, 256);
 
-            let left = panned
-                .iter()
-                .map(|(left, _)| *left)
-                .collect::<Vec<_>>();
-            let right = panned
-                .iter()
-                .map(|(_, right)| *right)
-                .collect::<Vec<_>>();
+            let left = panned.iter().map(|(left, _)| *left).collect::<Vec<_>>();
+            let right = panned.iter().map(|(_, right)| *right).collect::<Vec<_>>();
             let loud = left.iter().any(|sample| sample.abs() > 1000);
-            assert!(loud, "{model:?}: panning is not supposed to mute the side it routes to: {left:?}");
+            assert!(
+                loud,
+                "{model:?}: panning is not supposed to mute the side it routes to: {left:?}"
+            );
             assert_eq!(
                 left,
                 routed.iter().map(|(left, _)| *left).collect::<Vec<_>>(),
