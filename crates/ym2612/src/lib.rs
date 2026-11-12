@@ -1,25 +1,28 @@
 //! Yamaha YM2612 FM synthesizer.
 //!
 //! What lives here today is the bus interface, the register file and the two
-//! timers of M5-03 (#107) and the phase generator of M5-04 (#108): the four
-//! ports the 68k and the Z80 reach the chip through (`write`), the two
-//! 256-register banks behind them and the latched address each one writes to
-//! (`regs`), the status byte a read of any port answers with (`read_status`)
-//! with its BUSY flag and its two timer overflow flags, timer A and timer B
-//! (`timers`), and the F-Num, block, detune, multiple and key-on behind the 24
-//! phase counters (`phase`). `clock` is the sample step those timers and counters
-//! run in and still returns silence: the envelope generator and the slot output
-//! of M5-05 (#109) onwards are not here yet.
+//! timers of M5-03 (#107), the phase generator of M5-04 (#108) and the envelope
+//! generator of M5-05 (#109): the four ports the 68k and the Z80 reach the chip
+//! through (`write`), the two 256-register banks behind them and the latched
+//! address each one writes to (`regs`), the status byte a read of any port
+//! answers with (`read_status`) with its BUSY flag and its two timer overflow
+//! flags, timer A and timer B (`timers`), the F-Num, block, detune, multiple and
+//! key-on behind the 24 phase counters (`phase`), and the attack, decay, sustain
+//! and release behind the 24 attenuations (`envelope`). `clock` is the sample
+//! step those timers, counters and envelopes run in and still returns silence:
+//! turning the operators into a sample is the slot output of the next ticket.
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
 //! the Genesis part shares, and plutiedev's "YM2612 registers" page where that
 //! one is terse.
 
+mod envelope;
 mod phase;
 mod regs;
 mod timers;
 
+use envelope::EnvelopeGen;
 use phase::PhaseGen;
 use regs::{PART_I, PART_II};
 
@@ -72,6 +75,9 @@ pub struct Ym2612 {
     /// The 24 phase counters of the operators, driven by the writes to `&28`,
     /// `&30`-`&3E` and `&A0`-`&A6`.
     phases: PhaseGen,
+    /// The 24 envelopes of the operators, driven by the writes to `&28` and
+    /// `&40`-`&80` and stepped a third as often as the phase counters.
+    envelopes: EnvelopeGen,
     /// Internal cycles left of the BUSY flag: any positive value reads as busy,
     /// and a write refills it with [`BUSY_INTERNAL_CYCLES`].
     busy: u32,
@@ -85,6 +91,7 @@ impl Ym2612 {
             regs: regs::RegFile::new(),
             timers: timers::Timers::new(),
             phases: PhaseGen::new(),
+            envelopes: EnvelopeGen::new(),
             busy: 0,
         }
     }
@@ -123,6 +130,8 @@ impl Ym2612 {
         }
 
         self.phases.register_written(part, register, value);
+        self.envelopes
+            .register_written(&self.phases, part, register, value);
 
         self.busy = BUSY_INTERNAL_CYCLES;
     }
@@ -156,13 +165,15 @@ impl Ym2612 {
     /// right)` sample.
     ///
     /// Both are 0 for now: the FM sum goes left and the DAC of M5-11 (#116)
-    /// goes right, and the slot output needs the envelope generator of M5-05
-    /// (#109). What the step does today is run the two timers, advance the 24
-    /// phase counters and let BUSY run down.
+    /// goes right, and turning the 24 envelopes into a sample is the slot output
+    /// of the next ticket. What the step does today is run the two timers,
+    /// advance the 24 phase counters, step the envelopes - once every three
+    /// samples - and let BUSY run down.
     pub fn clock(&mut self) -> (i16, i16) {
         let config = self.regs.timer_config();
         self.timers.tick(&config);
         self.phases.tick();
+        self.envelopes.tick(&self.phases);
         self.busy = self.busy.saturating_sub(INTERNAL_CYCLES_PER_SAMPLE);
         (0, 0)
     }
@@ -598,5 +609,102 @@ mod tests {
         assert!(operator(&chip, 0, phase::SLOT_S3).key_on);
         assert!(!operator(&chip, 0, phase::SLOT_S1).key_on);
         assert!(!operator(&chip, 0, phase::SLOT_S4).key_on);
+    }
+
+    /// The five per-operator groups of the envelope, `&40` to `&80`, at the slot
+    /// offsets of a channel: +0 is operator 1, +4 operator 3, +8 operator 2 and
+    /// +C operator 4, with the channel in the low two bits and a part's fourth
+    /// address - `&43` and friends - not decoded at all (YM2608 application
+    /// manual "3. Register descriptions").
+    #[test]
+    fn envelope_registers_reach_their_operator_in_slot_order() {
+        let mut chip = Ym2612::new();
+
+        // The slot offsets of channel 1 with the total level to write there.
+        let slots: [(u8, usize, u8); 4] = [
+            (0x0, phase::SLOT_S1, 0x00),
+            (0x4, phase::SLOT_S3, 0x10),
+            (0x8, phase::SLOT_S2, 0x20),
+            (0xC, phase::SLOT_S4, 0x30),
+        ];
+        // AR 31 is rate 62 at key code 0, so a key on takes an operator to full
+        // level with the write itself: what each one contributes after that is
+        // its `&40` total level and nothing else (`&50`, `&40`).
+        for (offset, _, total_level) in slots {
+            write_reg(&mut chip, ADDR_1, DATA_1, 0x50 + offset, 0x1F);
+            write_reg(&mut chip, ADDR_1, DATA_1, 0x40 + offset, total_level);
+        }
+        // `&43` is the undecoded fourth channel of part I's `&40` group. Writing
+        // it may not reach the operator part II keeps at the same number.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x43, 0x7F);
+        // Part II's operator 1, keyed on with the channel field 4 of `&28`, with
+        // a total level of its own only if `&43` leaked into it.
+        write_reg(&mut chip, ADDR_2, DATA_2, 0x50, 0x1F);
+
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, 0xF0);
+        write_reg(&mut chip, ADDR_2, DATA_2, REG_KEY_ON, KEY_ON_S1 | 4);
+
+        for (offset, slot, total_level) in slots {
+            let envelope = chip.envelopes.envelope(0, slot);
+            assert_eq!(
+                envelope.state(),
+                envelope::State::Attack,
+                "slot offset {offset:#X}"
+            );
+            assert_eq!(envelope.level(), 0, "an attack of rate 62 is instant");
+            assert_eq!(envelope.output(), u16::from(total_level) << 3);
+        }
+        assert_eq!(
+            chip.envelopes.envelope(3, phase::SLOT_S1).output(),
+            0,
+            "the `&43` write went nowhere, so part II's operator 1 is at full level"
+        );
+    }
+
+    /// `&28` and `clock` together: a key on starts the attack, a key off starts
+    /// the release, and neither runs at sample rate but at a third of it
+    /// (Nemesis, "YM2612 envelope generator").
+    #[test]
+    fn key_on_and_off_steps_the_envelope_every_third_sample() {
+        let mut chip = Ym2612::new();
+
+        // AR 24 is rate 48 at key code 0: a shift of 0 and a row of all ones, so
+        // every envelope update takes exactly one step of the attack.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x50, 24);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1);
+
+        let level = |chip: &Ym2612| chip.envelopes.envelope(0, phase::SLOT_S1).level();
+        let mut level_now = level(&chip);
+        assert_eq!(
+            level_now,
+            envelope::SILENT,
+            "nothing keyed on has moved yet"
+        );
+
+        for _ in 0..4 {
+            clock_for(&mut chip, 2);
+            assert_eq!(level(&chip), level_now, "two samples are not an update");
+            chip.clock();
+            let after = level(&chip);
+            assert!(
+                after < level_now,
+                "the third sample of the group takes the step"
+            );
+            level_now = after;
+        }
+
+        // A key off goes to release, and RR 15 is the release rate 31: a shift of
+        // 4, so its update points are 16 counts of the envelope counter apart and
+        // its row is 0 at only one of the eight phases it spreads those over.
+        // 32 updates - 96 samples - therefore cannot miss a step (YM2608 `&80`).
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x80, 0x0F);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, 0);
+        assert_eq!(
+            chip.envelopes.envelope(0, phase::SLOT_S1).state(),
+            envelope::State::Release
+        );
+
+        clock_for(&mut chip, 3 * 32);
+        assert!(level(&chip) > level_now, "the release is on its way up");
     }
 }

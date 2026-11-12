@@ -22,10 +22,10 @@
 use crate::regs;
 
 /// Channels on the chip: three in part I and three in part II.
-const CHANNELS: usize = 6;
+pub(crate) const CHANNELS: usize = 6;
 
 /// Operators per channel, the chip's S1 to S4.
-const SLOTS: usize = 4;
+pub(crate) const SLOTS: usize = 4;
 
 /// The F-Num is 11 bits (YM2608 application manual `&A0`, `&A4`).
 const FNUM_MASK: u16 = 0x07FF;
@@ -78,7 +78,7 @@ const DETUNE: [[u8; 32]; 4] = [
 /// The `&28` bit mask of each operator: bits 7-4 are S4, S3, S2 and S1 in that
 /// order, which by the slot offsets above are the indices 3, 1, 2 and 0 (YM2608
 /// application manual `&28`).
-const KEY_ON_BITS: [(u8, usize); SLOTS] = [
+pub(crate) const KEY_ON_BITS: [(u8, usize); SLOTS] = [
     (0x10, SLOT_S1),
     (0x20, SLOT_S2),
     (0x40, SLOT_S3),
@@ -146,7 +146,10 @@ fn detune(inc: u32, dt: u8, kc: u8) -> u32 {
 /// Bits 2-0 are absolute channel numbers, not part-relative ones: 0-2 are the
 /// part I channels and 4-6 the part II ones, and 3 and 7 - the fourth channel
 /// of each part - are not decoded at all (YM2608 application manual `&28`).
-fn key_on_channel(field: u8) -> Option<usize> {
+///
+/// Shared with [`crate::envelope`], which reads the same bit of `&28` for its
+/// state machine rather than for the phase counter.
+pub(crate) fn key_on_channel(field: u8) -> Option<usize> {
     if field & 0x03 == 3 {
         return None;
     }
@@ -295,9 +298,19 @@ impl PhaseGen {
     /// What one channel holds right now: the F-Num and block its four operators
     /// share, and each operator's detune, multiple, key state and phase counter.
     ///
+    /// The key code of `channel` as its F-Num and block stand now: what the key
+    /// scaling of the envelope generator reads it for (YM2608 application manual
+    /// key scale table, and `crate::envelope`).
+    pub(crate) fn keycode(&self, channel: usize) -> u8 {
+        let channel = &self.channels[channel];
+        keycode(channel.fnum, channel.block)
+    }
+
+    /// What one channel holds right now: the F-Num and block its four operators
+    /// share, and each operator's detune, multiple, key state and phase counter.
+    ///
     /// `#[cfg(test)]` because a YM2612 cannot be read back: only the model and
-    /// its tests have this view of the chip, and the envelope generator of
-    /// M5-05 (#109) is the first non-test reader to need it.
+    /// its tests have this view of the chip.
     #[cfg(test)]
     pub(crate) fn channel(&self, channel: usize) -> &Channel {
         &self.channels[channel]
