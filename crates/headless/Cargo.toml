@@ -6,6 +6,17 @@ version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Allowed for this binary only, and only here: docs/ARCHITECTURE.md keeps the
+# core crates free of dependencies, but `headless` is a command line tool, never
+# linked into the emulator (M6-01, #120).
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+# The console to run (docs/ARCHITECTURE.md, "genesis").
+genesis = { path = "../genesis" }
+# `frame_hash` and `dump_png`, so the CLI hashes and writes PNGs exactly the
+# way the golden files do rather than nearly the same way (docs/TESTING.md,
+# "Golden files").
+testkit = { path = "../testkit" }
 
 [lints]
 workspace = true
