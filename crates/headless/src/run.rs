@@ -271,9 +271,7 @@ mod tests {
 
     #[test]
     fn pad_script_rejects_a_missing_frame() {
-        let err = parse_pad_script(Some("START"))
-            .err()
-            .expect("START without @ is an error");
+        let err = parse_pad_script(Some("START")).expect_err("START without @ is an error");
         assert!(
             err.to_string().contains("needs a frame"),
             "unhelpful error: {err}"
@@ -282,9 +280,7 @@ mod tests {
 
     #[test]
     fn pad_script_rejects_an_unknown_button() {
-        let err = parse_pad_script(Some("TRIGGER@3"))
-            .err()
-            .expect("TRIGGER is not a button");
+        let err = parse_pad_script(Some("TRIGGER@3")).expect_err("TRIGGER is not a button");
         assert!(err.to_string().contains("not a button"), "unhelpful: {err}");
     }
 
@@ -292,9 +288,8 @@ mod tests {
     fn pad_script_refuses_a_button_the_cli_cannot_hold() {
         // Not silently dropped: a script that asked for Z would test nothing,
         // because `Genesis::set_pad` attaches a 3-button pad.
-        let err = parse_pad_script(Some("Z@3"))
-            .err()
-            .expect("Z is not reachable through the CLI's pad");
+        let err =
+            parse_pad_script(Some("Z@3")).expect_err("Z is not reachable through the CLI's pad");
         assert!(err.to_string().contains("6-button"), "unhelpful: {err}");
     }
 
@@ -369,9 +364,7 @@ mod tests {
 
     #[test]
     fn describe_rejects_an_image_with_no_header() {
-        let err = describe(&[0_u8; 0x10], &Config::default())
-            .err()
-            .expect("0x10 bytes is not a ROM");
+        let err = describe(&[0_u8; 0x10], &Config::default()).expect_err("0x10 bytes is not a ROM");
         assert!(err.to_string().contains("no usable header"), "{err}");
     }
 }
