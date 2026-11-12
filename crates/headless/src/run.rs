@@ -58,7 +58,7 @@ impl RegionArg {
 
 /// Lower-case name a region is printed as, matching `--region` so a caller can
 /// feed one back into the other.
-fn region_name(region: Region) -> &'static str {
+pub(crate) fn region_name(region: Region) -> &'static str {
     match region {
         Region::Japan => "japan",
         Region::Usa => "usa",
@@ -89,6 +89,13 @@ pub struct RunArgs {
     /// Print `frame_hash=0x...` for the last frame on stdout.
     #[arg(long)]
     pub hash: bool,
+    /// Print `colours=N` for the last frame on stdout.
+    ///
+    /// N is the number of distinct pixels the frame holds, which is how
+    /// `crates/genesis/tests/commercial.rs` decides a screen is blank; `sweep`
+    /// asks for it in order to call a run that drew nothing `Blank` (M6-05, #124).
+    #[arg(long)]
+    pub colours: bool,
     /// Print `audio_hash=0x...` for the run's audio on stdout.
     ///
     /// FNV-1a 64 over the same PCM bytes `--dump-wav` writes as the WAV's
@@ -165,6 +172,9 @@ pub fn run(args: RunArgs) -> Result<()> {
         let hash = testkit::frame_hash(pixels, frame.width, frame.height);
         println!("frame_hash=0x{hash:016x}");
     }
+    if args.colours {
+        println!("colours={}", distinct_colours(pixels));
+    }
     if let Some(path) = &args.dump_wav {
         wav::write_wav(path, sample_rate, &audio)
             .with_context(|| format!("cannot write WAV {}", quote(path)))?;
@@ -214,6 +224,18 @@ fn describe(rom: &[u8], config: &Config) -> Result<String> {
     Ok(format!("title={title:?} region={}", region_name(region)))
 }
 
+/// Distinct pixels of a frame, as `--colours` prints them.
+///
+/// The same count `crates/genesis/tests/commercial.rs` takes to decide a screen
+/// is not blank, over the `0xAABBGGRR` pixels the machine holds.
+fn distinct_colours(pixels: &[u32]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    for pixel in pixels {
+        seen.insert(*pixel);
+    }
+    seen.len()
+}
+
 /// The cartridge's title for the summary line, or `None` when neither title
 /// field says anything.
 ///
@@ -224,7 +246,7 @@ fn describe(rom: &[u8], config: &Config) -> Result<String> {
 /// one, and a publisher may fill it a 16-byte block at a time, which is how
 /// `SONIC THE HEDGEHOG` reaches us as `SONIC THE<15 spaces>HEDGEHOG`. The
 /// summary is for a person to read, so it is shown the way it was meant.
-fn title_of(header: &genesis::cart::RomHeader) -> Option<String> {
+pub(crate) fn title_of(header: &genesis::cart::RomHeader) -> Option<String> {
     let readable = |field: &str| {
         let collapsed = field.split_whitespace().collect::<Vec<_>>().join(" ");
         (!collapsed.is_empty()).then_some(collapsed)
