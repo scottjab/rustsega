@@ -13,8 +13,8 @@
 //! it - the quarter-wave log sine, the exponent and the sign of one operator's
 //! output (`operator` and `tables`), wired through the eight algorithms and the
 //! feedback of `&B0` and summed into the six channel mixes of M5-07a (#111)
-//! (`channel`). The mix still does not reach the pins: the DAC output stage of
-//! M5-07b (#112) is what turns a channel sum into a sample.
+//! (`channel`), and turned into the sample `clock` answers with by the 9-bit DAC
+//! and the ladder of M5-07b (#112) (`output`).
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
@@ -24,10 +24,13 @@
 mod channel;
 mod envelope;
 mod operator;
+mod output;
 mod phase;
 mod regs;
 mod tables;
 mod timers;
+
+pub use output::ChipModel;
 
 use channel::FmChannel;
 use envelope::EnvelopeGen;
@@ -89,6 +92,9 @@ pub struct Ym2612 {
     /// The six channels' operator sums: the algorithm and the feedback of the
     /// `&B0` group, and the mix those leave behind (M5-07a, #111).
     channels: [FmChannel; CHANNELS],
+    /// Which DAC to model: [`ChipModel::Ym2612`], the discrete chip with its
+    /// ladder effect, until something says otherwise (M5-07b, #112).
+    model: ChipModel,
     /// Internal cycles left of the BUSY flag: any positive value reads as busy,
     /// and a write refills it with [`BUSY_INTERNAL_CYCLES`].
     busy: u32,
@@ -104,6 +110,7 @@ impl Ym2612 {
             phases: PhaseGen::new(),
             envelopes: EnvelopeGen::new(),
             channels: std::array::from_fn(|_| FmChannel::new()),
+            model: ChipModel::Ym2612,
             busy: 0,
         }
     }
@@ -178,16 +185,28 @@ impl Ym2612 {
         busy | timer_b | timer_a
     }
 
+    /// Say which chip's DAC [`Ym2612::clock`] models: [`ChipModel::Ym2612`] for
+    /// the discrete part of a Model 1, with its ladder effect, or
+    /// [`ChipModel::Ym3438`] for the integrated part of a Model 2 (M5-07b,
+    /// #112). Nothing else about the chip differs between the two, and the
+    /// default is [`ChipModel::Ym2612`].
+    pub fn set_model(&mut self, model: ChipModel) {
+        self.model = model;
+    }
+
     /// Advance the chip by one output sample - 144 68k clocks, about 53267 Hz
     /// (docs/ARCHITECTURE.md, "Clocks and timing") - and return the `(left,
     /// right)` sample.
     ///
-    /// Both are 0 for now: the FM sum goes left and the DAC of M5-11 (#116)
-    /// goes right, and the output stage of M5-07b (#112) is what turns the six
-    /// channel sums into a sample. What the step does today is run the two
-    /// timers, advance the 24 phase counters, step the envelopes - once every
-    /// three samples - mix the four operators of each channel into the algorithm
-    /// `&B0` names, and let BUSY run down.
+    /// What the step does is run the two timers, advance the 24 phase counters,
+    /// step the envelopes - once every three samples - mix the four operators of
+    /// each channel into the algorithm `&B0` names, and let BUSY run down. The
+    /// answer is the six channel sums through their DACs and added, in the 9-bit
+    /// LSBs of `crate::output` (M5-07b, #112): both sides get the whole mix,
+    /// because which channel goes to which side is the panning of M5-11 (#116),
+    /// and what the mix is scaled and filtered to is the mixer of M5-14 (#119).
+    /// A silent chip is therefore not at 0 on a [`ChipModel::Ym2612`] - six
+    /// converters at their ladder offset is a DC level of 24.
     ///
     /// The order is the chip's own: an operator is read at the phase the phase
     /// generator has just arrived at and at the attenuation the envelope
@@ -206,7 +225,9 @@ impl Ym2612 {
         }
 
         self.busy = self.busy.saturating_sub(INTERNAL_CYCLES_PER_SAMPLE);
-        (0, 0)
+        let mix = std::array::from_fn(|channel| self.channels[channel].output());
+        let sample = output::mix(mix, self.model);
+        (sample, sample)
     }
 }
 
@@ -259,6 +280,9 @@ mod tests {
     const KEY_ON_S2: u8 = 0x20;
     /// `&28` bit 6: key on operator 3.
     const KEY_ON_S3: u8 = 0x40;
+
+    /// `&28` bits 7-4 together: key on all four operators of a channel at once.
+    const KEY_ON_ALL: u8 = 0xF0;
 
     /// Status bit 7: the chip is still chewing on the last write.
     const STATUS_BUSY: u8 = 0x80;
@@ -737,5 +761,123 @@ mod tests {
 
         clock_for(&mut chip, 3 * 32);
         assert!(level(&chip) > level_now, "the release is on its way up");
+    }
+
+    /// Register `&B0`'s channel group, and the two frequency registers, named
+    /// here because the whole-chip patch below writes all three of them for
+    /// every channel of both parts.
+    const REG_ALGORITHM: u8 = 0xB0;
+
+    /// The whole chip at full voice: every operator of every channel of both
+    /// parts at total level 0 with multiple 1 and an instant attack, every
+    /// channel at block 4, F-Num 0x210 and algorithm 7, and all four operators
+    /// of all six channels keyed on.
+    ///
+    /// Channels 1 to 3 are part I and 4 to 6 part II, each part numbering its
+    /// own three channels from register offset 0 ([`regs::channel_of`]) while
+    /// `&28` is part I's alone and carries the global channel number - 3 of
+    /// which is not decoded ([`REG_KEY_ON`], `&30`, `&40`, `&50`, `&A0`, `&A4`,
+    /// `&B0`). The block and F-Num are the patch of [`crate::channel`]'s tests:
+    /// a cycle every 248 samples, so a few hundred of them carry the wave right
+    /// across the clamp of the channel sum.
+    fn all_six_channels_open(chip: &mut Ym2612) {
+        for (addr, data) in [(ADDR_1, DATA_1), (ADDR_2, DATA_2)] {
+            for channel in 0..3u8 {
+                for slot in 0..4u8 {
+                    // The per-operator groups are slot stride 4 and channel
+                    // stride 1, not the other way round (`crate::regs::
+                    // operator_of_group`, and the `+00` `+04` `+08` `+0C` of
+                    // `crate::phase`).
+                    let offset = slot * 4 + channel;
+                    write_reg(chip, addr, data, 0x30 + offset, 0x01);
+                    write_reg(chip, addr, data, 0x40 + offset, 0x00);
+                    write_reg(chip, addr, data, 0x50 + offset, 0x1F);
+                }
+                // `&A4` first and `&A0` second, because `&A4` only latches its
+                // two F-Num bits and its block and `&A0` is what applies them
+                // (`crate::phase`).
+                write_reg(chip, addr, data, 0xA4 + channel, 0x22);
+                write_reg(chip, addr, data, 0xA0 + channel, 0x10);
+                write_reg(chip, addr, data, REG_ALGORITHM + channel, 0x07);
+            }
+        }
+        for channel in 0..CHANNELS as u8 {
+            let field = channel + u8::from(channel > 2);
+            write_reg(chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_ALL | field);
+        }
+    }
+
+    /// One step of `chip`, checked against the six channel sums passed through
+    /// [`output::dac`] by hand as it goes: the chip's own sum has to equal that
+    /// exactly, which is what says it neither clamped nor wrapped (M5-07b,
+    /// #112). The exact sum is what the caller then looks at.
+    fn step_and_track(chip: &mut Ym2612, model: ChipModel) -> i32 {
+        let (left, right) = chip.clock();
+        let mut exact = 0i32;
+        for channel in 0..CHANNELS {
+            exact += output::dac(chip.channels[channel].output(), model);
+        }
+        assert_eq!(
+            i32::from(left),
+            exact,
+            "the pin is the six DAC outputs added"
+        );
+        assert_eq!(
+            left, right,
+            "every channel goes to both sides until the panning of #116"
+        );
+        exact
+    }
+
+    /// Six channels of algorithm 7 with every operator at full level is the
+    /// loudest thing the chip can be told to do, and their sum is what the 9-bit
+    /// DAC domain has to survive: six codes of at most 255 with at most 4 of
+    /// ladder on top is 1554, well inside the i16 `clock` returns, so the sum
+    /// needs no clamp and must not wrap either.
+    #[test]
+    fn sum_of_six_fits_i16() {
+        for model in [ChipModel::Ym2612, ChipModel::Ym3438] {
+            let mut chip = Ym2612::new();
+            chip.set_model(model);
+            all_six_channels_open(&mut chip);
+
+            let mut loudest = 0;
+            for _ in 0..256 {
+                let exact = step_and_track(&mut chip, model);
+                assert!(
+                    exact.abs() <= 6 * 259,
+                    "{model:?}: {exact} is past six DAC outputs of 259"
+                );
+                loudest = loudest.max(exact.abs());
+            }
+
+            // Algorithm 7, four carriers at total level 0, is pinned at the top
+            // and the bottom of the channel clamp for most of its run, so a run
+            // of it is nowhere near the 6 * 4 of a chip with nothing to say.
+            assert!(loudest > 1000, "{model:?}: the six channels are not loud");
+        }
+    }
+
+    /// Which DAC the model chooses is audible on a chip with nothing else going
+    /// on: a YM2612 that has never been written to sits at the ladder offset of
+    /// six silent converters, and a YM3438 at exactly nothing.
+    #[test]
+    fn chip_model_selects_the_ladder() {
+        let mut discrete = Ym2612::new();
+        assert_eq!(
+            discrete.clock(),
+            (24, 24),
+            "six silent channels at +4 each: the default is the discrete chip"
+        );
+
+        let mut asic = Ym2612::new();
+        asic.set_model(ChipModel::Ym3438);
+        assert_eq!(asic.clock(), (0, 0), "and the 3438 has no offset to sit on");
+
+        // Mid-run from the same state, too: the DAC is all that moved.
+        discrete.set_model(ChipModel::Ym3438);
+        assert_eq!(discrete.clock(), (0, 0));
+        discrete.set_model(ChipModel::Ym2612);
+        assert_eq!(discrete.clock(), (24, 24));
     }
 }
