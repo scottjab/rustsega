@@ -4,12 +4,11 @@
 
 | Status | ROMs |
 |---|---|
-| Boots | 1753 |
-| Blank | 518 |
+| Boots | 1758 |
+| Blank | 521 |
 | Panic | 496 |
-| Timeout | 8 |
 
-### Blank (518 - see the CSV for the full table)
+### Blank (521 - see the CSV for the full table)
 
 | ROM | Title | Notes |
 |---|---|---|
@@ -337,6 +336,8 @@
 | `Sagaia (USA).md` | SAGAIA | 2 colours |
 | `Sanguo Yanyi - Huoshao Chibi (Taiwan) (Unl).md` | .Enterprises Ltd. | 1 colours |
 | `Sega Art Tool (Japan) (En) (Program).md` | ................N...H...NqL...NsNV..N.....N...#. | 3 colours |
+| `Sega Channel (Japan) (v2.11) (Earlier) (Program).md` | Not Support | 1 colours |
+| `Sega Channel (Japan) (v2.11) (Program).md` | Not Support | 1 colours |
 | `Sega Channel (USA) (General Instrument) (Program).md` | Sega Channel | 1 colours |
 | `Sega Channel (USA) (Scientific Atlanta) (Program).md` | Sega Channel | 1 colours |
 | `Sega Game Toshokan (Japan) (En) (Rev A) (Program).md` | .Z.K.Q.[...}.... | 3 colours |
@@ -420,6 +421,7 @@
 | `Tinhead (USA).md` | TINHEAD | 1 colours |
 | `Tiny Toon Adventures - Buster's Hidden Treasure (Europe).md` | TINY TOON ADVENTURES | 3 colours |
 | `Tiny Toon Adventures - Buster's Hidden Treasure (USA).md` | TINY TOON ADVENTURES | 3 colours |
+| `Tiny Toon Adventures 3 (Taiwan) (En) (Unl).md` | GHTS RESERVED OF XXXXXX LTD. | 1 colours |
 | `Tom Mason's Dinosaurs for Hire (USA) (Beta) (1993-03-xx).md` | DINO'S FOR HIRE | 3 colours |
 | `Tom Mason's Dinosaurs for Hire (USA) (Beta) (1993-04-26).md` | DINOS FOR HIRE | 1 colours |
 | `Tom Mason's Dinosaurs for Hire (USA) (Beta) (1993-04-27).md` | DINOS FOR HIRE | 1 colours |
@@ -1032,17 +1034,4 @@
 | `Young Indiana Jones Chronicles, The (USA) (Beta).md` | YOUNG INDIANA JONES | attempt to add with overflow |
 | `Zhongguo Xiangqi (Taiwan) (Unl).md` | VEDIO GAME | attempt to add with overflow |
 | `Zombies Ate My Neighbors (USA) (Limited Run Games).md` | ZOMBIES ATE MY NEIGHBOURS | attempt to add with overflow |
-
-### Timeout (8 - see the CSV for the full table)
-
-| ROM | Title | Notes |
-|---|---|---|
-| `Sega Channel (Japan) (v2.11) (Earlier) (Program).md` | Not Support |  |
-| `Sega Channel (Japan) (v2.11) (Program).md` | Not Support |  |
-| `Super Real Basketball (Europe).md` | SUPER REAL BASKET BALL |  |
-| `Sword of Vermilion (USA, Europe) (1993-11-18) (Sega Channel).md` | SWORD OF VERMILION |  |
-| `Tiny Toon Adventures - ACME All-Stars (Europe) (En,Fr,De).md` | TINY TOON ADVENTURES ACME ALL STARS |  |
-| `Tiny Toon Adventures 3 (Taiwan) (En) (Unl).md` | GHTS RESERVED OF XXXXXX LTD. |  |
-| `ToeJam & Earl in Panic on Funkotron (Asia) (En).md` | TOEJAM & EARL II |  |
-| `ToeJam & Earl in Panic on Funkotron (Europe).md` | TOEJAM & EARL II |  |
 
