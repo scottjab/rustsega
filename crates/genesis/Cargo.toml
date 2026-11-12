@@ -37,5 +37,16 @@ postcard = { version = "1", features = ["alloc"] }
 # Used by the commercial-ROM test; the header decode itself needs nothing.
 testkit = { path = "../testkit" }
 
+# The frame benchmark of M6-11 (#131). `harness = false` because it is a `main`
+# of its own: it prints best-of-N milliseconds per frame and skips a cartridge
+# that is not on disk, which the libtest harness has no shape for. Run it with
+# `just bench`.
+[[bench]]
+name = "frame"
+harness = false
+# A measurement, not a test: `cargo test` builds it (which is what keeps it
+# compiling) but must not run ten seconds of frames to do it.
+test = false
+
 [lints]
 workspace = true
