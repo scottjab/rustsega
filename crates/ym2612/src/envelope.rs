@@ -311,10 +311,10 @@ impl Envelope {
     /// the total level of `&40` at 8 attenuation counts a step, clamped at
     /// silence (YM2608 application manual `&40`).
     ///
-    /// `#[cfg(test)]` until the slot output of the next ticket reads it, for the
-    /// same reason [`PhaseGen::channel`] is: a YM2612 cannot be read back. The
-    /// amplitude modulation of M5-08 (#113) is added on top there, not here.
-    #[cfg(test)]
+    /// Read by the slot output of the channel mix of M5-07a (#111), which is why
+    /// it is not `#[cfg(test)]`: the chip reads its own envelope here, it just
+    /// cannot be made to read it back out. The amplitude modulation of M5-08
+    /// (#113) is added on top there, not here.
     pub(crate) fn output(&self) -> u16 {
         (self.att + (u16::from(self.total_level) << 3)).min(SILENT)
     }
@@ -423,9 +423,9 @@ impl EnvelopeGen {
         }
     }
 
-    /// What one operator's envelope holds right now, for `Ym2612`'s tests: the
-    /// slot indices of [`phase::SLOT_S1`] and friends.
-    #[cfg(test)]
+    /// What one operator's envelope holds right now, which is what the slot
+    /// output of the channel mix of M5-07a (#111) asks for: the slot indices of
+    /// [`phase::SLOT_S1`] and friends.
     pub(crate) fn envelope(&self, channel: usize, slot: usize) -> &Envelope {
         &self.envelopes[channel][slot]
     }

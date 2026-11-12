@@ -19,6 +19,7 @@
 //! the Genesis part shares, and plutiedev's "YM2612 registers" page where that
 //! one is terse.
 
+mod channel;
 mod envelope;
 mod operator;
 mod phase;
@@ -26,8 +27,9 @@ mod regs;
 mod tables;
 mod timers;
 
+use channel::FmChannel;
 use envelope::EnvelopeGen;
-use phase::PhaseGen;
+use phase::{CHANNELS, PhaseGen};
 use regs::{PART_I, PART_II};
 
 /// Port 0: address, part I.
@@ -82,6 +84,9 @@ pub struct Ym2612 {
     /// The 24 envelopes of the operators, driven by the writes to `&28` and
     /// `&40`-`&80` and stepped a third as often as the phase counters.
     envelopes: EnvelopeGen,
+    /// The six channels' operator sums: the algorithm and the feedback of the
+    /// `&B0` group, and the mix those leave behind (M5-07a, #111).
+    channels: [FmChannel; CHANNELS],
     /// Internal cycles left of the BUSY flag: any positive value reads as busy,
     /// and a write refills it with [`BUSY_INTERNAL_CYCLES`].
     busy: u32,
@@ -96,6 +101,7 @@ impl Ym2612 {
             timers: timers::Timers::new(),
             phases: PhaseGen::new(),
             envelopes: EnvelopeGen::new(),
+            channels: std::array::from_fn(|_| FmChannel::new()),
             busy: 0,
         }
     }
@@ -136,6 +142,12 @@ impl Ym2612 {
         self.phases.register_written(part, register, value);
         self.envelopes
             .register_written(&self.phases, part, register, value);
+
+        if let Some(channel) =
+            regs::channel_of_register(part, regs::REG_ALGORITHM_FEEDBACK, register)
+        {
+            self.channels[channel].register_written(value);
+        }
 
         self.busy = BUSY_INTERNAL_CYCLES;
     }

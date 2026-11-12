@@ -85,6 +85,13 @@ pub(crate) const REG_FNUM_LOW: u8 = 0xA0;
 /// application manual `&A4`).
 pub(crate) const REG_BLOCK_FNUM: u8 = 0xA4;
 
+/// Register `&B0`, the first of the algorithm and feedback group: `&B0` +
+/// channel, bits 5-3 the feedback of operator 1 and bits 2-0 the connection mode
+/// of the channel's four operators. One register per channel rather than one per
+/// operator, so `&B0`-`&B2` and `&B4`-`&B6` are decoded and `&B3` and `&B7` are
+/// not (YM2608 application manual "3. Register descriptions", `&B0`).
+pub(crate) const REG_ALGORITHM_FEEDBACK: u8 = 0xB0;
+
 /// Registers in one per-operator group: the four slot offsets of a channel
 /// group, `&30` to `&3F` for the detune and multiple of [`REG_DT_MUL`].
 const OPERATOR_GROUP_WIDTH: u8 = 0x10;

@@ -315,6 +315,15 @@ impl PhaseGen {
     pub(crate) fn channel(&self, channel: usize) -> &Channel {
         &self.channels[channel]
     }
+
+    /// The 20-bit phase counter of one operator, which is what the slot output of
+    /// the channel mix reads as its waveform address (M5-07a, #111).
+    ///
+    /// Not `#[cfg(test)]`, for that reason: unlike [`PhaseGen::channel`] this one
+    /// is how the chip reads itself, not how the model does.
+    pub(crate) fn phase(&self, channel: usize, slot: usize) -> u32 {
+        self.channels[channel].operators[slot].phase
+    }
 }
 
 #[cfg(test)]
