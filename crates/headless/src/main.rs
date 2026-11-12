@@ -9,13 +9,15 @@
 //! status 1; `--help` is a success. See the crate's tests in `tests/cli.rs`.
 
 mod run;
+mod wav;
 
 use clap::Parser;
 
 use crate::run::RunArgs;
 
 /// The whole command line: `headless run <ROM> [--frames N] [--dump-png PATH]
-/// [--hash] [--region auto|usa|japan|europe] [--pad1 BUTTONS@FRAME,...]`.
+/// [--dump-wav PATH] [--hash] [--audio-hash] [--region auto|usa|japan|europe]
+/// [--pad1 BUTTONS@FRAME,...]`.
 #[derive(Parser)]
 #[command(
     name = "headless",
