@@ -21,7 +21,11 @@
 //! two exceptions on top of all that: `&27` bits 7-6 either give operators 1 to 3 of
 //! channel 3 F-Nums of their own out of `&A8`-`&AE` (`phase`), or - in CSM mode -
 //! key the four operators of the channel at every timer A overflow of `timers`,
-//! which [`Ym2612::csm_step`] passes to `envelope`.
+//! which [`Ym2612::csm_step`] passes to `envelope`. The channel 6 PCM DAC and the
+//! L/R routing of M5-11 (#116) are the last two steps to the pin: `&2B` bit 7 puts
+//! `&2A` in place of the FM of channel 6 (`Ym2612::channel_sums`), and the two
+//! enable bits of `&B4`-`&B6` decide which of the two output sides each of the six
+//! converters reaches (`regs`, and `output`).
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
@@ -67,6 +71,11 @@ const STATUS_BUSY: u8 = 0x80;
 const STATUS_TIMER_B: u8 = 0x02;
 /// Status bit 0: timer A overflowed with its enable bit set.
 const STATUS_TIMER_A: u8 = 0x01;
+
+/// The channel `&2B` bit 7 turns into a PCM DAC: channel 6, the sixth of the six
+/// and the only one the register means (YM2608 application manual "3. Register
+/// descriptions", `&2B`).
+const DAC_CHANNEL: usize = CHANNELS - 1;
 
 /// Internal YM2612 cycles in one output sample.
 ///
@@ -220,11 +229,12 @@ impl Ym2612 {
     ///
     /// What the step does is run the two timers, advance the 24 phase counters,
     /// step the envelopes - once every three samples - mix the four operators of
-    /// each channel into the algorithm `&B0` names, and let BUSY run down. The
+    /// each channel into the algorithm `&B0` names - channel 6 answered by `&2A`
+    /// instead of its operators while `&2B` bit 7 is set - and let BUSY run down. The
     /// answer is the six channel sums through their DACs and added, in the 9-bit
-    /// LSBs of `crate::output` (M5-07b, #112): both sides get the whole mix,
-    /// because which channel goes to which side is the panning of M5-11 (#116),
-    /// and what the mix is scaled and filtered to is the mixer of M5-14 (#119).
+    /// LSBs of `crate::output` (M5-07b, #112), each side taking the channels its
+    /// `&B4` bits route to it (M5-11, #116) and what the mix is scaled and filtered
+    /// to being the mixer of M5-14 (#119).
     /// A silent chip is therefore not at 0 on a [`ChipModel::Ym2612`] - six
     /// converters at their ladder offset is a DC level of 24.
     ///
@@ -251,9 +261,30 @@ impl Ym2612 {
         }
 
         self.busy = self.busy.saturating_sub(INTERNAL_CYCLES_PER_SAMPLE);
-        let mix = std::array::from_fn(|channel| self.channels[channel].output());
-        let sample = output::mix(mix, self.model);
-        (sample, sample)
+        let sums = self.channel_sums();
+        let pan = std::array::from_fn(|channel| self.regs.pan(channel));
+        output::mix(sums, pan, self.model)
+    }
+
+    /// The six channel sums the output stage reads this sample: the FM of each
+    /// channel, except that `&2B` bit 7 puts the `&2A` sample in place of channel
+    /// 6's (YM2608 application manual `&2A` and `&2B`, M5-11 #116).
+    ///
+    /// Only the sum is replaced. The operators of channel 6 keep their phase
+    /// counters and their envelopes, because the chip walks all 24 slots whatever
+    /// the output stage is listening to - which is how ymfm reads it too, clocking
+    /// all six channels and dropping only the sixth out of the sum - and a driver
+    /// that turns the DAC off again finds the FM of the channel where it left it.
+    fn channel_sums(&self) -> [i16; CHANNELS] {
+        let dac = self.regs.dac_enabled();
+        let sample = output::pcm_sample(self.regs.dac_data());
+        std::array::from_fn(|channel| {
+            if dac && channel == DAC_CHANNEL {
+                sample
+            } else {
+                self.channels[channel].output()
+            }
+        })
     }
 
     /// The CSM key of channel 3, one sample in.
@@ -889,7 +920,7 @@ mod tests {
         );
         assert_eq!(
             left, right,
-            "every channel goes to both sides until the panning of #116"
+            "nothing here is panned off, so both sides are the whole mix (#116)"
         );
         exact
     }
@@ -1342,6 +1373,318 @@ mod tests {
                 "mode {:02b} is not a CSM mode",
                 mode >> 6
             );
+        }
+    }
+
+    // The channel 6 PCM DAC and the per-channel L/R routing of M5-11 (#116).
+
+    /// Register `&2A`: the 8-bit PCM sample of the channel 6 DAC, part I like the
+    /// timers and the LFO beside it (YM2608 application manual "3. Register
+    /// descriptions", `&2A`).
+    const REG_DAC_DATA: u8 = 0x2A;
+    /// Register `&2B`: bit 7 the enable that puts `&2A` in place of the FM of
+    /// channel 6 (`&2B`).
+    const REG_DAC_ENABLE: u8 = 0x2B;
+    /// `&2B` bit 7.
+    const DAC_ON: u8 = 0x80;
+
+    /// `&B4`-`&B6` bit 7: this channel reaches the left output (`&B4`).
+    const PAN_LEFT: u8 = 0x80;
+    /// `&B4`-`&B6` bit 6: this channel reaches the right output (`&B4`).
+    const PAN_RIGHT: u8 = 0x40;
+
+    /// `&2A` and `&2B` of part I, the part that carries the global registers: the
+    /// DAC is one per chip, like the timers and the LFO (`&2A`, `&2B`).
+    fn set_dac(chip: &mut Ym2612, data: u8, enable: bool) {
+        write_reg(chip, ADDR_1, DATA_1, REG_DAC_DATA, data);
+        write_reg(
+            chip,
+            ADDR_1,
+            DATA_1,
+            REG_DAC_ENABLE,
+            if enable { DAC_ON } else { 0 },
+        );
+    }
+
+    /// The `&B4` of all six channels at once, AMS and PMS left at 0 so that
+    /// nothing but the routing of a test moves (`&B4`).
+    fn pan_all(chip: &mut Ym2612, pan: u8) {
+        for (addr, data) in [(ADDR_1, DATA_1), (ADDR_2, DATA_2)] {
+            for channel in 0..3u8 {
+                write_reg(chip, addr, data, REG_AMS_PMS + channel, pan);
+            }
+        }
+    }
+
+    /// Channel 6 on its own and loud: algorithm 7, every operator at total level
+    /// 0 with multiple 1 and an instant attack, at block 4 and F-Num 0x210, and
+    /// all four operators keyed on. One channel of [`all_six_channels_open`], so
+    /// part II's channel offset 2 and the channel field 6 of `&28` (`&30`, `&40`,
+    /// `&50`, `&A0`, `&B0`, `&28`).
+    fn open_channel_six(chip: &mut Ym2612) {
+        for slot in 0..4u8 {
+            let offset = slot * 4 + 2;
+            write_reg(chip, ADDR_2, DATA_2, 0x30 + offset, 0x01);
+            write_reg(chip, ADDR_2, DATA_2, 0x40 + offset, 0x00);
+            write_reg(chip, ADDR_2, DATA_2, 0x50 + offset, 0x1F);
+        }
+        write_reg(chip, ADDR_2, DATA_2, 0xA6, 0x22);
+        write_reg(chip, ADDR_2, DATA_2, 0xA2, 0x10);
+        write_reg(chip, ADDR_2, DATA_2, 0xB2, 0x07);
+        write_reg(chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_ALL | 6);
+    }
+
+    /// The next `count` samples of `chip`, as the `(left, right)` pairs came out.
+    fn samples(chip: &mut Ym2612, count: u32) -> Vec<(i16, i16)> {
+        (0..count).map(|_| chip.clock()).collect()
+    }
+
+    /// `&2B` bit 7 replaces the FM of channel 6 in the mix: what reaches the 9-bit
+    /// DAC of M5-07b (#112) is `&2A` and nothing the channel's operators are
+    /// still doing (`&2A`, `&2B`, M5-11 #116).
+    #[test]
+    fn dac_replaces_ch6() {
+        let mut chip = Ym2612::new();
+        open_channel_six(&mut chip);
+
+        // FM, and channel 6 alone is loud enough to see and moving enough to
+        // tell apart from a level.
+        let fm = samples(&mut chip, 64);
+        assert!(
+            fm.windows(2).any(|pair| pair[0] != pair[1]),
+            "the FM of channel 6 is not on the pin: {fm:?}"
+        );
+        assert!(
+            fm.iter().any(|(left, _)| left.abs() > 100),
+            "and the patch is not quiet either: {fm:?}"
+        );
+
+        // DAC mode at the centre of `&2A`: channel 6 is a sum of 0 now, so the
+        // pin drops to the DC level of six silent converters and stays there.
+        set_dac(&mut chip, 0x80, true);
+        for (left, right) in samples(&mut chip, 16) {
+            assert_eq!(
+                (left, right),
+                (6 * 4, 6 * 4),
+                "the ladder of #112, and no wave"
+            );
+        }
+
+        // And the 8-bit sample is on the pin through the DAC of #112: `&2A` 0xFF
+        // is the 9-bit code 254 and 0x00 the code -256, each with the step of
+        // ladder its own sign buys it and the +4 of the five silent channels.
+        for (data, want) in [(0xFFu8, 5 * 4 + 254 + 4), (0x00, 5 * 4 - 256 - 3)] {
+            write_reg(&mut chip, ADDR_1, DATA_1, REG_DAC_DATA, data);
+            let want = i16::try_from(want).expect("one 9-bit code and its ladder step");
+            assert_eq!(chip.clock(), (want, want), "`&2A` {data:#04X}");
+        }
+    }
+
+    /// `&2A` is an unsigned 8-bit sample whose centre is 0x80: `((data - 128) << 6)`
+    /// of the 14-bit channel domain, which is the 9-bit code `(data - 128) << 1`
+    /// of #112 - the bottom bit of that code is not wired to `&2A` at all, so a
+    /// PCM sample only ever reaches the even codes and the whole range of the
+    /// converter but its top code (YM2608 application manual `&2A`; plutiedev,
+    /// "DAC"; and the `(write_data ^ 0x80) << 1` of Nuked-OPN2's `ym3438.c`, read
+    /// 12 Nov 2026, which is the same number on the 9-bit code).
+    #[test]
+    fn dac_value_0x80_is_center() {
+        for model in [ChipModel::Ym2612, ChipModel::Ym3438] {
+            let mut chip = Ym2612::new();
+            chip.set_model(model);
+            // Nothing else running: channel 6 is the only one with anything to
+            // say, and DAC mode has taken the whole of it over.
+            set_dac(&mut chip, 0x80, true);
+
+            let centre = if model == ChipModel::Ym2612 { 24 } else { 0 };
+            assert_eq!(
+                chip.clock(),
+                (centre, centre),
+                "{model:?}: 0x80 is as silent as a channel can be"
+            );
+
+            let ladder = if model == ChipModel::Ym2612 { 4 } else { 0 };
+            for data in 0..=255u8 {
+                write_reg(&mut chip, ADDR_1, DATA_1, REG_DAC_DATA, data);
+                let code = (i32::from(data) - 128) * 2;
+                let offset = if model != ChipModel::Ym2612 {
+                    0
+                } else if code < 0 {
+                    -3
+                } else {
+                    4
+                };
+                let want = i16::try_from(5 * ladder + code + offset)
+                    .expect("five silent channels and one code");
+                assert_eq!(chip.clock(), (want, want), "{model:?}, `&2A` {data:#04X}");
+            }
+        }
+    }
+
+    /// `&2B` bit 7 clear is FM again, at the sample the disable lands on rather
+    /// than from the start of the wave: the chip walks all 24 slots whatever the
+    /// mix is listening to, so the operators of channel 6 keep their phase and
+    /// their envelope while the DAC is in front of them (`&2B`, M5-11 #116).
+    #[test]
+    fn dac_disable_restores_fm() {
+        let mut chip = Ym2612::new();
+        open_channel_six(&mut chip);
+        clock_for(&mut chip, 32);
+
+        set_dac(&mut chip, 0x40, true);
+        let during = samples(&mut chip, 40);
+        set_dac(&mut chip, 0x40, false);
+
+        // The same patch on a chip that was never in DAC mode, run to the same
+        // point: 32 samples before and 40 during is 72 by the disable.
+        let mut plain = Ym2612::new();
+        open_channel_six(&mut plain);
+        clock_for(&mut plain, 32 + 40);
+
+        let after = samples(&mut chip, 64);
+        let plain_after = samples(&mut plain, 64);
+        // `&2A` 0x40 is the code (64 - 128) << 1 = -128, so -128 - 3 of ladder,
+        // plus the +4 of each of the five silent channels: one level, held for the
+        // whole 40 samples.
+        assert!(
+            during.iter().all(|pair| *pair == (-111, -111)),
+            "`&2A` 0x40 is a level while the DAC holds: {during:?}"
+        );
+        assert!(
+            after.windows(2).any(|pair| pair[0] != pair[1]),
+            "the FM is on the pin again: {after:?}"
+        );
+        assert_eq!(
+            after, plain_after,
+            "and it is the FM of a channel 6 that never stopped"
+        );
+    }
+
+    /// Bit 7 of `&B4`-`&B6` is the left and bit 6 the right, and a channel routed
+    /// to one side only leaves the other side nothing but its step of ladder: the
+    /// six channels of [`all_six_channels_open`] are patched identically, so on a
+    /// discrete chip the routed side of every sample is six of one code and the
+    /// un-routed side six of one ladder step (`&B4`, M5-11 #116).
+    #[test]
+    fn pan_left_only() {
+        for model in [ChipModel::Ym2612, ChipModel::Ym3438] {
+            let mut chip = Ym2612::new();
+            chip.set_model(model);
+            all_six_channels_open(&mut chip);
+            pan_all(&mut chip, PAN_LEFT);
+            let panned = samples(&mut chip, 256);
+
+            // The same patch, routed to both sides, for the difference to be seen
+            // against.
+            let mut both = Ym2612::new();
+            both.set_model(model);
+            all_six_channels_open(&mut both);
+            let routed = samples(&mut both, 256);
+
+            let left = panned.iter().map(|(left, _)| *left).collect::<Vec<_>>();
+            let right = panned.iter().map(|(_, right)| *right).collect::<Vec<_>>();
+            let loud = left.iter().any(|sample| sample.abs() > 1000);
+            assert!(
+                loud,
+                "{model:?}: panning is not supposed to mute the side it routes to: {left:?}"
+            );
+            assert_eq!(
+                left,
+                routed.iter().map(|(left, _)| *left).collect::<Vec<_>>(),
+                "{model:?}: the routed side is the whole mix it always was"
+            );
+
+            if model == ChipModel::Ym3438 {
+                assert!(
+                    right.iter().all(|sample| *sample == 0),
+                    "a 3438 has nothing to leave on an un-routed side: {right:?}"
+                );
+            } else {
+                // Six channels at their ladder step of +4 or -4, and never a code:
+                // -24 is six channels with a negative sum panned off, which is the
+                // 4 of a muted channel rather than the 3 of a routed one.
+                assert!(
+                    right.iter().all(|sample| *sample == 24 || *sample == -24),
+                    "the right side of a discrete chip is ladder only: {right:?}"
+                );
+                assert!(
+                    right.contains(&-24),
+                    "and a panned-off channel with a negative sum is at -4: {right:?}"
+                );
+            }
+        }
+    }
+
+    /// Nothing on either bit is nothing on either side: the chip goes quiet on a
+    /// YM3438, and a discrete YM2612 keeps only the six converters' own steps -
+    /// the `+4` and the `-4` of M5-07b (#112), never a code, so no wave.
+    ///
+    /// The `-4` of a channel panned off with a negative sum, rather than the `-3`
+    /// of a routed one, is the `4 - pan` of the ladder this crate took from
+    /// Genesis Plus GX in #112; Nuked-OPN2's `OPN2_ChOutput` puts the un-routed
+    /// side of a channel at the sign of that channel's own value too, where ymfm
+    /// leaves it at the discontinuity of a zero (`dac_discontinuity(0)`). Read
+    /// 12 Nov 2026.
+    #[test]
+    fn pan_none_silences_channel() {
+        for model in [ChipModel::Ym2612, ChipModel::Ym3438] {
+            let mut chip = Ym2612::new();
+            chip.set_model(model);
+            all_six_channels_open(&mut chip);
+            pan_all(&mut chip, 0);
+            let panned = samples(&mut chip, 256);
+
+            if model == ChipModel::Ym3438 {
+                assert!(
+                    panned.iter().all(|&(left, right)| left == 0 && right == 0),
+                    "{model:?}: a channel routed nowhere is silent: {panned:?}"
+                );
+            } else {
+                assert!(
+                    panned
+                        .iter()
+                        .all(|&(left, right)| left == right && (left == 24 || left == -24)),
+                    "{model:?}: only the six ladder steps survive: {panned:?}"
+                );
+            }
+        }
+    }
+
+    /// The PCM of channel 6 is routed by `&B6` like any other channel's sum, which
+    /// it is by the time the routing happens: routing it to the left alone puts
+    /// the sample on the left and leaves the right with the channel's own step of
+    /// ladder (`&B4`, `&2A`, M5-11 #116).
+    #[test]
+    fn dac_output_is_panned_like_any_channel() {
+        let mut chip = Ym2612::new();
+        set_dac(&mut chip, 0xFF, true);
+        write_reg(&mut chip, ADDR_2, DATA_2, 0xB6, PAN_LEFT);
+        // 0xFF is a channel sum above zero, so the un-routed right keeps the +4 of
+        // a panned-off channel and the left the code of 254 with its own +4.
+        assert_eq!(chip.clock(), (5 * 4 + 254 + 4, 5 * 4 + 4));
+
+        let mut asic = Ym2612::new();
+        asic.set_model(ChipModel::Ym3438);
+        set_dac(&mut asic, 0xFF, true);
+        write_reg(&mut asic, ADDR_2, DATA_2, 0xB6, PAN_RIGHT);
+        assert_eq!(asic.clock(), (0, 254));
+    }
+
+    /// The routing a chip answers with before anything has written `&B4`-`&B6` is
+    /// both sides, not silence: the register file starts every channel on L+R the
+    /// way the chip's own reset does, so the whole of the existing FM model is
+    /// still on the pin of a chip that was never told to pan (`&B4`, and the
+    /// `pan_l[i] = pan_r[i] = 1` of Nuked-OPN2's `YM3438_reset`, read 12 Nov 2026).
+    #[test]
+    fn panning_defaults_to_both_sides() {
+        let mut chip = Ym2612::new();
+        all_six_channels_open(&mut chip);
+
+        assert_eq!(chip.regs.read(PART_I, REG_AMS_PMS), PAN_LEFT | PAN_RIGHT);
+        assert_eq!(chip.regs.read(PART_II, 0xB6), PAN_LEFT | PAN_RIGHT);
+
+        for (left, right) in samples(&mut chip, 64) {
+            assert_eq!(left, right, "and the two sides are still the same mix");
         }
     }
 }
