@@ -6,8 +6,18 @@ version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Serialising the CPU state for save states (M6-07a, #126). Optional and default
+# on: `--no-default-features` keeps the core dependency-free, per the rule in
+# docs/ARCHITECTURE.md that the core itself carries nothing.
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
 
 [dev-dependencies]
+# Round-trip of the saved CPU state (M6-07a, #126): tests only.
+postcard = { version = "1", features = ["alloc"] }
 # Only tests: the core itself keeps no dependencies, per docs/ARCHITECTURE.md.
 # `flate2` is for the pinned 680x0 suite, which is served as `.json.gz` only
 # (M1-03, #11); it is already in Cargo.lock as a dependency of `png`.
@@ -15,6 +25,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 flate2 = { workspace = true }
 testkit = { path = "../testkit" }
+
+# The round-trip test only compiles with the derives, i.e. with the `serde`
+# feature on; `--no-default-features` skips it rather than failing to build it.
+[[test]]
+name = "state_roundtrip"
+required-features = ["serde"]
 
 [lints]
 workspace = true

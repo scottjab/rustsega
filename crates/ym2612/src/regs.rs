@@ -20,6 +20,12 @@
 use crate::phase::{SLOT_S1, SLOT_S2, SLOT_S3};
 use crate::timers::TimerConfig;
 
+// Serialising the register file for save states (M6-07a, #126). Gated on the
+// crate's `serde` feature so `cargo build --no-default-features` keeps the core
+// with no dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Bank index of part I: slots 1 to 3 and the global registers.
 pub(crate) const PART_I: usize = 0;
 
@@ -310,13 +316,23 @@ fn channel_of(part: usize, channel: u8) -> Option<usize> {
 
 /// The register file of one YM2612: two banks and the address each of the two
 /// address ports last latched.
+///
+/// The `serde` derive carries the whole file, every register byte and both latches
+/// (M6-07a, #126).
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct RegFile {
     /// `banks[PART_I]` and `banks[PART_II]`, indexed by register number. Zeroed
     /// apart from the exception of [`RegFile::new`], which is not what a real chip
     /// powers up with - a YM2612 wakes with undefined registers - but is the only
     /// defined thing this model has.
-    banks: [[u8; REGISTERS]; PARTS],
+    ///
+    /// One boxed slice per part rather than a `[[u8; REGISTERS]; PARTS]` array
+    /// only so that serde can carry it: serde derives arrays up to 32 entries and
+    /// a bank is [`REGISTERS`] = 256, and a boxed slice is what the ticket asks
+    /// for instead of a `serde-big-array` dependency. Length is fixed at
+    /// [`REGISTERS`] by [`RegFile::new`] and nothing here grows it.
+    banks: [Box<[u8]>; PARTS],
     /// One latch per part: `&27`-style register numbers written to one part's
     /// address port do not move the other part's.
     latched: [u8; PARTS],
@@ -329,7 +345,8 @@ impl RegFile {
     /// register value this model has to start away from zero because a zeroed
     /// `&B4` would mean a chip that hears nothing at all (see [`PAN_BOTH`]).
     pub(crate) fn new() -> Self {
-        let mut banks = [[0; REGISTERS]; PARTS];
+        let mut banks: [Box<[u8]>; PARTS] =
+            std::array::from_fn(|_| vec![0; REGISTERS].into_boxed_slice());
         for bank in banks.iter_mut() {
             for channel in 0..CHANNELS_PER_PART {
                 bank[usize::from(REG_AMS_PMS) + channel] = PAN_BOTH;

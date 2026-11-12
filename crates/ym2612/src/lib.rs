@@ -50,6 +50,12 @@ use lfo::Lfo;
 use phase::{CHANNELS, PhaseGen};
 use regs::{PART_I, PART_II};
 
+// Serialising the chip state for save states (M6-07a, #126). Gated on the
+// crate's `serde` feature so `cargo build --no-default-features` keeps the core
+// with no dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Port 0: address, part I.
 ///
 /// The four ports are the chip's two address lines - A0 selects data over
@@ -95,6 +101,13 @@ const BUSY_INTERNAL_CYCLES: u32 = 32;
 
 /// The YM2612: its four bus ports, its two register banks, its status byte, its
 /// two timers and its phase counters.
+///
+/// The `serde` derive carries the whole chip, every sub-generator down to the
+/// individual envelopes and phase counters (M6-07a, #126). Nothing is
+/// `#[serde(skip)]`: the log sine and the exponent of the `tables` module are
+/// constants rather than fields, so a restored chip needs no reinitialisation
+/// before it can be clocked again.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Ym2612 {
     /// The two banks of registers and the address each part last latched.
     regs: regs::RegFile,

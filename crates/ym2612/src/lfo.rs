@@ -53,6 +53,12 @@
 use crate::phase::CHANNELS;
 use crate::regs::{self, PART_I};
 
+// Serialising this chip state for save states (M6-07a, #126). Gated on the
+// crate's `serde` feature so `cargo build --no-default-features` keeps the
+// core with no dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Output samples per step of the LFO counter, by `&22` bits 2-0 (YM2608
 /// application manual `&22`, LFO frequency table; the same eight numbers as
 /// Nuked-OPN2's `lfo_cycles`).
@@ -197,6 +203,7 @@ const PM_NEGATIVE: u8 = 0x10;
 
 /// The 7-bit LFO counter, and the per-channel `&B4` depths it is read at.
 #[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Lfo {
     /// `&22` bit 3: the LFO runs. Clear holds [`Lfo::counter`] at 0.
     enable: bool,

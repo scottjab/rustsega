@@ -8,6 +8,12 @@ use crate::address_error::{AccessKind, PendingFault};
 use crate::bus::{ADDR_MASK, Bus};
 use crate::sr::{CCR_MASK, SR_C, SR_INT_MASK, SR_MASK, SR_N, SR_RESET, SR_S, SR_V, SR_X, SR_Z};
 
+// Serialising the CPU state for save states (M6-07a, #126). Gated on the crate's
+// `serde` feature so `cargo build --no-default-features` keeps the core with no
+// dependencies at all, as docs/ARCHITECTURE.md asks of it.
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Address of the initial stack pointer in the reset vector table (M68000UM
 /// section 5 "Reset": the processor fetches the initial SSP from $000000).
 const RESET_VECTOR_SP: u32 = 0x0000_0000;
@@ -87,7 +93,12 @@ pub(crate) const INTERNAL_RESULT_WRITE_CLOCKS: u32 = 2;
 /// Fields are plain data (no `Box<dyn _>`, no references) so the save-state
 /// milestone can serialise them, and are public so tests and the `genesis`
 /// crate can poke them.
+///
+/// The `serde` derive carries the whole struct — every field is chip state a
+/// save state has to restore, including the prefetch queue and the pending
+/// faults — and there is nothing here to skip: the CPU holds no tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct M68k {
     /// Data registers D0–D7.
     pub d: [u32; 8],
