@@ -413,3 +413,105 @@ fn sonic_boots_to_non_blank_screen() {
         frame.height,
     );
 }
+
+/// Boots one Realtec cart for `frames` and returns how many distinct colours its
+/// last frame holds.
+///
+/// A Realtec cart is paged over its own image, so this is the test that the mapper
+/// is doing something: a cart on the wrong paging reads its own data as a
+/// different set of bytes and draws nothing, or draws noise.
+///
+/// `#[ignore]`d with the other real-ROM tests: CI has no commercial ROMs. Run with
+/// `cargo nextest run -p genesis --run-ignored only --test boot`.
+///
+/// `require_data!` is not used here because it leaves the test early, and this is a
+/// helper rather than a test: each test asks for its own ROM and passes it in.
+fn realtec_colours(path: &std::path::Path, frames: u32) -> usize {
+    use std::collections::HashSet;
+
+    let rom = std::fs::read(path).expect("the cart is readable");
+    let mut machine = Genesis::new(&rom, Config::default()).expect("the cart loads");
+
+    for _ in 0..frames {
+        machine.run_frame();
+    }
+
+    let frame = machine.frame();
+    let pixels = &frame.pixels[..frame.width * frame.height];
+    let colours: HashSet<u32> = pixels.iter().copied().collect();
+    testkit::dump_png(
+        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-output/realtec_prefix.png"),
+        pixels,
+        frame.width,
+        frame.height,
+    );
+    colours.len()
+}
+
+/// A blank screen is 4 distinct colours or fewer, the same floor
+/// `crates/genesis/tests/commercial.rs` uses and the one `headless sweep` calls
+/// `Blank` with (M6-05, #124).
+const BLANK: usize = 4;
+
+/// Earth Defense reaches its title screen after the 300-frame mark, so it is run to
+/// 600 - the checkpoint `headless sweep` itself uses (docs/compat.md). At 300 it is
+/// a 3-colour frame, and the cart is not the reason: the same is true of official
+/// carts in the same sweep.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn earth_defense_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom("Earth Defense"));
+    let colours = realtec_colours(&path, 600);
+    assert!(
+        colours > BLANK,
+        "600 frames in, Earth Defense is {} distinct colours",
+        colours
+    );
+}
+
+/// Funny World & Balloon Boy, the cart whose colour count the paging raises rather
+/// than rescues: 26 colours without the mapper, 31 with it.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn funny_world_and_balloon_boy_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom("Funny World & Balloon Boy"));
+    let colours = realtec_colours(&path, 300);
+    assert!(
+        colours > BLANK,
+        "300 frames in, Funny World & Balloon Boy is {} distinct colours",
+        colours
+    );
+}
+
+/// Whac-a-Critter: the clearest single-cart effect of the paging, 7 colours before
+/// and 22 after.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn whac_a_critter_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom("Whac-a-Critter"));
+    let colours = realtec_colours(&path, 300);
+    assert!(
+        colours > BLANK,
+        "300 frames in, Whac-a-Critter is {} distinct colours",
+        colours
+    );
+}
+
+/// Tom Clown, the cart the mapper unbreaks: on `main` it panics inside 600 frames
+/// with `not implemented: m68k opcode 0AC6`, and paged correctly it reaches a
+/// 30-colour screen instead.
+///
+/// The opcode is not implemented, and #355 stays open: what the paging changes is
+/// that the cart stops executing the bytes that held it.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn tom_clown_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom("Tom Clown"));
+    let colours = realtec_colours(&path, 300);
+    assert!(
+        colours > BLANK,
+        "300 frames in, Tom Clown is {} distinct colours",
+        colours
+    );
+}

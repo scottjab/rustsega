@@ -3,8 +3,10 @@
 //! [`eeprom`], and the bank registers of [`mapper`], each decoded from the image
 //! and each living behind [`crate::Bus`]'s cartridge area - has its own module.
 //!
-//! [`mapper`] holds the one mapper the console's own cart hardware has - the
-//! unlicensed mappers of M3-17 are not in it.
+//! [`mapper`] holds the console's own cart mapper and the one unlicensed mapper
+//! with evidence in the local collection - the survey of the rest is
+//! [`docs/mappers.md`](../../../../docs/mappers.md), and J-CART is the known
+//! remaining gap (#356).
 
 pub mod eeprom;
 pub mod header;

@@ -1633,11 +1633,32 @@ impl Bus {
         OPEN_BUS_WORD
     }
 
-    /// Undecoded byte write. Placeholder for [`Region::Unmapped`].
-    fn write_unmapped_byte(&mut self, _addr: u32, _value: u8) {}
+    /// Undecoded byte write: nothing but a Realtec cart's paging registers.
+    ///
+    /// The expansion slot at `0x400000-0x7FFFFF` is otherwise nothing's, but a
+    /// Realtec board keeps the three registers that page its image out there rather
+    /// than in the `0xA13000` block of [`crate::cart::mapper`] - see
+    /// [`mapper::realtec_register`] for the decode, and
+    /// [`Mapper::set_realtec_register`] for what a write to one does. A cart that is
+    /// not a Realtec cart drops the write, exactly as [`Bus::write_cart_extra_byte`]
+    /// drops a bank write on a cart with no Sega mapper.
+    fn write_unmapped_byte(&mut self, addr: u32, value: u8) {
+        if let Some(reg) = mapper::realtec_register(addr) {
+            self.mapper.set_realtec_register(reg, value);
+        }
+    }
 
-    /// Undecoded word write. Placeholder for [`Region::Unmapped`].
-    fn write_unmapped_word(&mut self, _addr: u32, _value: u16) {}
+    /// Undecoded word write: the high byte, which is the byte at the even lane.
+    ///
+    /// The opposite way round from [`Bus::write_cart_extra_word`], and deliberately:
+    /// the Realtec registers live on the even lane and take a word write from its own
+    /// byte (BlastEm's `realtec_write_w` hands `realtec_write_b` the value shifted
+    /// right by 8, and `realtec_write_b` then rejects odd addresses outright), while
+    /// the `0xA13000` block keeps its registers on the odd lane. Reusing one decode
+    /// for the other would take every Realtec write one byte late.
+    fn write_unmapped_word(&mut self, addr: u32, value: u16) {
+        self.write_unmapped_byte(addr, (value >> 8) as u8);
+    }
 }
 
 /// Is `addr`, masked and already decoded as [`Region::Io`], one of the two bytes
@@ -3653,6 +3674,100 @@ mod tests {
             8,
             "and the bank is back, where the mapper put it"
         );
+    }
+
+    // Realtec: a 512 KiB cart paged over itself by three registers out in the
+    // expansion slot. The slice arithmetic is [`crate::cart::mapper`]'s own tests;
+    // these are the ones about the decode in [`Bus::write_unmapped_byte`] and the
+    // fact that a cart without Realtec never sees it.
+
+    /// A 512 KiB Realtec cart: each 8 KiB block filled with its own number, plus
+    /// the `SEGA` at `0x7E100` that says the image is paged.
+    fn realtec_cart() -> Vec<u8> {
+        let mut rom = vec![0u8; 512 * 1024];
+        for block in 0..64u8 {
+            let size = 8 * 1024;
+            rom[usize::from(block) * size..(usize::from(block) + 1) * size].fill(block);
+        }
+        rom[0x7E100..0x7E104].copy_from_slice(b"SEGA");
+        rom
+    }
+
+    /// A Realtec cart answers its own header at `0x000100` before anything is
+    /// written, because the window is the image's last 8 KiB mirrored - and the
+    /// registers that move it are in the expansion slot, not the `0xA13000` block.
+    #[test]
+    fn a_realtec_cart_is_paged_from_the_expansion_slot() {
+        let mut bus = Bus::new(realtec_cart(), TEST_VERSION);
+        assert_eq!(bus.read_byte(0x00_0100), b'S', "its own header, mirrored");
+
+        // 128 KiB at 256 KiB: block 32 answers the bottom of the window.
+        bus.write_byte(0x40_2000, 1);
+        bus.write_byte(0x40_4000, 2);
+        assert_eq!(bus.read_byte(0x00_0000), 32);
+        assert_eq!(
+            bus.read_byte(0x02_0000),
+            32,
+            "mirrored, not banked per slot"
+        );
+
+        // A write to 0xA130F3, the Sega mapper's first bank register, does nothing
+        // to a Realtec cart: the two carts are decoded apart.
+        bus.write_byte(0xA130F3, 5);
+        assert_eq!(bus.read_byte(0x00_0000), 32, "unchanged");
+    }
+
+    /// The Realtec registers are read on the even lane and take a word write from
+    /// its high byte - the opposite of the `0xA13000` block, which keeps its
+    /// registers on the odd lane. Getting this wrong moves every write one byte.
+    #[test]
+    fn realtec_registers_answer_the_even_lane_and_the_high_byte() {
+        let mut bus = Bus::new(realtec_cart(), TEST_VERSION);
+
+        bus.write_byte(0x40_2001, 1);
+        assert_eq!(
+            bus.read_byte(0x00_0000),
+            63,
+            "an odd lane is not a register, so nothing paged"
+        );
+
+        // A word write to the start register takes its value from the high byte:
+        // 0x0200 is a write of 2, which is 2 * 128 KiB, and 32 blocks in.
+        bus.write_word(0x40_4000, 0x0200);
+        assert_eq!(
+            bus.read_byte(0x00_0000),
+            32,
+            "the high byte of a word write is the register"
+        );
+
+        // And the low byte of that same word is not: 0x00FF would have left the
+        // start where it was, so a write whose value is in the low lane does nothing.
+        let mut bus = Bus::new(realtec_cart(), TEST_VERSION);
+        bus.write_word(0x40_4000, 0x0002);
+        assert_eq!(
+            bus.read_byte(0x00_0000),
+            63,
+            "the low byte of a word write is not the register"
+        );
+    }
+
+    /// A cart that is not Realtec drops writes to the expansion slot, so the new
+    /// decode cannot disturb an ordinary cart: `0x400000` is the expansion slot and
+    /// answers nothing at all.
+    #[test]
+    fn an_ordinary_cart_ignores_the_realtec_registers() {
+        let mut rom = realtec_cart();
+        rom[0x7E100..0x7E104].copy_from_slice(b"sega");
+        let mut bus = Bus::new(rom, TEST_VERSION);
+
+        assert_eq!(
+            bus.read_byte(0x00_0100),
+            0,
+            "no mirror: the image answers itself"
+        );
+        bus.write_byte(0x40_2000, 1);
+        bus.write_byte(0x40_4000, 2);
+        assert_eq!(bus.read_byte(0x00_0000), 0, "and the write went nowhere");
     }
     // The serial EEPROM: the other save shape the cartridge slot answers, with
     // its two lines on bits of the cart data bus. The chip's own protocol is

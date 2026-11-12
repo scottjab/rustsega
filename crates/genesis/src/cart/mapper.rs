@@ -29,8 +29,11 @@
 //! Two neighbours are deliberately left out: the Mega Everdrive's *extended*
 //! variant, which has a register for slot 0 as well and which Genesis Plus GX
 //! gives any cart whose system type says `SEGA SSF` (its `mapper_512k_w`, of
-//! which `mapper_ssf2_w` is the slot-0-pinned form), and the unlicensed mappers
-//! of M3-17.
+//! which `mapper_ssf2_w` is the slot-0-pinned form). The other neighbour, the
+//! unlicensed mappers of M3-17, is no longer left out: [`Mapper::Realtec`] is the
+//! one the local collection has evidence for, and
+//! [`docs/mappers.md`](../../../../docs/mappers.md) surveys the rest and lists what
+//! is still open.
 //!
 //! ## Nothing unlocks these registers
 //!
@@ -89,6 +92,30 @@ const REGISTER_BLOCK: u32 = 0xA130F0;
 /// The last pair of bank registers, `0xA130FE`/`0xA130FF`, the top of the block.
 const LAST_BANK_LANE: u32 = REGISTER_BLOCK + 0x0E;
 
+/// The second `SEGA` signature that says a 512 KiB image is a Realtec cart.
+///
+/// A Realtec board holds the cartridge window paged over the image, so the reset
+/// vector it has to reach is not at `0x000000` of the image: it is at `0x7E100`,
+/// and the paging is what brings it to `0x000000` (BlastEm `realtec.c`'s
+/// `realtec_detect`, read for behaviour). The signature is therefore both how the
+/// cart is recognised and what the reset mirror exists to deliver.
+const REALTEC_SIGNATURE: usize = 0x7E100;
+/// How much of the image a Realtec cart mirrors across its window before any of
+/// its registers is written: the 8 KiB page the signature sits in.
+const REALTEC_RESET_SIZE: usize = 8 * 1024;
+/// Where that page starts, so the reset mirror and the signature cannot drift.
+const REALTEC_RESET_START: usize = REALTEC_SIGNATURE & !(REALTEC_RESET_SIZE - 1);
+/// The address range a Realtec cart's own registers are answered in. It is the
+/// expansion slot of plutiedev "Memory map", which [`crate::bus`] decodes as
+/// nothing, and not the `0xA13000` cart space the Sega mapper and the save RAM
+/// live in.
+const REALTEC_REGISTERS: std::ops::RangeInclusive<u32> = 0x40_0000..=0x7F_FFFF;
+/// The mirror of the Realtec register area: the three registers repeat every
+/// 32 KiB across [`REALTEC_REGISTERS`], each register being an 8 KiB block.
+const REALTEC_REGISTER_MIRROR: u32 = 32 * 1024;
+/// How many registers a Realtec cart has.
+const REALTEC_REGISTERS_COUNT: usize = 3;
+
 /// What turns a cartridge address into an offset in the image: nothing, or the
 /// Sega mapper's seven bank registers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +124,28 @@ pub enum Mapper {
     /// about being bigger: the image answers in address order, which is what
     /// [`Mapper::map`] reporting `None` tells [`crate::Bus`] to do.
     None,
+    /// A Realtec unlicensed cart: a 512 KiB image with the whole cartridge window
+    /// paged over it, controlled by three registers in the expansion slot.
+    ///
+    /// Unlike [`Mapper::SegaSsf2`] there is no bank per slot. A Realtec cart names
+    /// one slice of its image, and that slice is mirrored repeatedly to fill the
+    /// whole [`CARTRIDGE_SIZE`] the console sees - so the window is the paging
+    /// mechanism, and the low slots are not special (BlastEm `realtec.c`'s
+    /// `realtec_configure_rom` installs one chunk for `0x000000-0x3FFFFF`).
+    Realtec {
+        /// The three registers, in the order [`realtec_register`] numbers them.
+        ///
+        /// Kept because a write only re-pages when it changes a value - the
+        /// reference ignores a write of what is already there - and because the
+        /// slice is a function of all three together.
+        regs: [u8; REALTEC_REGISTERS_COUNT],
+        /// First byte of the slice, which may name a place past the end of the
+        /// image and is wrapped by [`Mapper::map`] rather than checked.
+        start: usize,
+        /// Length of the slice in bytes, always at least 1: [`Mapper::map`] takes
+        /// a modulo by it.
+        size: usize,
+    },
     /// The Sega mapper, with one page of the image behind each of the eight
     /// 512 KiB slots.
     SegaSsf2 {
@@ -155,6 +204,13 @@ impl Mapper {
     /// (M6-05, #124) finding the carts that need one, and it will want the mapper
     /// and the save RAM entries in the same pass.
     pub fn detect(rom: &[u8]) -> Self {
+        if Self::is_realtec(rom) {
+            return Self::Realtec {
+                regs: [0; REALTEC_REGISTERS_COUNT],
+                start: REALTEC_RESET_START,
+                size: REALTEC_RESET_SIZE,
+            };
+        }
         if rom.len() > CARTRIDGE_SIZE || asks_for_the_mapper(rom) {
             Self::SegaSsf2 {
                 banks: Self::identity(),
@@ -162,6 +218,19 @@ impl Mapper {
         } else {
             Self::None
         }
+    }
+
+    /// Does the image name itself a Realtec cart: exactly one 512 KiB of it, with
+    /// [`REALTEC_SIGNATURE`] written at the address the paging will mirror to
+    /// `0x000000`.
+    ///
+    /// Both halves are needed, and BlastEm's `realtec_detect` asks for both: the
+    /// signature is the address of a paged header, which is a property of these
+    /// boards and of nothing else, and the size is what makes that address mean
+    /// anything. Without the size the test would be "there are four bytes spelling
+    /// `SEGA` somewhere past half a megabyte", which real carts satisfy by accident.
+    fn is_realtec(rom: &[u8]) -> bool {
+        rom.len() == SLOT_SIZE && rom[REALTEC_SIGNATURE..].starts_with(b"SEGA")
     }
 
     /// The offset in the image that a read of the cartridge address `addr`
@@ -184,6 +253,16 @@ impl Mapper {
     pub fn map(&self, addr: u32) -> Option<usize> {
         match self {
             Self::None => None,
+            Self::Realtec { start, size, .. } => {
+                // The cartridge window a Realtec cart answers with is one page of
+                // the image mirrored across all four megabytes, and the slice
+                // repeats inside it: `start + (window % size)`, wrapped back into
+                // the image because the reference wraps it (`realtec_configure_rom`
+                // memcpys from `start` to `start + size` and, when that runs off
+                // the end of the page, continues from the start of the image).
+                let window = addr as usize & (SLOT_SIZE - 1);
+                Some((start + (window % *size)) % SLOT_SIZE)
+            }
             Self::SegaSsf2 { banks } => {
                 let page = usize::from(banks[(addr >> SLOT_SHIFT) as usize]);
                 Some(page * SLOT_SIZE + (addr as usize & (SLOT_SIZE - 1)))
@@ -208,16 +287,93 @@ impl Mapper {
         }
     }
 
+    /// A write of `value` to the Realtec register `reg`, as [`realtec_register`]
+    /// numbers one, and the slice it selects.
+    ///
+    /// A cart that is not a Realtec cart drops the write, so the bus can call this
+    /// for every cart as it calls [`Mapper::set_bank`]. A write that changes
+    /// nothing does nothing: the reference ignores it (`realtec_write_b` returns
+    /// when `r->regs[offset] == value`), and a cart is entitled to keep the slice
+    /// it is on while it rewrites a register with its own value.
+    pub fn set_realtec_register(&mut self, reg: usize, value: u8) {
+        let Self::Realtec { regs, start, size } = self else {
+            return;
+        };
+        let Some(current) = regs.get_mut(reg) else {
+            return;
+        };
+        if *current == value {
+            return;
+        }
+        *current = value;
+        (*start, *size) = realtec_slice(regs);
+    }
+
     /// Restart the registers, which is what a reset does: every slot back on the
     /// page it came up with ([`Mapper::identity`]). BlastEm does the same in
     /// `alloc_config_genesis`, and Genesis Plus GX asks for it with
     /// `cart.hw.bankshift = 1` on the carts that have the mapper - "cartridge ROM
     /// mapping is reinitialized on /VRES".
     pub fn reset(&mut self) {
-        if let Self::SegaSsf2 { banks } = self {
-            *banks = Self::identity();
+        match self {
+            Self::SegaSsf2 { banks } => *banks = Self::identity(),
+            Self::Realtec { regs, start, size } => {
+                *regs = [0; REALTEC_REGISTERS_COUNT];
+                // Not the slice `regs` would give: a Realtec cart comes up with
+                // its own header page mirrored over the window, which is what
+                // `realtec_init` asks for and what a cart relies on to reach its
+                // reset vector at all.
+                *start = REALTEC_RESET_START;
+                *size = REALTEC_RESET_SIZE;
+            }
+            Self::None => {}
         }
     }
+}
+
+/// The slice a Realtec cart mirrors across its window for `regs`: `size` bytes at
+/// `start`, in the 128 KiB units and 32 KiB offsets the registers are written in.
+///
+/// Register 1 is the length and register 2 the low half of the start; register 0
+/// supplies the top of the start above the megabyte, so a cart can name a place
+/// past its own image and [`Mapper::map`] wraps it rather than faulting.
+///
+/// A length of zero is impossible on the hardware and would be a modulo by zero
+/// here. The reference does not answer it at all - its `for (cur = 0; cur < 512K;
+/// cur += size)` never advances, so the rebuild does not terminate - and there is
+/// no behaviour to match, so the largest slice is used instead: a cart stays
+/// answerable, which is what every other reading of the register does.
+fn realtec_slice(regs: &[u8; REALTEC_REGISTERS_COUNT]) -> (usize, usize) {
+    let size = (usize::from(regs[1] & 7)) << 17;
+    let size = if size == 0 || size > SLOT_SIZE {
+        SLOT_SIZE
+    } else {
+        size
+    };
+    let start = ((usize::from(regs[2]) & 7) << 17) | ((usize::from(regs[0]) & 6) << 19);
+    (start, size)
+}
+
+/// Which Realtec register `addr` names, or `None` when it is not one of the three.
+///
+/// The registers are an 8 KiB block each at the bottom of every 32 KiB of the
+/// expansion slot, at `0x400000`, `0x402000` and `0x404000` of each mirror; the
+/// fourth block of a mirror is not a register and the writes to it are dropped
+/// (BlastEm `realtec_write_b`, which masks the address into the chunk, shifts it
+/// by 13 and honours only `offset < 3`).
+///
+/// Odd addresses are ignored rather than answered: a Realtec cart is read on the
+/// even lane of each pair, so `0x400001` is nothing while a word read of
+/// `0x400000` takes its value from the high byte. The reference says so directly
+/// (`if (address & 1) return;`), which is the opposite way round from the
+/// `0xA13000` block of [`bank_slot`] and worth noticing before reusing either
+/// decode for the other cart.
+pub fn realtec_register(addr: u32) -> Option<usize> {
+    if !REALTEC_REGISTERS.contains(&addr) || addr & 1 == 1 {
+        return None;
+    }
+    let block = (addr & (REALTEC_REGISTER_MIRROR - 1)) / (REALTEC_REGISTER_MIRROR / 4);
+    (block < REALTEC_REGISTERS_COUNT as u32).then_some(block as usize)
 }
 
 /// Which bank register's slot `addr` names, or `None` when `addr` is not one of
@@ -471,6 +627,219 @@ mod tests {
             "{} declares no save RAM",
             header.serial
         );
+    }
+
+    // The Realtec mapper: a 512 KiB cart whose whole cartridge window is a slice
+    // of itself. The reference is BlastEm's `realtec.c`, read for behaviour.
+
+    /// The 512 KiB cart of the Realtec boards: every byte of each of its 8 KiB
+    /// blocks is that block's number, so `image[i] == i / 8192` and a read of any
+    /// byte says which 8 KiB block it came from.
+    ///
+    /// With the second `SEGA` signature at `0x7E100` written in, which is what
+    /// makes the image a Realtec cart rather than an ordinary 512 KiB one.
+    fn realtec_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; SLOT_SIZE];
+        for block in 0..(SLOT_SIZE / REALTEC_RESET_SIZE) {
+            rom[block * REALTEC_RESET_SIZE..(block + 1) * REALTEC_RESET_SIZE].fill(block as u8);
+        }
+        rom[REALTEC_SIGNATURE..REALTEC_SIGNATURE + 4].copy_from_slice(b"SEGA");
+        rom
+    }
+
+    /// The byte a Realtec cart answers at cartridge address `addr`: the paging is
+    /// a translation like any other, so this is `map` and then the image.
+    fn realtec_byte(image: &[u8], mapper: &Mapper, addr: u32) -> u8 {
+        let offset = mapper.map(addr).expect("a Realtec cart always translates");
+        image[offset]
+    }
+
+    /// Detection is the signature at `0x7E100` on an image of exactly the Realtec
+    /// page, and neither alone: a 512 KiB cart without it is an ordinary cart, and
+    /// the signature at that address means nothing on a cart of another size.
+    #[test]
+    fn a_realtec_cart_is_named_by_its_second_header() {
+        assert_eq!(
+            Mapper::detect(&realtec_rom()),
+            Mapper::Realtec {
+                regs: [0; 3],
+                start: REALTEC_RESET_START,
+                size: REALTEC_RESET_SIZE,
+            }
+        );
+
+        // Same size, no second header: the 4 MiB-or-less ordinary cart of
+        // `detect_enables_on_size_or_on_the_system_type`.
+        let mut plain = realtec_rom();
+        plain[REALTEC_SIGNATURE..REALTEC_SIGNATURE + 4].copy_from_slice(b"sega");
+        assert_eq!(
+            Mapper::detect(&plain),
+            Mapper::None,
+            "lower-case is not a signature"
+        );
+
+        // Signature present, wrong size: the address is just data.
+        let mut double = vec![0u8; 2 * SLOT_SIZE];
+        double[..SLOT_SIZE].copy_from_slice(&realtec_rom());
+        assert_eq!(Mapper::detect(&double), Mapper::None);
+    }
+
+    /// The reset state is not "bank 0 mapped": the last 8 KiB of the image is
+    /// mirrored across the whole cartridge window, which is how a Realtec cart
+    /// gets the header at `0x7E100` to the reset vector at `0x000000`.
+    #[test]
+    fn a_realtec_cart_comes_up_with_its_last_page_mirrored() {
+        let rom = realtec_rom();
+        let mapper = Mapper::detect(&rom);
+
+        let last = (SLOT_SIZE / REALTEC_RESET_SIZE - 1) as u8;
+        // Every 8 KiB block of the 4 MiB window is the image's last 8 KiB. The
+        // addresses avoid `0x7E100` itself, which `realtec_rom` overwrote with the
+        // signature and which the three assertions below check instead.
+        for addr in [0u32, 0x2000, 0x1_0000, 0x8_0000, 0x3F_FFFF] {
+            assert_eq!(realtec_byte(&rom, &mapper, addr), last, "{addr:#010x}");
+        }
+        // And the cart's own header answers where a cart expects a header: this is
+        // the whole reason the mirror exists, and identity mapping would fail it.
+        assert_eq!(realtec_byte(&rom, &mapper, 0x100), b'S');
+        assert_eq!(realtec_byte(&rom, &mapper, 0x101), b'E');
+        assert_eq!(realtec_byte(&rom, &mapper, 0x103), b'A');
+    }
+
+    /// The three registers, at the first three 8 KiB blocks of every 32 KiB of
+    /// `0x400000-0x7FFFFF`; the fourth block of each mirror is nothing, odd lanes
+    /// are ignored, and outside the window the addresses belong to other hardware.
+    #[test]
+    fn the_realtec_registers_are_the_first_three_blocks_of_every_32k() {
+        for addr in [
+            0x40_0000u32,
+            0x40_0002,
+            0x40_1F_FE,
+            0x40_8000,
+            0x7F_8000,
+            0x7F_9FFC,
+        ] {
+            assert_eq!(realtec_register(addr), Some(0), "{addr:#010x}");
+        }
+        for addr in [0x40_2000u32, 0x40_2002, 0x40_A000] {
+            assert_eq!(realtec_register(addr), Some(1), "{addr:#010x}");
+        }
+        for addr in [0x40_4000u32, 0x40_4002, 0x40_C000] {
+            assert_eq!(realtec_register(addr), Some(2), "{addr:#010x}");
+        }
+
+        for addr in [0x40_2001u32, 0x40_4003, 0x40_6000, 0x40_7FFF] {
+            assert_eq!(
+                realtec_register(addr),
+                None,
+                "{addr:#010x} is not a register"
+            );
+        }
+        for addr in [0x3F_FFFE, 0x80_0000, 0xA1_30F3, 0] {
+            assert_eq!(
+                realtec_register(addr),
+                None,
+                "{addr:#010x} is not Realtec's"
+            );
+        }
+    }
+
+    /// A register write selects a `size`-byte slice at `start` and mirrors it
+    /// repeatedly to fill the window - so the window is the slice over and over,
+    /// not the slice once with open bus above it.
+    #[test]
+    fn writing_the_realtec_registers_pages_a_slice_across_the_window() {
+        let rom = realtec_rom();
+        let mut mapper = Mapper::detect(&rom);
+
+        // 128 KiB at 256 KiB: block 32 starts the slice, and it repeats every
+        // 128 KiB across the 512 KiB the cartridge window mirrors.
+        mapper.set_realtec_register(1, 1); // 1 * 128 KiB
+        mapper.set_realtec_register(2, 2); // 2 * 128 KiB == 256 KiB
+        assert_eq!(realtec_byte(&rom, &mapper, 0), 32);
+        assert_eq!(
+            realtec_byte(&rom, &mapper, 0x1_FFFF),
+            47,
+            "and nothing in between"
+        );
+        assert_eq!(
+            realtec_byte(&rom, &mapper, 0x2_0000),
+            32,
+            "mirrored a second time"
+        );
+    }
+
+    /// The slice wraps around the end of the image, and a `start` the cart cannot
+    /// have is kept inside it rather than run off the end of it.
+    #[test]
+    fn a_realtec_slice_wraps_around_the_end_of_the_image() {
+        let rom = realtec_rom();
+        let mut mapper = Mapper::detect(&rom);
+
+        // The largest slice there is (7 * 128 KiB, capped to the page) from a
+        // `start` past the end of the image: 0x60000 once the page is applied.
+        mapper.set_realtec_register(1, 7);
+        mapper.set_realtec_register(0, 6);
+        mapper.set_realtec_register(2, 7);
+        assert_eq!(realtec_byte(&rom, &mapper, 0), 48, "0x60000 is block 48");
+        assert_eq!(
+            realtec_byte(&rom, &mapper, 0x2_0000),
+            0,
+            "and it wraps to block 0"
+        );
+    }
+
+    /// A nonsense register value is a translation, never a panic and never open
+    /// bus: every window address stays inside a 512 KiB image.
+    #[test]
+    fn a_realtec_cart_always_answers_inside_its_image() {
+        let rom = realtec_rom();
+        let mut mapper = Mapper::detect(&rom);
+        for reg in 0..3 {
+            for value in [0u8, 1, 3, 7, 0x80, 0xFF] {
+                mapper.set_realtec_register(reg, value);
+                for addr in [0u32, 0x1234, 0x7_FFF8, 0x8_0000, 0x3F_FFFE] {
+                    let offset = mapper.map(addr).expect("a translation");
+                    assert!(offset < rom.len(), "{offset:#010x} is past the image");
+                }
+            }
+        }
+    }
+
+    /// A reset puts the mirror back, however the registers were left, because a
+    /// Realtec cart boots from the mirrored page and nothing else.
+    #[test]
+    fn a_realtec_reset_mirrors_the_last_page_again() {
+        let rom = realtec_rom();
+        let mut mapper = Mapper::detect(&rom);
+        mapper.set_realtec_register(1, 1);
+        mapper.set_realtec_register(2, 2);
+        let paged = realtec_byte(&rom, &mapper, 0);
+        let last = (SLOT_SIZE / REALTEC_RESET_SIZE - 1) as u8;
+        assert_ne!(paged, last, "the test needs the paging to have taken");
+
+        mapper.reset();
+        let Mapper::Realtec { regs, .. } = mapper else {
+            panic!("a Realtec cart is still Realtec after a reset");
+        };
+        assert_eq!(regs, [0; 3], "the registers restart with the mirror");
+        assert_eq!(realtec_byte(&rom, &mapper, 0), last);
+        assert_eq!(realtec_byte(&rom, &mapper, 0x3F_FFFF), last);
+    }
+
+    /// A cart that is not a Realtec cart drops `set_realtec_register` exactly as
+    /// [`Mapper::set_bank`] drops a bank write on a cart without the Sega mapper,
+    /// so the bus can call both for every cart.
+    #[test]
+    fn a_cart_that_is_not_realtec_ignores_its_registers() {
+        let image = vec![0u8; 0x10_0000];
+        let mut mapper = Mapper::detect(&image);
+        assert_eq!(mapper, Mapper::None);
+
+        for reg in 0..3 {
+            mapper.set_realtec_register(reg, 5);
+        }
+        assert_eq!(mapper.map(0x08_0000), None, "still no translation");
     }
 
     /// A cart with no mapper has no bank registers to write: [`Mapper::set_bank`]
