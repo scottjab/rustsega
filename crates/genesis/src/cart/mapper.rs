@@ -29,8 +29,11 @@
 //! Two neighbours are deliberately left out: the Mega Everdrive's *extended*
 //! variant, which has a register for slot 0 as well and which Genesis Plus GX
 //! gives any cart whose system type says `SEGA SSF` (its `mapper_512k_w`, of
-//! which `mapper_ssf2_w` is the slot-0-pinned form), and the unlicensed mappers
-//! of M3-17.
+//! which `mapper_ssf2_w` is the slot-0-pinned form). The other neighbour, the
+//! unlicensed mappers of M3-17, is no longer left out: [`Mapper::Realtec`] is the
+//! one the local collection has evidence for, and
+//! [`docs/mappers.md`](../../../../docs/mappers.md) surveys the rest and lists what
+//! is still open.
 //!
 //! ## Nothing unlocks these registers
 //!

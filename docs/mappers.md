@@ -229,4 +229,14 @@ cart, `0x7E100` for a Realtec) — and never on a declared size.
 
 ## Follow-up issues opened from this survey
 
-See the PR description on #78 for the issues opened and what each asks for.
+- **#356 - cart: implement J-CART, and decide who owns the shared bank/EEPROM
+  registers.** The register-ownership question in group 3 has to be answered before
+  the mapper is written, because `crate::cart::eeprom` and #270/#271 already hold
+  part of the same address block.
+- **#357 - genesis: diagnose the 2 MB and 4 MB Taiwan and China unlicensed carts
+  that draw nothing (not a mapper).** Group 2, with the three measurements that
+  ruled a mapper out and the shared-reset-vector clue, so the next person starts
+  from the evidence rather than from a guess.
+
+Nothing was opened for group 4: beyond 4 MiB the Sega mapper from #72 already
+handles what the collection contains, and Pier Solar is not in it.
