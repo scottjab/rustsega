@@ -10,7 +10,9 @@
 //! key-on behind the 24 phase counters (`phase`), and the attack, decay, sustain
 //! and release behind the 24 attenuations (`envelope`). `clock` is the sample
 //! step those timers, counters and envelopes run in and still returns silence:
-//! turning the operators into a sample is the slot output of the next ticket.
+//! what the operators answer with is here - the quarter-wave log sine, the
+//! exponent and the sign of one operator's output (`operator` and `tables`) -
+//! but nothing sums them into a channel until the algorithms of M5-07a (#111).
 //!
 //! Register bit documentation cites the Yamaha YM2608 (OPNA) application manual
 //! by register number, which is the manual that documents the OPN register set
@@ -18,8 +20,10 @@
 //! one is terse.
 
 mod envelope;
+mod operator;
 mod phase;
 mod regs;
+mod tables;
 mod timers;
 
 use envelope::EnvelopeGen;
