@@ -11,8 +11,15 @@ publish.workspace = true
 # linked into the emulator (M6-01, #120).
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# The `.vgz` of `headless vgm`, which is gzip: allowed for this binary by #117
+# and by nothing else, so it must not spread to a core crate.
+flate2 = "1"
 # The console to run (docs/ARCHITECTURE.md, "genesis").
 genesis = { path = "../genesis" }
+# The two chips `headless vgm` plays, driven directly rather than through a
+# `Genesis`: a VGM is a recording of the chips, not of the console (M5-12, #117).
+sn76489 = { path = "../sn76489" }
+ym2612 = { path = "../ym2612" }
 # `frame_hash` and `dump_png`, so the CLI hashes and writes PNGs exactly the
 # way the golden files do rather than nearly the same way (docs/TESTING.md,
 # "Golden files").

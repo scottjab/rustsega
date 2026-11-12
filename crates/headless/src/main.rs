@@ -1,23 +1,23 @@
 //! Headless CLI runner: runs a ROM without a browser, used by integration tests
 //! and by anyone who wants a frame out of the emulator without a window.
 //!
-//! This file is only the command-line shape - one subcommand, `run` - whose whole
-//! behaviour lives in the `run` module. `sweep` (M6-05, #125) will be the second
-//! variant.
+//! This file is only the command-line shape - the subcommands `run` and `vgm`,
+//! whose whole behaviour lives in the modules of the same name, with `sweep`
+//! (M6-05, #125) to follow - and the one thing it does itself is turn a `Result`
+//! into an exit status.
 //!
 //! Failures are reported as `error: <what and which path>` on stderr and exit
 //! status 1; `--help` is a success. See the crate's tests in `tests/cli.rs`.
 
-mod run;
-mod wav;
-
 use clap::Parser;
 
-use crate::run::RunArgs;
+use headless::run::RunArgs;
+use headless::vgm::VgmArgs;
+use headless::{run, vgm};
 
 /// The whole command line: `headless run <ROM> [--frames N] [--dump-png PATH]
 /// [--dump-wav PATH] [--hash] [--audio-hash] [--region auto|usa|japan|europe]
-/// [--pad1 BUTTONS@FRAME,...]`.
+/// [--pad1 BUTTONS@FRAME,...]`, or `headless vgm <VGM> [--out PATH]`.
 #[derive(Parser)]
 #[command(
     name = "headless",
@@ -27,11 +27,16 @@ use crate::run::RunArgs;
 enum Cli {
     /// Run a ROM for N frames, then print its frame hash and/or dump a PNG.
     Run(RunArgs),
+    /// Play a VGM or VGZ file through the YM2612 and the SN76489.
+    Vgm(VgmArgs),
 }
 
 fn main() -> std::process::ExitCode {
-    let Cli::Run(args) = Cli::parse();
-    match run::run(args) {
+    let played = match Cli::parse() {
+        Cli::Run(args) => run::run(args),
+        Cli::Vgm(args) => vgm::run(args),
+    };
+    match played {
         Ok(()) => std::process::ExitCode::SUCCESS,
         // `{:#}` is the whole anyhow context chain: "cannot read ROM \"x\":
         // No such file or directory (os error 2)".
