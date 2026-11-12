@@ -218,15 +218,14 @@ impl Ym2612 {
         self.phases.tick();
         self.envelopes.tick(&self.phases);
 
-        let mut mix = [0i16; CHANNELS];
         for channel in 0..CHANNELS {
             let phase = std::array::from_fn(|slot| self.phases.phase(channel, slot));
             let att = std::array::from_fn(|slot| self.envelopes.envelope(channel, slot).output());
             self.channels[channel].step(phase, att);
-            mix[channel] = self.channels[channel].output();
         }
 
         self.busy = self.busy.saturating_sub(INTERNAL_CYCLES_PER_SAMPLE);
+        let mix = std::array::from_fn(|channel| self.channels[channel].output());
         let sample = output::mix(mix, self.model);
         (sample, sample)
     }
