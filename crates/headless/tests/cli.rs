@@ -38,6 +38,10 @@ impl TempDir {
     fn join(&self, name: &str) -> PathBuf {
         self.0.join(name)
     }
+
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
 }
 
 impl Drop for TempDir {
@@ -199,6 +203,38 @@ fn dump_png_creates_file() {
         "{} is not a PNG ({} bytes)",
         png.display(),
         bytes.len()
+    );
+}
+
+/// `--dump-png` at a directory is a mistake a person makes, and the answer is
+/// one line of `error:`, not a panic from inside the PNG writer.
+#[test]
+fn dump_png_to_a_directory_errors_nicely() {
+    let dir = TempDir::new("png-dir");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "1",
+        "--dump-png",
+        dir.as_path().to_str().expect("utf-8 path"),
+    ]);
+    assert!(
+        !out.status.success(),
+        "dumping onto a directory must not succeed\nstdout: {}",
+        stdout(&out)
+    );
+    let text = stderr(&out);
+    assert!(
+        text.contains("is a directory"),
+        "the error must say what is wrong: {text}"
+    );
+    assert!(
+        !text.contains("panicked"),
+        "a clean error, not a panic: {text}"
     );
 }
 

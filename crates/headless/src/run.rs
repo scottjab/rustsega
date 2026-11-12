@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, ValueEnum};
 use genesis::{Buttons, Config, Genesis, Region, RegionSetting};
 
@@ -122,6 +122,12 @@ pub fn run(args: RunArgs) -> Result<()> {
     let frame = machine.frame();
     let pixels = &frame.pixels[..frame.width * frame.height];
     if let Some(path) = &args.dump_png {
+        if path.is_dir() {
+            // Worth saying here rather than letting `testkit::dump_png` panic on
+            // the `File::create` inside it: a panic is not how a command line
+            // tool should answer `--dump-png /tmp`.
+            bail!("--dump-png: {} is a directory", quote(path));
+        }
         testkit::dump_png(path, pixels, frame.width, frame.height);
     }
     if args.hash {
@@ -205,42 +211,44 @@ fn parse_pad_script(script: Option<&str>) -> Result<BTreeMap<u32, Buttons>> {
     Ok(pads)
 }
 
-/// One button name, as `--pad1` spells it: the [`Buttons`] constants, upper case.
+/// The buttons `--pad1` can hold, by the name it spells them with: the eight of
+/// a 3-button pad (plutiedev, "Controllers", "Button layout").
+const BUTTONS: [(&str, Buttons); 8] = [
+    ("UP", Buttons::UP),
+    ("DOWN", Buttons::DOWN),
+    ("LEFT", Buttons::LEFT),
+    ("RIGHT", Buttons::RIGHT),
+    ("A", Buttons::A),
+    ("B", Buttons::B),
+    ("C", Buttons::C),
+    ("START", Buttons::START),
+];
+
+/// One button name, as `--pad1` spells it: upper case, and the four a 6-button
+/// pad adds are refused rather than quietly dropped.
 ///
-/// `X`, `Y`, `Z` and `MODE` are refused rather than quietly dropped: the CLI
-/// attaches its pad through [`Genesis::set_pad`], which attaches a 3-button pad
-/// that cannot report them, and a script that asked for one would be testing
-/// nothing. A 6-button pad is a front-end setting (plutiedev, "Controllers",
+/// `Genesis::set_pad` attaches a 3-button pad, which cannot report `X`, `Y`, `Z`
+/// or `MODE`, so a script that asked for one would be holding a button no game
+/// can see. A 6-button pad is a front-end setting (plutiedev, "Controllers",
 /// "6-button controller") and comes with the movie work, M6-09 (#129).
 fn parse_button(name: &str) -> Result<Buttons> {
-    let trimmed = name.trim().to_ascii_uppercase();
-    let known = |button: &str| trimmed == button;
-    if known("UP") {
-        Ok(Buttons::UP)
-    } else if known("DOWN") {
-        Ok(Buttons::DOWN)
-    } else if known("LEFT") {
-        Ok(Buttons::LEFT)
-    } else if known("RIGHT") {
-        Ok(Buttons::RIGHT)
-    } else if known("A") {
-        Ok(Buttons::A)
-    } else if known("B") {
-        Ok(Buttons::B)
-    } else if known("C") {
-        Ok(Buttons::C)
-    } else if known("START") {
-        Ok(Buttons::START)
-    } else if known("X") || known("Y") || known("Z") || known("MODE") {
-        Err(anyhow!(
-            "--pad1: {trimmed} is a 6-button pad button and the CLI attaches a 3-button \
-             pad; 6-button input comes with the movie format (#129)"
-        ))
-    } else {
-        Err(anyhow!(
-            "--pad1: {name:?} is not a button; use UP DOWN LEFT RIGHT A B C or START"
-        ))
+    const SIX_BUTTON_ONLY: [&str; 4] = ["X", "Y", "Z", "MODE"];
+    let wanted = name.trim().to_ascii_uppercase();
+    if let Some((_, buttons)) = BUTTONS.iter().find(|(button, _)| *button == wanted) {
+        return Ok(*buttons);
     }
+    if SIX_BUTTON_ONLY.contains(&wanted.as_str()) {
+        bail!(
+            "--pad1: {wanted} is a 6-button pad button and the CLI attaches a 3-button \
+             pad; 6-button input comes with the movie format (#129)"
+        );
+    }
+    let names = BUTTONS
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(" ");
+    bail!("--pad1: {name:?} is not a button; use {names}")
 }
 
 #[cfg(test)]
