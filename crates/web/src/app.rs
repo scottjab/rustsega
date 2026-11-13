@@ -15,6 +15,9 @@ use crate::emulator::use_cartridge;
 use crate::gamepad_events::use_gamepad;
 use crate::keyboard_events::use_keyboard;
 use crate::menu::use_menu;
+use crate::render::FilterSetting;
+use crate::render::RendererKind;
+use crate::render::RendererSetting;
 use crate::rom::LoadedRom;
 use crate::rom_picker::EmptyScreen;
 use crate::rom_picker::RomFileInput;
@@ -85,11 +88,13 @@ pub fn App() -> impl IntoView {
     let roms = RwSignal::new(None::<LoadedRom>);
     provide_context(roms);
 
-    // The canvas the console draws to, and the loop that drives it. The emulator
-    // itself is not in a signal here - see [`crate::emulator`] for why - only the
-    // pause state its buttons show.
+    // The two canvases the console can draw to, and the loop that drives it. Both
+    // exist because a canvas belongs to one context type for its whole life, so
+    // the WebGL path and the 2D path cannot share one (M7-13, #146); which of them
+    // is on screen is [`Controls::renderer`].
     let canvas = NodeRef::<html::Canvas>::new();
-    let console = use_cartridge(canvas);
+    let canvas_gl = NodeRef::<html::Canvas>::new();
+    let console = use_cartridge(canvas, canvas_gl);
     // The two elements the screen's own half needs: the shell, which is what goes
     // fullscreen, and the screen area, which is what reports how much room the
     // picture has (M7-12, #145).
@@ -139,7 +144,7 @@ pub fn App() -> impl IntoView {
     // The canvas box, fullscreen, and the top bar's reveal - all from the same
     // owner, because the F11 hotkey, the top bar's button and the browser's own
     // `Escape` have to agree about what state the shell is in (#145).
-    let screen = use_screen(canvas, screen_area, shell, console, drawer_open);
+    let screen = use_screen(canvas, canvas_gl, screen_area, shell, console, drawer_open);
 
     use_keyboard(menu, loaded, toasts, settings, capture, screen);
 
@@ -295,13 +300,32 @@ pub fn App() -> impl IntoView {
                 class:screen-area--drag=move || dragging.get()
             >
                 <Show when=move || loaded.get() fallback=|| view! { <EmptyScreen/> }>
+                    // The 2D canvas, which is what was here before WebGL: the
+                    // drawing buffer is the VDP's own pixels and the browser
+                    // scales that. It is hidden while the console is drawing with
+                    // the canvas below, and only one of the two is laid out at a
+                    // time - `hidden` rather than a class, because `display: none`
+                    // is what keeps a canvas out of the screen area's grid
+                    // altogether (M7-13, #146).
                     <canvas
                         id="screen"
                         class="screen"
                         class:screen--smooth=move || settings.with(|settings| settings.smoothing)
+                        hidden=move || console.renderer.get() == RendererKind::Webgl
                         width=320
                         height=224
                         node_ref=canvas
+                    >
+                    </canvas>
+                    // The WebGL canvas: the drawing buffer is this element's CSS
+                    // box times `devicePixelRatio`, which is what a shader needs
+                    // to draw one crisp scanline rather than one CSS pixel of one.
+                    <canvas
+                        id="screen-webgl"
+                        class="screen"
+                        class:screen--smooth=move || settings.with(|settings| settings.smoothing)
+                        hidden=move || console.renderer.get() != RendererKind::Webgl
+                        node_ref=canvas_gl
                     >
                     </canvas>
                 </Show>
@@ -359,6 +383,37 @@ pub fn App() -> impl IntoView {
                             settings.update(|settings| settings.aspect = aspect);
                         })/> }
                     }
+                    {
+                        let settings = settings;
+                        let choices = options(&RendererSetting::ALL, |renderer| renderer.label());
+                        let chosen = Signal::derive(move || {
+                            position(
+                                &RendererSetting::ALL,
+                                settings.with(|settings| settings.renderer),
+                            )
+                        });
+                        view! { <Select label="Renderer".to_string() options=choices selected=chosen on_change=Callback::new(move |value: String| {
+                            let renderer = RendererSetting::ALL
+                                .get(value.parse::<usize>().unwrap_or(0))
+                                .copied()
+                                .unwrap_or_default();
+                            settings.update(|settings| settings.renderer = renderer);
+                        })/> }
+                    }
+                    {
+                        let settings = settings;
+                        let choices = options(&FilterSetting::ALL, |filter| filter.label());
+                        let chosen = Signal::derive(move || {
+                            position(&FilterSetting::ALL, settings.with(|settings| settings.filter))
+                        });
+                        view! { <Select label="Filter".to_string() options=choices selected=chosen on_change=Callback::new(move |value: String| {
+                            let filter = FilterSetting::ALL
+                                .get(value.parse::<usize>().unwrap_or(0))
+                                .copied()
+                                .unwrap_or_default();
+                            settings.update(|settings| settings.filter = filter);
+                        })/> }
+                    }
                     <Toggle
                         label="Smoothing".to_string()
                         checked=Signal::derive(move || settings.with(|settings| settings.smoothing))
@@ -366,6 +421,9 @@ pub fn App() -> impl IntoView {
                             settings.update(|settings| settings.smoothing = !settings.smoothing);
                         })
                     />
+                    <p class="settings-section__note">
+                        "The filter needs the WebGL renderer: the 2D canvas draws the frame as it is."
+                    </p>
                 </section>
 
                 <section class="settings-section">

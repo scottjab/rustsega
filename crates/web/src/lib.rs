@@ -24,6 +24,7 @@ pub mod input;
 pub mod keyboard_events;
 pub mod menu;
 pub mod nav;
+pub mod render;
 pub mod rom;
 pub mod rom_picker;
 pub mod scale;
