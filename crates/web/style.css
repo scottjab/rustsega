@@ -362,6 +362,34 @@ canvas {
   gap: var(--space-1);
 }
 
+/* The autoplay nudge (M7-05, #138): no browser will start an AudioContext until
+   a person does something, and while it is holding the sound back the honest
+   thing to say is that the sound is waiting. A pill rather than a toast: it is
+   a state of the console, not an event that happened. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  flex: none;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.chip:hover {
+  border-color: var(--accent);
+}
+
+.chip:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+
 /* The screen is the hero: it fills what is left of the page, and the canvas is
    centred in it with a soft accent glow behind. */
 .screen-area {

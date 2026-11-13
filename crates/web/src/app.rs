@@ -9,6 +9,7 @@
 use leptos::html;
 use leptos::prelude::*;
 
+use crate::audio::AudioSettings;
 use crate::emulator::use_cartridge;
 use crate::rom::LoadedRom;
 use crate::rom_picker::EmptyScreen;
@@ -21,9 +22,11 @@ use crate::ui::drawer::Drawer;
 use crate::ui::icons;
 use crate::ui::select::Select;
 use crate::ui::select::SelectOption;
+use crate::ui::slider::Slider;
 use crate::ui::toast::ToastArea;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
+use crate::ui::toggle::Toggle;
 
 /// Shown in the top bar's centre where the game title goes when nothing is loaded.
 const NO_CARTRIDGE: &str = "No cartridge loaded";
@@ -43,6 +46,13 @@ pub fn App() -> impl IntoView {
 
     let theme = RwSignal::new(Theme::default());
     let drawer_open = RwSignal::new(false);
+
+    // Volume and mute, provided before the console is mounted because
+    // [`use_cartridge`] reads them as it starts a console (M7-05, #138). The
+    // drawer and the top bar write them; `use_cartridge` is what tells the
+    // running console, and M7-10 (#143) is what makes them stick.
+    let audio = AudioSettings::default();
+    provide_context(audio);
 
     // The cartridge, if one has been opened. Context rather than a prop so M7-04
     // (run it) and M7-16 (the library) can react to it without the shell
@@ -131,8 +141,40 @@ pub fn App() -> impl IntoView {
                             .map(|region| view! { <span class="now-playing__region">{region}</span> })
                     }}
                 </p>
+                // The autoplay nudge: until the browser lets the audio clock run,
+                // the console is silent however loud the volume is (M7-05, #138).
+                {move || {
+                    (loaded.get() && !console.sound_on.get()).then(|| {
+                        view! {
+                            <button
+                                type="button"
+                                class="chip"
+                                on:click=move |_| console.enable_audio()
+                            >
+                                "Click to enable sound"
+                            </button>
+                        }
+                    })
+                }}
                 <nav class="topbar__actions" aria-label="Console">
                     {console_buttons}
+                    {move || {
+                        let muted = audio.muted.get();
+                        let (label, path) = if muted {
+                            ("Unmute", icons::VOLUME_OFF)
+                        } else {
+                            ("Mute", icons::VOLUME)
+                        };
+                        view! {
+                            <IconButton
+                                label=label.to_string()
+                                path=path
+                                on_click=Callback::new(move |_| {
+                                    audio.muted.update(|state| *state = !*state);
+                                })
+                            />
+                        }
+                    }}
                     <IconButton
                         label="Open ROM".to_string()
                         path=icons::OPEN
@@ -185,6 +227,22 @@ pub fn App() -> impl IntoView {
                     />
                     <p class="settings-section__note">
                         Settings live in this tab: M7-10 (#143) is what makes them stick.
+                    </p>
+                </section>
+
+                <section class="settings-section">
+                    <h3 class="settings-section__title">Sound</h3>
+                    <Slider
+                        label="Volume".to_string()
+                        min=0.0
+                        max=1.0
+                        step=0.05
+                        value=audio.volume
+                    />
+                    <Toggle label="Mute".to_string() checked=audio.muted />
+                    <p class="settings-section__note">
+                        Sound waits for a click, because no browser will start an audio
+                        clock until the page has had one.
                     </p>
                 </section>
             </Drawer>
