@@ -57,6 +57,24 @@ fetch:
 test-web:
     CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --target wasm32-unknown-unknown -p web
 
+# The cartridge the in-browser frame budget is measured with (M7-21, #154):
+# Overdrive 2, the one pinned public ROM that is a load rather than a judge, so
+# the VDP and both sound chips are busy on every line of it (docs/test-roms.md).
+perf-rom := "genesis/overdrive2/titan-overdrive2.bin"
+
+# The in-browser frame budget (M7-21, #154): 120 warm-up frames, then 600 timed
+# ones, in headless Firefox at the release profile, against an 8.0 ms average and
+# a 14.0 ms p99. Manual or nightly on purpose - it is the one measurement that
+# needs a cartridge baked into the test binary and an optimized wasm build, and CI
+# has neither, so it is in neither `check` nor CI. `perf-rom` is the cargo feature
+# that compiles `tests/browser_perf.rs` at all; `RUSTSEGA_PERF_ROM` is the path it
+# embeds, made absolute because `include_bytes!` reads a relative path against the
+# source file rather than against the directory cargo was run from.
+perf-web:
+    rom_dir="${RUSTSEGA_TEST_ROM_DIR:-test-roms}"
+    test -r "$rom_dir/{{perf-rom}}" || { echo "no {{perf-rom}} under $$rom_dir; run 'just fetch'" >&2; exit 1; }
+    RUSTSEGA_PERF_ROM="$$(cd "$$rom_dir" && pwd)/{{perf-rom}}" CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --release --target wasm32-unknown-unknown -p web --features perf-rom --test browser_perf -- --nocapture
+
 # Core crates must always build for the browser.
 wasm-core:
     cargo build --target wasm32-unknown-unknown {{core}}

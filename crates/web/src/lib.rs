@@ -29,6 +29,7 @@ pub mod input;
 pub mod keyboard_events;
 pub mod menu;
 pub mod nav;
+pub mod perf;
 pub mod recents;
 pub mod render;
 pub mod rom;
