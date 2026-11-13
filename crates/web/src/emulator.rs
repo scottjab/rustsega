@@ -810,11 +810,12 @@ mod tests {
         );
     }
 
-    /// The top bar's buttons are live before a cartridge is loaded, so the two
+    /// The top bar's buttons are live before a cartridge is loaded, so the
     /// console actions have to be inert rather than wrong: no console, no paused
-    /// state invented for a game that is not running, and no panic on reset.
+    /// state invented for a game that is not running, and no panic on reset, on
+    /// mute, on volume, or on the click that asks for sound.
     #[test]
-    fn pause_and_reset_do_nothing_without_a_console() {
+    fn pause_and_reset_and_the_audio_controls_do_nothing_without_a_console() {
         let owner = Owner::new();
         owner.set();
         let paused = RwSignal::new(false);
@@ -824,7 +825,11 @@ mod tests {
         };
 
         controls.reset();
+        controls.enable_audio();
+        controls.set_volume(0.5);
+        controls.set_muted(true);
         controls.toggle();
         assert!(!paused.get());
+        assert!(!controls.sound_on.get());
     }
 }

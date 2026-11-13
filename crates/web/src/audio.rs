@@ -331,3 +331,40 @@ impl AudioOut {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mute is a held value, not a zeroed one: unmuting returns to wherever the
+    /// slider was rather than to full, which is what a person who muted mid-game
+    /// expects the slider to still say.
+    #[test]
+    fn mute_holds_the_volume_rather_than_replacing_it() {
+        let owner = Owner::new();
+        owner.set();
+        let settings = AudioSettings::default();
+        assert_eq!(settings.gain(), DEFAULT_VOLUME as f32);
+
+        settings.volume.set(0.4);
+        assert_eq!(settings.gain(), 0.4);
+
+        settings.muted.set(true);
+        assert_eq!(settings.gain(), 0.0);
+        assert_eq!(settings.volume.get(), 0.4, "the slider still says 0.4");
+
+        settings.muted.set(false);
+        assert_eq!(settings.gain(), 0.4);
+    }
+
+    /// A new tab is not muted and is not quiet: the first thing a person hears
+    /// after the enabling click should be the game at the volume the slider shows.
+    #[test]
+    fn a_new_console_is_unmuted_and_at_full_volume() {
+        let owner = Owner::new();
+        owner.set();
+        let settings = AudioSettings::default();
+        assert!(!settings.muted.get());
+        assert_eq!(settings.volume.get(), DEFAULT_VOLUME);
+    }
+}
