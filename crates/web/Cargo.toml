@@ -31,6 +31,19 @@ wasm-bindgen-futures = "0.4"
 # The same wasm-bindgen family as leptos itself, and the only way to reach
 # `document`/`window`: the theme writes `data-theme` on `<html>` (M7-02, #135).
 web-sys = { version = "0.3", features = [
+  # The audio output of M7-05 (#138): a context, a buffer per block of console
+  # sound, a source node to play it, and a gain in front of the destination.
+  "AudioBuffer",
+  "AudioBufferSourceNode",
+  "AudioContext",
+  "AudioContextOptions",
+  "AudioContextState",
+  "AudioDestinationNode",
+  "AudioNode",
+  "AudioParam",
+  "AudioScheduledSourceNode",
+  "BaseAudioContext",
+  "GainNode",
   "Blob",
   "CanvasRenderingContext2d",
   "DataTransfer",
