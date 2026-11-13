@@ -7,9 +7,10 @@
 //!
 //! Of the ROM-loading pair, [`rom`] is the pure half - bytes in, [`rom::LoadedRom`]
 //! out - and [`rom_picker`] is the browser half that hands it a file. The input
-//! devices are the same pair: [`input::keyboard`] and [`input::gamepad`] say what
-//! a key and a pad reading mean, and [`keyboard_events`] and [`gamepad_events`]
-//! are the halves that listen for them and poll them.
+//! devices are the same pair: [`input::keyboard`], [`input::gamepad`] and
+//! [`input::touch`] say what a key, a pad reading and a finger mean, and
+//! [`keyboard_events`], [`gamepad_events`] and [`touch_events`] are the halves that
+//! listen for them, poll them, and draw them.
 
 pub mod app;
 pub mod audio;
@@ -22,6 +23,7 @@ pub mod keyboard_events;
 pub mod rom;
 pub mod rom_picker;
 pub mod theme;
+pub mod touch_events;
 pub mod ui;
 
 /// The application title, shown as the page heading.

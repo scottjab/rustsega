@@ -402,7 +402,10 @@ impl TouchTracker {
     }
 
     /// The control a pointer is on, if it is on one.
-    fn control_of(&self, pointer: i32) -> Option<Control> {
+    ///
+    /// How the browser half knows whether a `pointermove` belongs to the overlay at
+    /// all, and what a slid finger was holding before it slid.
+    pub fn control_of(&self, pointer: i32) -> Option<Control> {
         self.touches
             .iter()
             .find(|touch| touch.pointer == pointer)

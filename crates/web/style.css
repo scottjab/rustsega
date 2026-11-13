@@ -58,6 +58,14 @@
   --drawer-width: 380px;
   --bottom-sheet-height: 70dvh;
 
+  /* The touch overlay (M7-09, #142). 56px is the smallest thing a thumb is asked
+     to hit, so no control is drawn under it - and the band is the strip of
+     portrait screen the controls live in below the picture. */
+  --touch-key: 64px;
+  --touch-key-small: 48px;
+  --touch-dpad: 148px;
+  --touch-band: 248px;
+
   /* Motion. Every transition that uses these sits behind the
      prefers-reduced-motion query at the bottom of this file. */
   --duration: 170ms;
@@ -648,6 +656,201 @@ canvas {
 
 .toast--danger {
   border-left-color: var(--danger);
+}
+
+/* ---------------------------------------------------------- touch overlay -- */
+
+/* The on-screen controller (M7-09, #142).
+ *
+ * One fixed layer over the shell whose own pointer events are off, so that the
+ * space between the controls stays the page: only the controls are touchable.
+ * `touch-action: none` is the whole of the "no scrolling, no zooming, no text
+ * selection" rule, and it is not an inherited property - so every control carries
+ * it as well as the layer.
+ *
+ * In landscape the controls float over the picture, which is all a landscape phone
+ * leaves you. In portrait they get a band of their own below the screen, and the
+ * screen area shrinks to sit above them - see the `app--touch` rules below.
+ */
+.touch {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* The controls: a translucent disc each, `--surface-2` at 55% behind a hairline
+ * border, filled with `--accent` at 70% and scaled to 0.94 while held. The held
+ * state is `aria-pressed`, written by the pointer handlers and by nothing else, so
+ * there is one answer to "is this control down" and no class list to keep in step
+ * with the tracker. */
+.touch__dpad,
+.touch__key,
+.touch__pill,
+.touch__menu {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface-2) 55%, transparent);
+  /* The ticket's white label: `--text` is white on the dark theme, and on the
+     light one a white label on 55% `--surface-2` over a bright game is
+     unreadable. */
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-emphasis);
+  text-shadow: 0 1px 2px rgb(0 0 0 / 45%);
+  pointer-events: auto;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  /* Deliberately no transition: a control that takes 170ms to look pressed is a
+     control that looks unpressed. */
+}
+
+.touch__dpad[aria-pressed="true"],
+.touch__key[aria-pressed="true"],
+.touch__pill[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 70%, transparent);
+  color: var(--on-accent);
+  transform: scale(0.94);
+}
+
+/* Bottom left, where a left thumb already is. */
+.touch__dpad {
+  position: absolute;
+  bottom: calc(env(safe-area-inset-bottom) + var(--space-4));
+  left: calc(env(safe-area-inset-left) + var(--space-4));
+  width: var(--touch-dpad);
+  height: var(--touch-dpad);
+}
+
+/* The moulding, drawn rather than written so that it scales with the disc: two
+   rounded bars, one of them turned through a right angle. */
+.touch__dpad::before,
+.touch__dpad::after {
+  content: "";
+  position: absolute;
+  inset: 16%;
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, currentcolor 22%, transparent);
+}
+
+.touch__dpad::after {
+  transform: rotate(90deg);
+}
+
+/* Bottom right: the Genesis arc, `A` `B` `C` along the bottom and the smaller `X`
+   `Y` `Z` above them, the cluster bowed so that a thumb rolls from one to the next
+   without leaving the glass. */
+.touch__faces {
+  position: absolute;
+  right: calc(env(safe-area-inset-right) + var(--space-4));
+  bottom: calc(env(safe-area-inset-bottom) + var(--space-4));
+  width: calc(var(--touch-key) * 3 + var(--space-4));
+  height: 196px;
+}
+
+.touch__key {
+  position: absolute;
+  width: var(--touch-key);
+  height: var(--touch-key);
+}
+
+.touch__key--a {
+  left: 0;
+  bottom: var(--space-5);
+}
+
+.touch__key--b {
+  left: calc(var(--touch-key) + var(--space-3));
+  bottom: calc(var(--space-5) + var(--space-2));
+}
+
+.touch__key--c {
+  right: 0;
+  bottom: var(--space-5);
+}
+
+.touch__key--x,
+.touch__key--y,
+.touch__key--z {
+  width: var(--touch-key-small);
+  height: var(--touch-key-small);
+  font-size: var(--text-xs);
+}
+
+.touch__key--x {
+  left: var(--space-5);
+  top: 44px;
+}
+
+.touch__key--y {
+  left: calc(var(--touch-key) + var(--space-3) + var(--space-2));
+  top: var(--space-5);
+}
+
+.touch__key--z {
+  right: var(--space-3);
+  top: 44px;
+}
+
+/* Start and Mode, the small pills. Bottom centre in landscape; a phone in portrait
+   has no room for them between the d-pad and the face buttons, so they move up one
+   row and stay the middle of the band. */
+.touch__middle {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  gap: var(--space-3);
+  bottom: calc(env(safe-area-inset-bottom) + var(--space-4));
+}
+
+.touch__pill {
+  min-width: 72px;
+  height: 56px;
+  padding: 0 var(--space-3);
+  font-size: var(--text-xs);
+}
+
+/* Top right of the overlay, clear of the top bar: the only way into the settings
+   for a player with no keyboard, and not a control of the pad. */
+.touch__menu {
+  position: absolute;
+  top: calc(var(--topbar-height) + var(--space-3));
+  right: calc(env(safe-area-inset-right) + var(--space-3));
+  width: 48px;
+  height: 48px;
+}
+
+@media (orientation: portrait) {
+  .touch__middle {
+    bottom: calc(env(safe-area-inset-bottom) + var(--touch-dpad) + var(--space-4));
+  }
+
+  /* Portrait: the screen on top, the controls in the band under it rather than
+     lying over the picture. `align-items: start` is what puts the screen there,
+     and `width: 100%` what keeps it inside the band - `.screen` takes its own
+     width from the height of the whole viewport, which in portrait is not the axis
+     that binds. */
+  .app--touch .screen-area {
+    padding-bottom: calc(var(--touch-band) + env(safe-area-inset-bottom));
+    align-items: start;
+  }
+
+  .app--touch .screen {
+    width: 100%;
+  }
 }
 
 /* --------------------------------------------------------------- motion -- */

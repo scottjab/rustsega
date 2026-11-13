@@ -19,6 +19,9 @@ use crate::rom_picker::RomFileInput;
 use crate::rom_picker::open_picker;
 use crate::rom_picker::window_drop_target;
 use crate::theme::Theme;
+use crate::touch_events::TouchOverlay;
+use crate::touch_events::TouchSettings;
+use crate::touch_events::coarse_pointer;
 use crate::ui::button::IconButton;
 use crate::ui::drawer::Drawer;
 use crate::ui::icons;
@@ -93,11 +96,23 @@ pub fn App() -> impl IntoView {
     // to the pad, and while the drawer is open they are the drawer's.
     use_keyboard(console, drawer_open, loaded, toasts);
 
+    // Whether a controller is plugged in, which the touch overlay hides itself
+    // behind and nothing else asks about (M7-09, #142).
+    let controller_connected = RwSignal::new(false);
+
     // The gamepads, on the window and polled once per animation frame, for as
     // long as the shell is up (M7-08, #141). No `loaded` this time: a pad that
     // is plugged in is a pad the player is holding, whether or not a cartridge
     // is in, and its connect/disconnect news is worth a toast either way.
-    use_gamepad(console, drawer_open, toasts);
+    use_gamepad(console, drawer_open, toasts, controller_connected);
+
+    // The on-screen controller: on for a phone, on for a desktop that asked, off
+    // for a phone whose player picked up a pad. `coarse` is read once - a browser
+    // does not change what kind of pointer the machine has while the page is open,
+    // and the setting is there for the machine that does (M7-09, #142).
+    let touch = TouchSettings::new();
+    let coarse = coarse_pointer();
+    let touch_visible = Signal::derive(move || touch.visible(coarse, controller_connected.get()));
 
     // The two console controls. Re-rendered as a unit because both the icon of
     // one and the `disabled` of the other follow the console, and an icon-only
@@ -133,7 +148,9 @@ pub fn App() -> impl IntoView {
     let selected_theme = Signal::derive(move || theme.get().to_string());
 
     view! {
-        <div class="app">
+        // `app--touch` is what tells the screen area to give the controls room of
+        // their own in portrait, where they sit below the picture rather than on it.
+        <div class="app" class:app--touch=move || touch_visible.get()>
             <header class="topbar">
                 <span class="wordmark">
                     {crate::app_title()}
@@ -267,8 +284,24 @@ pub fn App() -> impl IntoView {
                         until it has had one. Two controllers become ports 1 and 2, in the
                         order they arrived."
                     </p>
+                    <Toggle label="Show touch controls".to_string() checked=touch.show />
+                    <Toggle
+                        label="Hide touch controls when a controller is connected".to_string()
+                        checked=touch.hide_with_controller
+                    />
+                    <Toggle label="Vibrate on press".to_string() checked=touch.vibrate />
+                    <p class="settings-section__note">
+                        "The on-screen pad appears by itself when the browser says your
+                        pointer is a finger."
+                    </p>
                 </section>
             </Drawer>
+
+            // The touch overlay, mounted exactly while it is on screen: its pointer
+            // listeners and its release-on-unmount come and go with it.
+            <Show when=move || touch_visible.get()>
+                <TouchOverlay settings=touch drawer_open=drawer_open />
+            </Show>
 
             <ToastArea/>
         </div>

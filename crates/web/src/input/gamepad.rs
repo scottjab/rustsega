@@ -145,6 +145,15 @@ impl PadSlots {
     pub fn port_of(&self, index: u8) -> Option<usize> {
         self.slots.iter().position(|slot| *slot == Some(index))
     }
+
+    /// Whether every port is empty again.
+    ///
+    /// What a page with a touch overlay asks when a controller comes and goes: a
+    /// player holding a pad does not want the on-screen buttons under their thumbs
+    /// (M7-09, #142).
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|slot| slot.is_none())
+    }
 }
 
 /// The Genesis buttons one raw reading of one pad is pressing.
@@ -396,6 +405,16 @@ mod tests {
         assert_eq!(slots.connect(3), Some(0));
         assert_eq!(slots.port_of(3), Some(0));
         assert_eq!(slots.port_of(4), None);
+    }
+
+    #[test]
+    fn the_slots_are_empty_until_a_pad_arrives_and_empty_again_when_it_goes() {
+        let mut slots = PadSlots::new();
+        assert!(slots.is_empty());
+        slots.connect(1);
+        assert!(!slots.is_empty());
+        slots.disconnect(1);
+        assert!(slots.is_empty());
     }
 
     #[test]

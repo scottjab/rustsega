@@ -63,12 +63,18 @@ struct Watcher {
     console: Controls,
     drawer_open: RwSignal<bool>,
     toasts: Toasts,
+    /// Whether any pad is plugged in at all, published for the touch overlay -
+    /// which hides itself while a real controller is about (M7-09, #142).
+    controller_connected: RwSignal<bool>,
 }
 
 impl Watcher {
     /// A pad has arrived: give it a port and say so.
     fn connected(&mut self, pad: &Gamepad) {
         let index = pad_index(pad);
+        // Before the port is handed out, because a pad that found no free port is
+        // still a pad in the player's hands.
+        self.controller_connected.set(true);
         let Some(port) = self.slots.connect(index) else {
             // A third controller. The console has two ports, so this one joins
             // the game as nothing at all - and saying so would only be noise.
@@ -94,6 +100,7 @@ impl Watcher {
         // nothing to report, but it must not keep a button either.
         crate::input::with_state(|input| input.clear_source(Source::Gamepad(index)));
         let port = self.slots.disconnect(index);
+        self.controller_connected.set(self.slots.is_empty());
         let Some(port) = port else { return };
         self.seen[port] = PadSeen::default();
         self.toasts
@@ -139,7 +146,17 @@ fn with_watcher<T>(f: impl FnOnce(&mut Watcher) -> T) -> Option<T> {
 /// `console`, `drawer_open` and `toasts` are the shell's, so that the two hotkeys
 /// a pad asks for - `home` and the right trigger - reach the same places the
 /// keyboard's hotkeys do (see [`crate::input::gamepad::poll_hotkey`]).
-pub fn use_gamepad(console: Controls, drawer_open: RwSignal<bool>, toasts: Toasts) {
+///
+/// `controller_connected` says whether any pad is plugged in, which is the fact the
+/// touch overlay hides itself behind (M7-09, #142). The browser only reports a pad
+/// after the player has touched it, so an overlay that appears before that is not a
+/// bug: it is the player's first chance to press anything.
+pub fn use_gamepad(
+    console: Controls,
+    drawer_open: RwSignal<bool>,
+    toasts: Toasts,
+    controller_connected: RwSignal<bool>,
+) {
     WATCHER.with(|watcher| {
         *watcher.borrow_mut() = Some(Watcher {
             slots: PadSlots::new(),
@@ -150,6 +167,7 @@ pub fn use_gamepad(console: Controls, drawer_open: RwSignal<bool>, toasts: Toast
             console,
             drawer_open,
             toasts,
+            controller_connected,
         });
     });
 
