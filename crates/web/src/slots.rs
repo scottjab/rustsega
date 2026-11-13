@@ -221,12 +221,18 @@ pub fn is_slot(slot: u32) -> bool {
 }
 
 /// How long ago `created_ms` was, for a card: "just now", "3 min ago", "2 hr ago",
-/// "5 days ago".
+/// "yesterday", "5 days ago".
 ///
 /// Relative rather than a date because the thing a player is deciding is "is this
 /// the one from before the boss", and a clock time says that only if they remember
 /// when they played. Coarse to one significant unit for the same reason: a card
 /// that reads "3 min 12 s ago" is a card nobody reads.
+///
+/// "Yesterday" is elapsed time - the 24 h to 48 h of it - and not a calendar day,
+/// because this is given two numbers on a monotonic-ish clock and has no date,
+/// timezone or midnight to work out (`#149` asked for the word; a calendar day
+/// would have needed a calendar). So a game opened at 11 pm reads "yesterday" at
+/// 1 am the next morning, which is what a card two hours old should say.
 ///
 /// Given the clock rather than reading one, like [`crate::storage::SramWatcher`],
 /// so the whole of it runs natively.
@@ -248,6 +254,8 @@ pub fn relative_time(now_ms: f64, created_ms: f64) -> String {
         unit(secs / 60, "min", "min")
     } else if secs < 86_400 {
         unit(secs / 3_600, "hr", "hr")
+    } else if secs < 2 * 86_400 {
+        "yesterday".to_string()
     } else {
         unit(secs / 86_400, "day", "days")
     }
@@ -559,12 +567,28 @@ mod tests {
         assert_eq!(relative_time(3.4 * minute, 0.0), "3 min ago");
         assert_eq!(relative_time(59.5 * minute, 0.0), "59 min ago");
         assert_eq!(relative_time(hour, 0.0), "1 hr ago");
-        assert_eq!(relative_time(26.0 * hour, 0.0), "1 day ago");
+        assert_eq!(relative_time(26.0 * hour, 0.0), "yesterday");
         assert_eq!(relative_time(5.0 * day, 0.0), "5 days ago");
         // A clock that went backwards, and a save from the future: both "just
         // now", because a card that says "-3 min ago" is a card that is wrong.
         assert_eq!(relative_time(0.0, minute), "just now");
         assert_eq!(relative_time(0.0, 0.0), "just now");
+    }
+
+    /// The two edges of "yesterday", pinned on both sides (#149 changed this
+    /// caption from "1 day ago"): the day before that is still counted in hours,
+    /// and the second day after is counted in days again.
+    #[test]
+    fn yesterday_is_two_days_of_elapsed_time_and_not_a_calendar_day() {
+        let minute = 60_000.0;
+        let hour = 60.0 * minute;
+        assert_eq!(relative_time(23.0 * hour + 59.0 * minute, 0.0), "23 hr ago");
+        assert_eq!(relative_time(24.0 * hour, 0.0), "yesterday");
+        assert_eq!(relative_time(47.0 * hour + 59.0 * minute, 0.0), "yesterday");
+        assert_eq!(relative_time(48.0 * hour + 1_000.0, 0.0), "2 days ago");
+        // Exactly two days, the same answer: the word "yesterday" is the day
+        // between one day and two, and it does not stretch to cover either edge.
+        assert_eq!(relative_time(48.0 * hour, 0.0), "2 days ago");
     }
 
     /// Every way a state can fail to load has its own sentence, and there is no

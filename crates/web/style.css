@@ -601,6 +601,107 @@ canvas {
   color: var(--text-muted);
 }
 
+/* The recent games grid (M7-16, #149): the cards above the drop zone, one per
+   game this browser still holds the image of. A grid rather than a list because
+   what a player is deciding is which of these to play, and twelve of them in a
+   column is a scroll. Wider than the 320px drop zone because a card with no
+   picture needs the width for a title to mean anything, and it scrolls rather
+   than pushing the drop zone out of a screen area that clips its overflow. */
+.recents {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  gap: var(--space-2);
+  width: min(680px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+}
+
+.recents__heading {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.recents__list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-2);
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.recent-card {
+  position: relative;
+}
+
+/* The card is the button: clicking it is the whole of what a player means, and
+   the (x) beside it is the only other thing there is to mean. Beside rather than
+   inside, because a button inside a button is markup no browser does anything
+   sensible with - and a (x) that is a third of the card's width is a (x) that is
+   pressed by accident on a phone. */
+.recent-card__launch {
+  display: grid;
+  align-content: start;
+  gap: var(--space-1);
+  width: 100%;
+  height: 100%;
+  padding: var(--space-3);
+  padding-right: var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface-2);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.recent-card__launch:hover {
+  border-color: var(--accent);
+}
+
+/* A header title is up to 48 characters of caps and a card is 180px. */
+.recent-card__title {
+  overflow: hidden;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-emphasis);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-card .btn--icon {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+  min-width: 28px;
+  height: 28px;
+  color: var(--text-muted);
+}
+
+.recent-card .btn--icon .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.recent-card__region {
+  justify-self: start;
+  padding: 0 var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.recent-card__time {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
 /* The file input every "Open ROM" button drives (see `rom_picker::open_picker`).
    Off the layout but not `display: none`, which a scripted `click()` cannot be
    relied on to open in every browser. */
