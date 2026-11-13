@@ -77,18 +77,19 @@ web-sys = { version = "0.3", features = [
   "MediaQueryList",
   "Navigator",
   "PointerEvent",
+  # The settings store of M7-10 (#143): `window().local_storage()` and the two
+  # items this reads and writes. Chosen over `gloo-storage` because web-sys is
+  # already a direct dependency and `Storage` is the whole of the extra surface.
+  "Storage",
   "Window",
 ] }
 # `Bindings` is rebindable and stored in `localStorage` (docs/ARCHITECTURE.md,
 # "Input"), so its `Serialize`/`Deserialize` derive needs `serde` at runtime,
 # not just under `cfg(test)` (M7-06, #139).
 serde = { workspace = true }
-
-# Only the round-trip test of `input::bindings` formats JSON (M7-06, #139), so
-# this is a dev-dependency: the smaller change, and `Storage::set_item` wants a
-# `String` rather than a format of its own. M7-10 (#143) promotes it to a real
-# dependency when it writes the settings file.
-[dev-dependencies]
+# Promoted from a dev-dependency by M7-10 (#143): `Settings::from_json` is the
+# store itself, so the JSON is now read and written at run time rather than only
+# in a round-trip test.
 serde_json = { workspace = true }
 
 [lints]

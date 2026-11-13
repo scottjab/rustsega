@@ -10,7 +10,8 @@
 //! devices are the same pair: [`input::keyboard`], [`input::gamepad`] and
 //! [`input::touch`] say what a key, a pad reading and a finger mean, and
 //! [`keyboard_events`], [`gamepad_events`] and [`touch_events`] are the halves that
-//! listen for them, poll them, and draw them.
+//! listen for them, poll them, and draw them. [`settings`] is the one store every
+//! of those reads, and [`controls`] is the drawer page that edits it.
 
 pub mod app;
 pub mod audio;
@@ -22,6 +23,7 @@ pub mod input;
 pub mod keyboard_events;
 pub mod rom;
 pub mod rom_picker;
+pub mod settings;
 pub mod theme;
 pub mod touch_events;
 pub mod ui;

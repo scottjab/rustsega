@@ -36,8 +36,11 @@ pub mod touch;
 use std::cell::RefCell;
 
 use genesis::Buttons;
+use serde::Deserialize;
+use serde::Serialize;
 
 pub use bindings::Bindings;
+pub use bindings::Displaced;
 pub use button::PadButton;
 
 /// The control ports the page drives: the console's two pad ports.
@@ -82,7 +85,11 @@ pub enum Source {
 /// A physical d-pad cannot press both of a pair, and games that see both do
 /// unpredictable things with it - which is why [`SocdMode::Neutral`] is the
 /// default rather than "report both and hope".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `serde` names are the ones the settings store writes (M7-10, #143), so they
+/// are snake_case and stable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SocdMode {
     /// Opposing directions cancel: holding Left and Right reports neither.
     #[default]

@@ -2,12 +2,20 @@
 
 use std::str::FromStr;
 
+use serde::Deserialize;
+use serde::Serialize;
+
 /// Which colour theme the shell should use.
 ///
 /// `System` means "no opinion": no `data-theme` attribute is written, and
 /// `style.css` follows `prefers-color-scheme` instead. That is why
 /// [`Theme::as_attr`] returns `None` for it rather than `"system"`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// The `serde` names are the [`Display`] tokens - `system`, `dark`, `light` -
+/// because they are also what the settings store keeps (M7-10, #143), and one
+/// spelling of a stored value is easier to keep true than two.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Theme {
     /// The default: follow `prefers-color-scheme`.
     #[default]

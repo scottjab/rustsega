@@ -10,6 +10,9 @@
 //! `code`, never `key`: `code` names the physical key, so the default arrow
 //! layout still works on a French keyboard where the same physical keys are
 //! `AZERTY` (`KeyboardEvent`, "the code attribute").
+//!
+//! [`capture_key`] is the same question asked while the controls page (M7-10,
+//! #143) is taking a binding, which has different answers - see it for why.
 
 use super::Bindings;
 use super::PadButton;
@@ -76,6 +79,43 @@ pub fn map_key(code: &str, bindings: &Bindings) -> KeyAction {
             port: *port,
             button: *button,
         })
+}
+
+/// What a keydown means while a settings cell is capturing the next key (M7-10,
+/// #143).
+///
+/// The capture owns the key absolutely, which is the whole reason this is a rule
+/// of its own rather than a case in the listener: `Escape` is the shell's
+/// `ToggleMenu` hotkey and `Tab` is its fast forward, so a listener that ran
+/// [`map_key`] first would shut the drawer on a player trying to cancel a rebind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CaptureKey {
+    /// `Escape`: abandon the capture and leave the binding as it was.
+    Cancel,
+    /// Bind this `code` to the button whose cell is capturing.
+    Bind {
+        /// The `KeyboardEvent.code` to bind.
+        code: String,
+    },
+    /// One of the shell's fixed hotkeys other than `Escape`. [`map_key`] gives
+    /// those to the shell whatever a bindings table says, so binding one here
+    /// would write an entry that can never fire - and a player who is told beats
+    /// a player who is silently ignored.
+    Refused,
+}
+
+/// Decides a keydown that arrived while a cell was capturing: cancel, bind, or
+/// refuse. `code` is the `KeyboardEvent.code`, never the `key`.
+pub fn capture_key(code: &str) -> CaptureKey {
+    if code == "Escape" {
+        return CaptureKey::Cancel;
+    }
+    if HOTKEYS.iter().any(|(bound, _)| *bound == code) {
+        return CaptureKey::Refused;
+    }
+    CaptureKey::Bind {
+        code: code.to_string(),
+    }
 }
 
 /// The `input` types that are text entries: they take typed text, so their
@@ -330,5 +370,41 @@ mod tests {
     #[test]
     fn an_unbound_key_is_never_swallowed() {
         assert!(!should_prevent_default(&KeyAction::None, true, false));
+    }
+
+    #[test]
+    fn a_capturing_cell_owns_escape_and_cancels_itself() {
+        // `Escape` is the shell's `ToggleMenu` hotkey. A player cancelling a
+        // rebind must not find the drawer sliding shut behind them, so the
+        // capture takes the key before `map_key` is ever asked.
+        assert_eq!(capture_key("Escape"), CaptureKey::Cancel);
+    }
+
+    #[test]
+    fn a_capturing_cell_binds_an_ordinary_key() {
+        assert_eq!(
+            capture_key("KeyK"),
+            CaptureKey::Bind {
+                code: "KeyK".to_string()
+            }
+        );
+        // Including a key the pad table does not know yet, and one that is
+        // already bound elsewhere - `rebind_key` sorts out the displacement.
+        assert_eq!(
+            capture_key("ArrowUp"),
+            CaptureKey::Bind {
+                code: "ArrowUp".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_capturing_cell_refuses_a_key_the_shell_keeps() {
+        // `map_key` always wins a hotkey key for the shell (see
+        // `a_hotkey_beats_a_pad_binding_on_the_same_key`), so binding one here
+        // would write a table entry that can never fire. Saying so is kinder.
+        for code in ["Tab", "F1", "F4", "F11", "KeyP"] {
+            assert_eq!(capture_key(code), CaptureKey::Refused, "{code}");
+        }
     }
 }
