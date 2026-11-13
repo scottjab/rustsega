@@ -20,6 +20,7 @@ pub mod app;
 pub mod audio;
 pub mod audio_pacing;
 pub mod controls;
+pub mod crash;
 pub mod emulator;
 pub mod fps;
 pub mod frame_pacer;
@@ -49,6 +50,18 @@ pub fn app_title() -> &'static str {
     "rustsega"
 }
 
+/// The version to show in the settings drawer's About section (M7-19, #152).
+///
+/// `CARGO_PKG_VERSION` is the workspace version, which is the version `nix build`
+/// built the binary with and therefore the only version the page can honestly
+/// name: the wasm, the server and the crate are one build of one checkout.
+pub fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+/// The repository, linked from the same About section.
+pub const REPOSITORY_URL: &str = "https://github.com/scottjab/rustsega";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,5 +69,23 @@ mod tests {
     #[test]
     fn app_title_is_rustsega() {
         assert_eq!(app_title(), "rustsega");
+    }
+
+    /// The About section has to name this build and point at its source, and both
+    /// are only worth having if they are the real thing: an empty version is a
+    /// version that never reached the page, and the repository is the one place a
+    /// player who has just read "the emulator crashed" can go.
+    #[test]
+    fn the_about_section_names_the_build_and_its_repo() {
+        let version = app_version();
+        assert!(!version.is_empty(), "no version reached the page");
+        assert!(
+            version
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit()),
+            "{version:?} does not read like a version"
+        );
+        assert_eq!(REPOSITORY_URL, "https://github.com/scottjab/rustsega");
     }
 }

@@ -26,6 +26,7 @@ pub const GAMEPAD: &str = "M6 8h12a4 4 0 0 1 0 8c-1.5 0-2.3-.8-3-2H9c-.7 1.2-1.5
 pub const KEYBOARD: &str =
     "M3 7h18v10H3z M6.5 10.5h.01 M10 10.5h.01 M13.5 10.5h.01 M17 10.5h.01 M8 13.5h8";
 pub const CLOSE: &str = "M6 6l12 12 M18 6 6 18";
+pub const MENU: &str = "M4 7h16 M4 12h16 M4 17h16";
 
 /// Every icon the shell has, for validation and lookup.
 pub const ALL: &[Icon] = &[
@@ -76,6 +77,10 @@ pub const ALL: &[Icon] = &[
     Icon {
         name: "close",
         path: CLOSE,
+    },
+    Icon {
+        name: "menu",
+        path: MENU,
     },
 ];
 
@@ -170,6 +175,7 @@ mod tests {
             "gamepad",
             "keyboard",
             "close",
+            "menu",
         ] {
             assert!(by_name(name).is_some(), "missing icon: {name}");
         }

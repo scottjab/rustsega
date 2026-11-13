@@ -19,6 +19,7 @@ use crate::controls::bind_key;
 use crate::emulator::Slots;
 use crate::input::Source;
 use crate::input::keyboard::CaptureKey;
+use crate::input::keyboard::HOTKEYS;
 use crate::input::keyboard::Hotkey;
 use crate::input::keyboard::KeyAction;
 use crate::input::keyboard::capture_key;
@@ -35,6 +36,7 @@ use crate::nav::UiMode;
 use crate::nav::ui_action;
 use crate::screen::Screen;
 use crate::settings::Settings;
+use crate::settings::keycap_label;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
 
@@ -43,8 +45,22 @@ use crate::ui::toast::Toasts;
 /// [`map_key`] gives a hotkey its key whatever the bindings say, so the binding
 /// would be dead the moment it was written; saying so is cheaper than a row in
 /// the table that does nothing (M7-10, #143).
-const REFUSED_KEY: &str =
-    "That key stays the shell's: Escape, Tab, `, F1, F2, F3, F4, F11 and P are fixed.";
+///
+/// The names are [`keycap_label`] of the codes in [`HOTKEYS`] rather than a second
+/// list of words (M7-19, #152): the controls page shows `Esc` on a keycap and the
+/// old sentence said `Escape`, which is how a player learns that the two are
+/// different keys.
+fn refused_key() -> String {
+    let names: Vec<String> = HOTKEYS.iter().map(|(code, _)| keycap_label(code)).collect();
+    // "Esc, F1, F2 and P": the last one is joined by an "and", the rest by commas.
+    let (last, rest) = names
+        .split_last()
+        .expect("HOTKEYS is not empty, so neither is this list");
+    format!(
+        "That key stays the shell's: {} and {last} are fixed.",
+        rest.join(", ")
+    )
+}
 
 /// Listens to the keyboard for as long as the component that calls this is
 /// mounted: `keydown` and `keyup` to move the pad, and `blur` to let go of it.
@@ -95,7 +111,7 @@ pub fn use_keyboard(
                             capture.set(None);
                         }
                     }
-                    CaptureKey::Refused => toasts.push(ToastKind::Warn, REFUSED_KEY),
+                    CaptureKey::Refused => toasts.push(ToastKind::Warn, refused_key()),
                 }
                 return;
             }
@@ -260,5 +276,29 @@ pub(crate) fn hotkey_do(
         // `keyup` above, and a pad's release is [`HotkeyEvent::Released`] over in
         // [`crate::gamepad_events`] (M7-17, #150).
         Hotkey::FastForward => menu.console.set_fast_forward(true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal a player reads when they try to bind one of the shell's keys
+    /// has to name them the way the keycaps of the same page name them: `Esc`, not
+    /// `Escape`, and `` ` `` rather than the word for it (M7-19, #152).
+    #[test]
+    fn the_refusal_names_the_fixed_keys_the_way_the_keycaps_do() {
+        let message = refused_key();
+        assert!(
+            !message.contains("Escape"),
+            "the keycap of Escape is Esc, so the sentence has to say that: {message:?}"
+        );
+        for (code, _) in HOTKEYS {
+            let label = keycap_label(code);
+            assert!(
+                message.contains(&label),
+                "{code} is missing from the refusal: {message:?}"
+            );
+        }
     }
 }

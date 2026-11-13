@@ -69,6 +69,9 @@
   /* Motion. Every transition that uses these sits behind the
      prefers-reduced-motion query at the bottom of this file. */
   --duration: 170ms;
+  /* The one thing that takes shorter than a transition: the picture arriving.
+     Long enough to read as a fade, short enough that nobody waits on it. */
+  --duration-enter: 150ms;
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
 
   color-scheme: dark;
@@ -78,7 +81,15 @@
    `data-theme="light"` (which the settings drawer sets), and once for a
    `data-theme`-less `<html>` on a machine that prefers light. `Theme::System`
    writes no attribute at all - see `src/theme.rs` - so this is how following
-   the OS works. Keep the two blocks in step. */
+   the OS works. Keep the two blocks in step.
+
+   The four colours after `--text-muted` are here because of M7-19 (#152), and they
+   are not optional decoration: `--accent`, `--danger` and `--warn` are painted as
+   *text* by `.keycap--capturing`, `.btn--danger` and `.slot-card__ask`, and in the
+   dark theme's values they are 3.16:1, 3.03:1 and 1.76:1 on white - under half the
+   4.5:1 WCAG AA asks of text. `--on-accent` comes with them because it is the other
+   half of `--accent`, and a dark navy on a dark blue is 1.5:1. The values below are
+   the ones tests/contrast.rs checks; run it rather than trusting these numbers. */
 @media (prefers-color-scheme: light) {
   :root:not([data-theme]) {
     --bg: #f5f6fa;
@@ -88,6 +99,10 @@
     --border: #d8dce6;
     --text: #141821;
     --text-muted: #5b6275;
+    --accent: #2f56cf;
+    --danger: #c0202a;
+    --warn: #7a5300;
+    --on-accent: #f7f9ff;
     color-scheme: light;
   }
 }
@@ -100,6 +115,10 @@
   --border: #d8dce6;
   --text: #141821;
   --text-muted: #5b6275;
+  --accent: #2f56cf;
+  --danger: #c0202a;
+  --warn: #7a5300;
+  --on-accent: #f7f9ff;
   color-scheme: light;
 }
 
@@ -257,7 +276,7 @@ canvas {
  * they are on screen. */
 .listbox {
   display: grid;
-  gap: 2px;
+  gap: var(--space-1);
   padding: var(--space-1);
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
@@ -318,6 +337,9 @@ canvas {
   background: var(--surface-2);
 }
 
+/* The 2px here and on `left` is not a space between things and is not on the 4px
+ * scale: it is what centres a 16px circle in a 22px pill (tests/spacing.rs
+ * therefore reads margins, paddings and gaps, and not this). */
 .toggle__thumb {
   position: absolute;
   top: 2px;
@@ -408,6 +430,37 @@ canvas {
 .topbar__actions {
   display: flex;
   gap: var(--space-1);
+}
+
+/* The actions come in two halves, of which exactly one is on screen (M7-19,
+   #152): the six icon buttons where the bar has room for them, and on a phone the
+   single menu button that opens the drawer they have moved into - the Console
+   section at the head of the sheet is where Pause lives once the bar has no room
+   for it.
+
+   Which half is CSS and not a width read at mount, because a rotation is not a
+   mount and a signal read once would hold the old answer. The 640px is the
+   drawer's own phone width, so the actions collapse into the menu at exactly the
+   width the menu becomes a bottom sheet. A hidden half is `display: none` rather
+   than moved off screen: that is what takes it out of the tab order and out of the
+   spatial walk, which ignores a box with no size (`menu::visible_box`). */
+.topbar__wide {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.topbar__narrow {
+  display: none;
+}
+
+@media (max-width: 639px) {
+  .topbar__wide {
+    display: none;
+  }
+
+  .topbar__narrow {
+    display: flex;
+  }
 }
 
 /* The autoplay nudge (M7-05, #138): no browser will start an AudioContext until
@@ -568,6 +621,89 @@ canvas {
   outline-offset: -8px;
 }
 
+/* The loading state (M7-19, #152): a ROM has been chosen and the console is not
+   painting yet - the `File` is still being read, then IndexedDB is still handing
+   over the cart's saved RAM (see `emulator::start`).
+
+   Absolutely positioned over the middle of the screen area rather than another row
+   of its grid, because "no layout shift when loading a ROM" is an acceptance
+   criterion and a grid row would push the empty state out of the way as it
+   arrived. It says "Loading" in words as well as drawing a ring: with motion
+   reduced the ring is still (see the motion section at the foot of this file), and
+   the word is the one thing left that knows something is happening. */
+.loading {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 2;
+  display: grid;
+  justify-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  transform: translate(-50%, -50%);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.loading__spinner {
+  width: var(--space-7);
+  height: var(--space-7);
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+}
+
+/* The crash card (M7-19, #152): what replaces the picture once the core has
+   panicked, when the frame loop has stopped and the frozen last frame is the only
+   thing left to look at. It is a card over the screen area rather than a toast - a
+   toast is something that happened and went by, and this has not gone by - and it
+   covers `z-index: 2`, where the loading spinner is, because a panic during a load
+   has left that spinner waiting for a console that is never arriving.
+
+   `inset` rather than a width: the card is the screen area with one unit of space
+   around it, so it works at desktop and at phone width without a second number to
+   keep in step. */
+.crash {
+  position: absolute;
+  inset: var(--space-4);
+  z-index: 3;
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  overflow: auto;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  text-align: center;
+}
+
+.crash__title {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-emphasis);
+}
+
+.crash__text {
+  max-width: 48ch;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+/* The panic's own words, quoted for the person who is going to file the bug -
+   monospace, and broken anywhere rather than widening the card, because a Rust
+   path is longer than any screen. */
+.crash__detail {
+  max-width: 100%;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
 /* The FPS overlay (M7-17, #150): the console's own frame rate and frame cost, in
    the top-left corner of the picture where it can be read without covering the
    part of the screen a game draws in.
@@ -589,6 +725,28 @@ canvas {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   pointer-events: none;
+}
+
+/* The empty screen as one block: the recent games above the drop zone (M7-19,
+   #152). They were two children of the screen area before, each sized by its own
+   implicit grid row, which is how a dozen cards pushed the drop zone past the
+   bottom of a container that clips its overflow - and the drop zone is the one
+   thing the empty state cannot be without.
+
+   One grid, one gap, one scroller. The screen area's own `place-items: center`
+   centres this block, so nothing here needs to centre itself: when the content is
+   shorter than the screen it sits in the middle at desktop width and at phone
+   width, and when it is not - landscape on a phone - it scrolls from the top and
+   the dashed card stays inside it. */
+.start-screen {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  gap: var(--space-5);
+  width: min(680px, 100%);
+  max-height: 100%;
+  padding: var(--space-1);
+  overflow-y: auto;
 }
 
 /* The empty state: what the screen area shows in place of the canvas until a
@@ -643,9 +801,7 @@ canvas {
   display: grid;
   justify-items: center;
   gap: var(--space-2);
-  width: min(680px, 100%);
-  max-height: 100%;
-  overflow-y: auto;
+  width: 100%;
 }
 
 .recents__heading {
@@ -848,7 +1004,7 @@ canvas {
 }
 
 .hint__key {
-  padding: 2px var(--space-2);
+  padding: var(--space-1) var(--space-2);
   border: 1px solid var(--border);
   border-radius: calc(var(--radius-control) - 2px);
   background: var(--surface-2);
@@ -879,6 +1035,16 @@ canvas {
   margin-bottom: var(--space-5);
 }
 
+/* The console actions in the drawer (M7-19, #152): the top bar's controls, for the
+   width that has no room for a top bar. Words rather than glyphs, because the
+   drawer is read rather than scanned and a word says whether it is Pause or Play
+   without a hover to ask it. */
+.console-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
 .settings-section__title {
   margin-bottom: var(--space-3);
   font-size: var(--text-xs);
@@ -891,6 +1057,14 @@ canvas {
 .settings-section__note {
   font-size: var(--text-sm);
   color: var(--text-muted);
+}
+
+/* The About section's link (M7-19, #152): the shell's only anchor, so it is the
+   one thing that has to be recognisable as one without relying on the UA's blue -
+   which is not a token and would not change with the theme. */
+.settings-section__link {
+  color: var(--accent);
+  font-size: var(--text-sm);
 }
 
 /* The save state panel (M7-15, #148): four cards, two across, in the drawer the
@@ -998,7 +1172,7 @@ canvas {
 
 .bindings th,
 .bindings td {
-  padding: 2px;
+  padding: var(--space-1);
   text-align: left;
 }
 
@@ -1327,12 +1501,45 @@ canvas {
       transform var(--duration) var(--ease);
   }
 
+  /* The loading ring of M7-19 (#152) is the only thing in the shell that moves
+     for no reason other than to say "wait": it turns at a speed slow enough not to
+     draw the eye, and with motion reduced it simply sits there while the word
+     beside it carries the message. */
+  .loading__spinner {
+    animation: spin 900ms linear infinite;
+  }
+
+  /* The screen fade-in of M7-19 (#152), on the class `app.rs` puts on the canvas
+     the moment the console is ready: `both` so the canvas cannot show its own bare
+     background between the class arriving and the first keyframe. The empty screen
+     area is not faded - it has had time enough, and a fade on a drop zone reads as
+     a page still loading. */
+  .screen--enter {
+    animation: screen-in var(--duration-enter) var(--ease) both;
+  }
+
   /* The "Saved" chip of M7-14 (#147) is taken off the page 1.5 s after a write
      lands; this spends the last third of that time going away, so the chip fades
      out rather than being cut off. With motion reduced it is simply there for
      1.5 s and then not, which is the same fact said less prettily. */
   .chip--saved {
     animation: chip-saved 1.5s var(--ease) both;
+  }
+}
+
+@keyframes screen-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 

@@ -60,8 +60,10 @@ pub enum Hotkey {
 /// The fixed hotkeys, as `(KeyboardEvent.code, hotkey)`.
 ///
 /// Looked up before the pad bindings, so a hotkey wins a key that a binding
-/// table also claims - see [`map_key`].
-const HOTKEYS: [(&str, Hotkey); 9] = [
+/// table also claims - see [`map_key`]. Public because the message that refuses
+/// one of them lists them, and a list written out a second time is a list that
+/// disagrees with this one (#152).
+pub const HOTKEYS: [(&str, Hotkey); 9] = [
     ("Escape", Hotkey::ToggleMenu),
     ("F1", Hotkey::SaveState),
     ("F2", Hotkey::PreviousSlot),

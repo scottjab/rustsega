@@ -734,4 +734,43 @@ mod tests {
         assert_eq!(keyboard[1].glyph, "Enter");
         assert_eq!(keyboard[2].glyph, "Esc");
     }
+
+    /// The hint bar is the shell's one key legend, so both of its halves have to be
+    /// spelled like the rest of the shell is spelled (M7-19, #152): the keyboard
+    /// half with the names [`keycap_label`] prints on a binding cell, and the pad
+    /// half with the names [`PadButton::label`] prints on the touch overlay.
+    #[test]
+    fn the_hint_glyphs_are_spelled_the_way_the_shell_spells_them() {
+        use crate::input::PadButton;
+        use crate::settings::keycap_label;
+
+        let keyboard = hints(LastDevice::Keyboard);
+        assert_eq!(
+            keyboard[0].glyph,
+            format!(
+                "{}{}{}{}",
+                keycap_label("ArrowUp"),
+                keycap_label("ArrowDown"),
+                keycap_label("ArrowLeft"),
+                keycap_label("ArrowRight"),
+            ),
+            "the d-pad hint is not the four arrow keycaps"
+        );
+        assert_eq!(keyboard[1].glyph, keycap_label("Enter"));
+        assert_eq!(keyboard[2].glyph, keycap_label("Escape"));
+
+        // The cross of a d-pad is the one glyph that is not a button name: a pad
+        // has one directional control where a keyboard has four keycaps.
+        let gamepad = hints(LastDevice::Gamepad);
+        assert_eq!(gamepad[0].glyph, "\u{271A}");
+        for hint in &gamepad[1..] {
+            assert!(
+                PadButton::ALL
+                    .iter()
+                    .any(|button| button.label() == hint.glyph),
+                "the pad hint {:?} is not a name the shell uses for a pad button",
+                hint.glyph
+            );
+        }
+    }
 }

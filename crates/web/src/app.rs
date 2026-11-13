@@ -11,6 +11,8 @@ use leptos::prelude::*;
 
 use crate::controls::CaptureTarget;
 use crate::controls::Controls;
+use crate::crash::CrashCard;
+use crate::crash::use_crash_report;
 use crate::emulator::Slots;
 use crate::emulator::use_cartridge;
 use crate::gamepad_events::use_gamepad;
@@ -37,6 +39,7 @@ use crate::ui::button::Button;
 use crate::ui::button::IconButton;
 use crate::ui::drawer::Drawer;
 use crate::ui::hint::HintBar;
+use crate::ui::hint::KeyCap;
 use crate::ui::icons;
 use crate::ui::recents_grid::RecentsGrid;
 use crate::ui::select::Listboxes;
@@ -99,6 +102,10 @@ pub fn App() -> impl IntoView {
     let canvas = NodeRef::<html::Canvas>::new();
     let canvas_gl = NodeRef::<html::Canvas>::new();
     let console = use_cartridge(canvas, canvas_gl);
+    // ... and handed down as a context, because the ROM picker has to say "I am
+    // still reading this file" and a file read has no other way to reach the
+    // screen area's spinner (M7-19, #152).
+    provide_context(console);
 
     // Every cartridge that opens becomes a recent. This signal is the one place
     // the file picker, the drop target and a recent card all arrive at, so
@@ -172,6 +179,20 @@ pub fn App() -> impl IntoView {
 
     use_keyboard(menu, loaded, toasts, settings, capture, screen, slots);
 
+    // Whether the core has panicked: the card that replaces the screen area when
+    // it has (M7-19, #152). A plain `Show` would do, but the flag lives behind a
+    // hook installed before this component exists, so it arrives here as a signal.
+    let crashed = use_crash_report();
+
+    // Whether the picture has arrived, which is what the `screen--enter` class
+    // below fades in on: `loading` comes down the moment a console has been made,
+    // and `frame` is how an empty screen area knows it has no picture yet.
+    //
+    // Both signals, because the canvas element outlives a ROM swap: a class that
+    // only ever went from off to on would animate the first game and then sit
+    // there, so the second game would start with no fade at all.
+    let entered = Signal::derive(move || !console.loading.get() && console.frame.get() != (0, 0));
+
     // Whether a controller is plugged in, which the touch overlay hides itself
     // behind and nothing else asks about (M7-09, #142).
     let controller_connected = RwSignal::new(false);
@@ -225,6 +246,16 @@ pub fn App() -> impl IntoView {
             />
         }
     };
+
+    // Opening the drawer, whichever control asked. The drawer is the menu: the
+    // settings on desktop, the console actions below, and from M7-19 (#152) the one
+    // button a phone's top bar has room for. The save state panel is a sibling one
+    // depth down and mutually exclusive with it - see
+    // [`crate::menu::Menu::open_states`].
+    let open_menu = Callback::new(move |_| {
+        slots_open.set(false);
+        drawer_open.update(|open| *open = !*open);
+    });
 
     let theme_options = Theme::ALL
         .iter()
@@ -304,50 +335,59 @@ pub fn App() -> impl IntoView {
                         }
                     })
                 }}
+                // Two halves of one nav, of which the stylesheet shows exactly one
+                // (M7-19, #152): all six actions where there is room for them, and
+                // on a phone the single menu button that opens the drawer they have
+                // moved into. Which half is on screen is CSS and not a width read at
+                // mount, because a rotation is not a mount.
                 <nav class="topbar__actions" aria-label="Console">
-                    {console_buttons}
-                    {move || {
-                        let muted = settings.with(|settings| settings.muted);
-                        let (label, path) = if muted {
-                            ("Unmute", icons::VOLUME_OFF)
-                        } else {
-                            ("Mute", icons::VOLUME)
-                        };
-                        view! {
-                            <IconButton
-                                label=label.to_string()
-                                path=path
-                                on_click=Callback::new(move |_| {
-                                    settings.update(|settings| settings.muted = !settings.muted);
-                                })
-                            />
-                        }
-                    }}
-                    <IconButton
-                        label="Open ROM".to_string()
-                        path=icons::OPEN
-                        on_click=Callback::new(move |_| open_picker())
-                    />
-                    <IconButton
-                        label="Save states".to_string()
-                        path=icons::SAVE
-                        on_click=Callback::new(move |_| menu.open_states())
-                    />
-                    <IconButton
-                        label="Fullscreen".to_string()
-                        path=icons::FULLSCREEN
-                        on_click=Callback::new(move |_| screen.toggle_fullscreen())
-                    />
-                    <IconButton
-                        label="Settings".to_string()
-                        path=icons::SETTINGS
-                        on_click=Callback::new(move |_| {
-                            // The two panels are one depth apart and mutually
-                            // exclusive: see [`crate::menu::Menu::open_states`].
-                            slots_open.set(false);
-                            drawer_open.update(|open| *open = !*open);
-                        })
-                    />
+                    <div class="topbar__wide">
+                        {console_buttons}
+                        {move || {
+                            let muted = settings.with(|settings| settings.muted);
+                            let (label, path) = if muted {
+                                ("Unmute", icons::VOLUME_OFF)
+                            } else {
+                                ("Mute", icons::VOLUME)
+                            };
+                            view! {
+                                <IconButton
+                                    label=label.to_string()
+                                    path=path
+                                    on_click=Callback::new(move |_| {
+                                        settings.update(|settings| settings.muted = !settings.muted);
+                                    })
+                                />
+                            }
+                        }}
+                        <IconButton
+                            label="Open ROM".to_string()
+                            path=icons::OPEN
+                            on_click=Callback::new(move |_| open_picker())
+                        />
+                        <IconButton
+                            label="Save states".to_string()
+                            path=icons::SAVE
+                            on_click=Callback::new(move |_| menu.open_states())
+                        />
+                        <IconButton
+                            label="Fullscreen".to_string()
+                            path=icons::FULLSCREEN
+                            on_click=Callback::new(move |_| screen.toggle_fullscreen())
+                        />
+                        <IconButton
+                            label="Settings".to_string()
+                            path=icons::SETTINGS
+                            on_click=open_menu
+                        />
+                    </div>
+                    <div class="topbar__narrow">
+                        <IconButton
+                            label="Menu".to_string()
+                            path=icons::MENU
+                            on_click=open_menu
+                        />
+                    </div>
                 </nav>
             </header>
 
@@ -356,9 +396,18 @@ pub fn App() -> impl IntoView {
                 node_ref=screen_area
                 class:screen-area--drag=move || dragging.get()
             >
+                // The canvas, or the empty state. The fade-in of the picture itself
+                // is `screen--enter` on the canvases below (M7-19, #152).
                 <Show
                     when=move || loaded.get()
-                    fallback=|| view! { <RecentsGrid/> <EmptyScreen/> }
+                    fallback=|| {
+                        view! {
+                            <div class="start-screen">
+                                <RecentsGrid/>
+                                <EmptyScreen/>
+                            </div>
+                        }
+                    }
                 >
                     // The 2D canvas, which is what was here before WebGL: the
                     // drawing buffer is the VDP's own pixels and the browser
@@ -371,6 +420,7 @@ pub fn App() -> impl IntoView {
                         id="screen"
                         class="screen"
                         class:screen--smooth=move || settings.with(|settings| settings.smoothing)
+                        class:screen--enter=move || entered.get()
                         hidden=move || console.renderer.get() == RendererKind::Webgl
                         width=320
                         height=224
@@ -384,11 +434,25 @@ pub fn App() -> impl IntoView {
                         id="screen-webgl"
                         class="screen"
                         class:screen--smooth=move || settings.with(|settings| settings.smoothing)
+                        class:screen--enter=move || entered.get()
                         hidden=move || console.renderer.get() != RendererKind::Webgl
                         node_ref=canvas_gl
                     >
                     </canvas>
                 </Show>
+                // The loading state: a ROM has been chosen and nothing is drawn
+                // yet. An overlay, so that the screen area's own box does not move
+                // when it arrives and goes (M7-19, #152).
+                {move || {
+                    console.loading.get().then(|| {
+                        view! {
+                            <p class="loading" role="status">
+                                <span class="loading__spinner" aria-hidden="true"></span>
+                                "Loading"
+                            </p>
+                        }
+                    })
+                }}
                 // The FPS overlay: what the console is really running at and what a
                 // frame of it costs, in the corner of the picture, for the player who
                 // asked for it in here or with `` ` `` (M7-17, #150). A reading rather
@@ -404,6 +468,12 @@ pub fn App() -> impl IntoView {
                             }
                         })
                 }}
+                // The crash card: the console has stopped, and the only thing the
+                // shell can still do is say so and offer to start again. Over the
+                // screen area rather than beside it, because it replaces the
+                // picture - and over the loading spinner, which a panic has left
+                // waiting for a console that is never going to arrive (M7-19, #152).
+                {move || crashed.get().then(|| view! { <CrashCard/> })}
                 <RomFileInput/>
             </main>
 
@@ -412,6 +482,51 @@ pub fn App() -> impl IntoView {
                 open=drawer_open
                 close_label="Close settings".to_string()
             >
+                // The console's own controls, where a phone's top bar has no room
+                // for them (M7-19, #152). Text buttons rather than the bar's icons
+                // because the drawer is read, not scanned: a player who has opened a
+                // settings sheet expects words, and a word says whether it is Pause
+                // or Play without a hover.
+                <section class="settings-section">
+                    <h3 class="settings-section__title">Console</h3>
+                    <div class="console-actions">
+                        <Button
+                            disabled=Signal::derive(move || !loaded.get())
+                            on_click=Callback::new(move |_| console.toggle())
+                        >
+                            {move || if console.paused.get() { "Play" } else { "Pause" }}
+                        </Button>
+                        <Button
+                            disabled=Signal::derive(move || !loaded.get())
+                            on_click=Callback::new(move |_| console.reset())
+                        >
+                            "Reset"
+                        </Button>
+                        <Button on_click=Callback::new(move |_| open_picker())>
+                            "Open ROM"
+                        </Button>
+                        <Button on_click=Callback::new(move |_| menu.open_states())>
+                            "Save states"
+                        </Button>
+                        <Button on_click=Callback::new(move |_| screen.toggle_fullscreen())>
+                            "Fullscreen"
+                        </Button>
+                        <Button
+                            on_click=Callback::new(move |_| {
+                                settings.update(|settings| settings.muted = !settings.muted);
+                            })
+                        >
+                            {move || {
+                                if settings.with(|settings| settings.muted) {
+                                    "Unmute"
+                                } else {
+                                    "Mute"
+                                }
+                            }}
+                        </Button>
+                    </div>
+                </section>
+
                 <section class="settings-section">
                     <h3 class="settings-section__title">Appearance</h3>
                     <Select
@@ -571,18 +686,52 @@ pub fn App() -> impl IntoView {
                         })
                     />
                     <p class="settings-section__note">
-                        "The backquote key (`) toggles the overlay. Tab, or a pad's right trigger, runs the console at this speed while it is held; letting go returns to normal sound."
+                        // The key names are the shell's own keycaps, so the page
+                        // that says "the backquote key" and the cell that shows
+                        // "`" are the same word (M7-19, #152).
+                        <KeyCap code="Backquote"/>
+                        " toggles the overlay. "
+                        <KeyCap code="Tab"/>
+                        ", or a pad's right trigger, runs the console at this speed while it is held; letting go returns to normal sound."
                     </p>
                 </section>
 
                 <section class="settings-section">
                     <h3 class="settings-section__title">Save states</h3>
                     <p class="settings-section__note">
-                        "Four slots per game, each holding the whole machine: press a slot's button, or use F1 to save and F4 to load the one that is highlighted."
+                        "Four slots per game, each holding the whole machine: press a slot's button, or use "
+                        <KeyCap code="F1"/>
+                        " to save and "
+                        <KeyCap code="F4"/>
+                        " to load the one that is highlighted."
                     </p>
                     <Button on_click=Callback::new(move |_| menu.open_states())>
                         "Open save states"
                     </Button>
+                </section>
+
+                // The build this page is, and where its source is (M7-19, #152).
+                // Last because it is the one thing on the page that is not a choice
+                // the player can make.
+                <section class="settings-section">
+                    <h3 class="settings-section__title">About</h3>
+                    <p class="settings-section__note">
+                        {format!(
+                            "{} {} - a Genesis emulator that runs in the browser.",
+                            crate::app_title(),
+                            crate::app_version(),
+                        )}
+                    </p>
+                    <p class="settings-section__note">
+                        <a
+                            class="settings-section__link"
+                            href=crate::REPOSITORY_URL
+                            target="_blank"
+                            rel="noopener"
+                        >
+                            "Source and issues"
+                        </a>
+                    </p>
                 </section>
 
                 <Controls drawer_open=drawer_open />

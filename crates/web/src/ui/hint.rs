@@ -9,6 +9,19 @@ use leptos::prelude::*;
 
 use crate::nav::LastDevice;
 use crate::nav::hints;
+use crate::settings::keycap_label;
+
+/// One key, drawn the way every other key in the shell is drawn (M7-19, #152).
+///
+/// `code` is a `KeyboardEvent.code` - `Escape`, `Backquote`, `KeyP` - and what
+/// appears is [`keycap_label`] of it: the same `Esc`, the same `` ` ``, the same
+/// `P` that the controls page puts in the cell beside the button it binds. A
+/// shell that says "Escape" in one sentence and "Esc" on one keycap teaches the
+/// player that the two are different keys.
+#[component]
+pub fn KeyCap(code: &'static str) -> impl IntoView {
+    view! { <kbd class="hint__key">{keycap_label(code)}</kbd> }
+}
 
 /// The hints for the menu they are at the bottom of.
 ///

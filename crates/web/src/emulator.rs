@@ -332,6 +332,10 @@ fn start(
     // browser calls back into a closure that has gone - and its RAM has to be
     // offered to storage while it still exists to read it.
     stop();
+    // The screen area shows a spinner from here to the first frame of the new
+    // cartridge, which is the same span as this task: the read of the cart's
+    // saved RAM, then the console being made (M7-19, #152).
+    console.loading.set(true);
     let token = begin_load();
     // Owned handles for the task: a borrow of a signal, or of a `NodeRef`, is not
     // something to be holding across an `.await` (#387), and a canvas element is a
@@ -345,7 +349,12 @@ fn start(
         if !load_is_current(token) {
             return;
         }
-        match Emulator::start(&rom, &canvas, &canvas_gl, console, settings, saved, toasts) {
+        let started = Emulator::start(&rom, &canvas, &canvas_gl, console, settings, saved, toasts);
+        // Either way the wait is over: the console is running, or it never will
+        // be and the toast below says so. Leaving the spinner up would be a lie
+        // of the kind this shell keeps making a point of not telling (M7-19, #152).
+        console.loading.set(false);
+        match started {
             Ok(emulator) => RUNNING.with(|running| *running.borrow_mut() = Some(emulator)),
             // The same one sentence the caller of a synchronous `start` used to
             // show: by now the only reason left is that the browser has nothing
@@ -517,6 +526,16 @@ pub struct Controls {
     /// (M7-17, #150). This is the one answer to "is it fast forward now", read by
     /// the loop every tick and by the top bar's `⏩ 4x` badge.
     pub fast_forward: RwSignal<bool>,
+    /// Whether a cartridge is on its way: the file is still being read, or the
+    /// console is still being made after [`crate::rom::load_rom`] accepted it
+    /// (M7-19, #152).
+    ///
+    /// This is the span the screen area puts a spinner over. It is deliberately not
+    /// `roms.is_some()`: a chosen ROM is in that signal a whole IndexedDB round trip
+    /// before anything is drawing, and the gap in between is what the spinner is for.
+    /// Written by [`start`] and by [`crate::rom_picker::load_file`], which is why
+    /// [`Controls`] is provided as a context by the shell.
+    pub loading: RwSignal<bool>,
 }
 
 impl Controls {
@@ -807,6 +826,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
         saved: RwSignal::new(false),
         fps: RwSignal::new(String::new()),
         fast_forward: RwSignal::new(false),
+        loading: RwSignal::new(false),
     };
 
     Effect::new(move |started: Option<Option<String>>| {
@@ -815,6 +835,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
         // there is nowhere to draw and whatever was running goes with it.
         let (Some(canvas), Some(canvas_gl)) = (canvas.get(), canvas_gl.get()) else {
             stop();
+            console.loading.set(false);
             return None;
         };
         // The cartridge, taken out of the signal as an owned value: `start` waits
@@ -822,6 +843,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
         // not something to be holding across an `.await` (#387).
         let Some(rom) = roms.with(|rom| rom.clone()) else {
             stop();
+            console.loading.set(false);
             return None;
         };
         if started.as_deref() == Some(rom.id.as_str()) {
@@ -1930,6 +1952,7 @@ mod tests {
             saved: RwSignal::new(false),
             fps: RwSignal::new(String::new()),
             fast_forward: RwSignal::new(false),
+            loading: RwSignal::new(false),
         };
 
         // No console, so the frame size is the one `use_cartridge` started with -
