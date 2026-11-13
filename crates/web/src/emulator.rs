@@ -29,18 +29,23 @@ use genesis::Genesis;
 use leptos::html;
 use leptos::prelude::*;
 use vdp::FrameBuffer;
-use wasm_bindgen::Clamped;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
-use web_sys::CanvasRenderingContext2d;
 use web_sys::HtmlCanvasElement;
-use web_sys::ImageData;
 
 use crate::audio::AudioOut;
 use crate::audio_pacing::MAX_FRAMES_PER_TICK;
 use crate::audio_pacing::TARGET_AHEAD_SECS;
 use crate::audio_pacing::frames_to_run;
 use crate::frame_pacer::FramePacer;
+use crate::render::FilterSetting;
+use crate::render::Renderer;
+use crate::render::RendererKind;
+use crate::render::RendererSetting;
+use crate::render::canvas2d::Canvas2dRenderer;
+use crate::render::choose_renderer;
+use crate::render::webgl::WebGlRenderer;
+use crate::render::webgl::webgl2_supported;
 use crate::rom::LoadedRom;
 use crate::settings::Settings;
 use crate::ui::toast::ToastKind;
@@ -167,6 +172,7 @@ fn stop() {
 fn start(
     rom: &LoadedRom,
     canvas: &HtmlCanvasElement,
+    canvas_gl: &HtmlCanvasElement,
     console: Controls,
     settings: RwSignal<Settings>,
 ) -> Result<(), StartError> {
@@ -174,7 +180,7 @@ fn start(
     // has to be cancelled, not merely dropped along with its callback, or the
     // browser calls back into a closure that has gone.
     stop();
-    let emulator = Emulator::start(rom, canvas, console, settings)?;
+    let emulator = Emulator::start(rom, canvas, canvas_gl, console, settings)?;
     RUNNING.with(|running| *running.borrow_mut() = Some(emulator));
     Ok(())
 }
@@ -192,8 +198,9 @@ pub struct Controls {
     /// for a gesture: a context the browser is holding back is silent, and the
     /// only thing that can start it is a person (M7-05, #138).
     pub sound_on: RwSignal<bool>,
-    /// The size of the frame the console is drawing, which is the canvas's own
-    /// `width` and `height` - `(0, 0)` until a console has painted once.
+    /// The size of the frame the console is drawing - the *frame*, which on the
+    /// WebGL path is not the size of the canvas's drawing buffer (M7-13, #146) -
+    /// or `(0, 0)` until a console has painted once.
     ///
     /// The picture the shell scales is this big, so [`crate::screen`] reads it:
     /// an H32 game is 256 wide rather than 320 and an interlaced one is 448 lines
@@ -202,6 +209,13 @@ pub struct Controls {
     /// size really moved, which is the only reason a screen has to be redone at
     /// all - a container resize cannot see it.
     pub frame: RwSignal<(u32, u32)>,
+    /// Which drawing path the console is on: the live answer, rather than the
+    /// `renderer` setting, which is only what the player asked for (M7-13, #146).
+    ///
+    /// The shell needs it because the two paths draw on two different canvas
+    /// elements - a canvas belongs to one context type for its whole life, so a
+    /// WebGL canvas can never be the 2D one - and exactly one of them is on screen.
+    pub renderer: RwSignal<RendererKind>,
 }
 
 impl Controls {
@@ -241,6 +255,30 @@ impl Controls {
         }
     }
 
+    /// Tells the running console that the picture's box is now `css_w` x `css_h`
+    /// CSS pixels at `dpr` device pixels per CSS pixel (M7-13, #146).
+    ///
+    /// [`crate::screen`] calls this from the same effect that writes the canvas's
+    /// CSS box, which is the shell's one resize signal: the WebGL path cannot
+    /// learn the size from its own drawing buffer, because following the buffer
+    /// would be following the very thing being sized.
+    pub fn resize(self, css_w: f64, css_h: f64, dpr: f64) {
+        if let Some(emulator) = running() {
+            emulator.borrow_mut().resize_surface(css_w, css_h, dpr);
+        }
+    }
+
+    /// Which drawing path to use and what the picture should look like on it
+    /// (M7-13, #146): the drawer's three picture settings, in one call because
+    /// they are read out of one `Settings`.
+    pub fn set_picture(self, renderer: RendererSetting, filter: FilterSetting, smoothing: bool) {
+        if let Some(emulator) = running() {
+            emulator
+                .borrow_mut()
+                .set_picture(renderer, filter, smoothing);
+        }
+    }
+
     /// Says what the console's frame is, which is what the picture is scaled from
     /// (M7-12, #145).
     ///
@@ -275,11 +313,17 @@ impl Controls {
 /// Runs the cartridge in [`LoadedRom`] context on `canvas`, for as long as the
 /// component that calls this is mounted.
 ///
-/// Mount it once, next to the canvas. Starting a console is a side effect on the
-/// browser, so it happens in an effect, and the effect reads both the canvas and
-/// the cartridge because the two are unmounted and mounted together by a `Show`
+/// Mount it once, next to the two canvases. Starting a console is a side effect on
+/// the browser, so it happens in an effect, and the effect reads the canvases and
+/// the cartridge because all three are unmounted and mounted together by a `Show`
 /// that does not promise which one arrives first.
-pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
+///
+/// `canvas` is the 2D element (`#screen`) and `canvas_gl` the WebGL one. The
+/// console needs both because a canvas belongs to one context type for its whole
+/// life: the path the console is not drawing with has to stay available for the
+/// moment it wants it, which is the whole of the WebGL fallback story (M7-13,
+/// #146).
+pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Canvas>) -> Controls {
     let roms = expect_context::<RwSignal<Option<LoadedRom>>>();
     let toasts = expect_context::<Toasts>();
     let settings = expect_context::<RwSignal<Settings>>();
@@ -288,13 +332,16 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
         paused,
         sound_on: RwSignal::new(false),
         frame: RwSignal::new((0, 0)),
+        // The 2D path until a console says otherwise - which is also the path
+        // that is on screen before a console exists at all.
+        renderer: RwSignal::new(RendererKind::Canvas),
     };
 
     Effect::new(move |started: Option<Option<String>>| {
         let started = started.flatten();
         // The canvas first, and untracked reads of nothing: if it is not there,
         // there is nowhere to draw and whatever was running goes with it.
-        let Some(canvas) = canvas.get() else {
+        let (Some(canvas), Some(canvas_gl)) = (canvas.get(), canvas_gl.get()) else {
             stop();
             return None;
         };
@@ -311,7 +358,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
         // it does not look at the signal.
         roms.with(|rom| {
             if let Some(rom) = rom.as_ref()
-                && let Err(error) = start(rom, &canvas, console, settings)
+                && let Err(error) = start(rom, &canvas, &canvas_gl, console, settings)
             {
                 toasts.push(ToastKind::Danger, error.to_string());
             }
@@ -325,13 +372,22 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
     // run first - it reads the same settings as it comes up.
     Effect::new(move |_| console.set_volume(settings.get().volume));
     Effect::new(move |_| console.set_muted(settings.get().muted));
+    // ... and so are the three picture settings: which path to draw with, whether
+    // it filters, and whether the sampler smooths (M7-13, #146).
+    Effect::new(move |_| {
+        console.set_picture(
+            settings.get().renderer,
+            settings.get().filter,
+            settings.get().smoothing,
+        );
+    });
 
     on_cleanup(stop);
 
     console
 }
 
-/// One running console: the machine, the canvas it is drawn to, and the
+/// One running console: the machine, the path it is drawn with, and the
 /// animation frame that drives it.
 struct Emulator {
     /// The machine. Never in a signal, and cloned by nothing: see the
@@ -353,11 +409,24 @@ struct Emulator {
     /// One console frame in seconds: `1 / target_hz`, which is what
     /// [`frames_to_run`] turns an audio lead into a number of frames with.
     frame_secs: f64,
-    /// The canvas whose context `ctx` draws into. Kept because its `width` and
-    /// `height` attributes are the canvas's own resolution, which is what has to
-    /// follow the VDP's display mode.
-    canvas: HtmlCanvasElement,
-    ctx: CanvasRenderingContext2d,
+    /// The 2D canvas (`#screen`): what the 2D path draws on, and what this
+    /// console falls back to when WebGL is refused or lost. Held because a canvas
+    /// belongs to one context type for its whole life, so this element is the one
+    /// that must never have been asked for a WebGL context (M7-13, #146).
+    canvas_2d: HtmlCanvasElement,
+    /// The WebGL canvas (`#screen-webgl`), kept for the same reason in the other
+    /// direction: once it has a context it can never be drawn on with 2D.
+    canvas_gl: HtmlCanvasElement,
+    /// Which of the two canvases above is the live one, mirrored to
+    /// [`Controls::renderer`] so the shell can show it.
+    kind: RendererKind,
+    /// The drawing path: `Canvas2dRenderer` or `WebGlRenderer`, whichever
+    /// [`choose_renderer`] and the browser agreed on (M7-13, #146).
+    renderer: Box<dyn Renderer>,
+    /// The filter and the smoothing the drawer asks for, kept so a renderer built
+    /// later - on a setting change, or after a lost context - is built the way the
+    /// player has it rather than the way the default is.
+    picture: (FilterSetting, bool),
     /// The RGBA bytes of the frame being drawn, reused every frame so the draw
     /// path allocates nothing (see [`frame_to_rgba_bytes`]).
     rgba: Vec<u8>,
@@ -365,8 +434,10 @@ struct Emulator {
     /// kept warm - but not listened to - while there is.
     pacer: FramePacer,
     paused: bool,
-    /// The canvas size the last frame was drawn at, so the attributes are written
-    /// only when the picture really changes size.
+    /// The frame size the last paint drew, which is what `Controls::frame` is
+    /// told about and what [`Emulator::redraw`] draws: the renderer keeps its own
+    /// idea of the drawing buffer, and the two are only the same number on the 2D
+    /// path by coincidence (#145, #146).
     drawn: (u32, u32),
     /// The animation frame that is currently requested, `None` once the browser
     /// stops asking or [`Emulator::stop`] has run.
@@ -382,8 +453,8 @@ struct Emulator {
 }
 
 impl Emulator {
-    /// The console `rom` runs on, painting to `canvas`, with the loop already
-    /// running.
+    /// The console `rom` runs on, painting to `canvas` (2D) or `canvas_gl`
+    /// (WebGL), with the loop already running.
     ///
     /// The animation frame is requested before the callback is filed away, so
     /// that there is no moment in which a tick could arrive for a console that
@@ -393,17 +464,24 @@ impl Emulator {
     fn start(
         rom: &LoadedRom,
         canvas: &HtmlCanvasElement,
+        canvas_gl: &HtmlCanvasElement,
         console: Controls,
         settings: RwSignal<Settings>,
     ) -> Result<Rc<RefCell<Self>>, StartError> {
-        // The canvas first, because everything after this point has a browser
-        // resource attached to it that a failed start would have to give back.
-        let ctx = canvas
-            .get_context("2d")
-            .ok()
-            .flatten()
-            .and_then(|context| context.dyn_into::<CanvasRenderingContext2d>().ok())
-            .ok_or(StartError::NoCanvas)?;
+        // The drawing path first, because everything after this point has a
+        // browser resource attached to it that a failed start would have to give
+        // back - and because a console with nothing to draw with is not a console.
+        let (renderer, filter, smoothing) = settings
+            .with_untracked(|settings| (settings.renderer, settings.filter, settings.smoothing));
+        let (kind, renderer) = make_renderer(
+            choose_renderer(webgl2_on_offer(renderer), renderer),
+            canvas,
+            canvas_gl,
+            filter,
+            smoothing,
+        )
+        .ok_or(StartError::NoCanvas)?;
+        console.renderer.set(kind);
 
         // The audio output next, and for one reason beyond the obvious: it is the
         // only place the sample rate the browser will really use is known, and
@@ -446,8 +524,11 @@ impl Emulator {
             console,
             samples: Vec::new(),
             frame_secs: 1.0 / target_hz,
-            canvas: canvas.clone(),
-            ctx,
+            canvas_2d: canvas.clone(),
+            canvas_gl: canvas_gl.clone(),
+            kind,
+            renderer,
+            picture: (filter, smoothing),
             rgba: Vec::new(),
             pacer: FramePacer::new(target_hz),
             paused: false,
@@ -663,21 +744,77 @@ impl Emulator {
 
         // H32 is 256 wide rather than 320, a 240-line mode is 240 rather than 224,
         // and interlace mode 2 is 448 or 480, so this does change while a game
-        // runs. Writing either attribute clears a canvas, so it is written when it
-        // has to be and not once per frame.
+        // runs. What the renderer does about it is its own business - the 2D path
+        // resizes its buffer, WebGL picks a different sub-rect of the texture -
+        // but the *frame* is the quantity the shell scales from, so it is the
+        // frame changing size that has to be announced (#145).
         if self.drawn != (width, height) {
-            self.canvas.set_width(width);
-            self.canvas.set_height(height);
             self.drawn = (width, height);
-            // The screen's box is scaled from the frame, so it is the frame
-            // changing size that has to be announced rather than the canvas
-            // attribute being written (#145).
             self.console.set_frame((width, height));
         }
 
-        let image = ImageData::new_with_u8_clamped_array_and_sh(Clamped(&self.rgba), width, height);
-        if let Ok(image) = image {
-            let _ = self.ctx.put_image_data(&image, 0.0, 0.0);
+        // A context the driver took away is the player's `Canvas` switch arriving
+        // from the other side, so it takes the same route: the 2D path, before the
+        // frame that would otherwise have been drawn on the lost one (#146).
+        if self.renderer.context_lost() {
+            self.use_renderer(RendererKind::Canvas);
+        }
+        self.renderer.draw(&self.rgba, width, height);
+    }
+
+    /// Switches the console to `kind`, and leaves the console on the path it was
+    /// on if the browser will not have the new one.
+    ///
+    /// Not a failure worth a toast either way: `Canvas` is an off switch, and a
+    /// WebGL that cannot be had is a line in the browser console from
+    /// [`make_renderer`], which is where the reason is known.
+    fn use_renderer(&mut self, kind: RendererKind) {
+        let (filter, smoothing) = self.picture;
+        let built = make_renderer(kind, &self.canvas_2d, &self.canvas_gl, filter, smoothing);
+        // Assigned only once the new path exists, so a failed switch cannot leave
+        // the console with a renderer it has dropped.
+        if let Some((kind, renderer)) = built {
+            self.kind = kind;
+            self.renderer = renderer;
+            self.console.renderer.set(kind);
+        }
+    }
+
+    /// The drawer's picture settings (M7-13, #146).
+    ///
+    /// A path change and a filter change are the same operation here, and both
+    /// end with a redraw: a canvas is transparent until something draws on it, so
+    /// a player who switches paths - or who is held and will not draw another
+    /// frame of their own - would otherwise be looking at nothing.
+    fn set_picture(&mut self, renderer: RendererSetting, filter: FilterSetting, smoothing: bool) {
+        self.picture = (filter, smoothing);
+        let wanted = choose_renderer(webgl2_on_offer(renderer), renderer);
+        if wanted != self.kind {
+            self.use_renderer(wanted);
+        }
+        self.renderer.set_filter(filter);
+        self.renderer.set_smoothing(smoothing);
+        self.redraw();
+    }
+
+    /// The picture's box moved, so the drawing buffer follows it (#146).
+    ///
+    /// Resizing a canvas clears it, and a held console draws no frames of its own
+    /// to fill it in again, so a held one gets its last frame back here.
+    fn resize_surface(&mut self, css_w: f64, css_h: f64, dpr: f64) {
+        self.renderer.resize(css_w, css_h, dpr);
+        if self.paused {
+            self.redraw();
+        }
+    }
+
+    /// Puts the frame that is already converted back on whatever the renderer is
+    /// now. Does nothing before the first frame, when there is no frame to put
+    /// back - which is why [`Emulator::start`] does not need to paint.
+    fn redraw(&mut self) {
+        if !self.rgba.is_empty() {
+            let (width, height) = self.drawn;
+            self.renderer.draw(&self.rgba, width, height);
         }
     }
 
@@ -727,6 +864,45 @@ impl Emulator {
         // Letting the output go is what closes its context: see `Drop for AudioOut`.
         self.audio = None;
     }
+}
+
+/// Whether this browser offers WebGL2, or `false` when the player has already
+/// said they do not want it.
+///
+/// The setting is consulted first because the answer costs a context: probing is
+/// asking a canvas of one's own for a WebGL2 context (see
+/// [`crate::render::webgl::webgl2_supported`]), and a player on `Canvas` should
+/// not pay for one they have refused (M7-13, #146).
+fn webgl2_on_offer(setting: RendererSetting) -> bool {
+    setting != RendererSetting::Canvas && webgl2_supported()
+}
+
+/// Builds the drawing path `kind` asks for, or `None` if neither canvas can be
+/// drawn on at all.
+///
+/// WebGL is tried first when that is the path wanted, and every WebGL failure -
+/// no context, a shader that will not compile, a driver that refuses the texture -
+/// becomes the 2D path: a cartridge worth loading is worth playing without a
+/// shader, and the reason is already in the browser console by the time this
+/// returns.
+///
+/// The two canvases are separate because a canvas belongs to one context type for
+/// its whole life. A WebGL failure must not have cost the 2D element its 2D
+/// context, and vice versa (M7-13, #146).
+fn make_renderer(
+    kind: RendererKind,
+    canvas_2d: &HtmlCanvasElement,
+    canvas_gl: &HtmlCanvasElement,
+    filter: FilterSetting,
+    smoothing: bool,
+) -> Option<(RendererKind, Box<dyn Renderer>)> {
+    if kind == RendererKind::Webgl
+        && let Some(renderer) = WebGlRenderer::new(canvas_gl, filter, smoothing)
+    {
+        return Some((RendererKind::Webgl, Box::new(renderer)));
+    }
+    let renderer = Canvas2dRenderer::new(canvas_2d)?;
+    Some((RendererKind::Canvas, Box::new(renderer)))
 }
 
 /// Attaches the [`WAKE_EVENTS`] listeners that take a context off autoplay, and
@@ -907,6 +1083,7 @@ mod tests {
             paused,
             sound_on: RwSignal::new(false),
             frame: RwSignal::new((0, 0)),
+            renderer: RwSignal::new(RendererKind::Canvas),
         };
 
         // No console, so the frame size is the one `use_cartridge` started with -
@@ -923,5 +1100,11 @@ mod tests {
         controls.toggle();
         assert!(!paused.get());
         assert!(!controls.sound_on.get());
+
+        // The picture controls of #146 are the same kind of no-op: a resize has
+        // no buffer to move, and a new path has no console to move.
+        controls.resize(640.0, 480.0, 2.0);
+        controls.set_picture(RendererSetting::Webgl, FilterSetting::Crt, true);
+        assert_eq!(controls.renderer.get_untracked(), RendererKind::Canvas);
     }
 }

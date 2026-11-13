@@ -46,6 +46,10 @@ web-sys = { version = "0.3", features = [
   "GainNode",
   "Blob",
   "CanvasRenderingContext2d",
+  # The WebGL path of M7-13 (#146) reports a shader it could not compile and a GL
+  # error it did not expect, because either one is a black screen rather than an
+  # exception a toast could show.
+  "console",
   # The spatial walk of M7-11 (#144) has to know which controls a player can see,
   # and `visibility` - which is how the shut drawer hides itself - is only
   # readable off the computed style.
@@ -101,6 +105,15 @@ web-sys = { version = "0.3", features = [
   # already a direct dependency and `Storage` is the whole of the extra surface.
   "Storage",
   "Window",
+  # The WebGL2 renderer of M7-13 (#146): the context, the two programs and their
+  # uniforms, the one frame texture, and the quad they are drawn with.
+  "WebGl2RenderingContext",
+  "WebGlBuffer",
+  "WebGlProgram",
+  "WebGlShader",
+  "WebGlTexture",
+  "WebGlUniformLocation",
+  "WebGlVertexArrayObject",
 ] }
 # `Bindings` is rebindable and stored in `localStorage` (docs/ARCHITECTURE.md,
 # "Input"), so its `Serialize`/`Deserialize` derive needs `serde` at runtime,

@@ -31,6 +31,8 @@ use serde::Serialize;
 use crate::input::Bindings;
 use crate::input::PORTS;
 use crate::input::SocdMode;
+use crate::render::FilterSetting;
+use crate::render::RendererSetting;
 use crate::scale::Aspect;
 use crate::scale::ScaleMode;
 use crate::theme::Theme;
@@ -148,6 +150,15 @@ pub struct Settings {
     /// What shape the frame's pixels are stretched to (M7-12, #145).
     #[serde(default)]
     pub aspect: Aspect,
+    /// Which drawing path the console should use: WebGL2 where the browser has
+    /// it, or the 2D canvas (M7-13, #146).
+    #[serde(default)]
+    pub renderer: RendererSetting,
+    /// How the WebGL path filters the frame - sharp, or a gentle CRT (M7-13,
+    /// #146). The 2D path has no filter to choose, so this one only has an
+    /// effect while the renderer is WebGL.
+    #[serde(default)]
+    pub filter: FilterSetting,
     /// Whether the picture is smoothed, which is `image-rendering: auto`, or
     /// left as blocky pixels, which is `pixelated` - what the shell drew before
     /// this switch existed, so `false` is the default (M7-12, #145).
@@ -180,6 +191,8 @@ impl Default for Settings {
             touch_overlay: TouchOverlayMode::default(),
             scale: ScaleMode::default(),
             aspect: Aspect::default(),
+            renderer: RendererSetting::default(),
+            filter: FilterSetting::default(),
             smoothing: false,
             haptics: true,
             hide_touch_with_controller: true,
@@ -279,6 +292,8 @@ impl Settings {
             touch_overlay: Self::field(value, "touch_overlay", TouchOverlayMode::default),
             scale: Self::field(value, "scale", ScaleMode::default),
             aspect: Self::field(value, "aspect", Aspect::default),
+            renderer: Self::field(value, "renderer", RendererSetting::default),
+            filter: Self::field(value, "filter", FilterSetting::default),
             smoothing: Self::field(value, "smoothing", bool::default),
             haptics: Self::field(value, "haptics", default_haptics),
             hide_touch_with_controller: Self::field(
@@ -444,6 +459,8 @@ mod tests {
         assert_eq!(settings.touch_overlay, TouchOverlayMode::Auto);
         assert_eq!(settings.scale, ScaleMode::Integer);
         assert_eq!(settings.aspect, Aspect::FourThree);
+        assert_eq!(settings.renderer, RendererSetting::Auto);
+        assert_eq!(settings.filter, FilterSetting::Sharp);
         assert!(!settings.smoothing);
         assert!(settings.haptics);
         assert!(settings.hide_touch_with_controller);
@@ -522,6 +539,8 @@ mod tests {
             touch_overlay: TouchOverlayMode::Always,
             scale: ScaleMode::Fit,
             aspect: Aspect::Square,
+            renderer: RendererSetting::Canvas,
+            filter: FilterSetting::Crt,
             smoothing: true,
             haptics: false,
             ..Settings::default()
@@ -603,6 +622,46 @@ mod tests {
             "pixelated is what the shell drew before"
         );
         assert_eq!(settings.version, SETTINGS_VERSION);
+    }
+
+    /// The two renderer fields of M7-13 (#146) are additive defaults too, so a
+    /// file written before they existed still loads - and `version` stays at 1.
+    #[test]
+    fn a_file_without_the_renderer_fields_still_loads_them_as_defaults() {
+        let settings = Settings::from_json(r#"{"theme":"dark","scale":"fit","version":1}"#);
+        assert_eq!(
+            settings.theme,
+            Theme::Dark,
+            "the fields it did have survived"
+        );
+        assert_eq!(settings.scale, ScaleMode::Fit);
+        assert_eq!(
+            settings.renderer,
+            RendererSetting::Auto,
+            "WebGL where the browser has it is what #146 ships as the default"
+        );
+        assert_eq!(settings.filter, FilterSetting::Sharp);
+        assert_eq!(settings.version, SETTINGS_VERSION);
+    }
+
+    #[test]
+    fn the_renderer_fields_are_read_as_themselves() {
+        let settings = Settings::from_json(r#"{"renderer":"webgl","filter":"crt"}"#);
+        assert_eq!(settings.renderer, RendererSetting::Webgl);
+        assert_eq!(settings.filter, FilterSetting::Crt);
+        let settings = Settings::from_json(r#"{"renderer":"canvas"}"#);
+        assert_eq!(settings.renderer, RendererSetting::Canvas);
+    }
+
+    #[test]
+    fn a_garbage_renderer_field_costs_only_itself() {
+        let settings = Settings::from_json(
+            r#"{"renderer":"raytracing","filter":7,"theme":"light","volume":0.25}"#,
+        );
+        assert_eq!(settings.renderer, RendererSetting::Auto);
+        assert_eq!(settings.filter, FilterSetting::Sharp);
+        assert_eq!(settings.theme, Theme::Light, "the good fields survived");
+        assert_eq!(settings.volume, 0.25);
     }
 
     #[test]

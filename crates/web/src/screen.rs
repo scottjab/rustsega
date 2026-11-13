@@ -116,6 +116,7 @@ struct Room {
 /// - taken away under them.
 pub fn use_screen(
     canvas: NodeRef<html::Canvas>,
+    canvas_gl: NodeRef<html::Canvas>,
     area: NodeRef<html::Main>,
     shell: NodeRef<html::Div>,
     console: Controls,
@@ -167,7 +168,9 @@ pub fn use_screen(
     // a canvas mounted by the `Show` that a cartridge arrives through is
     // measured like any other resize.
     Effect::new(move |_| {
-        let Some(canvas) = canvas.get() else { return };
+        let (Some(canvas), Some(canvas_gl)) = (canvas.get(), canvas_gl.get()) else {
+            return;
+        };
         let (container_w, container_h) = room.get();
         let (frame_w, frame_h) = console.frame.get();
         let (mode, aspect) = settings.with(|settings| (settings.scale, settings.aspect));
@@ -178,11 +181,23 @@ pub fn use_screen(
         if width <= 0.0 || height <= 0.0 {
             return;
         }
-        // UFCS because `ElementExt::style` - the Leptos one, for adding a style
-        // attribute - is what `canvas.style()` otherwise resolves to.
-        let style = HtmlElement::style(&canvas);
-        let _ = style.set_property("width", &format!("{width}px"));
-        let _ = style.set_property("height", &format!("{height}px"));
+        // Both canvases get the box, because either one of them may be the
+        // picture: the WebGL path and the 2D path use separate elements (M7-13,
+        // #146), and one element sized and one not would be a picture that jumps
+        // size when a player changes the renderer setting.
+        for canvas in [canvas, canvas_gl] {
+            // UFCS because `ElementExt::style` - the Leptos one, for adding a style
+            // attribute - is what `canvas.style()` otherwise resolves to.
+            let style = HtmlElement::style(&canvas);
+            let _ = style.set_property("width", &format!("{width}px"));
+            let _ = style.set_property("height", &format!("{height}px"));
+        }
+        // The other half of the same answer: the console's drawing buffer follows
+        // the box it was just given, at this device's pixel density. One signal
+        // for both, so there is no moment in which the CSS box and the buffer are
+        // sized by different reads of the room (#146).
+        let dpr = web_sys::window().map_or(1.0, |window| window.device_pixel_ratio());
+        console.resize(width, height, dpr);
     });
 
     // The fullscreen state, from the browser. This is the only place it is
