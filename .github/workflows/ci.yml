@@ -105,6 +105,15 @@ jobs:
       - name: just check
         run: nix develop -c just check
 
+      - name: just test-web
+        # The web crate's browser tests (M7-20, #153): `wasm-bindgen-test` run in
+        # headless Firefox by `wasm-bindgen-test-runner`. Its own step rather than
+        # part of `just check`, so a WebDriver problem reads as "the browser tests
+        # broke" and a core-crate commit does not depend on a browser. Nothing to
+        # install: this job already realises the dev shell, which pins Firefox and
+        # geckodriver and exports `GECKODRIVER`.
+        run: nix develop -c just test-web
+
       - name: m68k conformance gate
         # The whole 68000 SingleStepTests suite at state-and-clocks checking, as
         # `singlestep.rs`'s `all_instructions` gate: 3.7 s of test time, about

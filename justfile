@@ -46,6 +46,17 @@ test-commercial:
 fetch:
     scripts/fetch-test-data.sh
 
+# Browser tests of the web crate (M7-20, #153): `wasm-bindgen-test` in headless
+# Firefox. Cargo is pointed at the dev shell's `wasm-bindgen-test-runner`, which
+# finds the pinned geckodriver through the `GECKODRIVER` the flake exports and
+# runs headless unless `NO_HEADLESS=1`. Deliberately not part of `check`: this is
+# the one step that needs a browser, and a WebDriver problem should not gate a
+# core-crate commit. Compiling the web package for wasm finds the native tests of
+# `crates/web/tests` too, and they register no test there; they run on the host,
+# through `check`.
+test-web:
+    CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --target wasm32-unknown-unknown -p web
+
 # Core crates must always build for the browser.
 wasm-core:
     cargo build --target wasm32-unknown-unknown {{core}}
