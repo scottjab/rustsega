@@ -231,6 +231,12 @@ impl Menu {
         if self.edit_pause(|pause| pause.enter(!self.console.paused.get())) {
             self.console.toggle();
         }
+        // Fast forward is a hold, and a menu takes the pads away from
+        // `poll_hotkey` - so nothing would ever report the release of a trigger held
+        // on the way into the menu, and the console would come back out of it at 4x
+        // with nobody asking. Letting go is the same release the keyboard's keyup
+        // makes (M7-17, #150).
+        self.console.set_fast_forward(false);
         release_game_input();
         // The drawer's open class and its `visibility` are applied by effects
         // registered after this one, because `App` mounts the menu before it

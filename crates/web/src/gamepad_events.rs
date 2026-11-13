@@ -35,6 +35,7 @@ use crate::emulator::Slots;
 use crate::input::PadButton;
 use crate::input::Source;
 use crate::input::gamepad;
+use crate::input::gamepad::HotkeyEvent;
 use crate::input::gamepad::PadSlots;
 use crate::input::keyboard::Hotkey;
 use crate::keyboard_events::hotkey_do;
@@ -59,8 +60,8 @@ type CaptureBaseline = (CaptureTarget, Vec<(u8, Vec<u8>)>);
 struct PadSeen {
     /// The Genesis buttons it was holding, in [`PadButton::ALL`] order.
     buttons: Vec<PadButton>,
-    /// The hotkey it was asking for, so that a held trigger is one hotkey
-    /// rather than one per frame.
+    /// The hotkey it was asking for, so that a held trigger is one press and one
+    /// release rather than one of either per frame (M7-17, #150).
     hotkey: Option<Hotkey>,
 }
 
@@ -200,13 +201,14 @@ impl Watcher {
     }
 
     /// One pad's reading in play: move its port in [`crate::input`] to what it
-    /// reports now, and return the hotkey it has just started asking for.
+    /// reports now, and return the hotkey event this reading is - the start of a
+    /// hold, or the end of one.
     ///
     /// The menu is not asked about here: while a game is running this is the only
     /// thing that reads the pads, and [`gamepad::poll_hotkey`] is the owner of
     /// `home` and `select` + `start` - see [`poll_gamepads`] for how the two halves
     /// avoid a double toggle (M7-11, #144).
-    fn poll_pad(&mut self, pad: &Reading) -> Option<Hotkey> {
+    fn poll_pad(&mut self, pad: &Reading) -> Option<HotkeyEvent> {
         // Before the port is looked up: the shared gamepad map is keyed by button
         // index rather than by pad, so whichever pad just pressed a button is the
         // one that finishes the capture (M7-10, #143).
@@ -222,10 +224,12 @@ impl Watcher {
             gamepad::apply_snapshot(input, Source::Gamepad(pad.index), port, &previous, &buttons);
         });
         seen.buttons = buttons;
-        // Only the start of a press is reported, so a player holding the trigger
-        // gets one hotkey rather than sixty a second.
+        // Only a change is reported: a player holding the trigger gets one press
+        // rather than sixty a second, and the frame that let go of it gets the
+        // release - which is the only way a pad's fast forward ever ends, a poll
+        // having no keyup of its own (M7-17, #150).
         let last = std::mem::replace(&mut seen.hotkey, hotkey);
-        if hotkey != last { hotkey } else { None }
+        gamepad::hotkey_change(last, hotkey)
     }
 
     /// One frame of one pad, spent on the controls page's capture: bind the first
@@ -369,9 +373,11 @@ pub fn use_gamepad(
 /// Reads every pad the browser can see, once, and gives the frame's answer to
 /// whichever half of the shell is listening.
 ///
-/// In play that means the page's input state and the hotkey a pad started asking
-/// for. With a menu open it means [`UiAction`](crate::nav::UiAction)s instead, and
-/// nothing at all reaches the game (M7-11, #144).
+/// In play that means the page's input state and the hotkey events this frame's
+/// readings are: the start of a hold, and the end of one - which is the only way a
+/// pad's fast forward ever stops (M7-17, #150). With a menu open it means
+/// [`UiAction`](crate::nav::UiAction)s instead, and nothing at all reaches the game
+/// (M7-11, #144).
 ///
 /// `now_ms` is the animation frame's own timestamp, which is what a held
 /// direction is timed against - see [`RepeatTimer`](crate::nav::RepeatTimer).
@@ -409,9 +415,10 @@ pub fn poll_gamepads(now_ms: f64) {
             watcher.toasts,
             watcher.screen,
             watcher.state_slots,
+            watcher.settings,
         )
     });
-    let Some((hotkeys, actions, menu, toasts, screen, state_slots)) = asked else {
+    let Some((hotkeys, actions, menu, toasts, screen, state_slots, settings)) = asked else {
         return;
     };
     if !actions.is_empty() {
@@ -419,8 +426,16 @@ pub fn poll_gamepads(now_ms: f64) {
         // what the hint bar wants to hear.
         menu.announce(LastDevice::Gamepad);
     }
-    for hotkey in hotkeys {
-        hotkey_do(hotkey, menu, toasts, screen, state_slots);
+    for event in hotkeys {
+        match event {
+            HotkeyEvent::Pressed(hotkey) => {
+                hotkey_do(hotkey, menu, toasts, screen, state_slots, settings)
+            }
+            // The end of a hold. Fast forward is the only hotkey a pad holds, so
+            // every other release has nothing to undo (M7-17, #150).
+            HotkeyEvent::Released(Hotkey::FastForward) => menu.console.set_fast_forward(false),
+            HotkeyEvent::Released(_) => {}
+        }
     }
     for action in actions {
         menu.run(action);

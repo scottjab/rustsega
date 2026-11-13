@@ -39,7 +39,9 @@ use crate::audio::AudioOut;
 use crate::audio_pacing::MAX_FRAMES_PER_TICK;
 use crate::audio_pacing::TARGET_AHEAD_SECS;
 use crate::audio_pacing::frames_to_run;
+use crate::fps::FpsMeter;
 use crate::frame_pacer::FramePacer;
+use crate::frame_pacer::ff_frames;
 use crate::render::FilterSetting;
 use crate::render::Renderer;
 use crate::render::RendererKind;
@@ -80,9 +82,11 @@ const WAKE_EVENTS: [&str; 2] = ["pointerdown", "keydown"];
 
 /// The events that mean this page may be going away, or going quiet, so the
 /// cart's RAM should be offered to storage now rather than on the timer
-/// (M7-14, #147).
+/// (M7-14, #147) and the game should be held rather than run unseen (M7-17, #150).
 ///
-/// Both are on `window`, and both are answered by [`flush_running_sram`].
+/// Both are on `window`, and both are answered by [`flush_running_sram`]; only
+/// `visibilitychange` has a way back, and so only it is answered by
+/// [`Emulator::page_visibility`] as well.
 const LIFECYCLE_EVENTS: [&str; 2] = ["pagehide", "visibilitychange"];
 
 /// One [`LIFECYCLE_EVENTS`] listener: the event it is on `window` for, and the
@@ -397,8 +401,8 @@ fn page_is_hidden() -> bool {
         .is_some_and(|document| document.hidden())
 }
 
-/// Puts the two last-chance listeners of the ticket on `window`: `pagehide`, and
-/// `visibilitychange` to hidden.
+/// Puts the two last-chance listeners on `window`: `pagehide`, and
+/// `visibilitychange` in both directions.
 ///
 /// Called from [`use_cartridge`], which takes them off again - `window` outlives
 /// the component, and a closure kept by `window` after its owner is gone is a
@@ -408,16 +412,24 @@ fn page_is_hidden() -> bool {
 /// IndexedDB's best-effort moment, not a commit. What it buys is that a tab closed
 /// a moment after an in-game save gets that save, where the 2 s watcher would
 /// almost certainly not have.
-fn use_lifecycle_flush() {
+///
+/// `visibilitychange` is the one event with a way back, so it is also the one that
+/// holds the console on the way out and lets it go on the way in - see
+/// [`Emulator::page_visibility`] and the setting that decides it (M7-17, #150).
+fn use_lifecycle() {
     let Some(window) = web_sys::window() else {
         return;
     };
     for event in LIFECYCLE_EVENTS {
         let listener = Closure::wrap(Box::new(move || {
-            // `visibilitychange` fires in both directions, and a page that has
-            // just become visible has nothing it was about to lose. `pagehide` is
-            // already the way out, so it needs no test.
-            if event == "visibilitychange" && !page_is_hidden() {
+            let hidden = page_is_hidden();
+            if event == "visibilitychange" {
+                // A page that has just become visible has nothing it was about to
+                // lose, but it may well have a console it stopped for itself.
+                if hidden {
+                    flush_running_sram();
+                }
+                hold_for_visibility(hidden);
                 return;
             }
             flush_running_sram();
@@ -425,7 +437,16 @@ fn use_lifecycle_flush() {
         let _ = window.add_event_listener_with_callback(event, listener.as_ref().unchecked_ref());
         LIFECYCLE.with(|held| held.borrow_mut().push((event, listener)));
     }
-    on_cleanup(remove_lifecycle_flush);
+    on_cleanup(remove_lifecycle);
+}
+
+/// Tells the running console, if there is one, that the page has gone to the
+/// background or come back from it (M7-17, #150).
+fn hold_for_visibility(hidden: bool) {
+    let Some(emulator) = running() else {
+        return;
+    };
+    emulator.borrow_mut().page_visibility(hidden);
 }
 
 /// Takes the [`LIFECYCLE_EVENTS`] listeners off `window` again, which the shell's
@@ -434,7 +455,7 @@ fn use_lifecycle_flush() {
 /// A plain `fn`, because `on_cleanup` wants a `Send` closure and a `Closure` is
 /// not one: the closures themselves live in a thread local, which is also what
 /// keeps a second mount from adding a second pair.
-fn remove_lifecycle_flush() {
+fn remove_lifecycle() {
     LIFECYCLE.with(|held| {
         let held = held.take();
         let Some(window) = web_sys::window() else {
@@ -484,6 +505,18 @@ pub struct Controls {
     /// Set when the write lands rather than when it is asked for, so the chip
     /// never claims a save that the browser has not taken.
     pub saved: RwSignal<bool>,
+    /// What the FPS overlay says, as [`crate::fps`] words it: `60 fps  2.1 ms`
+    /// (M7-17, #150).
+    ///
+    /// A line of text rather than a number because the overlay shows one line and the
+    /// shell has no business deciding how a frame time is rounded. Empty until the
+    /// console has finished its first frame, which is the only moment the overlay has
+    /// nothing true to say - it is mounted on the setting, not on this signal.
+    pub fps: RwSignal<String>,
+    /// Whether the fast forward hotkey is held: `Tab`, or a pad's right trigger
+    /// (M7-17, #150). This is the one answer to "is it fast forward now", read by
+    /// the loop every tick and by the top bar's `⏩ 4x` badge.
+    pub fast_forward: RwSignal<bool>,
 }
 
 impl Controls {
@@ -501,6 +534,23 @@ impl Controls {
         });
         if let Some(held) = held {
             self.paused.set(held);
+        }
+    }
+
+    /// Holds or releases fast forward (M7-17, #150).
+    ///
+    /// Held, not tapped: a keyboard repeats its keydown while a key is down and a
+    /// pad reports the same reading every frame, so this is asked again and again
+    /// for one press. Only a change is worth acting on - and only the release has
+    /// anything to tell the console, which has been dropping sound on the way to
+    /// nowhere and needs its schedule started again (see [`Emulator::end_fast_forward`]).
+    pub fn set_fast_forward(self, held: bool) {
+        if self.fast_forward.get_untracked() == held {
+            return;
+        }
+        self.fast_forward.set(held);
+        if !held && let Some(emulator) = running() {
+            emulator.borrow_mut().end_fast_forward();
         }
     }
 
@@ -755,6 +805,8 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
         // that is on screen before a console exists at all.
         renderer: RwSignal::new(RendererKind::Canvas),
         saved: RwSignal::new(false),
+        fps: RwSignal::new(String::new()),
+        fast_forward: RwSignal::new(false),
     };
 
     Effect::new(move |started: Option<Option<String>>| {
@@ -797,8 +849,9 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
     });
 
     // The two flushes that do not come from the frame loop: a page going away, or
-    // going into a background tab (M7-14, #147).
-    use_lifecycle_flush();
+    // going into a background tab (M7-14, #147). The same listener holds the console
+    // for the background tab and lets it go for the one that came back (#150).
+    use_lifecycle();
 
     on_cleanup(stop);
 
@@ -961,8 +1014,16 @@ struct Emulator {
     /// path allocates nothing (see [`frame_to_rgba_bytes`]).
     rgba: Vec<u8>,
     /// The video-side pacer: the whole policy while there is no audio clock, and
-    /// kept warm - but not listened to - while there is.
+    /// kept warm - but not listened to - while there is. It is also the clock fast
+    /// forward multiplies, which is the one case where it is listened to while the
+    /// audio clock is running (M7-17, #150).
     pacer: FramePacer,
+    /// The frame times behind [`Controls::fps`], recorded once per console frame
+    /// (M7-17, #150).
+    fps_meter: FpsMeter,
+    /// Whether the console is held because the tab went to the background - the only
+    /// reason the tab coming back is allowed to let it go (M7-17, #150).
+    auto_paused: bool,
     paused: bool,
     /// The frame size the last paint drew, which is what `Controls::frame` is
     /// told about and what [`Emulator::redraw`] draws: the renderer keeps its own
@@ -1081,6 +1142,8 @@ impl Emulator {
             picture: (filter, smoothing),
             rgba: Vec::new(),
             pacer: FramePacer::new(target_hz),
+            fps_meter: FpsMeter::new(),
+            auto_paused: false,
             paused: false,
             // The canvas as the markup made it, so the first frame that does not
             // match it is seen as the change it is.
@@ -1126,14 +1189,25 @@ impl Emulator {
     /// One animation frame: run the console for the time that has passed since
     /// the last tick, draw what it produced, and ask for the next tick.
     fn tick(&mut self, now_ms: f64) {
-        let due = self.frames_due(now_ms);
+        let fast = self.console.fast_forward.get_untracked();
+        let due = self.frames_due(now_ms, fast);
         if !self.paused {
             for _ in 0..due {
                 self.sync_pads();
+                // Timed on `performance.now()` rather than on the tick's own
+                // timestamp, because one fast forward tick runs several frames and they
+                // cannot all be stamped the same moment. The moment and the cost of a
+                // frame are the pair the overlay turns into `60 fps  2.1 ms`, and the
+                // audio pump is outside it on purpose: the overlay says what the machine
+                // costs, not what the scheduler does (M7-17, #150).
+                let frame_started = crate::emulator::now_ms();
                 self.genesis.run_frame();
-                self.pump_audio();
+                let finished = crate::emulator::now_ms();
+                self.pump_audio(fast);
+                self.fps_meter.record(finished, finished - frame_started);
             }
             self.paint();
+            self.report_fps();
         }
         // Once a second, offer the cart's RAM to storage. The watcher does the
         // deciding, and it is the watcher's window that makes a game which dirties
@@ -1275,7 +1349,17 @@ impl Emulator {
     /// audio clock mid-session hands over to a pacer that is not about to run
     /// four frames of catch-up for a gap it never saw - and, as before #138, so
     /// that pausing spends time rather than borrowing it.
-    fn frames_due(&mut self, now_ms: f64) -> u32 {
+    ///
+    /// While fast forward is held the audio clock is not consulted at all, and the
+    /// pacer's answer is multiplied instead - see [`ff_frames`] for why that is the
+    /// one number fast forward can be built out of (M7-17, #150).
+    fn frames_due(&mut self, now_ms: f64, fast: bool) -> u32 {
+        if fast {
+            let speed = self
+                .settings
+                .with_untracked(|settings| settings.fast_forward_speed.multiplier());
+            return ff_frames(speed, self.pacer.frames_due(now_ms));
+        }
         let buffered = self
             .audio
             .as_ref()
@@ -1293,12 +1377,20 @@ impl Emulator {
         )
     }
 
-    /// Hands the frame that has just run to the speakers.
+    /// Hands the frame that has just run to the speakers - or, while `fast_forward`
+    /// is held, drains it and throws it away.
     ///
     /// Only ever called straight after `run_frame`, which is what makes the
     /// schedule line up with the picture: the sound of frame N is appended while
     /// frame N is the newest thing the console has made.
-    fn pump_audio(&mut self) {
+    ///
+    /// Fast forward still drains, because that is how the mixer is told it has
+    /// produced the frame; what it drains is simply not scheduled. Blocks are
+    /// scheduled in step with the play head, so at 4x they would arrive four times as
+    /// fast as the speakers eat them - the buffer pile-up the ticket names, and the
+    /// reason the sound of fast forward is silence rather than a rising squeal
+    /// (M7-17, #150).
+    fn pump_audio(&mut self, fast_forward: bool) {
         let Some(audio) = self.audio.as_mut() else {
             return;
         };
@@ -1318,6 +1410,12 @@ impl Emulator {
                 // age of the state in audio it will never hear.
                 self.samples = Vec::new();
             }
+            return;
+        }
+        if fast_forward {
+            // The block is dropped where the mixer can no longer reach it, and the
+            // per-frame buffer keeps its capacity for the frame after the release.
+            self.samples.clear();
             return;
         }
         if !audio.push(&self.samples) {
@@ -1375,6 +1473,52 @@ impl Emulator {
         }
     }
 
+    /// Fast forward has been let go: put the audio schedule back behind the play
+    /// head before the next block is worth pushing (M7-17, #150).
+    ///
+    /// Nothing was scheduled while fast forward ran, so the cursor is a moment in the
+    /// past and every block pushed against it would read as an underrun until the
+    /// schedule rebuilt itself. [`AudioOut::discard`] is the one method that re-seats
+    /// it, and the little that was still on its way when fast forward started is the
+    /// sound of a moment the console has left - the same reason a loaded state cuts it
+    /// (M7-15, #148).
+    fn end_fast_forward(&mut self) {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.discard();
+        }
+    }
+
+    /// The tab went to the background, or came back from it: hold the console, and
+    /// let it go again only if this is what stopped it (M7-17, #150).
+    ///
+    /// "Remember whether it was already held" is the whole of it. A console the
+    /// player stopped, or that an open menu is holding, has an owner, and a tab
+    /// becoming visible again has no business taking the game off them - which is
+    /// why [`Self::auto_paused`] is set to whether *this* stop was needed rather
+    /// than being set to the state of the pause itself.
+    fn page_visibility(&mut self, hidden: bool) {
+        if hidden {
+            if !self
+                .settings
+                .with_untracked(|settings| settings.pause_when_hidden)
+            {
+                return;
+            }
+            self.auto_paused = !self.paused;
+            if self.auto_paused {
+                self.set_paused(true);
+                self.console.paused.set(true);
+            }
+            return;
+        }
+        if !self.auto_paused {
+            return;
+        }
+        self.auto_paused = false;
+        self.set_paused(false);
+        self.console.paused.set(false);
+    }
+
     fn set_volume(&mut self, volume: f32) {
         if let Some(audio) = self.audio.as_mut() {
             audio.set_volume(volume);
@@ -1399,6 +1543,30 @@ impl Emulator {
         let running = self.audio.as_ref().is_some_and(|audio| audio.is_running());
         if self.console.sound_on.get() != running {
             self.console.sound_on.set(running);
+        }
+    }
+
+    /// Publishes the frame rate for the overlay, while the player has it switched on
+    /// (M7-17, #150).
+    ///
+    /// Gated on the setting, and on nothing else: the meter is cheap and fed whether
+    /// or not anybody is reading it, but a formatted string per frame is only worth
+    /// formatting - and writing, which is a render - for a player who asked to look
+    /// at it. The setting is read untracked because this runs on the animation frame,
+    /// which is not a reactive context.
+    ///
+    /// Written only when the line has actually moved, a handful of times a second
+    /// rather than sixty.
+    fn report_fps(&self) {
+        if !self
+            .settings
+            .with_untracked(|settings| settings.fps_overlay)
+        {
+            return;
+        }
+        let line = self.fps_meter.stats().label();
+        if self.console.fps.get_untracked() != line {
+            self.console.fps.set(line);
         }
     }
 
@@ -1760,6 +1928,8 @@ mod tests {
             frame: RwSignal::new((0, 0)),
             renderer: RwSignal::new(RendererKind::Canvas),
             saved: RwSignal::new(false),
+            fps: RwSignal::new(String::new()),
+            fast_forward: RwSignal::new(false),
         };
 
         // No console, so the frame size is the one `use_cartridge` started with -
@@ -1776,6 +1946,14 @@ mod tests {
         controls.toggle();
         assert!(!paused.get());
         assert!(!controls.sound_on.get());
+
+        // Fast forward is the same kind of no-op with no console to hurry, and the
+        // signal still keeps the truth of the hotkey for the badge to read: held,
+        // then let go again, with no console in either direction (M7-17, #150).
+        controls.set_fast_forward(true);
+        assert!(controls.fast_forward.get_untracked());
+        controls.set_fast_forward(false);
+        assert!(!controls.fast_forward.get_untracked());
 
         // The picture controls of #146 are the same kind of no-op: a resize has
         // no buffer to move, and a new path has no console to move.

@@ -11,7 +11,8 @@
 //! [`input::touch`] say what a key, a pad reading and a finger mean, and
 //! [`keyboard_events`], [`gamepad_events`] and [`touch_events`] are the halves that
 //! listen for them, poll them, and draw them. [`settings`] is the one store every
-//! of those reads, and [`controls`] is the drawer page that edits it. Bytes that
+//! of those reads, [`controls`] is the drawer page that edits it, and [`fps`] is the
+//! reading the frame loop publishes for the overlay to show. Bytes that
 //! outlive the page - a cart's saved RAM today, save states tomorrow - go through
 //! [`storage`], and [`emulator`] is the half that gets them there.
 
@@ -20,6 +21,7 @@ pub mod audio;
 pub mod audio_pacing;
 pub mod controls;
 pub mod emulator;
+pub mod fps;
 pub mod frame_pacer;
 pub mod gamepad_events;
 pub mod input;

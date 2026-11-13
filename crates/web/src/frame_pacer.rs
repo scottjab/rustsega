@@ -28,6 +28,39 @@ const MAX_CATCHUP: u32 = 4;
 /// tick that should be a 1 read as a 0. A nanoframe is neither.
 const DRIFT_TOLERANCE: f64 = 1e-9;
 
+/// The slowest fast forward the shell offers, and the floor under a speed that has
+/// rotted in storage (M7-17, #150). One is not a fast forward, and zero would be a
+/// console that stops rather than speeds up.
+const MIN_FAST_FORWARD_SPEED: u32 = 2;
+
+/// The fastest fast forward the shell offers.
+const MAX_FAST_FORWARD_SPEED: u32 = 8;
+
+/// The most frames fast forward will ever run in one animation frame.
+///
+/// [`MAX_CATCHUP`] is the ceiling for a loop trying to keep up; fast forward is a
+/// loop deliberately not trying to keep up, and it gets twice that. Eight frames of
+/// emulation is a tick that still fits inside one animation frame on a machine that
+/// is doing nothing else, which is the bargain a player strikes by holding the key -
+/// and past it the tick starts missing the animation frames it is paced by, which
+/// makes the whole thing slower rather than faster.
+const MAX_FAST_FORWARD_FRAMES_PER_TICK: u32 = 8;
+
+/// How many frames one tick runs while fast forward is held.
+///
+/// `base` is what the same tick would have run at normal speed, and it comes from
+/// [`FramePacer::frames_due`] rather than from [`crate::audio_pacing::frames_to_run`]
+/// for one reason: fast forward schedules no sound, so the audio lead it would read
+/// is a number that has already noticed the console is not keeping the speakers fed
+/// and is asking for the cap on top of the multiplier.
+///
+/// A `speed` outside the range the settings offer is the nearest end of it, so a
+/// stored setting cannot be a stall or a runaway.
+pub fn ff_frames(speed: u32, base: u32) -> u32 {
+    base.saturating_mul(speed.clamp(MIN_FAST_FORWARD_SPEED, MAX_FAST_FORWARD_SPEED))
+        .min(MAX_FAST_FORWARD_FRAMES_PER_TICK)
+}
+
 /// Turns `requestAnimationFrame` timestamps into a number of `Genesis::run_frame`
 /// calls. See the [module docs](self) for what it is for and what replaces it.
 #[derive(Clone, Debug)]
@@ -170,5 +203,42 @@ mod tests {
         pacer.frames_due(0.0);
         pacer.frames_due(5000.0);
         assert_eq!(pacer.frames_due(5000.0 + TICK_60), 1);
+    }
+
+    /// Fast forward is a multiplier on what a tick already owed, so a 120 Hz
+    /// display still runs nothing on its skipped ticks and a 30 Hz one still runs
+    /// its two - the console goes faster without the loop changing what a frame is.
+    #[test]
+    fn fast_forward_runs_the_frames_due_multiplied_by_the_speed() {
+        assert_eq!(ff_frames(2, 1), 2);
+        assert_eq!(ff_frames(4, 1), 4);
+        assert_eq!(ff_frames(4, 2), 8);
+    }
+
+    /// The cap is absolute, and it is what keeps a 30 Hz display holding a 60 Hz
+    /// console at 8 frames a tick rather than the 8.08 it would want at 4x: a tick
+    /// that ran thirty frames would be a tick long enough to miss the next one.
+    #[test]
+    fn fast_forward_never_runs_more_than_eight_frames_in_one_tick() {
+        assert_eq!(ff_frames(4, 4), 8);
+        assert_eq!(ff_frames(MAX_FAST_FORWARD_SPEED, MAX_CATCHUP), 8);
+        assert_eq!(ff_frames(MAX_FAST_FORWARD_SPEED, 1000), 8);
+    }
+
+    /// A tick that owes nothing runs nothing fast forward either: the multiplier is
+    /// of the frames due, not a floor under them.
+    #[test]
+    fn a_tick_that_owes_nothing_runs_nothing_fast_forward_or_otherwise() {
+        assert_eq!(ff_frames(4, 0), 0);
+    }
+
+    /// A speed outside the range the settings offer is the nearest end of it, so
+    /// a stored setting that has rotted is a slow fast forward rather than a way
+    /// to divide by zero or run the console backwards.
+    #[test]
+    fn a_speed_outside_the_offered_range_is_the_nearest_end_of_it() {
+        assert_eq!(ff_frames(0, 1), MIN_FAST_FORWARD_SPEED);
+        assert_eq!(ff_frames(1, 1), MIN_FAST_FORWARD_SPEED);
+        assert_eq!(ff_frames(MAX_FAST_FORWARD_SPEED + 1, 1), 8);
     }
 }

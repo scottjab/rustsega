@@ -47,6 +47,10 @@ pub enum Hotkey {
     NextSlot,
     /// `F11`: the screen fills the window (M7-12, #145).
     Fullscreen,
+    /// `` ` ``: the FPS overlay on and off (M7-17, #150). `Backquote` because F2
+    /// and F3 - the natural neighbours for a shell readout - are the save slot
+    /// keys of M7-15 (#148).
+    ToggleFps,
     /// `Tab`, held: run the console faster (M7-17, #150).
     FastForward,
     /// `KeyP`: hold the console or let it go.
@@ -57,13 +61,14 @@ pub enum Hotkey {
 ///
 /// Looked up before the pad bindings, so a hotkey wins a key that a binding
 /// table also claims - see [`map_key`].
-const HOTKEYS: [(&str, Hotkey); 8] = [
+const HOTKEYS: [(&str, Hotkey); 9] = [
     ("Escape", Hotkey::ToggleMenu),
     ("F1", Hotkey::SaveState),
     ("F2", Hotkey::PreviousSlot),
     ("F3", Hotkey::NextSlot),
     ("F4", Hotkey::LoadState),
     ("F11", Hotkey::Fullscreen),
+    ("Backquote", Hotkey::ToggleFps),
     ("Tab", Hotkey::FastForward),
     ("KeyP", Hotkey::Pause),
 ];
@@ -191,7 +196,7 @@ mod tests {
         let bindings = Bindings::default();
         // Not a pad binding, and not one of the hotkeys either.
         assert_eq!(map_key("KeyZ", &bindings), KeyAction::None);
-        assert_eq!(map_key("Backquote", &bindings), KeyAction::None);
+        assert_eq!(map_key("Backspace", &bindings), KeyAction::None);
     }
 
     #[test]
@@ -255,6 +260,14 @@ mod tests {
     }
 
     #[test]
+    fn backquote_toggles_the_fps_overlay() {
+        assert_eq!(
+            map_key("Backquote", &Bindings::default()),
+            KeyAction::Hotkey(Hotkey::ToggleFps)
+        );
+    }
+
+    #[test]
     fn key_p_pauses() {
         assert_eq!(
             map_key("KeyP", &Bindings::default()),
@@ -268,10 +281,19 @@ mod tests {
         // them may stop being a hotkey. `Tab` and `Enter`-adjacent keys are the
         // ones a player is most likely to bind by accident.
         let bindings = Bindings {
-            keyboard: ["Escape", "F1", "F4", "F11", "Tab", "KeyP", "ArrowUp"]
-                .iter()
-                .map(|code| (code.to_string(), 0, PadButton::A))
-                .collect(),
+            keyboard: [
+                "Escape",
+                "F1",
+                "F4",
+                "F11",
+                "Backquote",
+                "Tab",
+                "KeyP",
+                "ArrowUp",
+            ]
+            .iter()
+            .map(|code| (code.to_string(), 0, PadButton::A))
+            .collect(),
             gamepad: Vec::new(),
         };
         assert_eq!(
@@ -289,6 +311,10 @@ mod tests {
         assert_eq!(
             map_key("F11", &bindings),
             KeyAction::Hotkey(Hotkey::Fullscreen)
+        );
+        assert_eq!(
+            map_key("Backquote", &bindings),
+            KeyAction::Hotkey(Hotkey::ToggleFps)
         );
         assert_eq!(
             map_key("Tab", &bindings),
@@ -409,7 +435,7 @@ mod tests {
         // `map_key` always wins a hotkey key for the shell (see
         // `a_hotkey_beats_a_pad_binding_on_the_same_key`), so binding one here
         // would write a table entry that can never fire. Saying so is kinder.
-        for code in ["Tab", "F1", "F4", "F11", "KeyP"] {
+        for code in ["Tab", "F1", "F4", "F11", "Backquote", "KeyP"] {
             assert_eq!(capture_key(code), CaptureKey::Refused, "{code}");
         }
     }
