@@ -2071,6 +2071,7 @@ dependencies = [
  "js-sys",
  "leptos",
  "sha1_smol",
+ "vdp",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
