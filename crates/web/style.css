@@ -1,0 +1,15 @@
+/* Minimal styles for the M7-01 stub page. Real layout is a later M7 ticket. */
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #111;
+  color: #eee;
+}
+
+.app {
+  display: flex;
+  min-height: 100vh;
+  align-items: center;
+  justify-content: center;
+}
