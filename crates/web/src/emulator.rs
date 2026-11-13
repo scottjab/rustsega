@@ -192,6 +192,16 @@ pub struct Controls {
     /// for a gesture: a context the browser is holding back is silent, and the
     /// only thing that can start it is a person (M7-05, #138).
     pub sound_on: RwSignal<bool>,
+    /// The size of the frame the console is drawing, which is the canvas's own
+    /// `width` and `height` - `(0, 0)` until a console has painted once.
+    ///
+    /// The picture the shell scales is this big, so [`crate::screen`] reads it:
+    /// an H32 game is 256 wide rather than 320 and an interlaced one is 448 lines
+    /// rather than 224, and both change mid-play (M7-12, #145). It is written
+    /// from [`Emulator::start`] and from [`Emulator::paint`] on the frames whose
+    /// size really moved, which is the only reason a screen has to be redone at
+    /// all - a container resize cannot see it.
+    pub frame: RwSignal<(u32, u32)>,
 }
 
 impl Controls {
@@ -263,6 +273,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
     let console = Controls {
         paused,
         sound_on: RwSignal::new(false),
+        frame: RwSignal::new((0, 0)),
     };
 
     Effect::new(move |started: Option<Option<String>>| {
@@ -640,6 +651,10 @@ impl Emulator {
             self.canvas.set_width(width);
             self.canvas.set_height(height);
             self.drawn = (width, height);
+            // The screen's box is scaled from the frame, so it is the frame
+            // changing size that has to be announced rather than the canvas
+            // attribute being written (#145).
+            self.console.frame.set((width, height));
         }
 
         let image = ImageData::new_with_u8_clamped_array_and_sh(Clamped(&self.rgba), width, height);
