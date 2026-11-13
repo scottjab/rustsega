@@ -1,0 +1,20 @@
+# Trunk configuration for the `web` crate (M7-01, #134).
+#
+# `offline = true` is not cosmetic: NixOS cannot exec the prebuilt binaries
+# trunk would otherwise download, so both tools must come from the dev shell's
+# PATH (`pkgs.wasm-bindgen-cli`, `pkgs.binaryen`). With `offline = true` trunk
+# fails loudly instead of silently downloading if the versions below stop
+# matching `wasm-bindgen --version` / `wasm-opt --version` in `nix develop`.
+
+[build]
+target = "index.html"
+dist = "dist"
+offline = true
+
+[tools]
+# Must match `wasm-bindgen --version` in the dev shell, which is the same
+# version the `wasm-bindgen` crate is pinned to in the workspace Cargo.toml.
+wasm_bindgen = "0.2.130"
+# Must match `wasm-opt --version` in the dev shell, which prints
+# "wasm-opt version 133"; trunk wants the binaryen release tag, `version_133`.
+wasm_opt = "version_133"
