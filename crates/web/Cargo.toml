@@ -47,6 +47,9 @@ web-sys = { version = "0.3", features = [
   "Blob",
   "CanvasRenderingContext2d",
   "DataTransfer",
+  # The touch overlay's geometry (M7-09, #142): `getBoundingClientRect` answers one
+  # of these, and it is how a slide from one control to another is measured.
+  "DomRect",
   "Document",
   # The keyboard of M7-07 (#140): `Event::target` to see what a key landed on,
   # and the untyped `blur` that lets go of every held key.
@@ -68,7 +71,12 @@ web-sys = { version = "0.3", features = [
   "HtmlSelectElement",
   "ImageData",
   "KeyboardEvent",
+  # The touch overlay of M7-09 (#142): the pointer events, the box each control
+  # is measured in, the media query that says this is a finger, and the `navigator`
+  # that vibrates - which is already here for the gamepads.
+  "MediaQueryList",
   "Navigator",
+  "PointerEvent",
   "Window",
 ] }
 # `Bindings` is rebindable and stored in `localStorage` (docs/ARCHITECTURE.md,
