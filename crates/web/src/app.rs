@@ -11,6 +11,8 @@ use leptos::prelude::*;
 
 use crate::controls::CaptureTarget;
 use crate::controls::Controls;
+use crate::crash::CrashCard;
+use crate::crash::use_crash_report;
 use crate::emulator::Slots;
 use crate::emulator::use_cartridge;
 use crate::gamepad_events::use_gamepad;
@@ -175,6 +177,11 @@ pub fn App() -> impl IntoView {
     let screen = use_screen(canvas, canvas_gl, screen_area, shell, console, drawer_open);
 
     use_keyboard(menu, loaded, toasts, settings, capture, screen, slots);
+
+    // Whether the core has panicked: the card that replaces the screen area when
+    // it has (M7-19, #152). A plain `Show` would do, but the flag lives behind a
+    // hook installed before this component exists, so it arrives here as a signal.
+    let crashed = use_crash_report();
 
     // Whether the picture has arrived, which is what the `screen--enter` class
     // below fades in on: `loading` comes down the moment a console has been made,
@@ -434,6 +441,12 @@ pub fn App() -> impl IntoView {
                             }
                         })
                 }}
+                // The crash card: the console has stopped, and the only thing the
+                // shell can still do is say so and offer to start again. Over the
+                // screen area rather than beside it, because it replaces the
+                // picture - and over the loading spinner, which a panic has left
+                // waiting for a console that is never going to arrive (M7-19, #152).
+                {move || crashed.get().then(|| view! { <CrashCard/> })}
                 <RomFileInput/>
             </main>
 

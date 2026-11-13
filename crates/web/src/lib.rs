@@ -20,6 +20,7 @@ pub mod app;
 pub mod audio;
 pub mod audio_pacing;
 pub mod controls;
+pub mod crash;
 pub mod emulator;
 pub mod fps;
 pub mod frame_pacer;

@@ -603,6 +603,57 @@ canvas {
   border-radius: 50%;
 }
 
+/* The crash card (M7-19, #152): what replaces the picture once the core has
+   panicked, when the frame loop has stopped and the frozen last frame is the only
+   thing left to look at. It is a card over the screen area rather than a toast - a
+   toast is something that happened and went by, and this has not gone by - and it
+   covers `z-index: 2`, where the loading spinner is, because a panic during a load
+   has left that spinner waiting for a console that is never arriving.
+
+   `inset` rather than a width: the card is the screen area with one unit of space
+   around it, so it works at desktop and at phone width without a second number to
+   keep in step. */
+.crash {
+  position: absolute;
+  inset: var(--space-4);
+  z-index: 3;
+  display: grid;
+  justify-items: center;
+  align-content: center;
+  gap: var(--space-3);
+  padding: var(--space-5);
+  overflow: auto;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  text-align: center;
+}
+
+.crash__title {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-emphasis);
+}
+
+.crash__text {
+  max-width: 48ch;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+/* The panic's own words, quoted for the person who is going to file the bug -
+   monospace, and broken anywhere rather than widening the card, because a Rust
+   path is longer than any screen. */
+.crash__detail {
+  max-width: 100%;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
 /* The FPS overlay (M7-17, #150): the console's own frame rate and frame cost, in
    the top-left corner of the picture where it can be read without covering the
    part of the screen a game draws in.
