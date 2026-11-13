@@ -99,6 +99,10 @@ pub fn App() -> impl IntoView {
     let canvas = NodeRef::<html::Canvas>::new();
     let canvas_gl = NodeRef::<html::Canvas>::new();
     let console = use_cartridge(canvas, canvas_gl);
+    // ... and handed down as a context, because the ROM picker has to say "I am
+    // still reading this file" and a file read has no other way to reach the
+    // screen area's spinner (M7-19, #152).
+    provide_context(console);
 
     // Every cartridge that opens becomes a recent. This signal is the one place
     // the file picker, the drop target and a recent card all arrive at, so
@@ -389,6 +393,19 @@ pub fn App() -> impl IntoView {
                     >
                     </canvas>
                 </Show>
+                // The loading state: a ROM has been chosen and nothing is drawn
+                // yet. An overlay, so that the screen area's own box does not move
+                // when it arrives and goes (M7-19, #152).
+                {move || {
+                    console.loading.get().then(|| {
+                        view! {
+                            <p class="loading" role="status">
+                                <span class="loading__spinner" aria-hidden="true"></span>
+                                "Loading"
+                            </p>
+                        }
+                    })
+                }}
                 // The FPS overlay: what the console is really running at and what a
                 // frame of it costs, in the corner of the picture, for the player who
                 // asked for it in here or with `` ` `` (M7-17, #150). A reading rather

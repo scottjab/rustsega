@@ -13,6 +13,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::File;
 
+use crate::emulator::Controls;
 use crate::rom::{LoadedRom, NOT_A_ROM, load_rom};
 use crate::ui::button::Button;
 use crate::ui::button::ButtonVariant;
@@ -61,6 +62,7 @@ pub fn RomFileInput() -> impl IntoView {
     let input_ref = NodeRef::<html::Input>::new();
     let roms = rom_context();
     let toasts = expect_context::<Toasts>();
+    let loading = expect_context::<Controls>().loading;
 
     view! {
         <input
@@ -79,7 +81,7 @@ pub fn RomFileInput() -> impl IntoView {
                 // in a row is a second change rather than nothing at all.
                 input.set_value("");
                 if let Some(file) = file {
-                    load_file(file, roms, toasts);
+                    load_file(file, roms, toasts, loading);
                 }
             }
         />
@@ -97,6 +99,7 @@ pub fn window_drop_target() -> RwSignal<bool> {
     let dragging = RwSignal::new(false);
     let roms = rom_context();
     let toasts = expect_context::<Toasts>();
+    let loading = expect_context::<Controls>().loading;
 
     // Any drag highlights, not only drags of files: what is being dragged is
     // not worth reading on the way in, and highlighting for a drag that turns
@@ -117,7 +120,7 @@ pub fn window_drop_target() -> RwSignal<bool> {
         dragging.set(false);
         let files = event.data_transfer().and_then(|transfer| transfer.files());
         if let Some(file) = files.and_then(|files| files.item(0)) {
-            load_file(file, roms, toasts);
+            load_file(file, roms, toasts, loading);
         }
     });
 
@@ -155,19 +158,34 @@ pub fn EmptyScreen() -> impl IntoView {
 /// The read is asynchronous - a `File` is a handle to disk, not to bytes - so
 /// the answer arrives in a spawned task. Failure is one danger toast and no
 /// other state change: whatever was loaded before is still loaded.
-fn load_file(file: File, roms: RwSignal<Option<LoadedRom>>, toasts: Toasts) {
+///
+/// `loading` covers the read: it goes up before the `File` is awaited and comes
+/// down again only if the read or the header says this is not a ROM. On success it
+/// stays up, because [`crate::emulator::start`] picks the span up and takes it down
+/// with the first frame (M7-19, #152).
+pub(crate) fn load_file(
+    file: File,
+    roms: RwSignal<Option<LoadedRom>>,
+    toasts: Toasts,
+    loading: RwSignal<bool>,
+) {
     let file_name = file.name();
+    loading.set(true);
     spawn_local(async move {
         // The file can go away between the drop and the read; the user needs
         // the same answer either way, and only one message.
         let Ok(bytes) = read_file(&file).await else {
+            loading.set(false);
             toasts.push(ToastKind::Danger, NOT_A_ROM);
             return;
         };
         // `Err` here is a file that is not a ROM: too small, or too big.
         match load_rom(&file_name, bytes) {
             Ok(rom) => roms.set(Some(rom)),
-            Err(_) => toasts.push(ToastKind::Danger, NOT_A_ROM),
+            Err(_) => {
+                loading.set(false);
+                toasts.push(ToastKind::Danger, NOT_A_ROM);
+            }
         }
     });
 }

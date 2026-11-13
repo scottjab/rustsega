@@ -73,29 +73,27 @@ fn icon_button_tags(source: &str) -> Vec<(usize, String)> {
 fn has_label(attributes: &str) -> bool {
     let mut rest = attributes;
     while let Some(at) = find_word(rest, "label") {
-        let after = rest[at + "label".len()..].trim_start();
+        let tail = &rest[at + "label".len()..];
+        let after = tail.trim_start();
         // `label: something` is the struct form, which this component does not use
         // but a caller in another file might.
-        let value = match after
+        let Some(value) = after
             .strip_prefix('=')
             .or_else(|| after.strip_prefix(':'))
-        {
-            Some(value) => value.trim_start(),
-            None => {
-                rest = &rest[at + "label".len()..];
-                continue;
-            }
+            .map(str::trim_start)
+        else {
+            rest = tail;
+            continue;
         };
         if let Some(literal) = value.strip_prefix('"') {
-            if let Some(end) = literal.find('"') {
-                if !literal[..end].trim().is_empty() {
-                    return true;
-                }
+            let text = literal.split('"').next().unwrap_or_default();
+            if !text.trim().is_empty() {
+                return true;
             }
         } else if !value.is_empty() {
             return true;
         }
-        rest = &rest[at + "label".len()..];
+        rest = tail;
     }
     false
 }

@@ -24,24 +24,27 @@ fn style_css() -> String {
 /// and word boundaries survive.
 fn strip_comments(css: &str) -> String {
     let mut out = String::with_capacity(css.len());
-    let mut lines = css.split_inclusive('\n');
+    let mut chars = css.chars().peekable();
     let mut in_comment = false;
-    while let Some(line) = lines.next() {
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            if in_comment {
-                if c == '*' && chars.peek() == Some(&'/') {
-                    chars.next();
-                    in_comment = false;
-                }
+    while let Some(c) = chars.next() {
+        match (in_comment, c) {
+            // The end of a comment: both characters go, and the newline that
+            // follows it stays where it was so a report names the right line.
+            (true, '*') if chars.peek() == Some(&'/') => {
+                chars.next();
+                in_comment = false;
                 out.push(' ');
-            } else if c == '/' && chars.peek() == Some(&'*') {
+            }
+            // Inside a comment everything but a newline becomes a space: word
+            // boundaries survive, and so does the line count.
+            (true, '\n') => out.push('\n'),
+            (true, _) => out.push(' '),
+            (false, '/') if chars.peek() == Some(&'*') => {
                 chars.next();
                 in_comment = true;
                 out.push(' ');
-            } else {
-                out.push(c);
             }
+            (false, other) => out.push(other),
         }
     }
     out

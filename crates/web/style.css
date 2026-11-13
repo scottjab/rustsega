@@ -568,6 +568,38 @@ canvas {
   outline-offset: -8px;
 }
 
+/* The loading state (M7-19, #152): a ROM has been chosen and the console is not
+   painting yet - the `File` is still being read, then IndexedDB is still handing
+   over the cart's saved RAM (see `emulator::start`).
+
+   Absolutely positioned over the middle of the screen area rather than another row
+   of its grid, because "no layout shift when loading a ROM" is an acceptance
+   criterion and a grid row would push the empty state out of the way as it
+   arrived. It says "Loading" in words as well as drawing a ring: with motion
+   reduced the ring is still (see the motion section at the foot of this file), and
+   the word is the one thing left that knows something is happening. */
+.loading {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  z-index: 2;
+  display: grid;
+  justify-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  transform: translate(-50%, -50%);
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.loading__spinner {
+  width: var(--space-7);
+  height: var(--space-7);
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+}
+
 /* The FPS overlay (M7-17, #150): the console's own frame rate and frame cost, in
    the top-left corner of the picture where it can be read without covering the
    part of the screen a game draws in.
@@ -1327,12 +1359,26 @@ canvas {
       transform var(--duration) var(--ease);
   }
 
+  /* The loading ring of M7-19 (#152) is the only thing in the shell that moves
+     for no reason other than to say "wait": it turns at a speed slow enough not to
+     draw the eye, and with motion reduced it simply sits there while the word
+     beside it carries the message. */
+  .loading__spinner {
+    animation: spin 900ms linear infinite;
+  }
+
   /* The "Saved" chip of M7-14 (#147) is taken off the page 1.5 s after a write
      lands; this spends the last third of that time going away, so the chip fades
      out rather than being cut off. With motion reduced it is simply there for
      1.5 s and then not, which is the same fact said less prettily. */
   .chip--saved {
     animation: chip-saved 1.5s var(--ease) both;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
   }
 }
 
