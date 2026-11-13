@@ -40,6 +40,11 @@
             pkgs.shellcheck
             pkgs.curl
             pkgs.unzip
+            # SVG rasteriser, to regenerate the PWA icons of M7-18 (#151) from
+            # `crates/web/assets/icon.svg` (see the comment in that file for the
+            # exact commands). The PNGs are committed, so this is only needed
+            # when the icon art changes.
+            pkgs.resvg
             pkgs.pkg-config
             # For the web crate's wasm-bindgen browser tests (see M7-20).
             # `wasm-bindgen-test-runner`, already here as part of

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!--
+    The rustsega app icon (M7-18, #151): a d-pad on a rounded square, in the
+    accent colours of style.css. Original artwork, deliberately nothing
+    Sega-owned, and no lettering, so it reads at 32px.
+
+    The cross spans 380 of the 512 canvas and its outermost point is 199 from
+    the centre. The maskable safe zone is the inner 80 percent, a circle of
+    radius 205, so this one drawing serves both the "any" and the "maskable"
+    icons without shrinking. See README.md here for the commands that
+    regenerate the PNGs committed next to it.
+  -->
+  <rect width="512" height="512" rx="104" fill="#5b8cff" />
+  <g fill="#071021">
+    <rect x="196" y="66" width="120" height="380" rx="30" />
+    <rect x="66" y="196" width="380" height="120" rx="30" />
+  </g>
+  <circle cx="256" cy="256" r="46" fill="#5b8cff" />
+  <circle cx="256" cy="256" r="28" fill="#071021" />
+</svg>
