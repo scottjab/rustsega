@@ -11,8 +11,9 @@
 //! [`Controls`]: a `Copy` handle over the pause state, which is a signal.
 //!
 //! Sound is [`crate::audio`], and while its clock is running that clock is what
-//! decides how many frames [`Emulator::tick`] runs. Input is M7-07..09, so
-//! nothing here calls `Genesis::set_pad`.
+//! decides how many frames [`Emulator::tick`] runs. Input is [`crate::input`],
+//! the page's one merged pad state: this module only reads it, once per frame
+//! (M7-07, #140).
 //!
 //! [`genesis::Genesis::drain_audio`] is called once per frame, and only while the
 //! output is running: the mixer clears its chip buffers at the start of every
@@ -446,6 +447,7 @@ impl Emulator {
         let due = self.frames_due(now_ms);
         if !self.paused {
             for _ in 0..due {
+                self.sync_pads();
                 self.genesis.run_frame();
                 self.pump_audio();
             }
@@ -453,6 +455,19 @@ impl Emulator {
         }
         self.sync_sound();
         self.arm();
+    }
+
+    /// Reports the page's merged pad state to the console, once per frame.
+    ///
+    /// Before [`genesis::Genesis::run_frame`], because that call reads the pads
+    /// as they stand at the start of the frame: a press that lands while a frame
+    /// is running is then current for the next one (M7-07, #140). The state is
+    /// the page's, not the console's - see [`crate::input::with_state`] for why.
+    fn sync_pads(&mut self) {
+        for port in 0..crate::input::PORTS {
+            let buttons = crate::input::with_state(|input| input.buttons(port));
+            self.genesis.set_pad(port, buttons);
+        }
     }
 
     /// How many frames this tick owes: from the audio clock when there is one,

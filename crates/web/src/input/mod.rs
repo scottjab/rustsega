@@ -3,12 +3,21 @@
 //!
 //! docs/ARCHITECTURE.md, "Input: one `InputState` that merges keyboard, Gamepad
 //! API, and touch overlay into `Buttons` per port". This is the whole of that
-//! model and none of its plumbing: nothing here listens to a browser event, so
-//! the module imports no browser bindings at all and [`InputState`] runs under a
-//! plain `cargo test -p web`. The listeners - keyboard (M7-07, #140),
+//! model and none of its browser plumbing: nothing here listens to a browser
+//! event, so the module imports no browser bindings at all and [`InputState`]
+//! runs under a plain `cargo test -p web`. The listeners - keyboard (M7-07, #140),
 //! Gamepad API (M7-08, #141), touch overlay (M7-09, #142) - are the callers that
 //! will translate real events into [`InputState::set`] calls, and the settings UI
 //! (M7-10, #143) is the caller that edits [`Bindings`].
+//!
+//! The one piece of state the page shares is here: [`with_state`] is how a
+//! listener reports a press and how the emulation loop reads a port. It is a
+//! `thread_local` rather than an `InputState` owned by
+//! [`crate::emulator::Emulator`] because the held-button table is not the
+//! console's - it is there before a cartridge is loaded, it survives loading
+//! another one, and every source writes the same table whether or not a console
+//! happens to be running. A `Rc<RefCell<InputState>>` in a Leptos context is not
+//! an alternative: `provide_context` wants `Send + Sync` (M7-07, #140).
 //!
 //! The model is a table of held buttons rather than a `Buttons` per port, and
 //! that is the reason it exists. A `genesis::Buttons` is a set with no way to
@@ -20,11 +29,36 @@
 
 pub mod bindings;
 pub mod button;
+pub mod keyboard;
+
+use std::cell::RefCell;
 
 use genesis::Buttons;
 
 pub use bindings::Bindings;
 pub use button::PadButton;
+
+/// The control ports the page drives: the console's two pad ports.
+///
+/// [`genesis::Genesis::set_pad`] takes a third port for the peripherals no pad
+/// sits in, and [`InputState`] ignores a port it was not built with, so a
+/// binding that reaches for player two has somewhere to land and a loop cannot
+/// ask the console for a port it does not have.
+pub const PORTS: usize = 2;
+
+thread_local! {
+    /// The page's held buttons, one table for every source.
+    static PADS: RefCell<InputState> = RefCell::new(InputState::new(PORTS));
+}
+
+/// Runs `f` against the page's [`InputState`], which [`with_state`] owns.
+///
+/// The emulation loop reads it once per frame (see
+/// [`crate::emulator`]); the keyboard listener writes it (M7-07, #140), as do
+/// the gamepad (M7-08, #141) and the touch overlay (M7-09, #142).
+pub fn with_state<T>(f: impl FnOnce(&mut InputState) -> T) -> T {
+    PADS.with(|pads| f(&mut pads.borrow_mut()))
+}
 
 /// Who is reporting a button.
 ///
@@ -320,6 +354,18 @@ mod tests {
         let held = input.buttons(0);
         assert!(held.contains(Buttons::LEFT));
         assert!(!held.contains(Buttons::RIGHT));
+    }
+
+    #[test]
+    fn the_page_state_has_room_for_both_control_ports() {
+        with_state(|input| {
+            input.set(Source::Keyboard, 1, PadButton::Right, true);
+            assert!(input.buttons(1).contains(Buttons::RIGHT));
+            assert_eq!(input.buttons(0), Buttons::empty());
+            // Back to an empty table for any other test that reads it.
+            input.clear_source(Source::Keyboard);
+            assert_eq!(input.buttons(1), Buttons::empty());
+        });
     }
 
     #[test]
