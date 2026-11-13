@@ -17,12 +17,12 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::rc::Weak;
 
 use genesis::Config;
 use genesis::Genesis;
 use leptos::html;
 use leptos::prelude::*;
+use vdp::FrameBuffer;
 use wasm_bindgen::Clamped;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
@@ -115,12 +115,12 @@ pub fn frame_to_rgba_bytes(frame: &FrameBuffer, out: &mut Vec<u8>) {
     }
 }
 
-/// The console this tab is running: `None` until a cartridge is on the canvas,
-/// and replaced - never shared - when another ROM arrives.
-///
-/// A thread local rather than a context or a signal because it holds an `Rc`, and
-/// because the animation-frame callback, a file drop and a button click are all on
-/// this one thread and need one owner.
+// The console this tab is running: `None` until a cartridge is on the canvas, and
+// replaced - never shared - when another ROM arrives.
+//
+// A thread local rather than a context or a signal because it holds an `Rc`, and
+// because the animation-frame callback, a file drop and a button click are all on
+// this one thread and need one owner.
 thread_local! {
     static RUNNING: RefCell<Option<Rc<RefCell<Emulator>>>> = const { RefCell::new(None) };
 }
@@ -155,11 +155,11 @@ fn start(rom: &LoadedRom, canvas: &HtmlCanvasElement) -> Result<(), StartError> 
 ///
 /// `Copy`, and holding only a signal, so it can be captured by a [`Callback`] -
 /// which a `Genesis` could not be, being neither `Send` nor cheap to reach.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct Controls {
     /// Whether the console is being held. The top bar's one button shows this:
     /// pause when it is running, play when it is held.
-    pub paused: ReadSignal<bool>,
+    pub paused: RwSignal<bool>,
 }
 
 impl Controls {
@@ -198,9 +198,10 @@ impl Controls {
 pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
     let roms = expect_context::<RwSignal<Option<LoadedRom>>>();
     let toasts = expect_context::<Toasts>();
-    let (paused, set_paused) = signal(false);
+    let paused = RwSignal::new(false);
 
-    Effect::new(move |started: Option<String>| {
+    Effect::new(move |started: Option<Option<String>>| {
+        let started = started.flatten();
         // The canvas first, and untracked reads of nothing: if it is not there,
         // there is nowhere to draw and whatever was running goes with it.
         let Some(canvas) = canvas.get() else {
@@ -225,7 +226,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
                 }
             }
         });
-        set_paused.set(false);
+        paused.set(false);
         Some(id)
     });
 
@@ -268,7 +269,7 @@ impl Emulator {
     ///
     /// The animation frame is requested before the callback is filed away, so
     /// that there is no moment in which a tick could arrive for a console that
-    /// cannot answer it. The callback holds a [`Weak`] for the same reason
+    /// cannot answer it. The callback holds a `Weak` for the same reason
     /// [`stop`] can free the machine: a loop must not be what keeps a retired
     /// console alive.
     fn start(rom: &LoadedRom, canvas: &HtmlCanvasElement) -> Result<Rc<RefCell<Self>>, StartError> {
@@ -530,7 +531,7 @@ mod tests {
     fn pause_and_reset_do_nothing_without_a_console() {
         let owner = Owner::new();
         owner.set();
-        let (paused, _set_paused) = signal(false);
+        let paused = RwSignal::new(false);
         let controls = Controls { paused };
 
         controls.reset();
