@@ -723,8 +723,9 @@ async fn read_slot(store: SlotStore, slot: u32, toasts: Toasts) {
         return;
     };
     let outcome = emulator.borrow_mut().apply_slot(&record);
-    if let Err(error) = outcome {
-        toasts.push(ToastKind::Danger, slots::state_error_toast(error));
+    match outcome {
+        Ok(()) => toasts.push(ToastKind::Info, format!("Loaded slot {}", slot + 1)),
+        Err(error) => toasts.push(ToastKind::Danger, slots::state_error_toast(error)),
     }
 }
 
@@ -1240,7 +1241,11 @@ impl Emulator {
             audio.discard();
         }
         self.drop_audio_blocks = AUDIO_BACKLOG_BLOCKS;
-        self.paint();
+        // No `paint()` here. The state carries the machine, not the picture
+        // (`genesis::Genesis::load_state`), so right now `frame()` is a buffer
+        // nothing drew: painting would show black until the next frame runs. The
+        // next frame does redraw it, and while paused the last drawn picture is
+        // the honest one to leave up.
         self.flush_sram(now_ms(), true);
         Ok(())
     }

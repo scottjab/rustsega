@@ -280,7 +280,10 @@ fn SlotCardView(
         <li
             class="slot-card"
             class:slot-card--current=current
-            class:slot-card--empty=move || !cards.get(slot_number).filled
+            // `record`, not `cards.get`: the latter reads untracked, and a class
+            // bound to it would be computed once and then keep saying "empty" at a
+            // slot the player had just filled.
+            class:slot-card--empty=move || !record.get().filled
             aria-current=move || current.get().then_some("true")
         >
             <canvas
