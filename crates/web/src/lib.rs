@@ -22,6 +22,7 @@ pub mod frame_pacer;
 pub mod gamepad_events;
 pub mod input;
 pub mod keyboard_events;
+pub mod menu;
 pub mod nav;
 pub mod rom;
 pub mod rom_picker;

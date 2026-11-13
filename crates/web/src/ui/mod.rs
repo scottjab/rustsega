@@ -7,6 +7,7 @@
 
 pub mod button;
 pub mod drawer;
+pub mod hint;
 pub mod icons;
 pub mod select;
 pub mod slider;

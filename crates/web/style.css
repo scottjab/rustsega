@@ -226,7 +226,12 @@ canvas {
   color: var(--text-muted);
 }
 
-.select {
+/* The button of a listbox: what a `<select>` used to look like, because a native
+ * popup cannot be driven by a gamepad (M7-11, #144). */
+.listbox__button {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   width: 100%;
   min-height: 36px;
   padding: 0 var(--space-5) 0 var(--space-3);
@@ -244,6 +249,41 @@ canvas {
   font-size: var(--text-sm);
   appearance: none;
   cursor: pointer;
+  text-align: left;
+}
+
+/* The list behind that button: a panel of options, mounted only while it is open
+ * so that its buttons are in the tab order and in the spatial walk only while
+ * they are on screen. */
+.listbox {
+  display: grid;
+  gap: 2px;
+  padding: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+}
+
+.listbox__option {
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-radius: calc(var(--radius-control) - 2px);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.listbox__option:hover {
+  background: var(--surface);
+}
+
+.listbox__option[aria-selected="true"] {
+  background: var(--accent);
+  color: var(--on-accent);
 }
 
 .slider {
@@ -583,6 +623,39 @@ canvas {
   flex: 1;
   padding: var(--space-4);
   overflow-y: auto;
+}
+
+/* The hint bar at the foot of the menu: `sticky` to the bottom of the scrolled
+ * body, so it says what the buttons do while the player is still reading the
+ * middle of the page (M7-11, #144). */
+.hint {
+  position: sticky;
+  bottom: calc(var(--space-4) * -1);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  margin: var(--space-4) calc(var(--space-4) * -1) calc(var(--space-4) * -1);
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.hint__item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.hint__key {
+  padding: 2px var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius-control) - 2px);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
 }
 
 /* Under 640px the drawer is a bottom sheet, not a side panel. */
@@ -942,7 +1015,7 @@ canvas {
 
 @media (prefers-reduced-motion: no-preference) {
   .btn,
-  .select,
+  .listbox__button,
   .toggle__track,
   .toggle__thumb {
     transition:

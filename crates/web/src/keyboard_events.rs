@@ -4,9 +4,10 @@
 //!
 //! The policy is elsewhere and pure - [`crate::input::keyboard`] decides what a
 //! `code` means, whether an element has taken the key for itself, and whether
-//! the browser's own action is cancelled. This file is the part that cannot be
-//! pure: it holds a `KeyboardEvent`, reads its `code` and its target, and writes
-//! to the page's [`crate::input`] and to the shell's signals.
+//! the browser's own action is cancelled, and [`crate::nav`] decides what a key
+//! means to an open menu. This file is the part that cannot be pure: it holds a
+//! `KeyboardEvent`, reads its `code` and its target, and writes to the page's
+//! [`crate::input`], to [`crate::menu`] and to the shell's signals.
 
 use leptos::ev;
 use leptos::prelude::*;
@@ -15,7 +16,6 @@ use wasm_bindgen::JsCast;
 use crate::controls::CaptureDevice;
 use crate::controls::CaptureTarget;
 use crate::controls::bind_key;
-use crate::emulator::Controls;
 use crate::input::Source;
 use crate::input::keyboard::CaptureKey;
 use crate::input::keyboard::Hotkey;
@@ -24,6 +24,14 @@ use crate::input::keyboard::capture_key;
 use crate::input::keyboard::element_takes_key;
 use crate::input::keyboard::map_key;
 use crate::input::keyboard::should_prevent_default;
+use crate::menu::Menu;
+use crate::menu::slider_has_focus;
+use crate::nav::Dir;
+use crate::nav::LastDevice;
+use crate::nav::UiAction;
+use crate::nav::UiEvent;
+use crate::nav::UiMode;
+use crate::nav::ui_action;
 use crate::settings::Settings;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
@@ -49,10 +57,10 @@ const REFUSED_KEY: &str = "That key stays the shell's: Escape, Tab, F1, F4, F11 
 /// `capture` is the cell of that page waiting for a key, if there is one, and it
 /// outranks everything below it. `playing` is whether a cartridge is loaded,
 /// which decides how much of the page's keyboard the game gets - see
-/// [`should_prevent_default`].
+/// [`should_prevent_default`]. `menu` is the shell's menu mode, which owns the
+/// keyboard outright while a menu is open (M7-11, #144).
 pub fn use_keyboard(
-    console: Controls,
-    drawer_open: RwSignal<bool>,
+    menu: Menu,
     playing: Signal<bool>,
     toasts: Toasts,
     settings: RwSignal<Settings>,
@@ -86,7 +94,6 @@ pub fn use_keyboard(
                 }
                 return;
             }
-            let action = settings.with(|settings| map_key(&code, &settings.bindings));
             if takes_key_for_itself(&event) {
                 // A key aimed at a text entry or a `select` is that element's
                 // business, so the pad never hears of it. Saying nothing here is
@@ -96,14 +103,45 @@ pub fn use_keyboard(
                 // - which is a character the player did not want.
                 return;
             }
-            if should_prevent_default(&action, playing.get(), drawer_open.get()) {
+            let action = settings.with(|settings| map_key(&code, &settings.bindings));
+            if menu.mode.get_untracked() == UiMode::Menu {
+                // A menu is open, so the keyboard belongs to the menu (M7-11,
+                // #144): the arrows move the focus and Enter or Space activates
+                // what it landed on, and a key bound to a pad button is not game
+                // input while a menu is on screen - which is the acceptance
+                // criterion, not an optimisation.
+                if let Some(action) = ui_action(&UiEvent::Key(&code)) {
+                    // Left and right on a slider are the exception, because that
+                    // is what those two keys are for on one and the browser moves
+                    // the value itself. Up and down are not: they would move the
+                    // value too, and the walk wants them.
+                    let slider_arrows = slider_has_focus()
+                        && matches!(action, UiAction::Move(Dir::Left | Dir::Right));
+                    if !slider_arrows {
+                        // And the browser is told not to activate the focused
+                        // button as well, or a Space would press it twice.
+                        event.prevent_default();
+                        menu.announce(LastDevice::Keyboard);
+                        menu.run(action);
+                    }
+                    return;
+                }
+                // Everything else the menu does not want is the shell's or
+                // nobody's: `Tab` in particular, which the browser still uses to
+                // move focus, and `F1` and friends still reach the shell.
+                if let KeyAction::Hotkey(hotkey) = action {
+                    hotkey_do(hotkey, menu, toasts);
+                }
+                return;
+            }
+            if should_prevent_default(&action, playing.get(), menu.drawer_open.get()) {
                 event.prevent_default();
             }
             match action {
                 KeyAction::Pad { port, button } => crate::input::with_state(|input| {
                     input.set(Source::Keyboard, port, button, true);
                 }),
-                KeyAction::Hotkey(hotkey) => hotkey_do(hotkey, console, drawer_open, toasts),
+                KeyAction::Hotkey(hotkey) => hotkey_do(hotkey, menu, toasts),
                 KeyAction::None => {}
             }
         })
@@ -162,16 +200,17 @@ fn takes_key_for_itself(event: &web_sys::KeyboardEvent) -> bool {
 ///
 /// `pub(crate)` because a pad asks for these too - see
 /// [`crate::gamepad_events`] - and a hotkey means the same thing whoever
-/// reported it.
-pub(crate) fn hotkey_do(
-    hotkey: Hotkey,
-    console: Controls,
-    drawer_open: RwSignal<bool>,
-    toasts: Toasts,
-) {
+/// reported it. That sharing is what keeps a pad's `home` and the keyboard's
+/// `Escape` from both toggling the menu on the way into it (M7-11, #144): one of
+/// them owns the act, and it is this function while a game is running.
+///
+/// `ToggleMenu` and `Pause` go through the [`Menu`] rather than straight at the
+/// drawer and the console, because inside a menu the first means "close the
+/// innermost thing" and either one changes who is holding the console.
+pub(crate) fn hotkey_do(hotkey: Hotkey, menu: Menu, toasts: Toasts) {
     match hotkey {
-        Hotkey::Pause => console.toggle(),
-        Hotkey::ToggleMenu => drawer_open.update(|open| *open = !*open),
+        Hotkey::Pause => menu.pause_by_hand(),
+        Hotkey::ToggleMenu => menu.toggle_menu(),
         Hotkey::Fullscreen => toasts.push(
             ToastKind::Info,
             "Fullscreen is not wired up in this build yet.",

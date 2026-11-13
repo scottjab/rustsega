@@ -14,6 +14,7 @@ use crate::controls::Controls;
 use crate::emulator::use_cartridge;
 use crate::gamepad_events::use_gamepad;
 use crate::keyboard_events::use_keyboard;
+use crate::menu::use_menu;
 use crate::rom::LoadedRom;
 use crate::rom_picker::EmptyScreen;
 use crate::rom_picker::RomFileInput;
@@ -25,6 +26,7 @@ use crate::touch_events::TouchOverlay;
 use crate::touch_events::coarse_pointer;
 use crate::ui::button::IconButton;
 use crate::ui::drawer::Drawer;
+use crate::ui::hint::HintBar;
 use crate::ui::icons;
 use crate::ui::select::Select;
 use crate::ui::select::SelectOption;
@@ -109,11 +111,16 @@ pub fn App() -> impl IntoView {
     let region =
         Signal::derive(move || roms.with(|rom| rom.as_ref().map(|rom| rom.region.clone())));
 
+    // The menu mode, mounted once for the shell (M7-11, #144): opening a menu
+    // holds the console and takes the arrow keys off the game, and both the
+    // keyboard and the pads have to ask the same one about it.
+    let menu = use_menu(console, drawer_open, capture);
+
     // The keyboard, on the window, for as long as the shell is up (M7-07, #140).
-    // It takes the drawer and the cartridge because a form and a game cannot
+    // It takes the menu and the cartridge because a form and a game cannot
     // both have the arrow keys: while a game runs the keys are swallowed and go
-    // to the pad, and while the drawer is open they are the drawer's.
-    use_keyboard(console, drawer_open, loaded, toasts, settings, capture);
+    // to the pad, and while a menu is open they move its focus.
+    use_keyboard(menu, loaded, toasts, settings, capture);
 
     // Whether a controller is plugged in, which the touch overlay hides itself
     // behind and nothing else asks about (M7-09, #142).
@@ -123,14 +130,7 @@ pub fn App() -> impl IntoView {
     // long as the shell is up (M7-08, #141). No `loaded` this time: a pad that
     // is plugged in is a pad the player is holding, whether or not a cartridge
     // is in, and its connect/disconnect news is worth a toast either way.
-    use_gamepad(
-        console,
-        drawer_open,
-        toasts,
-        controller_connected,
-        settings,
-        capture,
-    );
+    use_gamepad(menu, toasts, controller_connected, settings, capture);
 
     // The on-screen controller: on for a phone, on for a desktop that asked, off
     // for a phone whose player picked up a pad. `coarse` is read once - a browser
@@ -314,6 +314,10 @@ pub fn App() -> impl IntoView {
                 </section>
 
                 <Controls drawer_open=drawer_open />
+
+                // What the buttons of whichever device is in hand do in here,
+                // which is the part a d-pad cannot work out for itself (M7-11, #144).
+                <HintBar device=Signal::derive(move || menu.hints.get()) />
             </Drawer>
 
             // The touch overlay, mounted exactly while it is on screen: its pointer

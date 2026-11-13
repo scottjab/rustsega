@@ -46,6 +46,10 @@ web-sys = { version = "0.3", features = [
   "GainNode",
   "Blob",
   "CanvasRenderingContext2d",
+  # The spatial walk of M7-11 (#144) has to know which controls a player can see,
+  # and `visibility` - which is how the shut drawer hides itself - is only
+  # readable off the computed style.
+  "CssStyleDeclaration",
   "DataTransfer",
   # The touch overlay's geometry (M7-09, #142): `getBoundingClientRect` answers one
   # of these, and it is how a slide from one control to another is measured.
@@ -67,6 +71,9 @@ web-sys = { version = "0.3", features = [
   "GamepadEvent",
   "GamepadMappingType",
   "HtmlCanvasElement",
+  # The focus the spatial walk moves (M7-11, #144): `focus`, `blur`, `click`, and
+  # the `getBoundingClientRect` a candidate is measured by.
+  "HtmlElement",
   "HtmlInputElement",
   "HtmlSelectElement",
   "ImageData",
@@ -76,6 +83,9 @@ web-sys = { version = "0.3", features = [
   # that vibrates - which is already here for the gamepads.
   "MediaQueryList",
   "Navigator",
+  # `querySelectorAll` hands the walk its candidates as a list of nodes.
+  "Node",
+  "NodeList",
   "PointerEvent",
   # The settings store of M7-10 (#143): `window().local_storage()` and the two
   # items this reads and writes. Chosen over `gloo-storage` because web-sys is
