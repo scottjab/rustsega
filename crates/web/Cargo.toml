@@ -91,6 +91,10 @@ web-sys = { version = "0.3", features = [
   "Node",
   "NodeList",
   "PointerEvent",
+  # The save watcher's clock (M7-14, #147): `performance.now()`, which is the
+  # timebase an animation frame's own timestamp is on, so a flush timed from the
+  # frame loop and one timed from `pagehide` are on the same ruler.
+  "Performance",
   # The fullscreen screen of M7-12 (#145): the observer that reports the room the
   # picture has, the element that goes fullscreen, and the orientation the phone
   # is asked to hold - which desktop Chrome refuses, so `Screen` and
@@ -123,6 +127,7 @@ serde = { workspace = true }
 # store itself, so the JSON is now read and written at run time rather than only
 # in a round-trip test.
 serde_json = { workspace = true }
+rexie = "0.6"
 
 [lints]
 workspace = true

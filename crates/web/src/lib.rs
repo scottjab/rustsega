@@ -11,7 +11,9 @@
 //! [`input::touch`] say what a key, a pad reading and a finger mean, and
 //! [`keyboard_events`], [`gamepad_events`] and [`touch_events`] are the halves that
 //! listen for them, poll them, and draw them. [`settings`] is the one store every
-//! of those reads, and [`controls`] is the drawer page that edits it.
+//! of those reads, and [`controls`] is the drawer page that edits it. Bytes that
+//! outlive the page - a cart's saved RAM today, save states tomorrow - go through
+//! [`storage`], and [`emulator`] is the half that gets them there.
 
 pub mod app;
 pub mod audio;
@@ -30,6 +32,7 @@ pub mod rom_picker;
 pub mod scale;
 pub mod screen;
 pub mod settings;
+pub mod storage;
 pub mod theme;
 pub mod touch_events;
 pub mod ui;
