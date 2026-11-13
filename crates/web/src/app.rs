@@ -381,7 +381,14 @@ pub fn App() -> impl IntoView {
                 // is `screen--enter` on the canvases below (M7-19, #152).
                 <Show
                     when=move || loaded.get()
-                    fallback=|| view! { <RecentsGrid/> <EmptyScreen/> }
+                    fallback=|| {
+                        view! {
+                            <div class="start-screen">
+                                <RecentsGrid/>
+                                <EmptyScreen/>
+                            </div>
+                        }
+                    }
                 >
                     // The 2D canvas, which is what was here before WebGL: the
                     // drawing buffer is the VDP's own pixels and the browser

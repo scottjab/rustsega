@@ -696,6 +696,28 @@ canvas {
   pointer-events: none;
 }
 
+/* The empty screen as one block: the recent games above the drop zone (M7-19,
+   #152). They were two children of the screen area before, each sized by its own
+   implicit grid row, which is how a dozen cards pushed the drop zone past the
+   bottom of a container that clips its overflow - and the drop zone is the one
+   thing the empty state cannot be without.
+
+   One grid, one gap, one scroller. The screen area's own `place-items: center`
+   centres this block, so nothing here needs to centre itself: when the content is
+   shorter than the screen it sits in the middle at desktop width and at phone
+   width, and when it is not - landscape on a phone - it scrolls from the top and
+   the dashed card stays inside it. */
+.start-screen {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  gap: var(--space-5);
+  width: min(680px, 100%);
+  max-height: 100%;
+  padding: var(--space-1);
+  overflow-y: auto;
+}
+
 /* The empty state: what the screen area shows in place of the canvas until a
    ROM arrives. It is a card, not a frame, so that the dashed edge reads as
    "drop here" and not as a broken screen. */
@@ -748,9 +770,7 @@ canvas {
   display: grid;
   justify-items: center;
   gap: var(--space-2);
-  width: min(680px, 100%);
-  max-height: 100%;
-  overflow-y: auto;
+  width: 100%;
 }
 
 .recents__heading {
