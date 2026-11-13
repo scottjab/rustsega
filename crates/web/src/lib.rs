@@ -11,9 +11,10 @@
 //! [`input::touch`] say what a key, a pad reading and a finger mean, and
 //! [`keyboard_events`], [`gamepad_events`] and [`touch_events`] are the halves that
 //! listen for them, poll them, and draw them. [`settings`] is the one store every
-//! of those reads, [`controls`] is the drawer page that edits it, and [`fps`] is the
-//! reading the frame loop publishes for the overlay to show. Bytes that
-//! outlive the page - a cart's saved RAM today, save states tomorrow - go through
+//! of those reads, [`controls`] is the drawer page that edits it, [`fps`] is the
+//! reading the frame loop publishes for the overlay to show, and [`perf`] is the
+//! arithmetic that turns the loop's own frame timings into the number the browser
+//! budget test asserts on. Bytes that outlive the page - a cart's saved RAM today, save states tomorrow - go through
 //! [`storage`], and [`emulator`] is the half that gets them there.
 
 pub mod app;
@@ -29,6 +30,7 @@ pub mod input;
 pub mod keyboard_events;
 pub mod menu;
 pub mod nav;
+pub mod perf;
 pub mod recents;
 pub mod render;
 pub mod rom;

@@ -5,6 +5,14 @@ edition.workspace = true
 version.workspace = true
 publish.workspace = true
 
+[features]
+# The in-browser frame-budget test (M7-21, #154). Off by default, and not a
+# runtime skip: that test `include_bytes!`s a cartridge named by the
+# `RUSTSEGA_PERF_ROM` environment variable, and `include_bytes!` is a compile-time
+# path, so an unset variable has to mean a file that is never compiled rather
+# than a test that prints `SKIPPED`. `just perf-web` turns it on; nothing else does.
+perf-rom = []
+
 [dependencies]
 console_error_panic_hook = "0.1"
 # The console: its cartridge header parser is what `rom.rs` reads a ROM with
