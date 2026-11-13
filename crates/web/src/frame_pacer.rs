@@ -104,11 +104,7 @@ mod tests {
     fn a_60_hz_console_on_a_60_hz_display_runs_one_frame_per_tick() {
         let mut pacer = FramePacer::new(60.0);
         for tick in 0..600 {
-            assert_eq!(
-                pacer.frames_due(tick as f64 * TICK_60),
-                1,
-                "tick {tick}"
-            );
+            assert_eq!(pacer.frames_due(tick as f64 * TICK_60), 1, "tick {tick}");
         }
     }
 
@@ -140,11 +136,7 @@ mod tests {
         // yet, so nothing is overdue.
         assert_eq!(pacer.frames_due(0.0), 1);
         for tick in 1..20 {
-            assert_eq!(
-                pacer.frames_due(tick as f64 * TICK_30),
-                2,
-                "tick {tick}"
-            );
+            assert_eq!(pacer.frames_due(tick as f64 * TICK_30), 2, "tick {tick}");
         }
     }
 

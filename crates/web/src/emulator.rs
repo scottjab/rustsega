@@ -220,10 +220,10 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
         // anything else runs: `Genesis::new` is the only thing that takes it, and
         // it does not look at the signal.
         roms.with(|rom| {
-            if let Some(rom) = rom.as_ref() {
-                if let Err(error) = start(rom, &canvas) {
-                    toasts.push(ToastKind::Danger, error.to_string());
-                }
+            if let Some(rom) = rom.as_ref()
+                && let Err(error) = start(rom, &canvas)
+            {
+                toasts.push(ToastKind::Danger, error.to_string());
             }
         });
         paused.set(false);
@@ -386,10 +386,10 @@ impl Emulator {
     /// The requested frame goes before the callback: dropping a `Closure` that
     /// the browser still intends to call leaves a call to nothing.
     fn stop(&mut self) {
-        if let Some(frame) = self.frame.take() {
-            if let Some(window) = web_sys::window() {
-                let _ = window.cancel_animation_frame(frame);
-            }
+        if let Some(frame) = self.frame.take()
+            && let Some(window) = web_sys::window()
+        {
+            let _ = window.cancel_animation_frame(frame);
         }
         self.tick = None;
     }
@@ -464,7 +464,11 @@ mod tests {
         };
         frame_to_rgba_bytes(&small, &mut out);
         assert_eq!(out, vec![0, 0, 255, 255]);
-        assert_eq!(out.capacity(), capacity, "the buffer is reused, not rebuilt");
+        assert_eq!(
+            out.capacity(),
+            capacity,
+            "the buffer is reused, not rebuilt"
+        );
     }
 
     /// A PAL-only cart is the only one that runs at 50 Hz, and the region comes
