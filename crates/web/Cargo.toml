@@ -56,11 +56,19 @@ web-sys = { version = "0.3", features = [
   "Element",
   "File",
   "FileList",
+  # The gamepads of M7-08 (#141): the pad itself, one of its buttons, the
+  # hotplug event that names it, the `navigator` that polls them, and the mapping
+  # string that says whether it follows the standard layout.
+  "Gamepad",
+  "GamepadButton",
+  "GamepadEvent",
+  "GamepadMappingType",
   "HtmlCanvasElement",
   "HtmlInputElement",
   "HtmlSelectElement",
   "ImageData",
   "KeyboardEvent",
+  "Navigator",
   "Window",
 ] }
 # `Bindings` is rebindable and stored in `localStorage` (docs/ARCHITECTURE.md,

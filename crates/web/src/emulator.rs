@@ -422,6 +422,12 @@ impl Emulator {
         // `weak`: the listeners need the same handle, and they only read it.
         let wake = wake_listeners(&weak);
         let callback = Closure::wrap(Box::new(move |now_ms: f64| {
+            // The gamepads first, and outside the borrow below. The Gamepad API
+            // is poll based, so this is the only place a pad's buttons change
+            // (M7-08, #141); a reading can also ask for a hotkey, and a hotkey
+            // can reach the console - which is a second `borrow_mut` inside the
+            // one just below.
+            crate::gamepad_events::poll_gamepads();
             if let Some(emulator) = weak.upgrade() {
                 emulator.borrow_mut().tick(now_ms);
             }
@@ -463,6 +469,11 @@ impl Emulator {
     /// as they stand at the start of the frame: a press that lands while a frame
     /// is running is then current for the next one (M7-07, #140). The state is
     /// the page's, not the console's - see [`crate::input::with_state`] for why.
+    ///
+    /// The gamepads are read a little before this, by
+    /// [`crate::gamepad_events::poll_gamepads`] in the animation frame, rather
+    /// than here: it is the same per-frame moment, but outside the borrow this
+    /// runs under.
     fn sync_pads(&mut self) {
         for port in 0..crate::input::PORTS {
             let buttons = crate::input::with_state(|input| input.buttons(port));

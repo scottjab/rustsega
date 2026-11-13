@@ -545,7 +545,7 @@ mod tests {
         // Genesis Mode: neither opens a menu.
         assert_eq!(poll_hotkey(&press(START)), None);
         assert_eq!(poll_hotkey(&press(SELECT)), None);
-        assert_eq!(poll_hotkey(&vec![true; 5]), None);
+        assert_eq!(poll_hotkey(&[true; 5]), None);
     }
 
     #[test]
