@@ -239,6 +239,24 @@ pub fn apply_snapshot(
     }
 }
 
+/// The first button index whose press began this frame: held now, not held on
+/// the `previous` reading.
+///
+/// The controls page (M7-10, #143) captures the next pad button for a binding,
+/// and it wants the edge rather than the level: a player who was already holding
+/// a button when they clicked the cell must not bind it without pressing
+/// anything. `previous` is `None` for the reading that arms a capture, so this
+/// answers `None` for it - the baseline frame binds nothing, however many buttons
+/// are down.
+///
+/// `held` and `previous` are one pad's pressed button indices, as
+/// [`crate::gamepad_events`] reads them off the `Gamepad`.
+pub fn newly_pressed(held: &[u8], previous: Option<&[u8]>) -> Option<u8> {
+    held.iter()
+        .find(|index| previous.is_some_and(|previous| !previous.contains(index)))
+        .copied()
+}
+
 /// The toast for a pad that has just been given port `port`.
 pub fn connect_toast(port: usize, id: &str) -> String {
     format!("Controller {} connected: {}", port + 1, id)
@@ -647,5 +665,23 @@ mod tests {
             NON_STANDARD_TOAST,
             "This controller isn't using the standard layout, you may need to rebind it"
         );
+    }
+
+    #[test]
+    fn newly_pressed_finds_the_button_that_began_being_held() {
+        assert_eq!(newly_pressed(&[0, 4], Some(&[0])), Some(4));
+    }
+
+    #[test]
+    fn newly_pressed_is_nothing_on_the_baseline_reading() {
+        // A pad already covered in buttons arms a capture with its first frame;
+        // that frame is the baseline, and it must bind nothing.
+        assert_eq!(newly_pressed(&[0, 1, 2], None), None);
+    }
+
+    #[test]
+    fn newly_pressed_is_nothing_while_the_same_buttons_are_held() {
+        assert_eq!(newly_pressed(&[0, 1], Some(&[0, 1])), None);
+        assert_eq!(newly_pressed(&[], Some(&[])), None);
     }
 }

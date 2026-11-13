@@ -16,6 +16,7 @@
 pub mod app;
 pub mod audio;
 pub mod audio_pacing;
+pub mod controls;
 pub mod emulator;
 pub mod frame_pacer;
 pub mod gamepad_events;

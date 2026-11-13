@@ -37,7 +37,7 @@ use web_sys::HtmlCanvasElement;
 use web_sys::ImageData;
 
 use crate::audio::AudioOut;
-use crate::audio::AudioSettings;
+use crate::settings::Settings;
 use crate::audio_pacing::MAX_FRAMES_PER_TICK;
 use crate::audio_pacing::TARGET_AHEAD_SECS;
 use crate::audio_pacing::frames_to_run;
@@ -168,7 +168,7 @@ fn start(
     rom: &LoadedRom,
     canvas: &HtmlCanvasElement,
     console: Controls,
-    settings: AudioSettings,
+    settings: RwSignal<Settings>,
 ) -> Result<(), StartError> {
     // Before the new console asks for a frame of its own: the old one's request
     // has to be cancelled, not merely dropped along with its callback, or the
@@ -233,7 +233,7 @@ impl Controls {
 
     /// Sets the running console's volume, `0.0` to `1.0` as the drawer's slider
     /// has it. With no console there is nothing to turn, and the setting is not
-    /// lost: a console made later reads [`AudioSettings`] for itself.
+    /// lost: a console made later reads [`Settings`] for itself.
     pub fn set_volume(self, volume: f64) {
         if let Some(emulator) = running() {
             emulator.borrow_mut().set_volume(volume as f32);
@@ -258,7 +258,7 @@ impl Controls {
 pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
     let roms = expect_context::<RwSignal<Option<LoadedRom>>>();
     let toasts = expect_context::<Toasts>();
-    let settings = expect_context::<AudioSettings>();
+    let settings = expect_context::<RwSignal<Settings>>();
     let paused = RwSignal::new(false);
     let console = Controls {
         paused,
@@ -298,8 +298,8 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
     // The drawer and the top bar write the volume and the mute; the running
     // console is told here. A console started later does not need these to have
     // run first - it reads the same settings as it comes up.
-    Effect::new(move |_| console.set_volume(settings.volume.get()));
-    Effect::new(move |_| console.set_muted(settings.muted.get()));
+    Effect::new(move |_| console.set_volume(settings.get().volume));
+    Effect::new(move |_| console.set_muted(settings.get().muted));
 
     on_cleanup(stop);
 
@@ -319,7 +319,7 @@ struct Emulator {
     audio: Option<AudioOut>,
     /// The volume and the mute, so a console started - or an output remade -
     /// part-way through a session comes up at the level the drawer shows.
-    settings: AudioSettings,
+    settings: RwSignal<Settings>,
     /// The shell's handle, so the loop can report the audio state back through
     /// [`Controls::sound_on`] without a second owner for the signals.
     console: Controls,
@@ -369,7 +369,7 @@ impl Emulator {
         rom: &LoadedRom,
         canvas: &HtmlCanvasElement,
         console: Controls,
-        settings: AudioSettings,
+        settings: RwSignal<Settings>,
     ) -> Result<Rc<RefCell<Self>>, StartError> {
         // The canvas first, because everything after this point has a browser
         // resource attached to it that a failed start would have to give back.
@@ -541,8 +541,13 @@ impl Emulator {
         if self.audio.is_none() {
             self.audio = AudioOut::new();
             if let Some(audio) = self.audio.as_mut() {
-                audio.set_volume(self.settings.volume.get() as f32);
-                audio.set_muted(self.settings.muted.get());
+                // Untracked: this runs on the animation frame and on a gesture,
+                // and the store is one struct now - a tracked read here would
+                // subscribe the console's own start-up to every setting there is.
+                let volume = self.settings.with_untracked(|settings| settings.volume);
+                let muted = self.settings.with_untracked(|settings| settings.muted);
+                audio.set_volume(volume as f32);
+                audio.set_muted(muted);
             }
         }
         let Some(audio) = self.audio.as_mut() else {

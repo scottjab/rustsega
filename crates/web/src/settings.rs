@@ -258,7 +258,7 @@ impl Settings {
             volume: Self::field(value, "volume", default_volume),
             muted: Self::field(value, "muted", bool::default),
             bindings: Self::field(value, "bindings", Bindings::default),
-            pad_type: Self::field(value, "pad_type", || <[PadType; PORTS]>::default()),
+            pad_type: Self::field(value, "pad_type", <[PadType; PORTS]>::default),
             socd: Self::field(value, "socd", SocdMode::default),
             touch_overlay: Self::field(value, "touch_overlay", TouchOverlayMode::default),
             haptics: Self::field(value, "haptics", default_haptics),
@@ -496,14 +496,16 @@ mod tests {
 
     #[test]
     fn settings_survive_a_json_round_trip() {
-        let mut settings = Settings::default();
-        settings.theme = Theme::Light;
-        settings.volume = 0.35;
-        settings.muted = true;
-        settings.pad_type = [PadType::ThreeButton, PadType::SixButton];
-        settings.socd = SocdMode::LastWins;
-        settings.touch_overlay = TouchOverlayMode::Always;
-        settings.haptics = false;
+        let mut settings = Settings {
+            theme: Theme::Light,
+            volume: 0.35,
+            muted: true,
+            pad_type: [PadType::ThreeButton, PadType::SixButton],
+            socd: SocdMode::LastWins,
+            touch_overlay: TouchOverlayMode::Always,
+            haptics: false,
+            ..Settings::default()
+        };
         settings
             .bindings
             .rebind_key(1, PadButton::Start, "Space");
@@ -513,8 +515,10 @@ mod tests {
 
     #[test]
     fn mute_holds_the_volume_rather_than_replacing_it() {
-        let mut settings = Settings::default();
-        settings.volume = 0.4;
+        let mut settings = Settings {
+            volume: 0.4,
+            ..Settings::default()
+        };
         assert_eq!(settings.gain(), 0.4);
         settings.muted = true;
         assert_eq!(settings.gain(), 0.0);
@@ -532,15 +536,19 @@ mod tests {
 
     #[test]
     fn always_shows_the_overlay_on_a_desktop_too() {
-        let mut settings = Settings::default();
-        settings.touch_overlay = TouchOverlayMode::Always;
+        let settings = Settings {
+            touch_overlay: TouchOverlayMode::Always,
+            ..Settings::default()
+        };
         assert!(settings.touch_visible(false, false));
     }
 
     #[test]
     fn never_hides_the_overlay_even_on_a_phone() {
-        let mut settings = Settings::default();
-        settings.touch_overlay = TouchOverlayMode::Never;
+        let settings = Settings {
+            touch_overlay: TouchOverlayMode::Never,
+            ..Settings::default()
+        };
         assert!(!settings.touch_visible(true, false));
     }
 

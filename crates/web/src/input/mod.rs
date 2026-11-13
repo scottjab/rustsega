@@ -98,6 +98,20 @@ pub enum SocdMode {
     LastWins,
 }
 
+impl SocdMode {
+    /// Every rule, in the order the settings select lists them.
+    pub const ALL: [Self; 2] = [Self::Neutral, Self::LastWins];
+
+    /// The label for this rule in the settings drawer, in the player's words
+    /// rather than the acronym (M7-10, #143).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Neutral => "Opposite directions cancel",
+            Self::LastWins => "Last press wins",
+        }
+    }
+}
+
 /// One button held down by one source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Held {

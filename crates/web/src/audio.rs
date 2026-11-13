@@ -30,7 +30,6 @@
 //! depends on lives in [`crate::audio_pacing`], which does.
 
 use js_sys::Reflect;
-use leptos::prelude::*;
 use wasm_bindgen::JsValue;
 use web_sys::AudioContext;
 use web_sys::AudioContextOptions;
@@ -61,45 +60,8 @@ const UNDERRUN_SECS: f64 = 0.01;
 /// rather than a race, short enough not to be a delay you can hear.
 const RESTART_LEAD_SECS: f64 = 0.05;
 
-/// The default volume of a new console, full.
-pub const DEFAULT_VOLUME: f64 = 1.0;
-
 /// The name of the debug mirror on `window`, published by [`AudioOut`].
 const MIRROR: &str = "rustsegaAudio";
-
-/// The volume and the mute, as one Leptos context (M7-05, #138).
-///
-/// Provided by `App`, written by the settings drawer and the top bar's mute
-/// button, read by [`crate::emulator`] when it starts a console and again
-/// whenever either changes. M7-10 (#143) is what persists them; until then this
-/// is the one place they live, so the drawer and the top bar cannot disagree.
-#[derive(Clone, Copy, Debug)]
-pub struct AudioSettings {
-    /// 0.0 to 1.0, as the drawer's slider has it.
-    pub volume: RwSignal<f64>,
-    /// Whether the output is muted, which keeps `volume` as it was.
-    pub muted: RwSignal<bool>,
-}
-
-impl Default for AudioSettings {
-    fn default() -> Self {
-        Self {
-            volume: RwSignal::new(DEFAULT_VOLUME),
-            muted: RwSignal::new(false),
-        }
-    }
-}
-
-impl AudioSettings {
-    /// The gain a console should put on its output for these settings.
-    pub fn gain(&self) -> f32 {
-        if self.muted.get() {
-            0.0
-        } else {
-            self.volume.get() as f32
-        }
-    }
-}
 
 /// One browser audio output: the context, the volume in front of it, and the
 /// cursor that says when the next block of console sound is due.
@@ -153,7 +115,7 @@ impl AudioOut {
             next_time: 0.0,
             left: Vec::new(),
             right: Vec::new(),
-            volume: DEFAULT_VOLUME as f32,
+            volume: crate::settings::DEFAULT_VOLUME as f32,
             muted: false,
             underruns: 0,
             blocks: 0,
@@ -332,42 +294,5 @@ impl Drop for AudioOut {
     fn drop(&mut self) {
         let _ = self.ctx.close();
         self.publish();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Mute is a held value, not a zeroed one: unmuting returns to wherever the
-    /// slider was rather than to full, which is what a person who muted mid-game
-    /// expects the slider to still say.
-    #[test]
-    fn mute_holds_the_volume_rather_than_replacing_it() {
-        let owner = Owner::new();
-        owner.set();
-        let settings = AudioSettings::default();
-        assert_eq!(settings.gain(), DEFAULT_VOLUME as f32);
-
-        settings.volume.set(0.4);
-        assert_eq!(settings.gain(), 0.4);
-
-        settings.muted.set(true);
-        assert_eq!(settings.gain(), 0.0);
-        assert_eq!(settings.volume.get(), 0.4, "the slider still says 0.4");
-
-        settings.muted.set(false);
-        assert_eq!(settings.gain(), 0.4);
-    }
-
-    /// A new tab is not muted and is not quiet: the first thing a person hears
-    /// after the enabling click should be the game at the volume the slider shows.
-    #[test]
-    fn a_new_console_is_unmuted_and_at_full_volume() {
-        let owner = Owner::new();
-        owner.set();
-        let settings = AudioSettings::default();
-        assert!(!settings.muted.get());
-        assert_eq!(settings.volume.get(), DEFAULT_VOLUME);
     }
 }
