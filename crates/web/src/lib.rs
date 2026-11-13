@@ -26,6 +26,7 @@ pub mod menu;
 pub mod nav;
 pub mod rom;
 pub mod rom_picker;
+pub mod scale;
 pub mod settings;
 pub mod theme;
 pub mod touch_events;

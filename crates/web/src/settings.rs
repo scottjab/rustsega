@@ -31,6 +31,8 @@ use serde::Serialize;
 use crate::input::Bindings;
 use crate::input::PORTS;
 use crate::input::SocdMode;
+use crate::scale::Aspect;
+use crate::scale::ScaleMode;
 use crate::theme::Theme;
 
 /// The `localStorage` key this whole struct lives under.
@@ -140,6 +142,17 @@ pub struct Settings {
     /// When the on-screen controller is on screen.
     #[serde(default)]
     pub touch_overlay: TouchOverlayMode,
+    /// How the frame is scaled into the screen area (M7-12, #145).
+    #[serde(default)]
+    pub scale: ScaleMode,
+    /// What shape the frame's pixels are stretched to (M7-12, #145).
+    #[serde(default)]
+    pub aspect: Aspect,
+    /// Whether the picture is smoothed, which is `image-rendering: auto`, or
+    /// left as blocky pixels, which is `pixelated` - what the shell drew before
+    /// this switch existed, so `false` is the default (M7-12, #145).
+    #[serde(default)]
+    pub smoothing: bool,
     /// `navigator.vibrate` on an overlay press, on browsers that have it.
     #[serde(default = "default_haptics")]
     pub haptics: bool,
@@ -165,6 +178,9 @@ impl Default for Settings {
             pad_type: [PadType::default(); PORTS],
             socd: SocdMode::default(),
             touch_overlay: TouchOverlayMode::default(),
+            scale: ScaleMode::default(),
+            aspect: Aspect::default(),
+            smoothing: false,
             haptics: true,
             hide_touch_with_controller: true,
             version: SETTINGS_VERSION,
@@ -261,6 +277,9 @@ impl Settings {
             pad_type: Self::field(value, "pad_type", <[PadType; PORTS]>::default),
             socd: Self::field(value, "socd", SocdMode::default),
             touch_overlay: Self::field(value, "touch_overlay", TouchOverlayMode::default),
+            scale: Self::field(value, "scale", ScaleMode::default),
+            aspect: Self::field(value, "aspect", Aspect::default),
+            smoothing: Self::field(value, "smoothing", bool::default),
             haptics: Self::field(value, "haptics", default_haptics),
             hide_touch_with_controller: Self::field(
                 value,
@@ -423,6 +442,9 @@ mod tests {
         assert_eq!(settings.pad_type, [PadType::SixButton, PadType::SixButton]);
         assert_eq!(settings.socd, SocdMode::Neutral);
         assert_eq!(settings.touch_overlay, TouchOverlayMode::Auto);
+        assert_eq!(settings.scale, ScaleMode::Integer);
+        assert_eq!(settings.aspect, Aspect::FourThree);
+        assert!(!settings.smoothing);
         assert!(settings.haptics);
         assert!(settings.hide_touch_with_controller);
         assert_eq!(settings.version, SETTINGS_VERSION);
@@ -498,6 +520,9 @@ mod tests {
             pad_type: [PadType::ThreeButton, PadType::SixButton],
             socd: SocdMode::LastWins,
             touch_overlay: TouchOverlayMode::Always,
+            scale: ScaleMode::Fit,
+            aspect: Aspect::Square,
+            smoothing: true,
             haptics: false,
             ..Settings::default()
         };
@@ -558,6 +583,31 @@ mod tests {
         // And a controller changes nothing when there is no overlay to hide.
         settings.touch_overlay = TouchOverlayMode::Auto;
         assert!(!settings.touch_visible(false, true));
+    }
+
+    /// The three video fields of M7-12 (#145) are additive defaults, so a file
+    /// written before they existed still loads: `version` stayed at 1.
+    #[test]
+    fn a_file_without_the_video_fields_still_loads_them_as_defaults() {
+        let settings = Settings::from_json(r#"{"theme":"dark","volume":0.5,"version":1}"#);
+        assert_eq!(settings.theme, Theme::Dark, "the fields it did have survived");
+        assert_eq!(settings.volume, 0.5);
+        assert_eq!(settings.scale, ScaleMode::Integer);
+        assert_eq!(settings.aspect, Aspect::FourThree);
+        assert!(!settings.smoothing, "pixelated is what the shell drew before");
+        assert_eq!(settings.version, SETTINGS_VERSION);
+    }
+
+    #[test]
+    fn a_garbage_video_field_costs_only_itself() {
+        let settings = Settings::from_json(
+            r#"{"scale":"bicubic","aspect":7,"smoothing":"smooth","theme":"light","volume":0.25}"#,
+        );
+        assert_eq!(settings.scale, ScaleMode::Integer);
+        assert_eq!(settings.aspect, Aspect::FourThree);
+        assert!(!settings.smoothing);
+        assert_eq!(settings.theme, Theme::Light, "the good fields survived");
+        assert_eq!(settings.volume, 0.25);
     }
 
     #[test]
