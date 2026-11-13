@@ -247,6 +247,16 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    // Opening the drawer, whichever control asked. The drawer is the menu: the
+    // settings on desktop, the console actions below, and from M7-19 (#152) the one
+    // button a phone's top bar has room for. The save state panel is a sibling one
+    // depth down and mutually exclusive with it - see
+    // [`crate::menu::Menu::open_states`].
+    let open_menu = Callback::new(move |_| {
+        slots_open.set(false);
+        drawer_open.update(|open| *open = !*open);
+    });
+
     let theme_options = Theme::ALL
         .iter()
         .map(|option| SelectOption::new(option.to_string(), option.label()))
@@ -325,50 +335,59 @@ pub fn App() -> impl IntoView {
                         }
                     })
                 }}
+                // Two halves of one nav, of which the stylesheet shows exactly one
+                // (M7-19, #152): all six actions where there is room for them, and
+                // on a phone the single menu button that opens the drawer they have
+                // moved into. Which half is on screen is CSS and not a width read at
+                // mount, because a rotation is not a mount.
                 <nav class="topbar__actions" aria-label="Console">
-                    {console_buttons}
-                    {move || {
-                        let muted = settings.with(|settings| settings.muted);
-                        let (label, path) = if muted {
-                            ("Unmute", icons::VOLUME_OFF)
-                        } else {
-                            ("Mute", icons::VOLUME)
-                        };
-                        view! {
-                            <IconButton
-                                label=label.to_string()
-                                path=path
-                                on_click=Callback::new(move |_| {
-                                    settings.update(|settings| settings.muted = !settings.muted);
-                                })
-                            />
-                        }
-                    }}
-                    <IconButton
-                        label="Open ROM".to_string()
-                        path=icons::OPEN
-                        on_click=Callback::new(move |_| open_picker())
-                    />
-                    <IconButton
-                        label="Save states".to_string()
-                        path=icons::SAVE
-                        on_click=Callback::new(move |_| menu.open_states())
-                    />
-                    <IconButton
-                        label="Fullscreen".to_string()
-                        path=icons::FULLSCREEN
-                        on_click=Callback::new(move |_| screen.toggle_fullscreen())
-                    />
-                    <IconButton
-                        label="Settings".to_string()
-                        path=icons::SETTINGS
-                        on_click=Callback::new(move |_| {
-                            // The two panels are one depth apart and mutually
-                            // exclusive: see [`crate::menu::Menu::open_states`].
-                            slots_open.set(false);
-                            drawer_open.update(|open| *open = !*open);
-                        })
-                    />
+                    <div class="topbar__wide">
+                        {console_buttons}
+                        {move || {
+                            let muted = settings.with(|settings| settings.muted);
+                            let (label, path) = if muted {
+                                ("Unmute", icons::VOLUME_OFF)
+                            } else {
+                                ("Mute", icons::VOLUME)
+                            };
+                            view! {
+                                <IconButton
+                                    label=label.to_string()
+                                    path=path
+                                    on_click=Callback::new(move |_| {
+                                        settings.update(|settings| settings.muted = !settings.muted);
+                                    })
+                                />
+                            }
+                        }}
+                        <IconButton
+                            label="Open ROM".to_string()
+                            path=icons::OPEN
+                            on_click=Callback::new(move |_| open_picker())
+                        />
+                        <IconButton
+                            label="Save states".to_string()
+                            path=icons::SAVE
+                            on_click=Callback::new(move |_| menu.open_states())
+                        />
+                        <IconButton
+                            label="Fullscreen".to_string()
+                            path=icons::FULLSCREEN
+                            on_click=Callback::new(move |_| screen.toggle_fullscreen())
+                        />
+                        <IconButton
+                            label="Settings".to_string()
+                            path=icons::SETTINGS
+                            on_click=open_menu
+                        />
+                    </div>
+                    <div class="topbar__narrow">
+                        <IconButton
+                            label="Menu".to_string()
+                            path=icons::MENU
+                            on_click=open_menu
+                        />
+                    </div>
                 </nav>
             </header>
 
@@ -463,6 +482,51 @@ pub fn App() -> impl IntoView {
                 open=drawer_open
                 close_label="Close settings".to_string()
             >
+                // The console's own controls, where a phone's top bar has no room
+                // for them (M7-19, #152). Text buttons rather than the bar's icons
+                // because the drawer is read, not scanned: a player who has opened a
+                // settings sheet expects words, and a word says whether it is Pause
+                // or Play without a hover.
+                <section class="settings-section">
+                    <h3 class="settings-section__title">Console</h3>
+                    <div class="console-actions">
+                        <Button
+                            disabled=Signal::derive(move || !loaded.get())
+                            on_click=Callback::new(move |_| console.toggle())
+                        >
+                            {move || if console.paused.get() { "Play" } else { "Pause" }}
+                        </Button>
+                        <Button
+                            disabled=Signal::derive(move || !loaded.get())
+                            on_click=Callback::new(move |_| console.reset())
+                        >
+                            "Reset"
+                        </Button>
+                        <Button on_click=Callback::new(move |_| open_picker())>
+                            "Open ROM"
+                        </Button>
+                        <Button on_click=Callback::new(move |_| menu.open_states())>
+                            "Save states"
+                        </Button>
+                        <Button on_click=Callback::new(move |_| screen.toggle_fullscreen())>
+                            "Fullscreen"
+                        </Button>
+                        <Button
+                            on_click=Callback::new(move |_| {
+                                settings.update(|settings| settings.muted = !settings.muted);
+                            })
+                        >
+                            {move || {
+                                if settings.with(|settings| settings.muted) {
+                                    "Unmute"
+                                } else {
+                                    "Mute"
+                                }
+                            }}
+                        </Button>
+                    </div>
+                </section>
+
                 <section class="settings-section">
                     <h3 class="settings-section__title">Appearance</h3>
                     <Select

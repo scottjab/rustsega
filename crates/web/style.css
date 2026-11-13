@@ -432,6 +432,37 @@ canvas {
   gap: var(--space-1);
 }
 
+/* The actions come in two halves, of which exactly one is on screen (M7-19,
+   #152): the six icon buttons where the bar has room for them, and on a phone the
+   single menu button that opens the drawer they have moved into - the Console
+   section at the head of the sheet is where Pause lives once the bar has no room
+   for it.
+
+   Which half is CSS and not a width read at mount, because a rotation is not a
+   mount and a signal read once would hold the old answer. The 640px is the
+   drawer's own phone width, so the actions collapse into the menu at exactly the
+   width the menu becomes a bottom sheet. A hidden half is `display: none` rather
+   than moved off screen: that is what takes it out of the tab order and out of the
+   spatial walk, which ignores a box with no size (`menu::visible_box`). */
+.topbar__wide {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.topbar__narrow {
+  display: none;
+}
+
+@media (max-width: 639px) {
+  .topbar__wide {
+    display: none;
+  }
+
+  .topbar__narrow {
+    display: flex;
+  }
+}
+
 /* The autoplay nudge (M7-05, #138): no browser will start an AudioContext until
    a person does something, and while it is holding the sound back the honest
    thing to say is that the sound is waiting. A pill rather than a toast: it is
@@ -1002,6 +1033,16 @@ canvas {
 
 .settings-section {
   margin-bottom: var(--space-5);
+}
+
+/* The console actions in the drawer (M7-19, #152): the top bar's controls, for the
+   width that has no room for a top bar. Words rather than glyphs, because the
+   drawer is read rather than scanned and a word says whether it is Pause or Play
+   without a hover to ask it. */
+.console-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
 }
 
 .settings-section__title {
