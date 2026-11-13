@@ -39,6 +39,7 @@ use crate::ui::button::Button;
 use crate::ui::button::IconButton;
 use crate::ui::drawer::Drawer;
 use crate::ui::hint::HintBar;
+use crate::ui::hint::KeyCap;
 use crate::ui::icons;
 use crate::ui::recents_grid::RecentsGrid;
 use crate::ui::select::Listboxes;
@@ -614,14 +615,24 @@ pub fn App() -> impl IntoView {
                         })
                     />
                     <p class="settings-section__note">
-                        "The backquote key (`) toggles the overlay. Tab, or a pad's right trigger, runs the console at this speed while it is held; letting go returns to normal sound."
+                        // The key names are the shell's own keycaps, so the page
+                        // that says "the backquote key" and the cell that shows
+                        // "`" are the same word (M7-19, #152).
+                        <KeyCap code="Backquote"/>
+                        " toggles the overlay. "
+                        <KeyCap code="Tab"/>
+                        ", or a pad's right trigger, runs the console at this speed while it is held; letting go returns to normal sound."
                     </p>
                 </section>
 
                 <section class="settings-section">
                     <h3 class="settings-section__title">Save states</h3>
                     <p class="settings-section__note">
-                        "Four slots per game, each holding the whole machine: press a slot's button, or use F1 to save and F4 to load the one that is highlighted."
+                        "Four slots per game, each holding the whole machine: press a slot's button, or use "
+                        <KeyCap code="F1"/>
+                        " to save and "
+                        <KeyCap code="F4"/>
+                        " to load the one that is highlighted."
                     </p>
                     <Button on_click=Callback::new(move |_| menu.open_states())>
                         "Open save states"
