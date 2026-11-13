@@ -59,6 +59,35 @@ const MAX_SURFACE: u32 = 8192;
 thread_local! {
     /// [`webgl2_supported`]'s answer, once per page: see the reason there.
     static WEBGL2: Cell<Option<bool>> = const { Cell::new(None) };
+    /// Whether a WebGL context has been lost during this page load: [`gl_lost`].
+    static GL_LOST: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether WebGL has gone away for good during this page load.
+///
+/// `true` from the first `webglcontextlost` onwards, and the shell reads it where
+/// it would otherwise ask [`webgl2_supported`] - so a settings change, or a second
+/// console, cannot put the player back on a driver that has already taken a context
+/// away (#146).
+///
+/// Deliberately *not* cleared by `webglcontextrestored`. A restored context means a
+/// renderer built against the old one is holding dead handles, and the shell would
+/// have to rebuild one mid-frame to use it; the loss is rare, the cost of staying
+/// on the 2D path until the page is reloaded is a session without shaders, and a
+/// driver that loses a context once is not obviously the one to hand a second
+/// attempt to. Recovery is tracked as its own issue rather than half-done here.
+pub fn gl_lost() -> bool {
+    GL_LOST.with(|latched| latched.get())
+}
+
+/// Latches a lost context, and says so once: the loss is one event, and the draw
+/// path runs it sixty times a second.
+fn latch_gl_lost() {
+    GL_LOST.with(|latched| {
+        if !latched.replace(true) {
+            report("WebGL context lost: using the canvas path for the rest of this page");
+        }
+    });
 }
 
 /// Whether this browser will give up a WebGL2 context at all.
@@ -312,6 +341,10 @@ impl WebGlRenderer {
         // callback, and the loop is about to read the flag anyway.
         let on_lost = Closure::wrap(Box::new(move |_: web_sys::Event| {
             listener.set(true);
+            // And for every renderer this page builds from now on, so the loss
+            // outlives this one: switching to the 2D path drops `self`, and with
+            // it the flag a later setting change would have had to read.
+            latch_gl_lost();
         }) as Box<dyn FnMut(web_sys::Event)>);
         if canvas
             .add_event_listener_with_callback(CONTEXT_LOST, on_lost.as_ref().unchecked_ref())

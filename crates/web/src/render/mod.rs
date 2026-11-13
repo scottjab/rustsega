@@ -130,6 +130,28 @@ pub fn choose_renderer(webgl2_available: bool, setting: RendererSetting) -> Rend
     }
 }
 
+/// [`choose_renderer`] with a context lost earlier in this page load taken into
+/// account: `gl_lost` is the latch, set once by a `webglcontextlost` event and
+/// never cleared by a setting change.
+///
+/// A lost context is not the player's doing, so this is not allowed to reach
+/// [`RendererSetting`] - a driver hiccup that rewrote the saved preference would
+/// leave a player who could have had shaders running on without them forever
+/// after. It is a statement about this page load only: WebGL is not going to come
+/// back by being asked again, so asking - from the settings drawer or from a
+/// second console - gets the 2D path (M7-13, #146).
+///
+/// Latching is therefore exactly "WebGL is no longer on offer", which is what
+/// [`Renderer::context_lost`] says about one context and this says about the rest
+/// of the page load.
+pub fn choose_renderer_latched(
+    webgl2_available: bool,
+    gl_lost: bool,
+    setting: RendererSetting,
+) -> RendererKind {
+    choose_renderer(webgl2_available && !gl_lost, setting)
+}
+
 /// The part of a `tex_w` x `tex_h` texture that a `w` x `h` frame fills, as
 /// `[left, top, right, bottom]` in texture coordinates.
 ///
@@ -240,6 +262,34 @@ mod tests {
             choose_renderer(true, RendererSetting::Webgl),
             RendererKind::Webgl
         );
+    }
+
+    /// The latch table: once a context has been lost, no setting and no available
+    /// browser puts the console back on WebGL for the rest of the page load - and
+    /// `Canvas` is still `Canvas`, because a latch is not a preference.
+    #[test]
+    fn a_lost_context_stays_lost_whatever_the_setting_asks_for() {
+        for setting in RendererSetting::ALL {
+            assert_eq!(
+                choose_renderer_latched(true, true, setting),
+                RendererKind::Canvas,
+                "{setting:?} after a lost context"
+            );
+        }
+        // And with nothing latched the latch changes nothing, which is what lets
+        // the console call it unconditionally.
+        for setting in RendererSetting::ALL {
+            assert_eq!(
+                choose_renderer_latched(true, false, setting),
+                choose_renderer(true, setting),
+                "{setting:?} with WebGL and no latch"
+            );
+            assert_eq!(
+                choose_renderer_latched(false, false, setting),
+                choose_renderer(false, setting),
+                "{setting:?} with no WebGL and no latch"
+            );
+        }
     }
 
     /// Asking for the canvas is the canvas whatever the browser can do, so the

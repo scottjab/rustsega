@@ -43,8 +43,9 @@ use crate::render::Renderer;
 use crate::render::RendererKind;
 use crate::render::RendererSetting;
 use crate::render::canvas2d::Canvas2dRenderer;
-use crate::render::choose_renderer;
+use crate::render::choose_renderer_latched;
 use crate::render::webgl::WebGlRenderer;
+use crate::render::webgl::gl_lost;
 use crate::render::webgl::webgl2_supported;
 use crate::rom::LoadedRom;
 use crate::settings::Settings;
@@ -474,7 +475,7 @@ impl Emulator {
         let (renderer, filter, smoothing) = settings
             .with_untracked(|settings| (settings.renderer, settings.filter, settings.smoothing));
         let (kind, renderer) = make_renderer(
-            choose_renderer(webgl2_on_offer(renderer), renderer),
+            choose_renderer_latched(webgl2_on_offer(renderer), gl_lost(), renderer),
             canvas,
             canvas_gl,
             filter,
@@ -788,7 +789,7 @@ impl Emulator {
     /// frame of their own - would otherwise be looking at nothing.
     fn set_picture(&mut self, renderer: RendererSetting, filter: FilterSetting, smoothing: bool) {
         self.picture = (filter, smoothing);
-        let wanted = choose_renderer(webgl2_on_offer(renderer), renderer);
+        let wanted = choose_renderer_latched(webgl2_on_offer(renderer), gl_lost(), renderer);
         if wanted != self.kind {
             self.use_renderer(wanted);
         }
@@ -866,13 +867,17 @@ impl Emulator {
     }
 }
 
-/// Whether this browser offers WebGL2, or `false` when the player has already
-/// said they do not want it.
+/// Whether this browser offers WebGL2 to this player, or `false` when they have
+/// already said they do not want it.
 ///
 /// The setting is consulted first because the answer costs a context: probing is
 /// asking a canvas of one's own for a WebGL2 context (see
 /// [`crate::render::webgl::webgl2_supported`]), and a player on `Canvas` should
 /// not pay for one they have refused (M7-13, #146).
+///
+/// A context lost earlier is *not* folded in here - that is the `gl_lost`
+/// argument of [`crate::render::choose_renderer_latched`], so the two reasons for
+/// not using WebGL stay distinguishable.
 fn webgl2_on_offer(setting: RendererSetting) -> bool {
     setting != RendererSetting::Canvas && webgl2_supported()
 }
