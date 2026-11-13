@@ -146,6 +146,10 @@ fn stop() {
 /// mode of "load another ROM without reloading the page", and it also costs
 /// another megabyte of machine.
 fn start(rom: &LoadedRom, canvas: &HtmlCanvasElement) -> Result<(), StartError> {
+    // Before the new console asks for a frame of its own: the old one's request
+    // has to be cancelled, not merely dropped along with its callback, or the
+    // browser calls back into a closure that has gone.
+    stop();
     let emulator = Emulator::start(rom, canvas)?;
     RUNNING.with(|running| *running.borrow_mut() = Some(emulator));
     Ok(())
