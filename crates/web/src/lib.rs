@@ -9,6 +9,7 @@
 //! out - and [`rom_picker`] is the browser half that hands it a file.
 
 pub mod app;
+pub mod audio_pacing;
 pub mod emulator;
 pub mod frame_pacer;
 pub mod rom;
