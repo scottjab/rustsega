@@ -438,6 +438,15 @@ canvas {
   box-shadow: var(--focus);
 }
 
+/* The save confirmation (M7-14, #147): the same pill as the autoplay nudge, for
+   the one moment a save has actually reached IndexedDB. It is a fact that
+   happened rather than a thing to click, so it borrows the pill's shape and none
+   of its pointer affordances, and it is the green of a toast that went well. */
+.chip--saved {
+  border-color: var(--ok);
+  cursor: default;
+}
+
 /* The screen is the hero: it fills what is left of the page, and the canvas is
    centred in it with a soft accent glow behind. */
 .screen-area {
@@ -1102,5 +1111,24 @@ canvas {
     transition:
       opacity var(--duration) var(--ease),
       transform var(--duration) var(--ease);
+  }
+
+  /* The "Saved" chip of M7-14 (#147) is taken off the page 1.5 s after a write
+     lands; this spends the last third of that time going away, so the chip fades
+     out rather than being cut off. With motion reduced it is simply there for
+     1.5 s and then not, which is the same fact said less prettily. */
+  .chip--saved {
+    animation: chip-saved 1.5s var(--ease) both;
+  }
+}
+
+@keyframes chip-saved {
+  0%,
+  65% {
+    opacity: 1;
+  }
+
+  100% {
+    opacity: 0;
   }
 }

@@ -20,6 +20,7 @@
 //! frame and appends only to a buffer the caller owns, so an undrained console
 //! does not grow.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::rc::Weak;
@@ -31,6 +32,7 @@ use leptos::prelude::*;
 use vdp::FrameBuffer;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
+use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlCanvasElement;
 
 use crate::audio::AudioOut;
@@ -49,6 +51,8 @@ use crate::render::webgl::gl_lost;
 use crate::render::webgl::webgl2_supported;
 use crate::rom::LoadedRom;
 use crate::settings::Settings;
+use crate::storage;
+use crate::storage::SramWatcher;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
 
@@ -72,6 +76,30 @@ const PAL_HZ: f64 = 50.0;
 /// (M7-07..09). They stay attached for the life of a console: a `resume()` on a
 /// context that is already running asks for nothing.
 const WAKE_EVENTS: [&str; 2] = ["pointerdown", "keydown"];
+
+/// The events that mean this page may be going away, or going quiet, so the
+/// cart's RAM should be offered to storage now rather than on the timer
+/// (M7-14, #147).
+///
+/// Both are on `window`, and both are answered by [`flush_running_sram`].
+const LIFECYCLE_EVENTS: [&str; 2] = ["pagehide", "visibilitychange"];
+
+/// One [`LIFECYCLE_EVENTS`] listener: the event it is on `window` for, and the
+/// closure `window` is holding - which is what has to be handed back to
+/// `remove_event_listener_with_callback` for the listener to actually go away.
+type LifecycleListener = (&'static str, Closure<dyn FnMut()>);
+
+/// How often the frame loop asks [`SramWatcher`] whether the cart's RAM has
+/// moved: the "check once per second" of the ticket.
+///
+/// Not once per frame, which is what the loop could do for nothing: a cart's RAM
+/// is 8 KiB, and sixty comparisons a second of it would be work for a watcher
+/// whose own window is twice as long as that.
+const SRAM_CHECK_INTERVAL_MS: f64 = 1_000.0;
+
+/// How long the "Saved" chip stays up, in milliseconds: the 1.5 s of the ticket.
+#[cfg(target_arch = "wasm32")]
+const SAVED_CHIP_MS: i32 = 1_500;
 
 /// Why a cartridge would not start, in the one sentence a toast shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -148,6 +176,14 @@ pub fn frame_to_rgba_bytes(frame: &FrameBuffer, out: &mut Vec<u8>) {
 // this one thread and need one owner.
 thread_local! {
     static RUNNING: RefCell<Option<Rc<RefCell<Emulator>>>> = const { RefCell::new(None) };
+    /// Counts ROM loads, so a load that was superseded while it was waiting for
+    /// IndexedDB can see that and not install a console for a cartridge the
+    /// player has already moved on from.
+    static LOADING: Cell<u32> = const { Cell::new(0) };
+    /// The [`LIFECYCLE_EVENTS`] listeners this page put on `window`, held so they
+    /// can be taken off it again: `window` outlives the component that added them,
+    /// and a `Closure` the page cannot remove is a `Closure` forever.
+    static LIFECYCLE: RefCell<Vec<LifecycleListener>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The running console, if there is one.
@@ -155,35 +191,259 @@ fn running() -> Option<Rc<RefCell<Emulator>>> {
     RUNNING.with(|running| running.borrow().clone())
 }
 
-/// Stops the running console, if any: cancels its animation frame and lets it go.
+/// Marks a ROM load the newest one and returns its token: see [`load_is_current`].
+fn begin_load() -> u32 {
+    LOADING.with(|loading| {
+        let token = loading.get() + 1;
+        loading.set(token);
+        token
+    })
+}
+
+/// Whether `token` still names the newest ROM load.
+///
+/// Every [`stop`] and every [`start`] takes the token off a load that is still
+/// waiting on storage, which is what keeps a quick pair of ROM switches from
+/// installing the console of the ROM that was dropped first.
+fn load_is_current(token: u32) -> bool {
+    LOADING.with(|loading| loading.get() == token)
+}
+
+/// Stops the running console, if any: saves it, cancels its animation frame, and
+/// lets it go.
 fn stop() {
+    // Retiring a console is one of the two moments a cart's last frames of RAM
+    // have to be handed over - the other is a page going away - and it is
+    // synchronous, so the write is offered now and IndexedDB takes it up on the
+    // microtask after this borrow is gone.
+    //
     // Taking it out of the slot before stopping it is what frees the machine -
     // the loop itself only holds a `Weak` (see [`Emulator::start`]).
     let emulator = RUNNING.with(|running| running.borrow_mut().take());
     if let Some(emulator) = emulator {
-        emulator.borrow_mut().stop();
+        let mut emulator = emulator.borrow_mut();
+        emulator.flush_sram(now_ms(), true);
+        emulator.stop();
+    }
+    // ... and a load still waiting on storage for the console that is going away
+    // is a load nobody is waiting for any more.
+    begin_load();
+}
+
+/// Offers the running console's RAM to storage now, if there is a running console
+/// and a save to make (M7-14, #147).
+fn flush_running_sram() {
+    let Some(emulator) = running() else { return };
+    emulator.borrow_mut().flush_sram(now_ms(), true);
+}
+
+/// What storage had for a cartridge when it was loaded: the database to write
+/// back to, and the RAM it holds for this ROM.
+///
+/// `stored` being `None` is a cart that has never been saved; the whole of this
+/// being `None` is a browser that would not open IndexedDB at all.
+struct SavedSram {
+    db: storage::Db,
+    stored: Option<Vec<u8>>,
+}
+
+/// The save-RAM half of a running console: the database its RAM goes back to,
+/// the key it is stored under, and the watcher that decides when.
+///
+/// Held as `Option<Save>` by [`Emulator`]: `None` for a cart with no
+/// battery-backed RAM, and for a cart whose IndexedDB would not open. In both
+/// cases the game runs, nothing is written, and there is nothing to lose by it.
+struct Save {
+    db: storage::Db,
+    rom_id: String,
+    watcher: SramWatcher,
+}
+
+/// Gives `genesis` the save storage had for it, and returns the [`Save`] half of
+/// the console - `None` when there is nothing to save.
+///
+/// Nothing to save means one of two ordinary things: the cart has no
+/// battery-backed RAM, which is what a `None` from [`Genesis::sram`] means and is
+/// checked first precisely so that a `None` can never become an empty record that
+/// blanks a real save; or this browser would not open IndexedDB, in which case
+/// [`read_save`] has already said so once.
+///
+/// The watcher is seeded with the RAM as it stands *after* the save is loaded, so
+/// a cart that is loaded, played and never written to is never written back.
+fn install_save(genesis: &mut Genesis, saved: Option<SavedSram>, rom_id: &str) -> Option<Save> {
+    genesis.sram()?;
+    let SavedSram { db, stored } = saved?;
+    if let Some(stored) = stored {
+        genesis.load_sram(&stored);
+    }
+    Some(Save {
+        db,
+        rom_id: rom_id.to_string(),
+        watcher: SramWatcher::new(genesis.sram().unwrap_or_default(), now_ms()),
+    })
+}
+
+/// The write itself: one cart's RAM, into one record, off the frame loop.
+///
+/// A failure is a toast and never a panic - private mode and a full disk are
+/// ordinary facts about a browser, and a page that dies on one takes the game and
+/// the player's place in it with it (M7-14, #147). Success is the "Saved" chip,
+/// because the chip means *IndexedDB has this* and only this much is known here.
+async fn write_saved_sram(
+    db: storage::Db,
+    rom_id: String,
+    bytes: Vec<u8>,
+    console: Controls,
+    toasts: Toasts,
+) {
+    match db.put_sram(&rom_id, &bytes).await {
+        Ok(()) => console.mark_saved(),
+        Err(error) => toasts.push(ToastKind::Warn, error.to_string()),
     }
 }
 
-/// Starts `rom` on `canvas`, replacing whatever was running.
+/// Starts `rom` on `canvas`, replacing whatever was running, with its saved RAM
+/// already in the cart.
 ///
 /// Replacing, not adding: a second console drawing into one canvas is the failure
 /// mode of "load another ROM without reloading the page", and it also costs
 /// another megabyte of machine.
+///
+/// The new console is made after the save has been read rather than before it,
+/// which is the whole reason this is a spawned task: the frames between a cart
+/// starting and its save arriving are frames in which the game can overwrite the
+/// RAM it is about to be handed. One read of one 8 KiB record is what the first
+/// picture waits for (the ticket's "load SRAM before the first frame").
 fn start(
     rom: &LoadedRom,
     canvas: &HtmlCanvasElement,
     canvas_gl: &HtmlCanvasElement,
     console: Controls,
     settings: RwSignal<Settings>,
-) -> Result<(), StartError> {
+    toasts: Toasts,
+) {
     // Before the new console asks for a frame of its own: the old one's request
     // has to be cancelled, not merely dropped along with its callback, or the
-    // browser calls back into a closure that has gone.
+    // browser calls back into a closure that has gone - and its RAM has to be
+    // offered to storage while it still exists to read it.
     stop();
-    let emulator = Emulator::start(rom, canvas, canvas_gl, console, settings)?;
-    RUNNING.with(|running| *running.borrow_mut() = Some(emulator));
-    Ok(())
+    let token = begin_load();
+    // Owned handles for the task: a borrow of a signal, or of a `NodeRef`, is not
+    // something to be holding across an `.await` (#387), and a canvas element is a
+    // reference-counted handle that cloning keeps alive if the component is
+    // unmounted while storage is being asked.
+    let rom = rom.clone();
+    let canvas = canvas.clone();
+    let canvas_gl = canvas_gl.clone();
+    spawn_local(async move {
+        let saved = read_save(&rom.id, toasts).await;
+        if !load_is_current(token) {
+            return;
+        }
+        match Emulator::start(&rom, &canvas, &canvas_gl, console, settings, saved, toasts) {
+            Ok(emulator) => RUNNING.with(|running| *running.borrow_mut() = Some(emulator)),
+            // The same one sentence the caller of a synchronous `start` used to
+            // show: by now the only reason left is that the browser has nothing
+            // to draw on or has stopped giving frames.
+            Err(error) => toasts.push(ToastKind::Danger, error.to_string()),
+        }
+    });
+}
+
+/// The database handle and this ROM's saved RAM: what [`Emulator::start`] needs
+/// before it will make a console.
+///
+/// `None` means this browser would not open IndexedDB at all. The toast is pushed
+/// here, and once per load only: with no database there is no periodic write
+/// either, so a player in private mode is told once rather than every two
+/// seconds (M7-14, #147).
+async fn read_save(rom_id: &str, toasts: Toasts) -> Option<SavedSram> {
+    let db = match storage::open().await {
+        Ok(db) => db,
+        Err(error) => {
+            toasts.push(ToastKind::Warn, error.to_string());
+            return None;
+        }
+    };
+    match db.get_sram(rom_id).await {
+        Ok(stored) => Some(SavedSram { db, stored }),
+        Err(error) => {
+            // A save that cannot be read is not a game that cannot be played:
+            // one warning, and a cart that starts from its own power-on RAM. The
+            // write path stays alive, since a read that failed once is not a
+            // write that will.
+            toasts.push(ToastKind::Warn, error.to_string());
+            Some(SavedSram { db, stored: None })
+        }
+    }
+}
+
+/// The clock the save watcher is timed against: `performance.now()`, which is the
+/// timebase an animation frame's own timestamp is on, so a write timed from the
+/// loop and a write timed from a page event are on the same ruler.
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|window| window.performance())
+        .map(|performance| performance.now())
+        .unwrap_or(0.0)
+}
+
+/// Whether this page is in the background, which is the half of
+/// `visibilitychange` worth flushing (M7-14, #147).
+fn page_is_hidden() -> bool {
+    web_sys::window()
+        .and_then(|window| window.document())
+        .is_some_and(|document| document.hidden())
+}
+
+/// Puts the two last-chance listeners of the ticket on `window`: `pagehide`, and
+/// `visibilitychange` to hidden.
+///
+/// Called from [`use_cartridge`], which takes them off again - `window` outlives
+/// the component, and a closure kept by `window` after its owner is gone is a
+/// warning in the console at best and a borrowed `RefCell` at worst (#387).
+///
+/// A write started during `pagehide` is the browser's to finish or not: it is
+/// IndexedDB's best-effort moment, not a commit. What it buys is that a tab closed
+/// a moment after an in-game save gets that save, where the 2 s watcher would
+/// almost certainly not have.
+fn use_lifecycle_flush() {
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    for event in LIFECYCLE_EVENTS {
+        let listener = Closure::wrap(Box::new(move || {
+            // `visibilitychange` fires in both directions, and a page that has
+            // just become visible has nothing it was about to lose. `pagehide` is
+            // already the way out, so it needs no test.
+            if event == "visibilitychange" && !page_is_hidden() {
+                return;
+            }
+            flush_running_sram();
+        }) as Box<dyn FnMut()>);
+        let _ = window.add_event_listener_with_callback(event, listener.as_ref().unchecked_ref());
+        LIFECYCLE.with(|held| held.borrow_mut().push((event, listener)));
+    }
+    on_cleanup(remove_lifecycle_flush);
+}
+
+/// Takes the [`LIFECYCLE_EVENTS`] listeners off `window` again, which the shell's
+/// cleanup does.
+///
+/// A plain `fn`, because `on_cleanup` wants a `Send` closure and a `Closure` is
+/// not one: the closures themselves live in a thread local, which is also what
+/// keeps a second mount from adding a second pair.
+fn remove_lifecycle_flush() {
+    LIFECYCLE.with(|held| {
+        let held = held.take();
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        for (event, listener) in held.iter() {
+            let _ = window
+                .remove_event_listener_with_callback(event, listener.as_ref().unchecked_ref());
+        }
+    });
 }
 
 /// What the shell can ask the running console to do.
@@ -217,6 +477,12 @@ pub struct Controls {
     /// elements - a canvas belongs to one context type for its whole life, so a
     /// WebGL canvas can never be the 2D one - and exactly one of them is on screen.
     pub renderer: RwSignal<RendererKind>,
+    /// Whether a save of this cart's RAM has just been committed to IndexedDB,
+    /// which is what the "Saved" chip shows, for a second and a half (M7-14, #147).
+    ///
+    /// Set when the write lands rather than when it is asked for, so the chip
+    /// never claims a save that the browser has not taken.
+    pub saved: RwSignal<bool>,
 }
 
 impl Controls {
@@ -309,6 +575,33 @@ impl Controls {
             emulator.borrow_mut().set_muted(muted);
         }
     }
+
+    /// Lights the "Saved" chip, for a second and a half.
+    ///
+    /// Called by the write itself, not by the flush decision, so a cart whose
+    /// write was refused shows nothing at all rather than a lie that faded.
+    pub fn mark_saved(self) {
+        self.saved.set(true);
+        self.hide_saved_after_chip();
+    }
+
+    /// The timer that takes the chip off again.
+    #[cfg(target_arch = "wasm32")]
+    fn hide_saved_after_chip(self) {
+        let callback = Closure::wrap(Box::new(move || self.saved.set(false)) as Box<dyn FnMut()>);
+        if let Some(window) = web_sys::window() {
+            let on_fire: &js_sys::Function = callback.as_js_value().unchecked_ref();
+            let _ = window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(on_fire, SAVED_CHIP_MS);
+        }
+        // The timer outlives this scope, so the closure goes to JS and the GC
+        // frees it - the same arrangement a toast's dismiss timer uses (#135).
+        callback.into_js_value();
+    }
+
+    /// Natively there is no timer to arm, as with a toast's.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn hide_saved_after_chip(self) {}
 }
 
 /// Runs the cartridge in [`LoadedRom`] context on `canvas`, for as long as the
@@ -336,6 +629,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
         // The 2D path until a console says otherwise - which is also the path
         // that is on screen before a console exists at all.
         renderer: RwSignal::new(RendererKind::Canvas),
+        saved: RwSignal::new(false),
     };
 
     Effect::new(move |started: Option<Option<String>>| {
@@ -346,26 +640,20 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
             stop();
             return None;
         };
-        let Some(id) = roms.with(|rom| rom.as_ref().map(|rom| rom.id.clone())) else {
+        // The cartridge, taken out of the signal as an owned value: `start` waits
+        // on IndexedDB before it will make a console, and a borrow of a signal is
+        // not something to be holding across an `.await` (#387).
+        let Some(rom) = roms.with(|rom| rom.clone()) else {
             stop();
             return None;
         };
-        if started.as_deref() == Some(id.as_str()) {
+        if started.as_deref() == Some(rom.id.as_str()) {
             // Same cartridge, and a canvas that has not changed hands.
             return started;
         }
-        // The image is read with the signal and put in the console before
-        // anything else runs: `Genesis::new` is the only thing that takes it, and
-        // it does not look at the signal.
-        roms.with(|rom| {
-            if let Some(rom) = rom.as_ref()
-                && let Err(error) = start(rom, &canvas, &canvas_gl, console, settings)
-            {
-                toasts.push(ToastKind::Danger, error.to_string());
-            }
-        });
+        start(&rom, &canvas, &canvas_gl, console, settings, toasts);
         paused.set(false);
-        Some(id)
+        Some(rom.id)
     });
 
     // The drawer and the top bar write the volume and the mute; the running
@@ -382,6 +670,10 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
             settings.get().smoothing,
         );
     });
+
+    // The two flushes that do not come from the frame loop: a page going away, or
+    // going into a background tab (M7-14, #147).
+    use_lifecycle_flush();
 
     on_cleanup(stop);
 
@@ -405,6 +697,14 @@ struct Emulator {
     /// The shell's handle, so the loop can report the audio state back through
     /// [`Controls::sound_on`] without a second owner for the signals.
     console: Controls,
+    /// The cart's RAM, if it has any and if this browser can keep it: see [`Save`].
+    save: Option<Save>,
+    /// When the loop last asked [`SramWatcher`] about this cart's RAM, on the
+    /// animation frame's clock - the once a second of [`SRAM_CHECK_INTERVAL_MS`].
+    sram_checked: f64,
+    /// Where a storage failure is reported, there being no caller to hand it to:
+    /// the frame loop and a spawned write are both answerable only to a toast.
+    toasts: Toasts,
     /// The block being drained, reused every frame like [`Self::rgba`].
     samples: Vec<i16>,
     /// One console frame in seconds: `1 / target_hz`, which is what
@@ -468,6 +768,8 @@ impl Emulator {
         canvas_gl: &HtmlCanvasElement,
         console: Controls,
         settings: RwSignal<Settings>,
+        saved: Option<SavedSram>,
+        toasts: Toasts,
     ) -> Result<Rc<RefCell<Self>>, StartError> {
         // The drawing path first, because everything after this point has a
         // browser resource attached to it that a failed start would have to give
@@ -511,7 +813,12 @@ impl Emulator {
         // A console that will not start takes the audio output back with it: an
         // `AudioOut` dropped is a context closed, which is the only way the
         // browser stops counting it.
-        let genesis = Genesis::new(&rom.bytes, config.clone()).map_err(|_| StartError::NotARom)?;
+        let mut genesis =
+            Genesis::new(&rom.bytes, config.clone()).map_err(|_| StartError::NotARom)?;
+        // The saved RAM goes in here, before the loop is armed: `install_save` is
+        // the one place a cart is given its save, and it is the reason `start` is
+        // called only once storage has answered (M7-14, #147).
+        let save = install_save(&mut genesis, saved, &rom.id);
 
         let target_hz = target_hz(&config, &rom.bytes);
         // One read of the canvas, and both the baseline `paint` compares against
@@ -523,6 +830,9 @@ impl Emulator {
             audio,
             settings,
             console,
+            save,
+            sram_checked: now_ms(),
+            toasts,
             samples: Vec::new(),
             frame_secs: 1.0 / target_hz,
             canvas_2d: canvas.clone(),
@@ -586,8 +896,56 @@ impl Emulator {
             }
             self.paint();
         }
+        // Once a second, offer the cart's RAM to storage. The watcher does the
+        // deciding, and it is the watcher's window that makes a game which dirties
+        // its save every frame one write every two seconds rather than a write per
+        // frame (M7-14, #147).
+        if now_ms - self.sram_checked >= SRAM_CHECK_INTERVAL_MS {
+            self.sram_checked = now_ms;
+            self.flush_sram(now_ms, false);
+        }
         self.sync_sound();
         self.arm();
+    }
+
+    /// Offers this cart's RAM to storage if [`SramWatcher`] says it has moved.
+    ///
+    /// Three things about this are deliberate, and they are all about the frame
+    /// loop it runs inside (#387):
+    ///
+    /// * the cart's RAM is copied to an owned `Vec` first, so no borrow of the
+    ///   console outlives this function and nothing is borrowed across the
+    ///   `.await` the write does;
+    /// * the write is *spawned*, never awaited - an IndexedDB round trip has no
+    ///   business stopping a frame, and a frame that stops is a stutter;
+    /// * `spawn_local` only queues a task, so the write is first polled after the
+    ///   borrow below has been given back.
+    ///
+    /// `force` is the last chance of a cart being swapped out or a page closing:
+    /// it skips the watcher's window, never its checks.
+    fn flush_sram(&mut self, now_ms: f64, force: bool) {
+        let Some(save) = self.save.as_mut() else {
+            return;
+        };
+        // The snapshot, and the last moment the console itself is read.
+        let Some(sram) = self.genesis.sram() else {
+            return;
+        };
+        let bytes = sram.to_vec();
+        if force {
+            save.watcher.force();
+        }
+        if !save.watcher.should_flush(&bytes, now_ms) {
+            return;
+        }
+        let (db, rom_id) = (save.db.clone(), save.rom_id.clone());
+        spawn_local(write_saved_sram(
+            db,
+            rom_id,
+            bytes,
+            self.console,
+            self.toasts,
+        ));
     }
 
     /// Reports the page's merged pad state to the console, once per frame.
@@ -1089,6 +1447,7 @@ mod tests {
             sound_on: RwSignal::new(false),
             frame: RwSignal::new((0, 0)),
             renderer: RwSignal::new(RendererKind::Canvas),
+            saved: RwSignal::new(false),
         };
 
         // No console, so the frame size is the one `use_cartridge` started with -
@@ -1111,5 +1470,14 @@ mod tests {
         controls.resize(640.0, 480.0, 2.0);
         controls.set_picture(RendererSetting::Webgl, FilterSetting::Crt, true);
         assert_eq!(controls.renderer.get_untracked(), RendererKind::Canvas);
+
+        // The "Saved" chip is the one part of `Controls` that is not a message to
+        // a console: it reports something that has already happened, so a write
+        // that landed lights it with no console running at all. The 1.5 s timer
+        // that takes it off is a browser timer, and natively there is none to
+        // arm - so it stays lit, which is what `mark_saved` promises.
+        assert!(!controls.saved.get_untracked());
+        controls.mark_saved();
+        assert!(controls.saved.get_untracked());
     }
 }

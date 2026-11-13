@@ -252,6 +252,19 @@ pub fn App() -> impl IntoView {
                         }
                     })
                 }}
+                // The save confirmation: one write of this cart's RAM that
+                // IndexedDB really committed, shown for a moment and then gone
+                // (M7-14, #147). `role="status"` so a screen reader hears it
+                // without it taking the focus a player is using to play.
+                {move || {
+                    console.saved.get().then(|| {
+                        view! {
+                            <span class="chip chip--saved" role="status">
+                                "Saved"
+                            </span>
+                        }
+                    })
+                }}
                 <nav class="topbar__actions" aria-label="Console">
                     {console_buttons}
                     {move || {
