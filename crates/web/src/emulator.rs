@@ -1,0 +1,549 @@
+//! The emulation loop: `requestAnimationFrame`, the canvas, pause and reset
+//! (M7-04, #137).
+//!
+//! [`Emulator`] owns one running [`Genesis`] and the canvas it paints. It lives in
+//! a `thread_local!` behind an `Rc<RefCell<_>>` rather than in a Leptos signal,
+//! which is what the ticket asks for and for two reasons: the console is the size
+//! of the machine, so anything that read it as a value would clone megabytes per
+//! frame, and neither `Genesis` nor the canvas element it borrows is `Send` - and
+//! [`Callback`] holds a `Send + Sync` closure. So the console is owned by the
+//! component that mounts the canvas, and what the shell gets instead is
+//! [`Controls`]: a `Copy` handle over the pause state, which is a signal.
+//!
+//! Video only. Audio is M7-05 (#138) and input is M7-07..09, so nothing here
+//! calls `Genesis::set_pad`, and nothing calls `drain_audio` either: the mixer
+//! clears its chip buffers at the start of every frame and appends only to a
+//! buffer the caller owns, so an undrained console does not grow.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use genesis::Config;
+use genesis::Genesis;
+use leptos::html;
+use leptos::prelude::*;
+use vdp::FrameBuffer;
+use wasm_bindgen::Clamped;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
+use web_sys::CanvasRenderingContext2d;
+use web_sys::HtmlCanvasElement;
+use web_sys::ImageData;
+
+use crate::frame_pacer::FramePacer;
+use crate::rom::LoadedRom;
+use crate::ui::toast::ToastKind;
+use crate::ui::toast::Toasts;
+
+/// The frame rate of the NTSC machine, as the pacer wants it.
+///
+/// The exact raster rate is 53_693_175 / (3420 * 262) = 59.92 Hz (docs/
+/// ARCHITECTURE.md, "Clocks and timing"), and `FramePacer` is a stand-in for the
+/// audio clock that will pace this properly in M7-05 (#138); a tenth of a percent
+/// is below anything a person can see, and below anything the pacer tests care
+/// about.
+const NTSC_HZ: f64 = 60.0;
+
+/// The frame rate of the PAL machine: 53_203_424 / (3420 * 313) = 49.70 Hz
+/// exactly, and 50 for the same reason [`NTSC_HZ`] is 60.
+const PAL_HZ: f64 = 50.0;
+
+/// Why a cartridge would not start, in the one sentence a toast shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartError {
+    /// [`Genesis::new`] refused the image: too small to hold a header at 0x100,
+    /// which is the only thing it can refuse a ROM that [`crate::rom::load_rom`]
+    /// has already accepted for display.
+    NotARom,
+    /// The canvas would not give up a 2d context, so there is nothing to draw
+    /// with. Canvas is switched off, or the element is not a canvas.
+    NoCanvas,
+    /// `requestAnimationFrame` refused the callback, so there is no loop to run.
+    NoAnimationFrames,
+}
+
+impl core::fmt::Display for StartError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotARom => write!(f, "The console could not start this ROM"),
+            Self::NoCanvas => write!(f, "This browser will not draw to the screen"),
+            Self::NoAnimationFrames => {
+                write!(f, "This browser stopped giving the screen animation frames")
+            }
+        }
+    }
+}
+
+/// The console rate `Genesis::run_frame` has to be called at for `bytes` run
+/// under `config`: 50 Hz for a PAL machine, 60 Hz for an NTSC one.
+///
+/// The same three steps [`Genesis::new`] takes - normalize, header,
+/// [`Config::resolve_region`] - because `Genesis` does not expose the region it
+/// resolved, and it is `config`'s preference order that decides, not the region
+/// string in [`LoadedRom::region`]: that lists every region a cartridge *claims*,
+/// so a `JUE` release would read as PAL here and run 4 % slow in play.
+///
+/// `bytes` is the image as it was read, before [`Genesis::new`] normalized it.
+pub fn target_hz(config: &Config, bytes: &[u8]) -> f64 {
+    let rom = genesis::normalize_rom(bytes);
+    match genesis::parse_header(&rom) {
+        Ok(header) if config.resolve_region(&header).is_pal() => PAL_HZ,
+        // Includes the header-less case [`crate::rom::load_rom`] let through for
+        // its own reasons: homebrew on a 512 byte image, which the console itself
+        // runs as the NTSC export machine.
+        _ => NTSC_HZ,
+    }
+}
+
+/// `frame` as RGBA8888 bytes, ready for [`web_sys::ImageData`].
+///
+/// `FrameBuffer::pixels` is `0xAABBGGRR` (docs/ARCHITECTURE.md, "vdp"), and one of
+/// those in little endian memory is the bytes R, G, B, A: `to_le_bytes` is the
+/// whole conversion, with nothing to swap. `testkit::dump_png` writes PNGs the
+/// same way, for the same reason.
+///
+/// `out` is cleared and refilled rather than returned, because the loop holds one
+/// of these for its whole life and must not allocate per frame. Only
+/// `width * height` of a frame buffer is valid - it is sized for the largest
+/// picture the VDP can make - so only those pixels are read.
+pub fn frame_to_rgba_bytes(frame: &FrameBuffer, out: &mut Vec<u8>) {
+    let pixels = frame.width * frame.height;
+    out.clear();
+    out.reserve(pixels * 4);
+    for pixel in frame.pixels.iter().take(pixels) {
+        out.extend_from_slice(&pixel.to_le_bytes());
+    }
+}
+
+// The console this tab is running: `None` until a cartridge is on the canvas, and
+// replaced - never shared - when another ROM arrives.
+//
+// A thread local rather than a context or a signal because it holds an `Rc`, and
+// because the animation-frame callback, a file drop and a button click are all on
+// this one thread and need one owner.
+thread_local! {
+    static RUNNING: RefCell<Option<Rc<RefCell<Emulator>>>> = const { RefCell::new(None) };
+}
+
+/// The running console, if there is one.
+fn running() -> Option<Rc<RefCell<Emulator>>> {
+    RUNNING.with(|running| running.borrow().clone())
+}
+
+/// Stops the running console, if any: cancels its animation frame and lets it go.
+fn stop() {
+    // Taking it out of the slot before stopping it is what frees the machine -
+    // the loop itself only holds a `Weak` (see [`Emulator::start`]).
+    let emulator = RUNNING.with(|running| running.borrow_mut().take());
+    if let Some(emulator) = emulator {
+        emulator.borrow_mut().stop();
+    }
+}
+
+/// Starts `rom` on `canvas`, replacing whatever was running.
+///
+/// Replacing, not adding: a second console drawing into one canvas is the failure
+/// mode of "load another ROM without reloading the page", and it also costs
+/// another megabyte of machine.
+fn start(rom: &LoadedRom, canvas: &HtmlCanvasElement) -> Result<(), StartError> {
+    // Before the new console asks for a frame of its own: the old one's request
+    // has to be cancelled, not merely dropped along with its callback, or the
+    // browser calls back into a closure that has gone.
+    stop();
+    let emulator = Emulator::start(rom, canvas)?;
+    RUNNING.with(|running| *running.borrow_mut() = Some(emulator));
+    Ok(())
+}
+
+/// What the shell can ask the running console to do.
+///
+/// `Copy`, and holding only a signal, so it can be captured by a [`Callback`] -
+/// which a `Genesis` could not be, being neither `Send` nor cheap to reach.
+#[derive(Clone, Copy)]
+pub struct Controls {
+    /// Whether the console is being held. The top bar's one button shows this:
+    /// pause when it is running, play when it is held.
+    pub paused: RwSignal<bool>,
+}
+
+impl Controls {
+    /// Pause a running console, or let a held one go: the Pause/Play button.
+    ///
+    /// With no console there is nothing to hold, and the signal is left alone -
+    /// the button is disabled in that case anyway, and a press must not invent a
+    /// paused state for a game that is not running.
+    pub fn toggle(self) {
+        let held = running().map(|emulator| {
+            let mut emulator = emulator.borrow_mut();
+            emulator.paused = !emulator.paused;
+            emulator.paused
+        });
+        if let Some(held) = held {
+            self.paused.set(held);
+        }
+    }
+
+    /// The console's reset button: back to the start of the game, held or running
+    /// as it was.
+    pub fn reset(self) {
+        if let Some(emulator) = running() {
+            emulator.borrow_mut().reset();
+        }
+    }
+}
+
+/// Runs the cartridge in [`LoadedRom`] context on `canvas`, for as long as the
+/// component that calls this is mounted.
+///
+/// Mount it once, next to the canvas. Starting a console is a side effect on the
+/// browser, so it happens in an effect, and the effect reads both the canvas and
+/// the cartridge because the two are unmounted and mounted together by a `Show`
+/// that does not promise which one arrives first.
+pub fn use_cartridge(canvas: NodeRef<html::Canvas>) -> Controls {
+    let roms = expect_context::<RwSignal<Option<LoadedRom>>>();
+    let toasts = expect_context::<Toasts>();
+    let paused = RwSignal::new(false);
+
+    Effect::new(move |started: Option<Option<String>>| {
+        let started = started.flatten();
+        // The canvas first, and untracked reads of nothing: if it is not there,
+        // there is nowhere to draw and whatever was running goes with it.
+        let Some(canvas) = canvas.get() else {
+            stop();
+            return None;
+        };
+        let Some(id) = roms.with(|rom| rom.as_ref().map(|rom| rom.id.clone())) else {
+            stop();
+            return None;
+        };
+        if started.as_deref() == Some(id.as_str()) {
+            // Same cartridge, and a canvas that has not changed hands.
+            return started;
+        }
+        // The image is read with the signal and put in the console before
+        // anything else runs: `Genesis::new` is the only thing that takes it, and
+        // it does not look at the signal.
+        roms.with(|rom| {
+            if let Some(rom) = rom.as_ref()
+                && let Err(error) = start(rom, &canvas)
+            {
+                toasts.push(ToastKind::Danger, error.to_string());
+            }
+        });
+        paused.set(false);
+        Some(id)
+    });
+
+    on_cleanup(stop);
+
+    Controls { paused }
+}
+
+/// One running console: the machine, the canvas it is drawn to, and the
+/// animation frame that drives it.
+struct Emulator {
+    /// The machine. Never in a signal, and cloned by nothing: see the
+    /// [module docs](self).
+    genesis: Genesis,
+    /// The canvas whose context `ctx` draws into. Kept because its `width` and
+    /// `height` attributes are the canvas's own resolution, which is what has to
+    /// follow the VDP's display mode.
+    canvas: HtmlCanvasElement,
+    ctx: CanvasRenderingContext2d,
+    /// The RGBA bytes of the frame being drawn, reused every frame so the draw
+    /// path allocates nothing (see [`frame_to_rgba_bytes`]).
+    rgba: Vec<u8>,
+    pacer: FramePacer,
+    paused: bool,
+    /// The canvas size the last frame was drawn at, so the attributes are written
+    /// only when the picture really changes size.
+    drawn: (u32, u32),
+    /// The animation frame that is currently requested, `None` once the browser
+    /// stops asking or [`Emulator::stop`] has run.
+    frame: Option<i32>,
+    /// The callback JS is holding. It has to stay alive at least until the
+    /// requested frame fires, so it belongs to the console rather than to the
+    /// stack that requested it.
+    tick: Option<Closure<dyn FnMut(f64)>>,
+}
+
+impl Emulator {
+    /// The console `rom` runs on, painting to `canvas`, with the loop already
+    /// running.
+    ///
+    /// The animation frame is requested before the callback is filed away, so
+    /// that there is no moment in which a tick could arrive for a console that
+    /// cannot answer it. The callback holds a `Weak` for the same reason
+    /// [`stop`] can free the machine: a loop must not be what keeps a retired
+    /// console alive.
+    fn start(rom: &LoadedRom, canvas: &HtmlCanvasElement) -> Result<Rc<RefCell<Self>>, StartError> {
+        // The only `Config` this app has so far: TMSS off, region from the
+        // header, 48 kHz. The settings drawer (M7-10, #143) is what will change
+        // it, and it will have to hand the same one to [`target_hz`].
+        let config = Config::default();
+        let genesis = Genesis::new(&rom.bytes, config.clone()).map_err(|_| StartError::NotARom)?;
+        let ctx = canvas
+            .get_context("2d")
+            .ok()
+            .flatten()
+            .and_then(|context| context.dyn_into::<CanvasRenderingContext2d>().ok())
+            .ok_or(StartError::NoCanvas)?;
+
+        let emulator = Rc::new(RefCell::new(Self {
+            genesis,
+            canvas: canvas.clone(),
+            ctx,
+            rgba: Vec::new(),
+            pacer: FramePacer::new(target_hz(&config, &rom.bytes)),
+            paused: false,
+            // The canvas as the markup made it, so the first frame that does not
+            // match it is seen as the change it is.
+            drawn: (canvas.width(), canvas.height()),
+            frame: None,
+            tick: None,
+        }));
+
+        let weak = Rc::downgrade(&emulator);
+        let callback = Closure::wrap(Box::new(move |now_ms: f64| {
+            if let Some(emulator) = weak.upgrade() {
+                emulator.borrow_mut().tick(now_ms);
+            }
+        }) as Box<dyn FnMut(f64)>);
+        let frame = web_sys::window()
+            .ok_or(StartError::NoAnimationFrames)?
+            .request_animation_frame(callback.as_js_value().unchecked_ref())
+            .map_err(|_| StartError::NoAnimationFrames)?;
+
+        let mut this = emulator.borrow_mut();
+        this.tick = Some(callback);
+        this.frame = Some(frame);
+        drop(this);
+
+        Ok(emulator)
+    }
+
+    /// One animation frame: run the console for the time that has passed since
+    /// the last tick, draw what it produced, and ask for the next tick.
+    fn tick(&mut self, now_ms: f64) {
+        // The pacer is advanced while held too, so pausing spends the time rather
+        // than borrowing it: on resume the console picks up where it left off
+        // instead of sprinting to catch up with the wall clock.
+        let due = self.pacer.frames_due(now_ms);
+        if !self.paused {
+            for _ in 0..due {
+                self.genesis.run_frame();
+            }
+            self.paint();
+        }
+        self.arm();
+    }
+
+    /// The last frame the console drew, to the canvas.
+    ///
+    /// Called on the tick and on a reset, which is the one other moment the
+    /// picture changes while nobody is watching it.
+    fn paint(&mut self) {
+        let (width, height) = {
+            let frame = self.genesis.frame();
+            frame_to_rgba_bytes(frame, &mut self.rgba);
+            (frame.width as u32, frame.height as u32)
+        };
+
+        // H32 is 256 wide rather than 320, a 240-line mode is 240 rather than 224,
+        // and interlace mode 2 is 448 or 480, so this does change while a game
+        // runs. Writing either attribute clears a canvas, so it is written when it
+        // has to be and not once per frame.
+        if self.drawn != (width, height) {
+            self.canvas.set_width(width);
+            self.canvas.set_height(height);
+            self.drawn = (width, height);
+        }
+
+        let image = ImageData::new_with_u8_clamped_array_and_sh(Clamped(&self.rgba), width, height);
+        if let Ok(image) = image {
+            let _ = self.ctx.put_image_data(&image, 0.0, 0.0);
+        }
+    }
+
+    /// Requests the next animation frame, and stops the loop when the browser
+    /// says no: a tab that has stopped animating is not going to start again by
+    /// being asked repeatedly.
+    fn arm(&mut self) {
+        let requested = self.tick.as_ref().and_then(|tick| {
+            let window = web_sys::window()?;
+            window
+                .request_animation_frame(tick.as_js_value().unchecked_ref())
+                .ok()
+        });
+        self.frame = requested;
+    }
+
+    /// The console's own reset, then a draw: the player should see the game come
+    /// back to its title screen even while the loop is held.
+    fn reset(&mut self) {
+        self.genesis.reset();
+        self.paint();
+    }
+
+    /// Stops the loop.
+    ///
+    /// The requested frame goes before the callback: dropping a `Closure` that
+    /// the browser still intends to call leaves a call to nothing.
+    fn stop(&mut self) {
+        if let Some(frame) = self.frame.take()
+            && let Some(window) = web_sys::window()
+        {
+            let _ = window.cancel_animation_frame(frame);
+        }
+        self.tick = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 512 byte image with just enough of a header for [`target_hz`]: the
+    /// system string that says this is a Mega Drive ROM, and the region
+    /// field at 0x1F0.
+    fn header(region: &str) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x200];
+        rom[0x100..0x200].fill(b' ');
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        rom[0x1F0..0x1F0 + region.len()].copy_from_slice(region.as_bytes());
+        rom
+    }
+
+    /// `0xFF0000FF` and `0xFFFF0000` are red and blue as the VDP writes them.
+    const RED: u32 = 0xFF00_00FF;
+    const BLUE: u32 = 0xFFFF_0000;
+
+    #[test]
+    fn a_two_by_one_frame_is_eight_bytes_of_red_then_blue() {
+        let frame = FrameBuffer {
+            width: 2,
+            height: 1,
+            pixels: vec![RED, BLUE],
+        };
+        let mut out = Vec::new();
+        frame_to_rgba_bytes(&frame, &mut out);
+        assert_eq!(out, vec![255, 0, 0, 255, 0, 0, 255, 255]);
+        assert_eq!(out.len(), frame.width * frame.height * 4);
+    }
+
+    /// `FrameBuffer::pixels` is 320 * 480 whatever the display mode, so the
+    /// conversion has to stop at `width * height` rather than turn the rest of
+    /// the buffer into image bytes.
+    #[test]
+    fn only_the_valid_pixels_of_a_full_frame_buffer_are_converted() {
+        let mut frame = FrameBuffer::new();
+        frame.width = 1;
+        frame.height = 1;
+        frame.pixels[0] = 0x1122_3344;
+        frame.pixels[1] = 0xDEAD_BEEF;
+
+        let mut out = Vec::new();
+        frame_to_rgba_bytes(&frame, &mut out);
+        assert_eq!(out, vec![0x44, 0x33, 0x22, 0x11]);
+    }
+
+    /// The reuse contract: a second call replaces the buffer instead of appending
+    /// to it, and does not hand back a new allocation. This is what lets the draw
+    /// path hold one buffer for the life of the loop.
+    #[test]
+    fn a_second_call_replaces_the_buffer_rather_than_appending_to_it() {
+        let frame = FrameBuffer {
+            width: 2,
+            height: 1,
+            pixels: vec![RED, BLUE],
+        };
+        let mut out = Vec::new();
+        frame_to_rgba_bytes(&frame, &mut out);
+        let capacity = out.capacity();
+
+        let small = FrameBuffer {
+            width: 1,
+            height: 1,
+            pixels: vec![BLUE],
+        };
+        frame_to_rgba_bytes(&small, &mut out);
+        assert_eq!(out, vec![0, 0, 255, 255]);
+        assert_eq!(
+            out.capacity(),
+            capacity,
+            "the buffer is reused, not rebuilt"
+        );
+    }
+
+    /// A PAL-only cart is the only one that runs at 50 Hz, and the region comes
+    /// from the same [`Config::resolve_region`] the console itself uses.
+    #[test]
+    fn a_cart_that_claims_only_europe_paces_at_50_hz() {
+        assert_eq!(target_hz(&Config::default(), &header("E")), PAL_HZ);
+    }
+
+    /// `JUE` - the common all-region header - is the NTSC machine, because
+    /// [`Config::default`] prefers USA and that is what the console will run it
+    /// as. Keying off the *claimed* regions instead would call this PAL and play
+    /// every exported game 4 % slow.
+    #[test]
+    fn an_all_region_cart_paces_at_60_hz_because_the_console_prefers_ntsc() {
+        assert_eq!(target_hz(&Config::default(), &header("JUE")), NTSC_HZ);
+        assert_eq!(target_hz(&Config::default(), &header("UE")), NTSC_HZ);
+        assert_eq!(target_hz(&Config::default(), &header("J")), NTSC_HZ);
+    }
+
+    /// Homebrew and dumps with nothing in the region field: the console gives
+    /// them the NTSC export machine, so 60 Hz here too.
+    #[test]
+    fn a_cart_that_claims_nothing_paces_at_60_hz() {
+        assert_eq!(target_hz(&Config::default(), &header("")), NTSC_HZ);
+    }
+
+    /// A `Config` that prefers Europe is a PAL machine for an all-region cart,
+    /// which is the whole reason `target_hz` takes the config rather than reading
+    /// the header on its own.
+    #[test]
+    fn a_europe_preferring_host_paces_an_all_region_cart_at_50_hz() {
+        let config = Config {
+            prefer: [
+                genesis::Region::Europe,
+                genesis::Region::Usa,
+                genesis::Region::Japan,
+            ],
+            ..Config::default()
+        };
+        assert_eq!(target_hz(&config, &header("JUE")), PAL_HZ);
+    }
+
+    #[test]
+    fn a_failure_says_what_to_tell_the_player() {
+        assert_eq!(
+            StartError::NotARom.to_string(),
+            "The console could not start this ROM"
+        );
+        assert_eq!(
+            StartError::NoCanvas.to_string(),
+            "This browser will not draw to the screen"
+        );
+        assert_eq!(
+            StartError::NoAnimationFrames.to_string(),
+            "This browser stopped giving the screen animation frames"
+        );
+    }
+
+    /// The top bar's buttons are live before a cartridge is loaded, so the two
+    /// console actions have to be inert rather than wrong: no console, no paused
+    /// state invented for a game that is not running, and no panic on reset.
+    #[test]
+    fn pause_and_reset_do_nothing_without_a_console() {
+        let owner = Owner::new();
+        owner.set();
+        let paused = RwSignal::new(false);
+        let controls = Controls { paused };
+
+        controls.reset();
+        controls.toggle();
+        assert!(!paused.get());
+    }
+}

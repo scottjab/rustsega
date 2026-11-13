@@ -10,6 +10,11 @@ console_error_panic_hook = "0.1"
 # The console: its cartridge header parser is what `rom.rs` reads a ROM with
 # (M3-01, #61). It builds for wasm32 like every core crate.
 genesis = { path = "../genesis" }
+# The frame the canvas draws is `vdp::FrameBuffer`, and naming its type here is
+# the only way to say what the draw path converts (M7-04, #137). `genesis`
+# already reaches the browser through it; this is a path dependency, not a new
+# crate in the binary.
+vdp = { path = "../vdp" }
 leptos = { version = "0.8", features = ["csr"] }
 # ROM identity for SRAM and save-state keys (M7-03, #136): pure Rust, so it
 # costs nothing on the way to wasm.
@@ -27,14 +32,17 @@ wasm-bindgen-futures = "0.4"
 # `document`/`window`: the theme writes `data-theme` on `<html>` (M7-02, #135).
 web-sys = { version = "0.3", features = [
   "Blob",
+  "CanvasRenderingContext2d",
   "DataTransfer",
   "Document",
   "DragEvent",
   "Element",
   "File",
   "FileList",
+  "HtmlCanvasElement",
   "HtmlInputElement",
   "HtmlSelectElement",
+  "ImageData",
   "KeyboardEvent",
   "Window",
 ] }

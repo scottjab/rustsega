@@ -59,6 +59,11 @@ pub fn IconButton(
     /// Visual weight; [`ButtonVariant::Ghost`] unless the caller says otherwise.
     #[prop(optional)]
     variant: ButtonVariant,
+    /// Inert: the real `disabled` attribute, so the button is out of the tab
+    /// order as well as unclickable. A control for something that has not been
+    /// loaded yet says so rather than answering a press with nothing.
+    #[prop(optional, into)]
+    disabled: bool,
     /// Called when the button is activated: click, Enter or Space.
     on_click: Callback<()>,
 ) -> impl IntoView {
@@ -69,6 +74,7 @@ pub fn IconButton(
             class=classes
             aria-label=label.clone()
             title=label
+            disabled=disabled
             on:click=move |_| on_click.run(())
         >
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">

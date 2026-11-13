@@ -2,11 +2,14 @@
 //!
 //! The console screen is the hero: everything else is 56px of chrome above it
 //! or an overlay beside it. The shell's own state - theme, drawer, toasts, the
-//! loaded cartridge - is held in signals here. Emulation and persistence arrive
-//! in later M7 tickets.
+//! loaded cartridge - is held in signals here. The machine itself is not: it is
+//! owned by [`crate::emulator`], and the shell only holds the pause state its
+//! buttons show.
 
+use leptos::html;
 use leptos::prelude::*;
 
+use crate::emulator::use_cartridge;
 use crate::rom::LoadedRom;
 use crate::rom_picker::EmptyScreen;
 use crate::rom_picker::RomFileInput;
@@ -47,6 +50,12 @@ pub fn App() -> impl IntoView {
     let roms = RwSignal::new(None::<LoadedRom>);
     provide_context(roms);
 
+    // The canvas the console draws to, and the loop that drives it. The emulator
+    // itself is not in a signal here - see [`crate::emulator`] for why - only the
+    // pause state its buttons show.
+    let canvas = NodeRef::<html::Canvas>::new();
+    let console = use_cartridge(canvas);
+
     // Window-wide drop handling; the screen area wears the result.
     let dragging = window_drop_target();
 
@@ -65,6 +74,33 @@ pub fn App() -> impl IntoView {
     let title = Signal::derive(move || roms.with(|rom| rom.as_ref().map(|rom| rom.title.clone())));
     let region =
         Signal::derive(move || roms.with(|rom| rom.as_ref().map(|rom| rom.region.clone())));
+
+    // The two console controls. Re-rendered as a unit because both the icon of
+    // one and the `disabled` of the other follow the console, and an icon-only
+    // button with no accessible name is unusable - so the label changes with it.
+    let console_buttons = move || {
+        let loaded = loaded.get();
+        let paused = console.paused.get();
+        let (label, path) = if paused {
+            ("Play", icons::PLAY)
+        } else {
+            ("Pause", icons::PAUSE)
+        };
+        view! {
+            <IconButton
+                label=label.to_string()
+                path=path
+                disabled=!loaded
+                on_click=Callback::new(move |_| console.toggle())
+            />
+            <IconButton
+                label="Reset".to_string()
+                path=icons::RESET
+                disabled=!loaded
+                on_click=Callback::new(move |_| console.reset())
+            />
+        }
+    };
 
     let theme_options = Theme::ALL
         .iter()
@@ -96,6 +132,7 @@ pub fn App() -> impl IntoView {
                     }}
                 </p>
                 <nav class="topbar__actions" aria-label="Console">
+                    {console_buttons}
                     <IconButton
                         label="Open ROM".to_string()
                         path=icons::OPEN
@@ -121,7 +158,14 @@ pub fn App() -> impl IntoView {
 
             <main class="screen-area" class:screen-area--drag=move || dragging.get()>
                 <Show when=move || loaded.get() fallback=|| view! { <EmptyScreen/> }>
-                    <canvas id="screen" class="screen" width=320 height=224></canvas>
+                    <canvas
+                        id="screen"
+                        class="screen"
+                        width=320
+                        height=224
+                        node_ref=canvas
+                    >
+                    </canvas>
                 </Show>
                 <RomFileInput/>
             </main>
