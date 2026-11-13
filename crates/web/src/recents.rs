@@ -282,17 +282,16 @@ impl Recents {
                     return;
                 }
             };
-            if let Some(bytes) = (!already_stored).then_some(bytes) {
-                if let Err(error) = db
+            if !already_stored
+                && let Err(error) = db
                     .put(storage::Store::Roms, &storage::rom_key(&id), &bytes)
                     .await
-                {
-                    // `StoreError::Write` is the quota sentence, and it is the
-                    // whole of what changes for the player: the game is running
-                    // and this browser will not have kept it for next time.
-                    toasts.push(ToastKind::Danger, error.to_string());
-                    return;
-                }
+            {
+                // `StoreError::Write` is the quota sentence, and it is the whole
+                // of what changes for the player: the game is running and this
+                // browser will not have kept it for next time.
+                toasts.push(ToastKind::Danger, error.to_string());
+                return;
             }
             // The list as of now, not as of the `await`: two opens cannot
             // interleave here anyway, because publishing the list is synchronous
@@ -427,12 +426,17 @@ fn load_local() -> Vec<RecentMeta> {
 ///
 /// A full `localStorage` is not worth losing the session over: the game in front
 /// of the player is the thing that matters, and the list is still on screen.
+#[cfg(target_arch = "wasm32")]
 fn save_local(items: &[RecentMeta]) {
-    #[cfg(target_arch = "wasm32")]
     if let Some(storage) = crate::settings::storage() {
         let _ = storage.set_item(STORAGE_KEY, &to_json(items));
     }
 }
+
+/// Native builds have no `localStorage` to write to, which is the same fact
+/// [`load_local`] states by returning nothing.
+#[cfg(not(target_arch = "wasm32"))]
+fn save_local(_items: &[RecentMeta]) {}
 
 /// One line in the browser console, for the storage failure the player can do
 /// nothing about: the same shape as `render::webgl::report`.

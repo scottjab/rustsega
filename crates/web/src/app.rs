@@ -106,10 +106,10 @@ pub fn App() -> impl IntoView {
     // (M7-16, #149).
     Effect::new(move |opened: Option<Option<String>>| {
         let current = roms.with(|rom| rom.as_ref().map(|rom| rom.id.clone()));
-        if current.is_some() && current != opened.flatten() {
-            if let Some(rom) = roms.with(|rom| rom.clone()) {
-                recents.record(rom);
-            }
+        if current != opened.flatten()
+            && let Some(rom) = roms.with(|rom| rom.clone())
+        {
+            recents.record(rom);
         }
         current
     });
