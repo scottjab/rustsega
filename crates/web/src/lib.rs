@@ -13,6 +13,7 @@ pub mod audio;
 pub mod audio_pacing;
 pub mod emulator;
 pub mod frame_pacer;
+pub mod input;
 pub mod rom;
 pub mod rom_picker;
 pub mod theme;
