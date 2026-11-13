@@ -89,6 +89,13 @@ wasm-web:
 web:
     cd crates/web && trunk build --release
 
+# The single binary (M8-01, #155): `target/release/rustsega`, the frontend baked
+# in. `embed-web` is off by default, which is what lets fmt, clippy, nextest and
+# the wasm builds run with no `crates/web/dist` at all; this recipe is the one
+# place that turns it on, and it runs `web` first so the folder is there.
+build: web
+    cargo build --release -p server --features embed-web
+
 # Serve the frontend with trunk's dev server (autoreload) on http://127.0.0.1:8081.
 # This is the debug build: fast to compile, ~13x the wasm, not a thing to measure fps on.
 web-serve:
