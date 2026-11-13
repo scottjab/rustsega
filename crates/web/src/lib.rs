@@ -6,6 +6,8 @@
 //! the WASM entry point and does nothing but mount the app.
 
 pub mod app;
+pub mod theme;
+pub mod ui;
 
 /// The application title, shown as the page heading.
 ///

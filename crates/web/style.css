@@ -1,15 +1,590 @@
-/* Minimal styles for the M7-01 stub page. Real layout is a later M7 ticket. */
+/* rustsega shell (M7-02, #135).
+ *
+ * Plain CSS, loaded by trunk through `<link data-trunk rel="css">` in
+ * `index.html`. No framework, no downloaded fonts, no JavaScript: the layout is
+ * here and the markup that uses it is in `src/`.
+ *
+ * Sections, in order: tokens, reset, buttons and form controls, app shell
+ * (top bar / screen / drawer / toasts), motion.
+ */
+
+/* ---------------------------------------------------------------- tokens -- */
+
+:root {
+  --bg: #0b0d12;
+  --bg-screen: #05060a;
+  --surface: #141821;
+  --surface-2: #1c2230;
+  --border: #2a3142;
+  --text: #e8ecf4;
+  --text-muted: #8b93a7;
+  --accent: #5b8cff;
+  --accent-2: #ff5c7a;
+  --ok: #3ddc97;
+  --warn: #ffb547;
+  --danger: #ff5c5c;
+  /* Text on top of --accent. Dark on both themes: the accent is light enough
+     that white text on it fails contrast. */
+  --on-accent: #071021;
+  --focus: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+
+  /* Spacing, on a 4px grid. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+
+  /* Radii: controls, cards, drawer. */
+  --radius-control: 6px;
+  --radius-card: 10px;
+  --radius-drawer: 16px;
+
+  /* Type scale: 12, 14, 16 (base), 20, 28. Weights 400 and 600. */
+  --text-xs: 12px;
+  --text-sm: 14px;
+  --text-base: 16px;
+  --text-lg: 20px;
+  --text-xl: 28px;
+  --weight-regular: 400;
+  --weight-emphasis: 600;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Shell geometry. */
+  --topbar-height: 56px;
+  --drawer-width: 380px;
+  --bottom-sheet-height: 70dvh;
+
+  /* Motion. Every transition that uses these sits behind the
+     prefers-reduced-motion query at the bottom of this file. */
+  --duration: 170ms;
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  color-scheme: dark;
+}
+
+/* The light theme, written twice on purpose: once for an explicit
+   `data-theme="light"` (which the settings drawer sets), and once for a
+   `data-theme`-less `<html>` on a machine that prefers light. `Theme::System`
+   writes no attribute at all - see `src/theme.rs` - so this is how following
+   the OS works. Keep the two blocks in step. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    --bg: #f5f6fa;
+    --bg-screen: #e9ebf2;
+    --surface: #ffffff;
+    --surface-2: #eef0f6;
+    --border: #d8dce6;
+    --text: #141821;
+    --text-muted: #5b6275;
+    color-scheme: light;
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #f5f6fa;
+  --bg-screen: #e9ebf2;
+  --surface: #ffffff;
+  --surface-2: #eef0f6;
+  --border: #d8dce6;
+  --text: #141821;
+  --text-muted: #5b6275;
+  color-scheme: light;
+}
+
+/* ----------------------------------------------------------------- reset -- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
 
 body {
   margin: 0;
-  font-family: system-ui, sans-serif;
-  background: #111;
-  color: #eee;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  font-weight: var(--weight-regular);
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
 }
 
-.app {
-  display: flex;
-  min-height: 100vh;
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+  font-weight: inherit;
+}
+
+canvas {
+  display: block;
+}
+
+/* The focus ring the whole shell uses - gamepad and keyboard users depend on it
+   being the same everywhere, so it is one rule rather than per component. */
+:focus-visible {
+  box-shadow: var(--focus);
+  outline: none;
+}
+
+/* --------------------------------------------------------------- buttons -- */
+
+.btn {
+  display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-emphasis);
+  cursor: pointer;
+  appearance: none;
+  text-align: center;
+}
+
+.btn:hover {
+  border-color: var(--accent);
+}
+
+.btn--primary {
+  border-color: transparent;
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.btn--ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text);
+}
+
+.btn--ghost:hover {
+  background: var(--surface-2);
+}
+
+.btn--danger {
+  border-color: var(--danger);
+  background: transparent;
+  color: var(--danger);
+}
+
+.btn--danger:hover {
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+}
+
+/* An icon-only button is square, so the glyph has room to breathe. */
+.btn--icon {
+  min-width: 36px;
+  padding: 0;
+}
+
+.icon {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* -------------------------------------------------------- form controls -- */
+
+.field {
+  display: grid;
+  gap: var(--space-1);
+  margin-bottom: var(--space-4);
+}
+
+.field__label {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.select {
+  width: 100%;
+  min-height: 36px;
+  padding: 0 var(--space-5) 0 var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  /* Inline caret, so the control looks the same in every browser and in both
+     themes without shipping an image or a font. */
+  background-color: var(--surface-2);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b93a7' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right var(--space-2) center;
+  background-size: 16px 16px;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--text-sm);
+  appearance: none;
+  cursor: pointer;
+}
+
+.slider {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-1) 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: left;
+  cursor: pointer;
+}
+
+.toggle__track {
+  position: relative;
+  display: block;
+  width: 40px;
+  height: 22px;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+}
+
+.toggle__thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  display: block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.toggle[aria-checked="true"] .toggle__track {
+  border-color: transparent;
+  background: var(--accent);
+}
+
+.toggle[aria-checked="true"] .toggle__thumb {
+  left: 20px;
+  background: var(--on-accent);
+}
+
+/* ------------------------------------------------------------ app shell -- */
+
+.app {
+  display: grid;
+  grid-template-rows: var(--topbar-height) 1fr;
+  /* `minmax(0, 1fr)`, not the implicit `auto`: a content-sized column lets a
+     wide canvas widen the whole shell past the viewport, which `overflow:
+     hidden` then hides from the scrollbar rather than fixing. */
+  grid-template-columns: minmax(0, 1fr);
+  height: 100dvh;
+  min-height: 100vh;
+  overflow: hidden;
+}
+
+/* The top bar: wordmark, current game, actions. */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: var(--topbar-height);
+  padding: 0 var(--space-3);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.wordmark {
+  display: inline-flex;
+  align-items: baseline;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-emphasis);
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.wordmark__dot {
+  width: 8px;
+  height: 8px;
+  margin-left: var(--space-1);
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+.now-playing {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.now-playing--loaded {
+  color: var(--text);
+}
+
+.topbar__actions {
+  display: flex;
+  gap: var(--space-1);
+}
+
+/* The screen is the hero: it fills what is left of the page, and the canvas is
+   centred in it with a soft accent glow behind. */
+.screen-area {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  padding: var(--space-4);
+  background: var(--bg-screen);
+  overflow: hidden;
+}
+
+.screen-area::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    55% 55% at 50% 45%,
+    color-mix(in srgb, var(--accent) 8%, transparent),
+    transparent 70%
+  );
+  pointer-events: none;
+}
+
+/* The canvas keeps the Genesis 320x224 ratio at any window size. The width is
+   taken from the room the screen area has (`100dvh` minus the top bar and this
+   rule's own padding), and `max-width: 100%` takes over when the window is
+   narrow. Doing it this way, rather than with `height: 100%`, matters: Firefox
+   clamps a replaced element's two axes independently and stretches the box.
+   M7-04 (#137) draws into this canvas. */
+.screen {
+  position: relative;
+  width: min(
+    100%,
+    calc((100dvh - var(--topbar-height) - (var(--space-4) * 2)) * (320 / 224))
+  );
+  height: auto;
+  max-width: 100%;
+  max-height: 100%;
+  aspect-ratio: 320 / 224;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--bg-screen);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 45%);
+  image-rendering: pixelated;
+}
+
+/* ----------------------------------------------------- drawer and toasts -- */
+
+/* One fixed, clipped layer for the drawer and its backdrop. Clipping matters:
+   the closed drawer sits off-screen, and without this it would be scrollable. */
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgb(0 0 0 / 45%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.drawer-backdrop--open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  width: min(var(--drawer-width), 100%);
+  height: 100%;
+  border-left: 1px solid var(--border);
+  border-radius: var(--radius-drawer) 0 0 var(--radius-drawer);
+  background: var(--surface);
+  box-shadow: -12px 0 32px rgb(0 0 0 / 35%);
+  transform: translateX(100%);
+  /* Hidden rather than merely off-screen: `visibility: hidden` takes the
+     drawer's own controls out of the tab order while it is shut. */
+  visibility: hidden;
+}
+
+.drawer--open {
+  transform: translateX(0);
+  visibility: visible;
+}
+
+.drawer__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.drawer__title {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-emphasis);
+}
+
+.drawer__body {
+  flex: 1;
+  padding: var(--space-4);
+  overflow-y: auto;
+}
+
+/* Under 640px the drawer is a bottom sheet, not a side panel. */
+@media (max-width: 639px) {
+  .drawer {
+    top: auto;
+    bottom: 0;
+    width: 100%;
+    height: min(var(--bottom-sheet-height), 100%);
+    border-left: 0;
+    border-top: 1px solid var(--border);
+    border-radius: var(--radius-drawer) var(--radius-drawer) 0 0;
+    transform: translateY(100%);
+  }
+
+  .drawer--open {
+    transform: translateY(0);
+  }
+}
+
+.settings-section {
+  margin-bottom: var(--space-5);
+}
+
+.settings-section__title {
+  margin-bottom: var(--space-3);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-emphasis);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.settings-section__note {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.toasts {
+  position: fixed;
+  bottom: var(--space-4);
+  left: 50%;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  width: min(420px, calc(100% - (var(--space-4) * 2)));
+  transform: translateX(-50%);
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: var(--radius-card);
+  background: var(--surface-2);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 35%);
+}
+
+.toast__text {
+  flex: 1;
+  font-size: var(--text-sm);
+}
+
+.toast--info {
+  border-left-color: var(--accent);
+}
+
+.toast--ok {
+  border-left-color: var(--ok);
+}
+
+.toast--warn {
+  border-left-color: var(--warn);
+}
+
+.toast--danger {
+  border-left-color: var(--danger);
+}
+
+/* --------------------------------------------------------------- motion -- */
+
+@media (prefers-reduced-motion: no-preference) {
+  .btn,
+  .select,
+  .toggle__track,
+  .toggle__thumb {
+    transition:
+      background-color var(--duration) var(--ease),
+      border-color var(--duration) var(--ease),
+      color var(--duration) var(--ease);
+  }
+
+  .toggle__track {
+    transition: background-color var(--duration) var(--ease);
+  }
+
+  .toggle__thumb {
+    transition: left var(--duration) var(--ease);
+  }
+
+  .drawer-backdrop {
+    transition: opacity var(--duration) var(--ease);
+  }
+
+  /* `visibility` is in the transition list so it waits for the slide to finish
+     on the way out, and flips immediately on the way in. */
+  .drawer {
+    transition:
+      transform var(--duration) var(--ease),
+      visibility var(--duration) step-end;
+  }
+
+  .toast {
+    transition:
+      opacity var(--duration) var(--ease),
+      transform var(--duration) var(--ease);
+  }
 }
