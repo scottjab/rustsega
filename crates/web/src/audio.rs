@@ -277,22 +277,6 @@ impl AudioOut {
         self.publish();
     }
 
-    /// Gives up this output's context.
-    ///
-    /// A browser allows only a handful of contexts per tab, and dropping the Rust
-    /// handle does not close the JS object, so loading six ROMs in one tab
-    /// without this is six contexts and then no audio at all.
-    pub fn close(&mut self) {
-        let _ = self.ctx.close();
-        self.publish();
-    }
-
-    /// How many blocks arrived too late to fit the schedule since this output
-    /// was made.
-    pub fn underruns(&self) -> u32 {
-        self.underruns
-    }
-
     /// Refreshes `window.rustsegaAudio`, which is the only way anything outside
     /// this tab can see the schedule.
     ///
@@ -309,6 +293,10 @@ impl AudioOut {
         set("ahead", JsValue::from_f64(self.buffered_secs()));
         set("underruns", JsValue::from_f64(f64::from(self.underruns)));
         set("blocks", JsValue::from_f64(f64::from(self.blocks)));
+        set(
+            "sampleRate",
+            JsValue::from_f64(f64::from(self.ctx.sample_rate())),
+        );
         set(
             "gain",
             JsValue::from_f64(f64::from(self.gain.gain().value())),
@@ -329,6 +317,21 @@ impl AudioOut {
             // which is a context that is playing.
             _ => "closed",
         }
+    }
+}
+
+impl Drop for AudioOut {
+    /// Gives the context back to the browser.
+    ///
+    /// A browser allows only a handful of `AudioContext`s per tab, and dropping a
+    /// Rust handle does not close the JS object: six cartridges in one tab would
+    /// be six live contexts and then silence. Dropping this output *is* the end of
+    /// it - a second cartridge, a start that failed after the context was made -
+    /// so the context goes here rather than at one call site that could be
+    /// forgotten.
+    fn drop(&mut self) {
+        let _ = self.ctx.close();
+        self.publish();
     }
 }
 

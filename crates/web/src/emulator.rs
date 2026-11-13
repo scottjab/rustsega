@@ -370,9 +370,18 @@ impl Emulator {
         console: Controls,
         settings: AudioSettings,
     ) -> Result<Rc<RefCell<Self>>, StartError> {
-        // The audio output first, and for one reason beyond the obvious: it is
-        // the only place the sample rate the browser will really use is known,
-        // and `Genesis` has to be mixed to that rather than to the 48 kHz of
+        // The canvas first, because everything after this point has a browser
+        // resource attached to it that a failed start would have to give back.
+        let ctx = canvas
+            .get_context("2d")
+            .ok()
+            .flatten()
+            .and_then(|context| context.dyn_into::<CanvasRenderingContext2d>().ok())
+            .ok_or(StartError::NoCanvas)?;
+
+        // The audio output next, and for one reason beyond the obvious: it is the
+        // only place the sample rate the browser will really use is known, and
+        // `Genesis` has to be mixed to that rather than to the 48 kHz of
         // `Config::default`. A browser that will not give up a context is not a
         // reason not to run the game, so `None` is a normal answer here and the
         // loop paces on frames until a gesture makes one possible.
@@ -381,13 +390,10 @@ impl Emulator {
         if let Some(audio) = audio.as_ref() {
             config.sample_rate = audio.sample_rate();
         }
+        // A console that will not start takes the audio output back with it: an
+        // `AudioOut` dropped is a context closed, which is the only way the
+        // browser stops counting it.
         let genesis = Genesis::new(&rom.bytes, config.clone()).map_err(|_| StartError::NotARom)?;
-        let ctx = canvas
-            .get_context("2d")
-            .ok()
-            .flatten()
-            .and_then(|context| context.dyn_into::<CanvasRenderingContext2d>().ok())
-            .ok_or(StartError::NoCanvas)?;
 
         let target_hz = target_hz(&config, &rom.bytes);
         let emulator = Rc::new(RefCell::new(Self {
@@ -638,9 +644,7 @@ impl Emulator {
             }
         }
         self.wake.clear();
-        if let Some(audio) = self.audio.as_mut() {
-            audio.close();
-        }
+        // Letting the output go is what closes its context: see `Drop for AudioOut`.
         self.audio = None;
     }
 }
