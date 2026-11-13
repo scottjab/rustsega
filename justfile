@@ -61,5 +61,11 @@ web:
     cd crates/web && trunk build --release
 
 # Serve the frontend with trunk's dev server (autoreload) on http://127.0.0.1:8081.
+# This is the debug build: fast to compile, ~13x the wasm, not a thing to measure fps on.
 web-serve:
     cd crates/web && trunk serve --open=false --address 127.0.0.1 --port 8081
+
+# Same as web-serve but with --release (#402): autoreload plus the optimized wasm.
+# Use this one to look at frame pacing, the renderer and audio timing.
+web-serve-release:
+    cd crates/web && trunk serve --release --open=false --address 127.0.0.1 --port 8081
