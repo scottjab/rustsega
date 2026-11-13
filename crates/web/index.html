@@ -2,10 +2,41 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!--
+      `viewport-fit=cover` lets the app draw into the display cutout on a phone,
+      which is what the `viewport-fit` safe-area insets of the touch overlay
+      (M7-09) measure against.
+    -->
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>rustsega</title>
+
+    <!--
+      Installable PWA (M7-18, #151). No service worker and no offline support:
+      modern Chromium installs from the manifest alone, and a service worker is
+      JavaScript, which this app has none of (docs/ARCHITECTURE.md, goal 3).
+      `assets/` is copied to the root of `dist` by the `copy-file` links below,
+      so these absolute paths are the shipped layout.
+    -->
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <!--
+      Two theme colours: the first has no `media` and is the dark default (the
+      `--bg` token of style.css), the second applies on a light machine. When
+      more than one `theme-color` matches, the browser takes the last of them,
+      so light has to come after the default rather than before it.
+    -->
+    <meta name="theme-color" content="#0b0d12" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f5f6fa" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <!-- iOS ignores the manifest icon and wants a PNG touch icon of its own. -->
+    <link rel="apple-touch-icon" href="/icon-192.png" />
+
     <link data-trunk rel="rust" data-wasm-opt="z" />
     <link data-trunk rel="css" href="style.css" />
+    <link data-trunk rel="copy-file" href="assets/manifest.webmanifest" />
+    <link data-trunk rel="copy-file" href="assets/icon.svg" />
+    <link data-trunk rel="copy-file" href="assets/icon-192.png" />
+    <link data-trunk rel="copy-file" href="assets/icon-512.png" />
+    <link data-trunk rel="copy-file" href="assets/maskable-512.png" />
   </head>
   <body></body>
 </html>
