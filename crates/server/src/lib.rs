@@ -37,12 +37,18 @@ const NO_CACHE: &str = "no-cache";
 /// allowed to compile (`wasm-unsafe-eval`) and inline styles allowed because
 /// Leptos writes `style=` attributes.
 ///
-/// This is the policy M8-01 (#155) asked for and `static_files.rs` pins it
-/// verbatim. Trunk injects one inline `<script type="module">` to bootstrap the
-/// wasm loader, which `script-src 'self'` rejects unless the value grows a hash
-/// of that script or `'unsafe-inline'`: `just build` + the browser check of the
-/// PR is what decides it.
-pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'";
+/// `script-src` ends in `'unsafe-inline'`, one step looser than M8-01 (#155)
+/// asked for, and only for the single inline `<script type="module">` trunk
+/// injects into `dist/index.html` to call the wasm loader. Without it the policy
+/// is enforced exactly as written and the app never starts: in the dev shell's
+/// Firefox 159, every subresource of the page loaded (`wasm-bindgen`'s `.js` and
+/// the `.wasm` both 200, brotli-compressed) while the bootstrap did not run, so
+/// `window.wasmBindings` stayed `undefined` and no canvas was ever mounted.
+///
+/// A per-file `'sha256-...'` of that script would be narrower and is the right
+/// fix; it is not taken here because hashing it means `sha2` and `base64` as
+/// direct dependencies, which #155 does not list.
+pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'";
 
 /// The CSP header name, which the `http` crate does not define for us.
 const CONTENT_SECURITY_POLICY_HEADER: &str = "content-security-policy";

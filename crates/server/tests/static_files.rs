@@ -168,7 +168,9 @@ async fn dot_dot_in_a_path_never_escapes_the_asset_tree() {
 
 #[tokio::test]
 async fn every_response_carries_the_security_headers() {
-    let csp = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
+    // Pinned verbatim, including the `'unsafe-inline'` on `script-src` that the
+    // inline bootstrap script of trunk needs: see CONTENT_SECURITY_POLICY.
+    let csp = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; \
                style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; \
                connect-src 'self'";
 
