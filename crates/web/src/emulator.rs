@@ -241,6 +241,20 @@ impl Controls {
         }
     }
 
+    /// Says what the console's frame is, which is what the picture is scaled from
+    /// (M7-12, #145).
+    ///
+    /// [`Emulator::start`] calls this with the canvas as the markup made it - the
+    /// same value it seeds [`Emulator::drawn`] with, so the two cannot disagree
+    /// about what is current - and [`Emulator::paint`] calls it whenever that
+    /// baseline moves. One method for the one field because `paint` reports a
+    /// *change*: a console whose first frame is already the size the markup asked
+    /// for announces nothing there, and a frame size that is never announced is a
+    /// picture that is never scaled.
+    pub fn set_frame(self, size: (u32, u32)) {
+        self.frame.set(size);
+    }
+
     /// Sets the running console's volume, `0.0` to `1.0` as the drawer's slider
     /// has it. With no console there is nothing to turn, and the setting is not
     /// lost: a console made later reads [`Settings`] for itself.
@@ -421,6 +435,10 @@ impl Emulator {
         let genesis = Genesis::new(&rom.bytes, config.clone()).map_err(|_| StartError::NotARom)?;
 
         let target_hz = target_hz(&config, &rom.bytes);
+        // One read of the canvas, and both the baseline `paint` compares against
+        // and the size the shell is told come from it (#145).
+        let seeded = (canvas.width(), canvas.height());
+        console.set_frame(seeded);
         let emulator = Rc::new(RefCell::new(Self {
             genesis,
             audio,
@@ -435,7 +453,7 @@ impl Emulator {
             paused: false,
             // The canvas as the markup made it, so the first frame that does not
             // match it is seen as the change it is.
-            drawn: (canvas.width(), canvas.height()),
+            drawn: seeded,
             frame: None,
             tick: None,
             wake: Vec::new(),
@@ -654,7 +672,7 @@ impl Emulator {
             // The screen's box is scaled from the frame, so it is the frame
             // changing size that has to be announced rather than the canvas
             // attribute being written (#145).
-            self.console.frame.set((width, height));
+            self.console.set_frame((width, height));
         }
 
         let image = ImageData::new_with_u8_clamped_array_and_sh(Clamped(&self.rgba), width, height);
@@ -888,7 +906,15 @@ mod tests {
         let controls = Controls {
             paused,
             sound_on: RwSignal::new(false),
+            frame: RwSignal::new((0, 0)),
         };
+
+        // No console, so the frame size is the one `use_cartridge` started with -
+        // and it has exactly one door, which is what lets `start` and `paint`
+        // share it without either reading the other (#145).
+        assert_eq!(controls.frame.get_untracked(), (0, 0));
+        controls.set_frame((256, 224));
+        assert_eq!(controls.frame.get_untracked(), (256, 224));
 
         controls.reset();
         controls.enable_audio();

@@ -36,6 +36,26 @@ impl SelectOption {
     }
 }
 
+/// The options of a [`Select`] built from a list of values and their labels.
+///
+/// Position rather than a token of the enum's own because a settings list is read
+/// back into the same array it was built from, and an index needs no parser that
+/// could get out of step with it ([`position`] is the other half).
+pub fn options<T: Copy>(list: &[T], label: impl Fn(T) -> &'static str) -> Vec<SelectOption> {
+    list.iter()
+        .enumerate()
+        .map(|(index, item)| SelectOption::new(index.to_string(), label(*item)))
+        .collect()
+}
+
+/// The position of `value` in `list`, as the [`Select`] value that shows it.
+pub fn position<T: PartialEq>(list: &[T], value: T) -> String {
+    list.iter()
+        .position(|item| *item == value)
+        .unwrap_or(0)
+        .to_string()
+}
+
 thread_local! {
     /// The number to hand out to the next [`Select`] mounted.
     static NEXT_NUMBER: Cell<usize> = const { Cell::new(1) };

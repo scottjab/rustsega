@@ -44,6 +44,7 @@ use crate::nav::UiAction;
 use crate::nav::UiMode;
 use crate::nav::fresh_actions;
 use crate::nav::pad_actions;
+use crate::screen::Screen;
 use crate::settings::Settings;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
@@ -72,6 +73,9 @@ struct Watcher {
     settings: RwSignal<Settings>,
     /// The cell of the controls page waiting for a pad button, if there is one.
     capture: RwSignal<Option<CaptureTarget>>,
+    /// Fullscreen, for `F11`: the same owner the top bar's button uses, so the
+    /// pad cannot disagree with the keyboard about what the shell is doing (#145).
+    screen: Screen,
     /// What the pads were asking the menu for as of the last frame, while a menu
     /// was open: the same difference trick as `PadSeen::buttons`, so that a press
     /// is reported once (M7-11, #144).
@@ -316,12 +320,14 @@ pub fn use_gamepad(
     controller_connected: RwSignal<bool>,
     settings: RwSignal<Settings>,
     capture: RwSignal<Option<CaptureTarget>>,
+    screen: Screen,
 ) {
     WATCHER.with(|watcher| {
         *watcher.borrow_mut() = Some(Watcher {
             slots: PadSlots::new(),
             settings,
             capture,
+            screen,
             capture_baseline: None,
             menu_seen: Vec::new(),
             menu_repeat: RepeatTimer::default(),
@@ -390,9 +396,15 @@ pub fn poll_gamepads(now_ms: f64) {
         // and a signal write is a render - which is the one thing that must not
         // happen while the watcher is borrowed, for the reason
         // [`crate::emulator`] spells out about the console.
-        (hotkeys, actions, watcher.menu, watcher.toasts)
+        (
+            hotkeys,
+            actions,
+            watcher.menu,
+            watcher.toasts,
+            watcher.screen,
+        )
     });
-    let Some((hotkeys, actions, menu, toasts)) = asked else {
+    let Some((hotkeys, actions, menu, toasts, screen)) = asked else {
         return;
     };
     if !actions.is_empty() {
@@ -401,7 +413,7 @@ pub fn poll_gamepads(now_ms: f64) {
         menu.announce(LastDevice::Gamepad);
     }
     for hotkey in hotkeys {
-        hotkey_do(hotkey, menu, toasts);
+        hotkey_do(hotkey, menu, toasts, screen);
     }
     for action in actions {
         menu.run(action);

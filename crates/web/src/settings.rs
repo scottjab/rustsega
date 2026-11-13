@@ -590,11 +590,18 @@ mod tests {
     #[test]
     fn a_file_without_the_video_fields_still_loads_them_as_defaults() {
         let settings = Settings::from_json(r#"{"theme":"dark","volume":0.5,"version":1}"#);
-        assert_eq!(settings.theme, Theme::Dark, "the fields it did have survived");
+        assert_eq!(
+            settings.theme,
+            Theme::Dark,
+            "the fields it did have survived"
+        );
         assert_eq!(settings.volume, 0.5);
         assert_eq!(settings.scale, ScaleMode::Integer);
         assert_eq!(settings.aspect, Aspect::FourThree);
-        assert!(!settings.smoothing, "pixelated is what the shell drew before");
+        assert!(
+            !settings.smoothing,
+            "pixelated is what the shell drew before"
+        );
         assert_eq!(settings.version, SETTINGS_VERSION);
     }
 

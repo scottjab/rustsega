@@ -25,7 +25,8 @@ use crate::settings::gamepad_button_label;
 use crate::settings::keycap_label;
 use crate::ui::button::Button;
 use crate::ui::select::Select;
-use crate::ui::select::SelectOption;
+use crate::ui::select::options;
+use crate::ui::select::position;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
 use crate::ui::toggle::Toggle;
@@ -120,26 +121,6 @@ pub fn bind_pad(target: CaptureTarget, index: u8, settings: RwSignal<Settings>, 
         ),
     };
     toasts.push(ToastKind::Ok, text);
-}
-
-/// The options of a [`Select`] built from a list of labels, valued by position.
-///
-/// Position rather than a token of the enum's own because these three lists are
-/// read back into the same array they were built from, and an index needs no
-/// parser that could get out of step with it.
-fn options<T: Copy>(list: &[T], label: impl Fn(T) -> &'static str) -> Vec<SelectOption> {
-    list.iter()
-        .enumerate()
-        .map(|(index, item)| SelectOption::new(index.to_string(), label(*item)))
-        .collect()
-}
-
-/// The position of `value` in `list`, as the [`Select`] value that shows it.
-fn position<T: PartialEq>(list: &[T], value: T) -> String {
-    list.iter()
-        .position(|item| *item == value)
-        .unwrap_or(0)
-        .to_string()
 }
 
 /// One cell of a player's table: the key or pad button bound to this button, as a

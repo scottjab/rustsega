@@ -87,6 +87,15 @@ web-sys = { version = "0.3", features = [
   "Node",
   "NodeList",
   "PointerEvent",
+  # The fullscreen screen of M7-12 (#145): the observer that reports the room the
+  # picture has, the element that goes fullscreen, and the orientation the phone
+  # is asked to hold - which desktop Chrome refuses, so `Screen` and
+  # `OrientationLockType` are here for the call that is allowed to fail.
+  "ResizeObserver",
+  "ResizeObserverEntry",
+  "Screen",
+  "ScreenOrientation",
+  "OrientationLockType",
   # The settings store of M7-10 (#143): `window().local_storage()` and the two
   # items this reads and writes. Chosen over `gloo-storage` because web-sys is
   # already a direct dependency and `Storage` is the whole of the extra surface.
