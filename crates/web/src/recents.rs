@@ -283,7 +283,9 @@ impl Recents {
                 }
             };
             if let Some(bytes) = (!already_stored).then_some(bytes) {
-                if let Err(error) = db.put(storage::Store::Roms, &storage::rom_key(&id), &bytes).await
+                if let Err(error) = db
+                    .put(storage::Store::Roms, &storage::rom_key(&id), &bytes)
+                    .await
                 {
                     // `StoreError::Write` is the quota sentence, and it is the
                     // whole of what changes for the player: the game is running
@@ -386,7 +388,10 @@ impl Recents {
                 return;
             };
             for id in evicted {
-                if let Err(error) = db.delete(storage::Store::Roms, &storage::rom_key(&id)).await {
+                if let Err(error) = db
+                    .delete(storage::Store::Roms, &storage::rom_key(&id))
+                    .await
+                {
                     // Console-only. The bytes are unreachable either way, and a
                     // toast about a removal that the player can see has happened
                     // would say the opposite of what the card now says.

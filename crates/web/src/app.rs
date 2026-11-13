@@ -16,6 +16,7 @@ use crate::emulator::use_cartridge;
 use crate::gamepad_events::use_gamepad;
 use crate::keyboard_events::use_keyboard;
 use crate::menu::use_menu;
+use crate::recents::Recents;
 use crate::render::FilterSetting;
 use crate::render::RendererKind;
 use crate::render::RendererSetting;
@@ -36,6 +37,7 @@ use crate::ui::button::IconButton;
 use crate::ui::drawer::Drawer;
 use crate::ui::hint::HintBar;
 use crate::ui::icons;
+use crate::ui::recents_grid::RecentsGrid;
 use crate::ui::select::Listboxes;
 use crate::ui::select::Select;
 use crate::ui::select::SelectOption;
@@ -83,6 +85,12 @@ pub fn App() -> impl IntoView {
     let roms = RwSignal::new(None::<LoadedRom>);
     provide_context(roms);
 
+    // The games this browser can relaunch, read from `localStorage` here so the
+    // empty state has its cards on the first frame rather than after a round trip
+    // it does not need (M7-16, #149).
+    let recents = Recents::new(toasts);
+    provide_context(recents);
+
     // The two canvases the console can draw to, and the loop that drives it. Both
     // exist because a canvas belongs to one context type for its whole life, so
     // the WebGL path and the 2D path cannot share one (M7-13, #146); which of them
@@ -90,6 +98,21 @@ pub fn App() -> impl IntoView {
     let canvas = NodeRef::<html::Canvas>::new();
     let canvas_gl = NodeRef::<html::Canvas>::new();
     let console = use_cartridge(canvas, canvas_gl);
+
+    // Every cartridge that opens becomes a recent. This signal is the one place
+    // the file picker, the drop target and a recent card all arrive at, so
+    // recording here is what makes "opened" mean the same thing on all three of
+    // them - and the bytes are in IndexedDB before the list says they are
+    // (M7-16, #149).
+    Effect::new(move |opened: Option<Option<String>>| {
+        let current = roms.with(|rom| rom.as_ref().map(|rom| rom.id.clone()));
+        if current.is_some() && current != opened.flatten() {
+            if let Some(rom) = roms.with(|rom| rom.clone()) {
+                recents.record(rom);
+            }
+        }
+        current
+    });
     // The save state panel's own open signal, and the four slots the quick keys
     // work on. `Slots` is a `Copy` handle over the console, so the keyboard, the
     // pads and the cards all move the same one (M7-15, #148).
@@ -318,7 +341,10 @@ pub fn App() -> impl IntoView {
                 node_ref=screen_area
                 class:screen-area--drag=move || dragging.get()
             >
-                <Show when=move || loaded.get() fallback=|| view! { <EmptyScreen/> }>
+                <Show
+                    when=move || loaded.get()
+                    fallback=|| view! { <RecentsGrid/> <EmptyScreen/> }
+                >
                     // The 2D canvas, which is what was here before WebGL: the
                     // drawing buffer is the VDP's own pixels and the browser
                     // scales that. It is hidden while the console is drawing with
