@@ -834,8 +834,13 @@ canvas {
 }
 
 @media (orientation: portrait) {
+  /* A phone in portrait has no room for the pills between the d-pad and the face
+     buttons - they would land on `Y` - so they sit above the d-pad, which is where
+     the left thumb already is. */
   .touch__middle {
-    bottom: calc(env(safe-area-inset-bottom) + var(--touch-dpad) + var(--space-4));
+    left: calc(env(safe-area-inset-left) + var(--space-4));
+    transform: none;
+    bottom: calc(env(safe-area-inset-bottom) + var(--touch-dpad) + var(--space-1));
   }
 
   /* Portrait: the screen on top, the controls in the band under it rather than
