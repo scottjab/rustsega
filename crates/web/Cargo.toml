@@ -8,6 +8,21 @@ publish.workspace = true
 [dependencies]
 console_error_panic_hook = "0.1"
 leptos = { version = "0.8", features = ["csr"] }
+# The workspace pin, `=0.2.130`, which is the dev shell's `wasm-bindgen
+# --version` (AGENTS.md 1). Needed for the `Closure` that arms a toast's
+# auto-dismiss timer (M7-02, #135).
+wasm-bindgen = { workspace = true }
+# For the `js_sys::Function` handle `Window::set_timeout_*` wants.
+js-sys = "0.3"
+# The same wasm-bindgen family as leptos itself, and the only way to reach
+# `document`/`window`: the theme writes `data-theme` on `<html>` (M7-02, #135).
+web-sys = { version = "0.3", features = [
+  "Document",
+  "Element",
+  "HtmlSelectElement",
+  "KeyboardEvent",
+  "Window",
+] }
 
 [lints]
 workspace = true
