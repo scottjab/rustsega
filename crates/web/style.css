@@ -555,6 +555,14 @@ canvas {
 .drawer--open {
   transform: translateX(0);
   visibility: visible;
+
+  /* `pointer-events`, and the reason it is here: `.overlay` above shuts the
+     whole layer to the pointer and each child that wants clicks opens itself
+     again - `.drawer-backdrop--open` does, and this did not, so every control in
+     the drawer was hit-tested against the backdrop, which closed the drawer
+     instead of being clicked. Found in #143, where it stood between a player and
+     the binding table. */
+  pointer-events: auto;
 }
 
 .drawer__header {
