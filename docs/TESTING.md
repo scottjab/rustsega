@@ -32,7 +32,7 @@ compiled at all by the workspace run: `just check` adds the clippy and nextest o
 | Commercial smoke | `crates/genesis/tests/commercial.rs` | Boot real games N frames, assert no panic, non-blank output, golden frame hash. The games and what they say are in [`compat-commercial.md`](compat-commercial.md). |
 | Commercial gameplay | `crates/genesis/tests/gameplay.rs` | Replay a committed input movie (`tests/movies`, [`movie-format.md`](movie-format.md)) into the first level of five games and golden three frames of it plus the audio of the run. `cargo nextest run -p genesis --run-ignored only gameplay`. |
 | Collection sweep | `headless sweep <ROM DIR>` | Run every ROM in the local collection in a child process and report what happened. `cargo` runs none of it; the report is a committed artifact, [`compat.md`](compat.md) over [`compat.csv`](compat.csv). |
-| Frontend | `crates/web` with `wasm-bindgen-test` | Input mapping, settings, pure logic. Keep logic out of components so it is testable natively. What needs a browser runs under `just test-web`. |
+| Frontend | `crates/web` with `wasm-bindgen-test` | Input mapping, settings, pure logic. Keep logic out of components so it is testable natively. What needs a browser runs under `just test-web`, and what a browser frame costs is measured under `just perf-web`. |
 
 `wasm-bindgen-test` runs the wasm tests in a real browser: the dev shell pins
 Firefox and geckodriver and exports `GECKODRIVER` for
@@ -51,6 +51,74 @@ they stay with `check` on the host. `test-web` is not part of `check` -- `check`
 gates core-crate commits too, and a WebDriver problem is not a reason for those
 to go red -- but CI runs it as its own step, so it is checked on every pull
 request. About 4 s warm, 13 s with the wasm test build.
+
+### Browser frame budget: `just perf-web`
+
+`just perf-web` (M7-21, #154) measures `Genesis::run_frame` in the same headless
+Firefox and fails if it is over budget: 120 warm-up frames, then 600 timed ones,
+average under 8.0 ms and the 99th percentile under 14.0 ms, printed either way.
+It is a manual or nightly run, and deliberately in neither `check` nor CI: it
+needs a cartridge and a release wasm build, CI has neither, and `test-web`
+already owns the browser lane there.
+
+The browser cannot read `$RUSTSEGA_TEST_ROM_DIR`, so the cartridge travels inside
+the test binary: `crates/web/tests/browser_perf.rs` is
+`include_bytes!(env!("RUSTSEGA_PERF_ROM"))` behind a `perf-rom` cargo feature of
+the `web` crate that only that recipe turns on. The feature is load-bearing and
+not decoration. `include_bytes!` is a compile-time read, so an unset variable is
+a build failure, not a skipped test -- and `cargo test --target
+wasm32-unknown-unknown -p web`, which is `just test-web`, which CI runs, compiles
+every test file of the crate. A `SKIPPED` print would have needed the file to
+compile first. Prove the gate to yourself by dropping `feature = "perf-rom"`
+from the file's `#![cfg]` and running `cargo check --target
+wasm32-unknown-unknown -p web --all-targets` with the variable unset: `error:
+environment variable RUSTSEGA_PERF_ROM not defined at compile time`.
+
+The ROM is Overdrive 2, 8,386,056 B, at
+`$RUSTSEGA_TEST_ROM_DIR/genesis/overdrive2/titan-overdrive2.bin`. It is the one
+pinned public ROM that is a *load* rather than a *judge*: mid-line register
+writes, the VDP write FIFO, DMA during the raster, H32/H40 switching and sprite
+limits, with both sound chips going on every line ([`test-roms.md`](test-roms.md)). The `md-test-pack` alternatives are 1 KB to
+128 KB of pattern-and-register tests that draw a picture, print a verdict, and go
+silent; they would measure the frame loop of an idle machine. What embedding it
+costs, measured by building the same test binary against a 1 KB ROM instead:
+
+| | 1 KB ROM | Overdrive 2 | delta |
+|---|---:|---:|---:|
+| release test wasm | 2,541,459 B | 10,926,490 B | +8,385,031 B |
+| `cargo test --release --no-run`, warm | 1.15 s | 1.23 s | +0.08 s |
+
+so the 8 MB is the ROM and nothing else - one raw data segment, and no extra work
+for the optimiser - in a test binary that nothing ships. For scale, the frontend's
+own `trunk build --release` wasm is 1,383,661 B.
+
+#### The baseline
+
+`nix develop -c just perf-web` on the dev machine: Intel Core i7-14700KF, 64 GB,
+x86_64 Linux, in the Firefox and geckodriver `flake.nix` pins (Firefox 159.0.1,
+geckodriver 0.37.1), headless, 2026-11-13:
+
+| Run | avg | p99 | max |
+|---|---:|---:|---:|
+| 1 | 1.368 ms | 1.640 ms | 1.860 ms |
+| 2 | 1.360 ms | 1.660 ms | 1.940 ms |
+| 3 | 1.358 ms | 1.620 ms | 1.860 ms |
+| 4 | 1.364 ms | 1.640 ms | 1.860 ms |
+
+Ten thousandths of a millisecond of spread on the average between runs. The test
+prints the colour count of its last frame with the timings - 10, for Overdrive 2
+at frame 720 - and asserts on it, because a budget met by a machine that stopped
+drawing is a budget met by an idle machine.
+
+A sixth of the average budget and an eighth of the tail: this machine is not near
+the gate, so the gate is the thing worth watching. Numbers from another machine,
+browser, or browser version are a second baseline rather than a regression - what
+`run_frame` costs is a property of the whole box, which is why the budget is what
+is asserted and this table is only where one box sits under it.
+
+If it ever fails the budget, do not loosen the budget and do not ignore the test.
+M6-11 (#131) and its follow-ups are what fixes performance, and a quiet test is
+how a regression becomes permanent.
 
 CPU conformance runs against the fetched SingleStepTests suites and skips (does
 not fail) when the data is absent, so `just check` is green with or without

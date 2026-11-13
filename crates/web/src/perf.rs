@@ -15,14 +15,16 @@
 /// unit too.
 ///
 /// Nearest rank means the returned value is always one of the samples, never an
-/// interpolated one: the sample is ranked by value, and the answer is the value
-/// at rank `ceil(p * n)` counting from 1. So `p = 1.0` is the maximum, `p = 0.0`
-/// and everything below the first rank is the minimum, and the 99th percentile of
-/// 600 frame times is the 594th fastest of them - which is what "one frame in a
-/// hundred is allowed to be this slow, and no more" has to mean for a budget.
+/// interpolated one: the samples are ranked by value, shortest first, and the answer
+/// is the value at rank `ceil(p * n)` counting from 1. So `p = 1.0` is the maximum,
+/// `p = 0.0` - rank zero, no sample at all - is the minimum, and the 99th percentile
+/// of 600 frame times is the 594th of them, the seventh slowest frame of the run.
+/// Which is what "one frame in a hundred is allowed to be this slow, and no more"
+/// has to mean for a budget.
 ///
-/// `samples` is sorted in place, because six hundred `f64`s is not worth a second
-/// allocation in a harness whose whole job is to measure the frame loop.
+/// `samples` is sorted in place: six hundred `f64`s is one clone a measuring
+/// harness does not need, and a caller that cared about the order of what it
+/// handed over would be the only one.
 ///
 /// An empty sample set has no percentile and answers [`f64::NAN`]. No comparison
 /// with NaN holds, so a caller that collected nothing fails its budget loudly
@@ -129,6 +131,7 @@ mod tests {
         percentile(&mut samples, 1.5);
     }
 
+    /// The negative half of the same caller bug.
     #[test]
     #[should_panic(expected = "within 0.0..=1.0")]
     fn a_percentile_below_zero_panics() {
