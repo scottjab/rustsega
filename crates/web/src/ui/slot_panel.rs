@@ -223,7 +223,7 @@ pub fn SlotPanel(
 /// One card: its picture, its slot's number and time, and its two buttons.
 #[component]
 fn SlotCardView(
-    /// Which slot_number this card is: 0 to 3. Named `slot_number` because `slot_number` is the
+    /// Which slot this card is: 0 to 3. Named `slot_number` because `slot` is the
     /// view macro's own attribute.
     slot_number: u32,
     /// The game's slots, which is where a Save and a Load are asked for. Named
@@ -250,8 +250,8 @@ fn SlotCardView(
     let label = format!("Slot {}", slot_number + 1);
 
     // The picture, drawn whenever the card's record changes. Every card holds one
-    // canvas for the life of the panel, so a slot_number that goes empty has to have
-    // its canvas erased as well as a slot_number that goes full has to have its drawn:
+    // canvas for the life of the panel, so a slot that goes empty has to have its
+    // canvas erased as well as a slot that goes full has to have it drawn:
     // a canvas keeps whatever it was last given.
     Effect::new(move |_: Option<()>| {
         let Some(canvas) = thumb.get() else { return };
@@ -266,7 +266,7 @@ fn SlotCardView(
         cards.read(slot_state, toasts);
     });
     let save = Callback::new(move |()| {
-        // Confirm first over a slot_number that holds something: a save state is the
+        // Confirm first over a slot that holds something: a save state is the
         // only copy of a moment, and the ticket's "not `window.confirm`" is about
         // a dialog that steals the page rather than about asking at all.
         if cards.get(slot_number).filled {
@@ -308,7 +308,7 @@ fn SlotCardView(
             { move || {
                 if asking.get() {
                     view! {
-                        <p class="slot-card__ask">{format!("Overwrite slot_number {}?", slot_number + 1)}</p>
+                        <p class="slot-card__ask">{format!("Overwrite slot {}?", slot_number + 1)}</p>
                         <div class="slot-card__row">
                             <Button
                                 variant=ButtonVariant::Danger
