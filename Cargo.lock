@@ -2070,6 +2070,8 @@ dependencies = [
  "genesis",
  "js-sys",
  "leptos",
+ "serde",
+ "serde_json",
  "sha1_smol",
  "vdp",
  "wasm-bindgen",
