@@ -6,7 +6,9 @@
 //! the WASM entry point and does nothing but mount the app.
 //!
 //! Of the ROM-loading pair, [`rom`] is the pure half - bytes in, [`rom::LoadedRom`]
-//! out - and [`rom_picker`] is the browser half that hands it a file.
+//! out - and [`rom_picker`] is the browser half that hands it a file. The
+//! keyboard is the same pair: [`input::keyboard`] maps keys to actions, and
+//! [`keyboard_events`] is the half that listens for them.
 
 pub mod app;
 pub mod audio;
@@ -14,6 +16,7 @@ pub mod audio_pacing;
 pub mod emulator;
 pub mod frame_pacer;
 pub mod input;
+pub mod keyboard_events;
 pub mod rom;
 pub mod rom_picker;
 pub mod theme;

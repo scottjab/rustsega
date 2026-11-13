@@ -1,7 +1,10 @@
 //! The settings drawer: a panel that slides in from the right, or up from the
-//! bottom on narrow screens, and closes on Escape or a backdrop click.
+//! bottom on narrow screens.
+//!
+//! It owns no key handling: `Escape` is the shell's `ToggleMenu` hotkey, which
+//! opens this as well as closing it (M7-07, #140), so a drawer that listened for
+//! `Escape` itself would fight it over the signal - see [`crate::keyboard_events`].
 
-use leptos::ev;
 use leptos::prelude::*;
 
 use crate::ui::button::IconButton;
@@ -17,19 +20,13 @@ use crate::ui::icons;
 pub fn Drawer(
     /// The panel's heading, and its accessible name.
     title: String,
-    /// Whether the drawer is showing. The drawer clears it on Escape and on a
-    /// backdrop click; the caller sets it.
+    /// Whether the drawer is showing. The drawer clears it on a backdrop click
+    /// and on its close button; the caller sets it, and `Escape` toggles it from
+    /// the shell's keyboard.
     open: RwSignal<bool>,
     children: Children,
 ) -> impl IntoView {
     let drawer_label = title.clone();
-
-    let handle = window_event_listener(ev::keydown, move |event: web_sys::KeyboardEvent| {
-        if event.key() == "Escape" {
-            open.set(false);
-        }
-    });
-    on_cleanup(move || handle.remove());
 
     view! {
         <div class="overlay">

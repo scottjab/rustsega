@@ -11,6 +11,7 @@ use leptos::prelude::*;
 
 use crate::audio::AudioSettings;
 use crate::emulator::use_cartridge;
+use crate::keyboard_events::use_keyboard;
 use crate::rom::LoadedRom;
 use crate::rom_picker::EmptyScreen;
 use crate::rom_picker::RomFileInput;
@@ -84,6 +85,12 @@ pub fn App() -> impl IntoView {
     let title = Signal::derive(move || roms.with(|rom| rom.as_ref().map(|rom| rom.title.clone())));
     let region =
         Signal::derive(move || roms.with(|rom| rom.as_ref().map(|rom| rom.region.clone())));
+
+    // The keyboard, on the window, for as long as the shell is up (M7-07, #140).
+    // It takes the drawer and the cartridge because a form and a game cannot
+    // both have the arrow keys: while a game runs the keys are swallowed and go
+    // to the pad, and while the drawer is open they are the drawer's.
+    use_keyboard(console, drawer_open, loaded, toasts);
 
     // The two console controls. Re-rendered as a unit because both the icon of
     // one and the `disabled` of the other follow the console, and an icon-only
