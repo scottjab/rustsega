@@ -276,7 +276,7 @@ canvas {
  * they are on screen. */
 .listbox {
   display: grid;
-  gap: 2px;
+  gap: var(--space-1);
   padding: var(--space-1);
   border: 1px solid var(--border);
   border-radius: var(--radius-control);
@@ -337,6 +337,9 @@ canvas {
   background: var(--surface-2);
 }
 
+/* The 2px here and on `left` is not a space between things and is not on the 4px
+ * scale: it is what centres a 16px circle in a 22px pill (tests/spacing.rs
+ * therefore reads margins, paddings and gaps, and not this). */
 .toggle__thumb {
   position: absolute;
   top: 2px;
@@ -950,7 +953,7 @@ canvas {
 }
 
 .hint__key {
-  padding: 2px var(--space-2);
+  padding: var(--space-1) var(--space-2);
   border: 1px solid var(--border);
   border-radius: calc(var(--radius-control) - 2px);
   background: var(--surface-2);
@@ -1108,7 +1111,7 @@ canvas {
 
 .bindings th,
 .bindings td {
-  padding: 2px;
+  padding: var(--space-1);
   text-align: left;
 }
 
