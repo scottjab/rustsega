@@ -995,6 +995,14 @@ canvas {
   color: var(--text-muted);
 }
 
+/* The About section's link (M7-19, #152): the shell's only anchor, so it is the
+   one thing that has to be recognisable as one without relying on the UA's blue -
+   which is not a token and would not change with the theme. */
+.settings-section__link {
+  color: var(--accent);
+  font-size: var(--text-sm);
+}
+
 /* The save state panel (M7-15, #148): four cards, two across, in the drawer the
    settings drawer is. A card is the game's own 10:7 picture at the width a 380px
    drawer allows two of, its slot number, how long ago it was written, and its two

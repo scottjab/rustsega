@@ -628,6 +628,30 @@ pub fn App() -> impl IntoView {
                     </Button>
                 </section>
 
+                // The build this page is, and where its source is (M7-19, #152).
+                // Last because it is the one thing on the page that is not a choice
+                // the player can make.
+                <section class="settings-section">
+                    <h3 class="settings-section__title">About</h3>
+                    <p class="settings-section__note">
+                        {format!(
+                            "{} {} - a Genesis emulator that runs in the browser.",
+                            crate::app_title(),
+                            crate::app_version(),
+                        )}
+                    </p>
+                    <p class="settings-section__note">
+                        <a
+                            class="settings-section__link"
+                            href=crate::REPOSITORY_URL
+                            target="_blank"
+                            rel="noopener"
+                        >
+                            "Source and issues"
+                        </a>
+                    </p>
+                </section>
+
                 <Controls drawer_open=drawer_open />
 
                 // What the buttons of whichever device is in hand do in here,
