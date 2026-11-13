@@ -386,7 +386,20 @@ impl Emulator {
         // `Config::default`. A browser that will not give up a context is not a
         // reason not to run the game, so `None` is a normal answer here and the
         // loop paces on frames until a gesture makes one possible.
-        let audio = AudioOut::new();
+        let mut audio = AudioOut::new();
+        // The level the drawer shows is applied here as well as in `enable_audio`,
+        // because a console made after boot is made with an output that has never
+        // heard of the store: the volume effect only runs on a *change*, and a
+        // freshly started console is not one. It stayed invisible while the
+        // output's own default and the shell's were both full (M7-05, #138); with
+        // the store's 0.8 (M7-10, #143) a console that ignored it was audible.
+        // Untracked for the same reason as [`Emulator::enable_audio`].
+        if let Some(audio) = audio.as_mut() {
+            let volume = settings.with_untracked(|settings| settings.volume);
+            let muted = settings.with_untracked(|settings| settings.muted);
+            audio.set_volume(volume as f32);
+            audio.set_muted(muted);
+        }
         let mut config = Config::default();
         if let Some(audio) = audio.as_ref() {
             config.sample_rate = audio.sample_rate();
