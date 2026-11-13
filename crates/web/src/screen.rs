@@ -302,7 +302,7 @@ impl Reveal {
             pending.set(None);
             // Over the bar is a player about to click it; in the drawer is a
             // player who cannot see the bar and must not lose it (#145).
-            if over_bar.get() || drawer_open.get_untracked() {
+            if over_bar.get_untracked() || drawer_open.get_untracked() {
                 return;
             }
             revealed.set(false);

@@ -504,6 +504,13 @@ canvas {
    that the JS failed to clear can never hide a bar that should be seen:
    `app--bar-shown` only says which half of this rule is in force. */
 .app:fullscreen {
+  /*
+   * One row, because the bar leaves the flow below: leaving the `--topbar-height`
+   * track in place puts the screen area - and so the canvas - in a 56px row, which
+   * is the whole reason this rule is here rather than the transform alone
+   * (M7-12, #145; found in the browser, not in the arithmetic).
+   */
+  grid-template-rows: 1fr;
   background: var(--bg-app);
 }
 
