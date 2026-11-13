@@ -29,6 +29,7 @@
 
 pub mod bindings;
 pub mod button;
+pub mod gamepad;
 pub mod keyboard;
 
 use std::cell::RefCell;

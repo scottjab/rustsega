@@ -11,6 +11,7 @@ use leptos::prelude::*;
 
 use crate::audio::AudioSettings;
 use crate::emulator::use_cartridge;
+use crate::gamepad_events::use_gamepad;
 use crate::keyboard_events::use_keyboard;
 use crate::rom::LoadedRom;
 use crate::rom_picker::EmptyScreen;
@@ -91,6 +92,12 @@ pub fn App() -> impl IntoView {
     // both have the arrow keys: while a game runs the keys are swallowed and go
     // to the pad, and while the drawer is open they are the drawer's.
     use_keyboard(console, drawer_open, loaded, toasts);
+
+    // The gamepads, on the window and polled once per animation frame, for as
+    // long as the shell is up (M7-08, #141). No `loaded` this time: a pad that
+    // is plugged in is a pad the player is holding, whether or not a cartridge
+    // is in, and its connect/disconnect news is worth a toast either way.
+    use_gamepad(console, drawer_open, toasts);
 
     // The two console controls. Re-rendered as a unit because both the icon of
     // one and the `disabled` of the other follow the console, and an icon-only
@@ -250,6 +257,15 @@ pub fn App() -> impl IntoView {
                     <p class="settings-section__note">
                         Sound waits for a click, because no browser will start an audio
                         clock until the page has had one.
+                    </p>
+                </section>
+
+                <section class="settings-section">
+                    <h3 class="settings-section__title">Controls</h3>
+                    <p class="settings-section__note">
+                        "Press any button on your controller: no browser gives a page a pad
+                        until it has had one. Two controllers become ports 1 and 2, in the
+                        order they arrived."
                     </p>
                 </section>
             </Drawer>

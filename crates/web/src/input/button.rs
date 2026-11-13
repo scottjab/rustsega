@@ -49,6 +49,26 @@ pub enum PadButton {
 }
 
 impl PadButton {
+    /// Every button of a 6-button pad, in the order the enum declares them.
+    ///
+    /// The one order worth using for "all of them": a held-button snapshot lists
+    /// its buttons in it, so two snapshots of the same pad can be compared by
+    /// name (see [`super::gamepad::apply_snapshot`]).
+    pub const ALL: [Self; 12] = [
+        Self::Up,
+        Self::Down,
+        Self::Left,
+        Self::Right,
+        Self::A,
+        Self::B,
+        Self::C,
+        Self::Start,
+        Self::X,
+        Self::Y,
+        Self::Z,
+        Self::Mode,
+    ];
+
     /// The [`genesis::Buttons`] bit this button is.
     ///
     /// Written out per variant, and the test below checks all twelve: the bit

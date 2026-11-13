@@ -121,7 +121,16 @@ fn takes_key_for_itself(event: &web_sys::KeyboardEvent) -> bool {
 /// the top bar reports the features it has not got either: the key is mapped
 /// already, so the ticket that builds the feature has somewhere to put it
 /// (Fullscreen M7-12 #145, save states M7-15 #148, fast forward M7-17 #150).
-fn hotkey_do(hotkey: Hotkey, console: Controls, drawer_open: RwSignal<bool>, toasts: Toasts) {
+///
+/// `pub(crate)` because a pad asks for these too - see
+/// [`crate::gamepad_events`] - and a hotkey means the same thing whoever
+/// reported it.
+pub(crate) fn hotkey_do(
+    hotkey: Hotkey,
+    console: Controls,
+    drawer_open: RwSignal<bool>,
+    toasts: Toasts,
+) {
     match hotkey {
         Hotkey::Pause => console.toggle(),
         Hotkey::ToggleMenu => drawer_open.update(|open| *open = !*open),
