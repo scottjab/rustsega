@@ -495,6 +495,15 @@ canvas {
   image-rendering: auto;
 }
 
+/* `canvas { display: block }` above is an author rule, and author rules beat the
+   UA's `[hidden] { display: none }` whatever the specificity, so a hidden canvas
+   would otherwise stay laid out: the pair would stack and the live one would be
+   pushed out of view. Hiding is how the drawer's Renderer setting puts the
+   unused canvas out of the way, so it has to actually hide it. */
+.screen[hidden] {
+  display: none;
+}
+
 /* Fullscreen is the app shell, not the screen area. The ticket asks for the top
    bar to go away and come back on mouse move, and only the fullscreen element and
    its descendants are rendered - a bar outside the subtree could not be shown
