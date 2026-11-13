@@ -32,12 +32,25 @@ compiled at all by the workspace run: `just check` adds the clippy and nextest o
 | Commercial smoke | `crates/genesis/tests/commercial.rs` | Boot real games N frames, assert no panic, non-blank output, golden frame hash. The games and what they say are in [`compat-commercial.md`](compat-commercial.md). |
 | Commercial gameplay | `crates/genesis/tests/gameplay.rs` | Replay a committed input movie (`tests/movies`, [`movie-format.md`](movie-format.md)) into the first level of five games and golden three frames of it plus the audio of the run. `cargo nextest run -p genesis --run-ignored only gameplay`. |
 | Collection sweep | `headless sweep <ROM DIR>` | Run every ROM in the local collection in a child process and report what happened. `cargo` runs none of it; the report is a committed artifact, [`compat.md`](compat.md) over [`compat.csv`](compat.csv). |
-| Frontend | `crates/web` with `wasm-bindgen-test` | Input mapping, settings, pure logic. Keep logic out of components so it is testable natively. |
+| Frontend | `crates/web` with `wasm-bindgen-test` | Input mapping, settings, pure logic. Keep logic out of components so it is testable natively. What needs a browser runs under `just test-web`. |
 
 `wasm-bindgen-test` runs the wasm tests in a real browser: the dev shell pins
 Firefox and geckodriver and exports `GECKODRIVER` for
 `wasm-bindgen-test-runner`, which runs headless unless you set `NO_HEADLESS`.
 There is nothing to install per machine: both are pinned in `flake.nix`.
+
+Run the browser tests with `just test-web` (M7-20, #153). It sets
+`CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner` for one
+`cargo test --target wasm32-unknown-unknown -p web`, so no `.cargo/config.toml`
+is needed and the runner is only in play when the recipe asks for it. A test file
+that needs a browser says so itself, with `#![cfg(target_arch = "wasm32")]` and
+`wasm_bindgen_test_configure!(run_in_browser)`, and lives beside the native ones
+in `crates/web/tests`; `browser_smoke.rs` is that file and the harness check. The
+native tests of that directory compile for wasm and register nothing there, so
+they stay with `check` on the host. `test-web` is not part of `check` -- `check`
+gates core-crate commits too, and a WebDriver problem is not a reason for those
+to go red -- but CI runs it as its own step, so it is checked on every pull
+request. About 4 s warm, 13 s with the wasm test build.
 
 CPU conformance runs against the fetched SingleStepTests suites and skips (does
 not fail) when the data is absent, so `just check` is green with or without

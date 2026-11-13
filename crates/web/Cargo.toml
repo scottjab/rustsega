@@ -129,5 +129,14 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rexie = "0.6"
 
+# Browser tests (M7-20, #153), wasm32 only: `just test-web` runs them in headless
+# Firefox through `wasm-bindgen-test-runner`, which is part of the dev shell's
+# `wasm-bindgen-cli` (see `flake.nix`). `0.3.80` is the release that depends on
+# `wasm-bindgen = "=0.2.130"`, the workspace pin and the CLI version, so the
+# runtime and the runner agree; every release of this crate names exactly one
+# `wasm-bindgen` patch, so bump it with the pin and not on its own (AGENTS.md 1).
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "=0.3.80"
+
 [lints]
 workspace = true
