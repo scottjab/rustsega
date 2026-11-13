@@ -24,6 +24,11 @@ pub fn Drawer(
     /// and on its close button; the caller sets it, and `Escape` toggles it from
     /// the shell's keyboard.
     open: RwSignal<bool>,
+    /// The accessible name of the close control. Every drawer has to be named
+    /// something other than "Close", and the settings drawer was the only one
+    /// until the save state panel arrived (M7-15, #148).
+    #[prop(into)]
+    close_label: String,
     children: Children,
 ) -> impl IntoView {
     let drawer_label = title.clone();
@@ -46,7 +51,7 @@ pub fn Drawer(
                 <header class="drawer__header">
                     <h2 class="drawer__title">{title}</h2>
                     <IconButton
-                        label="Close settings".into()
+                        label=close_label
                         path=icons::CLOSE
                         on_click=Callback::new(move |_| open.set(false))
                     />

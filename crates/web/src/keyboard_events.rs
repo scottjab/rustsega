@@ -16,6 +16,7 @@ use wasm_bindgen::JsCast;
 use crate::controls::CaptureDevice;
 use crate::controls::CaptureTarget;
 use crate::controls::bind_key;
+use crate::emulator::Slots;
 use crate::input::Source;
 use crate::input::keyboard::CaptureKey;
 use crate::input::keyboard::Hotkey;
@@ -42,7 +43,8 @@ use crate::ui::toast::Toasts;
 /// [`map_key`] gives a hotkey its key whatever the bindings say, so the binding
 /// would be dead the moment it was written; saying so is cheaper than a row in
 /// the table that does nothing (M7-10, #143).
-const REFUSED_KEY: &str = "That key stays the shell's: Escape, Tab, F1, F4, F11 and P are fixed.";
+const REFUSED_KEY: &str =
+    "That key stays the shell's: Escape, Tab, F1, F2, F3, F4, F11 and P are fixed.";
 
 /// Listens to the keyboard for as long as the component that calls this is
 /// mounted: `keydown` and `keyup` to move the pad, and `blur` to let go of it.
@@ -67,6 +69,7 @@ pub fn use_keyboard(
     settings: RwSignal<Settings>,
     capture: RwSignal<Option<CaptureTarget>>,
     screen: Screen,
+    slots: Slots,
 ) {
     let pressed = {
         window_event_listener(ev::keydown, move |event: web_sys::KeyboardEvent| {
@@ -132,7 +135,7 @@ pub fn use_keyboard(
                 // nobody's: `Tab` in particular, which the browser still uses to
                 // move focus, and `F1` and friends still reach the shell.
                 if let KeyAction::Hotkey(hotkey) = action {
-                    hotkey_do(hotkey, menu, toasts, screen);
+                    hotkey_do(hotkey, menu, toasts, screen, slots);
                 }
                 return;
             }
@@ -143,7 +146,7 @@ pub fn use_keyboard(
                 KeyAction::Pad { port, button } => crate::input::with_state(|input| {
                     input.set(Source::Keyboard, port, button, true);
                 }),
-                KeyAction::Hotkey(hotkey) => hotkey_do(hotkey, menu, toasts, screen),
+                KeyAction::Hotkey(hotkey) => hotkey_do(hotkey, menu, toasts, screen, slots),
                 KeyAction::None => {}
             }
         })
@@ -209,7 +212,7 @@ fn takes_key_for_itself(event: &web_sys::KeyboardEvent) -> bool {
 /// `ToggleMenu` and `Pause` go through the [`Menu`] rather than straight at the
 /// drawer and the console, because inside a menu the first means "close the
 /// innermost thing" and either one changes who is holding the console.
-pub(crate) fn hotkey_do(hotkey: Hotkey, menu: Menu, toasts: Toasts, screen: Screen) {
+pub(crate) fn hotkey_do(hotkey: Hotkey, menu: Menu, toasts: Toasts, screen: Screen, slots: Slots) {
     match hotkey {
         Hotkey::Pause => menu.pause_by_hand(),
         Hotkey::ToggleMenu => menu.toggle_menu(),
@@ -217,14 +220,14 @@ pub(crate) fn hotkey_do(hotkey: Hotkey, menu: Menu, toasts: Toasts, screen: Scre
         // what is fullscreen for it to hide and then come back on mouse move, and
         // `Screen` is the one owner of that state (#145).
         Hotkey::Fullscreen => screen.toggle_fullscreen(),
-        Hotkey::SaveState => toasts.push(
-            ToastKind::Info,
-            "Save states are not wired up in this build yet.",
-        ),
-        Hotkey::LoadState => toasts.push(
-            ToastKind::Info,
-            "A load key is not wired up in this build yet.",
-        ),
+        // The three that are real as of #148. A save and a load do not announce
+        // themselves here: the console has the only say in whether either
+        // happened, and it reports through [`crate::emulator`]'s own toast -
+        // including the one sentence of why a load did not (M7-15, #148).
+        Hotkey::SaveState => slots.save_here(),
+        Hotkey::LoadState => slots.load_here(),
+        Hotkey::PreviousSlot => slots.step(-1, toasts),
+        Hotkey::NextSlot => slots.step(1, toasts),
         Hotkey::FastForward => toasts.push(
             ToastKind::Info,
             "Fast forward is not wired up in this build yet.",

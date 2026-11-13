@@ -57,6 +57,9 @@ const FOCUS_WAIT_MS: i32 = 25;
 pub struct Menu {
     /// The console, which an open menu holds.
     pub console: Controls,
+    /// Whether the save state panel is showing: the other menu this shell has,
+    /// and the innermost thing `Escape` has to close (M7-15, #148).
+    pub states_open: RwSignal<bool>,
     /// Whether the settings drawer is open, which is what `mode` is read from.
     pub drawer_open: RwSignal<bool>,
     /// The controls page's rebind capture: the innermost thing the page has.
@@ -90,11 +93,12 @@ pub struct Menu {
 pub fn use_menu(
     console: Controls,
     drawer_open: RwSignal<bool>,
+    states_open: RwSignal<bool>,
     capture: RwSignal<Option<CaptureTarget>>,
     lists: Listboxes,
 ) -> Menu {
     let mode = Signal::derive(move || {
-        if drawer_open.get() {
+        if drawer_open.get() || states_open.get() {
             UiMode::Menu
         } else {
             UiMode::Playing
@@ -103,6 +107,7 @@ pub fn use_menu(
     let menu = Menu {
         console,
         drawer_open,
+        states_open,
         capture,
         lists,
         mode,
@@ -153,6 +158,18 @@ impl Menu {
         }
     }
 
+    /// Opens the save state panel, and shuts the settings drawer on the way past
+    /// it (M7-15, #148).
+    ///
+    /// The two are mutually exclusive because both are a `.drawer--open`, and
+    /// [`crate::menu`]'s own focus rule - "the first control of the open drawer" -
+    /// has one drawer in mind. Two open at once would be a panel whose focus
+    /// could be in either.
+    pub fn open_states(self) {
+        self.drawer_open.set(false);
+        self.states_open.set(true);
+    }
+
     /// Closes the innermost open thing, and nothing outside it.
     ///
     /// The order is the page's own depth: a list of options is inside a settings
@@ -165,6 +182,12 @@ impl Menu {
         }
         if self.capture.get().is_some() {
             self.capture.set(None);
+            return;
+        }
+        // The save state panel is a drawer of its own and it is on top of the
+        // settings drawer, which is why it closes first (M7-15, #148).
+        if self.states_open.get() {
+            self.states_open.set(false);
             return;
         }
         if self.drawer_open.get() {

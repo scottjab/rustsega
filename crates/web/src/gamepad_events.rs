@@ -31,6 +31,7 @@ use web_sys::GamepadMappingType;
 use crate::controls::CaptureDevice;
 use crate::controls::CaptureTarget;
 use crate::controls::bind_pad;
+use crate::emulator::Slots;
 use crate::input::PadButton;
 use crate::input::Source;
 use crate::input::gamepad;
@@ -76,6 +77,9 @@ struct Watcher {
     /// Fullscreen, for `F11`: the same owner the top bar's button uses, so the
     /// pad cannot disagree with the keyboard about what the shell is doing (#145).
     screen: Screen,
+    /// The save state slots, for `F1` and friends - the same handle the keyboard
+    /// is given, because a hotkey has one owner whoever pressed it (M7-15, #148).
+    state_slots: Slots,
     /// What the pads were asking the menu for as of the last frame, while a menu
     /// was open: the same difference trick as `PadSeen::buttons`, so that a press
     /// is reported once (M7-11, #144).
@@ -321,6 +325,7 @@ pub fn use_gamepad(
     settings: RwSignal<Settings>,
     capture: RwSignal<Option<CaptureTarget>>,
     screen: Screen,
+    state_slots: Slots,
 ) {
     WATCHER.with(|watcher| {
         *watcher.borrow_mut() = Some(Watcher {
@@ -328,6 +333,7 @@ pub fn use_gamepad(
             settings,
             capture,
             screen,
+            state_slots,
             capture_baseline: None,
             menu_seen: Vec::new(),
             menu_repeat: RepeatTimer::default(),
@@ -402,9 +408,10 @@ pub fn poll_gamepads(now_ms: f64) {
             watcher.menu,
             watcher.toasts,
             watcher.screen,
+            watcher.state_slots,
         )
     });
-    let Some((hotkeys, actions, menu, toasts, screen)) = asked else {
+    let Some((hotkeys, actions, menu, toasts, screen, state_slots)) = asked else {
         return;
     };
     if !actions.is_empty() {
@@ -413,7 +420,7 @@ pub fn poll_gamepads(now_ms: f64) {
         menu.announce(LastDevice::Gamepad);
     }
     for hotkey in hotkeys {
-        hotkey_do(hotkey, menu, toasts, screen);
+        hotkey_do(hotkey, menu, toasts, screen, state_slots);
     }
     for action in actions {
         menu.run(action);

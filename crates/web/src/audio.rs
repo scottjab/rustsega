@@ -81,6 +81,11 @@ pub struct AudioOut {
     /// to when it is switched back off.
     volume: f32,
     muted: bool,
+    /// Every block this output has scheduled and the play head has not finished:
+    /// held so [`AudioOut::discard`] can stop them, which is the only way a
+    /// load-state can silence the sound of a moment the console has just left
+    /// (M7-15, #148). Pruned by [`AudioOut::forget_finished`] on every block.
+    scheduled: Vec<Played>,
     /// Blocks that arrived too late to fit the schedule: one of these is a
     /// click-in-waiting, and it is the only honest number for "is this loop
     /// keeping up" from outside the tab.
@@ -117,6 +122,7 @@ impl AudioOut {
             right: Vec::new(),
             volume: crate::settings::DEFAULT_VOLUME as f32,
             muted: false,
+            scheduled: Vec::new(),
             underruns: 0,
             blocks: 0,
             mirror: js_sys::Object::new(),
@@ -188,10 +194,56 @@ impl AudioOut {
         source.connect_with_audio_node(&self.gain).ok()?;
         source.start_with_when(start).ok()?;
 
-        self.next_time = start + f64::from(frames) / rate;
+        let end = start + f64::from(frames) / rate;
+        self.forget_finished();
+        self.scheduled.push(Played { source, ends: end });
+        self.next_time = end;
         self.blocks += 1;
         self.publish();
         Some(())
+    }
+
+    /// Stops every block that has been scheduled and not finished, and re-seats the
+    /// cursor where a fresh context's is: the console has gone back to a moment
+    /// this output has already promised the speakers, and both that audio and the
+    /// schedule built on it have to go before the moment can be played again
+    /// (M7-15, #148).
+    ///
+    /// [`AudioOut::suspend`] is not this. A suspended context keeps what it has
+    /// scheduled and starts it where it left off on the resume - which is the
+    /// sound of the moment the console just left, for up to [`Self::buffered_secs`]
+    /// of it.
+    ///
+    /// Returns how far the schedule was ahead when it was cut short, which is how
+    /// long the player would otherwise have gone on hearing the past: the number a
+    /// measurement of a load looks at.
+    pub fn discard(&mut self) -> f64 {
+        let ahead = self.buffered_secs();
+        for played in self.scheduled.iter() {
+            // Off the graph rather than `stop()`: web-sys marks both `stop`
+            // overloads of a buffer source deprecated, and a source that is
+            // disconnected from the destination makes no sound either way -
+            // routing is decided when a quantum is rendered, not when the node was
+            // started. A source scheduled for a time that has not come yet is
+            // covered by the same cut.
+            let _ = played.source.disconnect();
+        }
+        self.scheduled.clear();
+        self.next_time = self.ctx.current_time() + RESTART_LEAD_SECS;
+        self.publish();
+        ahead
+    }
+
+    /// Drops the blocks whose last sample has already been played.
+    ///
+    /// Called before every push, which is what keeps [`AudioOut::scheduled`] the
+    /// few blocks of one [`crate::audio_pacing::TARGET_AHEAD_SECS`] schedule
+    /// rather than every block a game has ever played: a played-out
+    /// `AudioBufferSourceNode` is still a JS object with a buffer under it, and
+    /// holding those is holding a megabyte a minute of play.
+    fn forget_finished(&mut self) {
+        let now = self.ctx.current_time();
+        self.scheduled.retain(|played| played.ends > now);
     }
 
     /// Sets the volume of the whole output, `0.0` to `1.0`; values outside that
@@ -280,6 +332,14 @@ impl AudioOut {
             _ => "closed",
         }
     }
+}
+
+/// One block of sound the context has been told to play, and the context time its
+/// last sample is due at: `ends` alone is what the pruning needs, and what is
+/// pruned is what has already been heard.
+struct Played {
+    source: web_sys::AudioBufferSourceNode,
+    ends: f64,
 }
 
 impl Drop for AudioOut {
