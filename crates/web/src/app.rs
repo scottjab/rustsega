@@ -311,7 +311,7 @@ pub fn App() -> impl IntoView {
                         id="screen"
                         class="screen"
                         class:screen--smooth=move || settings.with(|settings| settings.smoothing)
-                        hidden=move || console.renderer.get() != RendererKind::Webgl
+                        hidden=move || console.renderer.get() == RendererKind::Webgl
                         width=320
                         height=224
                         node_ref=canvas
@@ -324,7 +324,7 @@ pub fn App() -> impl IntoView {
                         id="screen-webgl"
                         class="screen"
                         class:screen--smooth=move || settings.with(|settings| settings.smoothing)
-                        hidden=move || console.renderer.get() == RendererKind::Webgl
+                        hidden=move || console.renderer.get() != RendererKind::Webgl
                         node_ref=canvas_gl
                     >
                     </canvas>
