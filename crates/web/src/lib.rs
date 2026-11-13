@@ -30,6 +30,7 @@ pub mod rom_picker;
 pub mod scale;
 pub mod screen;
 pub mod settings;
+pub mod storage;
 pub mod theme;
 pub mod touch_events;
 pub mod ui;

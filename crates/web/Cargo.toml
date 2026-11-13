@@ -123,6 +123,7 @@ serde = { workspace = true }
 # store itself, so the JSON is now read and written at run time rather than only
 # in a round-trip test.
 serde_json = { workspace = true }
+rexie = "0.6"
 
 [lints]
 workspace = true
