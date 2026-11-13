@@ -78,7 +78,8 @@ impl Watcher {
         self.toasts
             .push(ToastKind::Ok, gamepad::connect_toast(port, &pad.id()));
         if pad.mapping() != GamepadMappingType::Standard {
-            self.toasts.push(ToastKind::Warn, gamepad::NON_STANDARD_TOAST);
+            self.toasts
+                .push(ToastKind::Warn, gamepad::NON_STANDARD_TOAST);
         }
     }
 
@@ -108,13 +109,7 @@ impl Watcher {
         let seen = &mut self.seen[port];
         let previous = std::mem::take(&mut seen.buttons);
         crate::input::with_state(|input| {
-            gamepad::apply_snapshot(
-                input,
-                Source::Gamepad(pad.index),
-                port,
-                &previous,
-                &buttons,
-            );
+            gamepad::apply_snapshot(input, Source::Gamepad(pad.index), port, &previous, &buttons);
         });
         seen.buttons = buttons;
         // Only the start of a press is reported, so a player holding the trigger
@@ -163,11 +158,10 @@ pub fn use_gamepad(console: Controls, drawer_open: RwSignal<bool>, toasts: Toast
         with_watcher(|watcher| watcher.connected(&pad));
     });
 
-    let disconnected =
-        window_event_listener_untyped("gamepaddisconnected", move |event| {
-            let Some(pad) = pad_of(&event) else { return };
-            with_watcher(|watcher| watcher.disconnected(&pad));
-        });
+    let disconnected = window_event_listener_untyped("gamepaddisconnected", move |event| {
+        let Some(pad) = pad_of(&event) else { return };
+        with_watcher(|watcher| watcher.disconnected(&pad));
+    });
 
     on_cleanup(move || {
         connected.remove();

@@ -263,9 +263,9 @@ pub fn App() -> impl IntoView {
                 <section class="settings-section">
                     <h3 class="settings-section__title">Controls</h3>
                     <p class="settings-section__note">
-                        Press any button on your controller: no browser will hand one
-                        to the page until it has had a press. Two controllers become
-                        ports 1 and 2, in the order they arrived.
+                        "Press any button on your controller: no browser gives a page a pad
+                        until it has had one. Two controllers become ports 1 and 2, in the
+                        order they arrived."
                     </p>
                 </section>
             </Drawer>

@@ -125,7 +125,12 @@ fn takes_key_for_itself(event: &web_sys::KeyboardEvent) -> bool {
 /// `pub(crate)` because a pad asks for these too - see
 /// [`crate::gamepad_events`] - and a hotkey means the same thing whoever
 /// reported it.
-pub(crate) fn hotkey_do(hotkey: Hotkey, console: Controls, drawer_open: RwSignal<bool>, toasts: Toasts) {
+pub(crate) fn hotkey_do(
+    hotkey: Hotkey,
+    console: Controls,
+    drawer_open: RwSignal<bool>,
+    toasts: Toasts,
+) {
     match hotkey {
         Hotkey::Pause => console.toggle(),
         Hotkey::ToggleMenu => drawer_open.update(|open| *open = !*open),
