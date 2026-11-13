@@ -15,8 +15,8 @@
 
 use leptos::prelude::*;
 
-use crate::input::PadButton;
 use crate::input::PORTS;
+use crate::input::PadButton;
 use crate::input::SocdMode;
 use crate::settings::PadType;
 use crate::settings::Settings;
@@ -27,8 +27,8 @@ use crate::ui::button::Button;
 use crate::ui::select::Select;
 use crate::ui::select::SelectOption;
 use crate::ui::toast::ToastKind;
-use crate::ui::toggle::Toggle;
 use crate::ui::toast::Toasts;
+use crate::ui::toggle::Toggle;
 
 /// Which device a capturing cell is waiting for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,12 +70,7 @@ pub struct CaptureTarget {
 /// "One key, one action" is otherwise invisible: binding `B` to the key `A` had
 /// leaves `A` with nothing, and a player who finds their d-pad gone ten seconds
 /// later is not going to remember which cell caused it.
-pub fn bind_key(
-    target: CaptureTarget,
-    code: &str,
-    settings: RwSignal<Settings>,
-    toasts: Toasts,
-) {
+pub fn bind_key(target: CaptureTarget, code: &str, settings: RwSignal<Settings>, toasts: Toasts) {
     // `update` writes and returns nothing, so what was displaced is carried out
     // in a variable of its own.
     let mut displaced = None;
@@ -104,12 +99,7 @@ pub fn bind_key(
 }
 
 /// Binds the pad button a cell was capturing to, as [`bind_key`] does for a key.
-pub fn bind_pad(
-    target: CaptureTarget,
-    index: u8,
-    settings: RwSignal<Settings>,
-    toasts: Toasts,
-) {
+pub fn bind_pad(target: CaptureTarget, index: u8, settings: RwSignal<Settings>, toasts: Toasts) {
     let mut displaced = None;
     settings.update(|settings| {
         displaced = settings.bindings.rebind_gamepad(target.button, index);
@@ -146,7 +136,10 @@ fn options<T: Copy>(list: &[T], label: impl Fn(T) -> &'static str) -> Vec<Select
 
 /// The position of `value` in `list`, as the [`Select`] value that shows it.
 fn position<T: PartialEq>(list: &[T], value: T) -> String {
-    list.iter().position(|item| *item == value).unwrap_or(0).to_string()
+    list.iter()
+        .position(|item| *item == value)
+        .unwrap_or(0)
+        .to_string()
 }
 
 /// One cell of a player's table: the key or pad button bound to this button, as a
@@ -180,7 +173,12 @@ fn BindingCell(
                 .with(|settings| settings.bindings.key_of(port, button).map(keycap_label))
                 .unwrap_or_else(|| UNBOUND.to_string()),
             CaptureDevice::Gamepad => settings
-                .with(|settings| settings.bindings.gamepad_of(button).map(gamepad_button_label))
+                .with(|settings| {
+                    settings
+                        .bindings
+                        .gamepad_of(button)
+                        .map(gamepad_button_label)
+                })
                 .unwrap_or_else(|| UNBOUND.to_string()),
         }
     });
@@ -309,9 +307,8 @@ pub fn Controls(
         }
     });
 
-    let touch_selected = Signal::derive(move || {
-        position(&TouchOverlayMode::ALL, settings.get().touch_overlay)
-    });
+    let touch_selected =
+        Signal::derive(move || position(&TouchOverlayMode::ALL, settings.get().touch_overlay));
     let set_touch = Callback::new(move |value: String| {
         let index: usize = value.parse().unwrap_or(0);
         if let Some(mode) = TouchOverlayMode::ALL.get(index) {

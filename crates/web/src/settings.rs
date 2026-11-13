@@ -29,8 +29,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::input::Bindings;
-use crate::input::SocdMode;
 use crate::input::PORTS;
+use crate::input::SocdMode;
 use crate::theme::Theme;
 
 /// The `localStorage` key this whole struct lives under.
@@ -289,12 +289,7 @@ impl Settings {
     pub fn load_local() -> Self {
         #[cfg(target_arch = "wasm32")]
         {
-            let text = storage().and_then(|storage| {
-                storage
-                    .get_item(STORAGE_KEY)
-                    .ok()
-                    .flatten()
-            });
+            let text = storage().and_then(|storage| storage.get_item(STORAGE_KEY).ok().flatten());
             match text {
                 Some(text) => Self::from_json(&text),
                 None => Self::default(),
@@ -400,7 +395,8 @@ pub fn gamepad_button_label(index: u8) -> String {
 
 /// The standard mapping's button names, indexed by `GamepadButton` index.
 const GAMEPAD_BUTTONS: [&str; 17] = [
-    "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "Select", "Start", "L3", "R3", "↑", "↓", "←", "→", "Home",
+    "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "Select", "Start", "L3", "R3", "↑", "↓", "←", "→",
+    "Home",
 ];
 
 #[cfg(test)]
@@ -475,9 +471,8 @@ mod tests {
 
     #[test]
     fn a_wrongly_typed_field_costs_only_that_field() {
-        let settings = Settings::from_json(
-            r#"{"volume":99,"bindings":null,"version":999,"theme":"light"}"#,
-        );
+        let settings =
+            Settings::from_json(r#"{"volume":99,"bindings":null,"version":999,"theme":"light"}"#);
         assert_eq!(settings.theme, Theme::Light, "the good field survived");
         assert_eq!(settings.volume, 1.0);
         assert_eq!(settings.bindings, Bindings::default());
@@ -506,9 +501,7 @@ mod tests {
             haptics: false,
             ..Settings::default()
         };
-        settings
-            .bindings
-            .rebind_key(1, PadButton::Start, "Space");
+        settings.bindings.rebind_key(1, PadButton::Start, "Space");
         let json = settings.to_json();
         assert_eq!(Settings::from_json(&json), settings);
     }

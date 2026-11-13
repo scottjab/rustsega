@@ -37,12 +37,12 @@ use web_sys::HtmlCanvasElement;
 use web_sys::ImageData;
 
 use crate::audio::AudioOut;
-use crate::settings::Settings;
 use crate::audio_pacing::MAX_FRAMES_PER_TICK;
 use crate::audio_pacing::TARGET_AHEAD_SECS;
 use crate::audio_pacing::frames_to_run;
 use crate::frame_pacer::FramePacer;
 use crate::rom::LoadedRom;
+use crate::settings::Settings;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
 

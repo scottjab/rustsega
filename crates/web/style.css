@@ -613,6 +613,78 @@ canvas {
   color: var(--text-muted);
 }
 
+/* The controls page (M7-10, #143): one keycap table per player, in a drawer
+   that is 380px wide on the desktop and the full width of a phone below 640px.
+   Three columns - the button, its key, its pad button - and the row names stay
+   on one line however narrow the drawer gets. */
+.binding-player {
+  margin-bottom: var(--space-4);
+}
+
+.binding-player__title {
+  margin-bottom: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-emphasis);
+}
+
+.bindings {
+  width: 100%;
+  margin-bottom: var(--space-3);
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+}
+
+.bindings th,
+.bindings td {
+  padding: 2px;
+  text-align: left;
+}
+
+.bindings thead th {
+  color: var(--text-muted);
+  font-weight: var(--weight-regular);
+  border-bottom: 1px solid var(--border);
+}
+
+.bindings tbody th {
+  width: 30%;
+  padding-right: var(--space-2);
+  font-weight: var(--weight-regular);
+  white-space: nowrap;
+}
+
+/* A binding is a keycap, so it is drawn as one: raised surface, monospaced
+   label, and the 32px of height a pointer needs to hit it reliably. */
+.keycap {
+  display: block;
+  width: 100%;
+  min-height: 32px;
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-align: center;
+  cursor: pointer;
+}
+
+.keycap:hover {
+  border-color: var(--accent);
+}
+
+.keycap:focus-visible {
+  box-shadow: var(--focus);
+}
+
+/* The cell that is waiting for a key says so in the accent colour, because the
+   player has to see which of twenty-four cells is listening. */
+.keycap--capturing {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .toasts {
   position: fixed;
   bottom: var(--space-4);

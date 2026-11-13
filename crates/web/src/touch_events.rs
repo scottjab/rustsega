@@ -29,9 +29,9 @@ use wasm_bindgen::JsCast;
 
 use crate::input::PadButton;
 use crate::input::Source;
-use crate::settings::Settings;
 use crate::input::gamepad;
 use crate::input::touch::{self, Control, ControlBox, DpadDir, TouchTracker};
+use crate::settings::Settings;
 use crate::ui::icons;
 
 /// The port the overlay drives.

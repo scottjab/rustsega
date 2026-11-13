@@ -109,11 +109,12 @@ impl Bindings {
         let previous = self
             .keyboard
             .iter()
-            .position(|(_, bound_port, bound_button)| *bound_port == port && *bound_button == button);
-        self.keyboard
-            .retain(|(bound, bound_port, bound_button)| {
-                bound != code && !(*bound_port == port && *bound_button == button)
+            .position(|(_, bound_port, bound_button)| {
+                *bound_port == port && *bound_button == button
             });
+        self.keyboard.retain(|(bound, bound_port, bound_button)| {
+            bound != code && !(*bound_port == port && *bound_button == button)
+        });
         let entry = (code.to_string(), port, button);
         match previous {
             Some(index) => self.keyboard.insert(index, entry),
@@ -348,7 +349,13 @@ mod tests {
         // to one key.
         let mut bindings = Bindings::default();
         let displaced = bindings.rebind_key(0, PadButton::B, "KeyA");
-        assert_eq!(displaced, Some(Displaced { port: 0, button: PadButton::A }));
+        assert_eq!(
+            displaced,
+            Some(Displaced {
+                port: 0,
+                button: PadButton::A
+            })
+        );
         assert_eq!(keyboard(&bindings, "KeyA"), Some((0, PadButton::B)));
         assert_eq!(bindings.key_of(0, PadButton::B), Some("KeyA"));
         // `B`'s own default key is gone with it, and `A` is left unbound.
@@ -373,7 +380,10 @@ mod tests {
         let displaced = bindings.rebind_key(1, PadButton::Start, "ArrowUp");
         assert_eq!(
             displaced,
-            Some(Displaced { port: 0, button: PadButton::Up })
+            Some(Displaced {
+                port: 0,
+                button: PadButton::Up
+            })
         );
         assert_eq!(keyboard(&bindings, "ArrowUp"), Some((1, PadButton::Start)));
         assert_eq!(bindings.key_of(0, PadButton::Up), None);
