@@ -44,7 +44,7 @@ use crate::ui::toast::Toasts;
 /// would be dead the moment it was written; saying so is cheaper than a row in
 /// the table that does nothing (M7-10, #143).
 const REFUSED_KEY: &str =
-    "That key stays the shell's: Escape, Tab, F1, F2, F3, F4, F11 and P are fixed.";
+    "That key stays the shell's: Escape, Tab, `, F1, F2, F3, F4, F11 and P are fixed.";
 
 /// Listens to the keyboard for as long as the component that calls this is
 /// mounted: `keydown` and `keyup` to move the pad, and `blur` to let go of it.
@@ -135,7 +135,7 @@ pub fn use_keyboard(
                 // nobody's: `Tab` in particular, which the browser still uses to
                 // move focus, and `F1` and friends still reach the shell.
                 if let KeyAction::Hotkey(hotkey) = action {
-                    hotkey_do(hotkey, menu, toasts, screen, slots);
+                    hotkey_do(hotkey, menu, toasts, screen, slots, settings);
                 }
                 return;
             }
@@ -146,7 +146,9 @@ pub fn use_keyboard(
                 KeyAction::Pad { port, button } => crate::input::with_state(|input| {
                     input.set(Source::Keyboard, port, button, true);
                 }),
-                KeyAction::Hotkey(hotkey) => hotkey_do(hotkey, menu, toasts, screen, slots),
+                KeyAction::Hotkey(hotkey) => {
+                    hotkey_do(hotkey, menu, toasts, screen, slots, settings)
+                }
                 KeyAction::None => {}
             }
         })
@@ -160,8 +162,18 @@ pub fn use_keyboard(
             // `ArrowDown` - has to stop when the key does, or the game walks on
             // for the rest of the session.
             let action = settings.with(|settings| map_key(&event.code(), &settings.bindings));
-            if let KeyAction::Pad { port, button } = action {
-                crate::input::with_state(|input| input.set(Source::Keyboard, port, button, false));
+            match action {
+                KeyAction::Pad { port, button } => crate::input::with_state(|input| {
+                    input.set(Source::Keyboard, port, button, false);
+                }),
+                // Letting go is the act, for the one hotkey that is held rather than
+                // tapped: the console goes back to its own rate, with the audio
+                // schedule started again from the play head (M7-17, #150). The
+                // release ignores the menu and the focus for the same reason the pad
+                // release does - a keyup that never arrives is a console stuck at 4x.
+                KeyAction::Hotkey(Hotkey::FastForward) => menu.console.set_fast_forward(false),
+                // Every other hotkey is one act per keydown and has nothing to undo.
+                KeyAction::Hotkey(_) | KeyAction::None => {}
             }
         })
     };
@@ -198,10 +210,10 @@ fn takes_key_for_itself(event: &web_sys::KeyboardEvent) -> bool {
 
 /// Does what a hotkey asks for.
 ///
-/// Two of the six are real in this build. The others report themselves the way
-/// the top bar reports the features it has not got either: the key is mapped
-/// already, so the ticket that builds the feature has somewhere to put it
-/// (Fullscreen M7-12 #145, save states M7-15 #148, fast forward M7-17 #150).
+/// Every one of them is real in this build now: fullscreen is #145, the four save
+/// state keys are #148, and fast forward and the overlay are #150. A hotkey the
+/// shell ever adds without a feature behind it should report itself the way the top
+/// bar reports the features it has not got, rather than do nothing.
 ///
 /// `pub(crate)` because a pad asks for these too - see
 /// [`crate::gamepad_events`] - and a hotkey means the same thing whoever
@@ -212,7 +224,18 @@ fn takes_key_for_itself(event: &web_sys::KeyboardEvent) -> bool {
 /// `ToggleMenu` and `Pause` go through the [`Menu`] rather than straight at the
 /// drawer and the console, because inside a menu the first means "close the
 /// innermost thing" and either one changes who is holding the console.
-pub(crate) fn hotkey_do(hotkey: Hotkey, menu: Menu, toasts: Toasts, screen: Screen, slots: Slots) {
+///
+/// `settings` is for the one hotkey that is a setting with a key: the overlay
+/// switch in the drawer and the `` ` `` key are the same write, so they cannot
+/// disagree about whether the overlay is on (M7-17, #150).
+pub(crate) fn hotkey_do(
+    hotkey: Hotkey,
+    menu: Menu,
+    toasts: Toasts,
+    screen: Screen,
+    slots: Slots,
+    settings: RwSignal<Settings>,
+) {
     match hotkey {
         Hotkey::Pause => menu.pause_by_hand(),
         Hotkey::ToggleMenu => menu.toggle_menu(),
@@ -228,9 +251,14 @@ pub(crate) fn hotkey_do(hotkey: Hotkey, menu: Menu, toasts: Toasts, screen: Scre
         Hotkey::LoadState => slots.load_here(),
         Hotkey::PreviousSlot => slots.step(-1, toasts),
         Hotkey::NextSlot => slots.step(1, toasts),
-        Hotkey::FastForward => toasts.push(
-            ToastKind::Info,
-            "Fast forward is not wired up in this build yet.",
-        ),
+        // A setting, because the drawer shows it and a key that disagreed with the
+        // drawer would be a second answer to whether the overlay is on.
+        Hotkey::ToggleFps => {
+            settings.update(|settings| settings.fps_overlay = !settings.fps_overlay);
+        }
+        // Held rather than tapped, so this is half the pair: the other half is the
+        // `keyup` above, and a pad's release is [`HotkeyEvent::Released`] over in
+        // [`crate::gamepad_events`] (M7-17, #150).
+        Hotkey::FastForward => menu.console.set_fast_forward(true),
     }
 }

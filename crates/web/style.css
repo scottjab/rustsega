@@ -447,6 +447,14 @@ canvas {
   cursor: default;
 }
 
+/* The fast forward badge (M7-17, #150): the same pill for the same kind of fact -
+   something the console is doing right now rather than a thing to click - in the
+   accent colour, because unlike a save it is about to stop. */
+.chip--fast-forward {
+  border-color: var(--accent);
+  cursor: default;
+}
+
 /* The screen is the hero: it fills what is left of the page, and the canvas is
    centred in it with a soft accent glow behind. */
 .screen-area {
@@ -558,6 +566,29 @@ canvas {
 .screen-area--drag {
   outline: 3px dashed var(--accent);
   outline-offset: -8px;
+}
+
+/* The FPS overlay (M7-17, #150): the console's own frame rate and frame cost, in
+   the top-left corner of the picture where it can be read without covering the
+   part of the screen a game draws in.
+
+   `--surface` at 70% so the game shows through it - the reading is over the
+   picture, not a window on it - and monospace because the line changes sixty times
+   a second and a proportional font would make it jiggle. It is not a control: no
+   focus, no pointer, and `role="status"` on the markup says so to a reader. */
+.fps-overlay {
+  position: absolute;
+  top: var(--space-3);
+  left: var(--space-3);
+  z-index: 2;
+  margin: 0;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--surface) 70%, transparent);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  pointer-events: none;
 }
 
 /* The empty state: what the screen area shows in place of the canvas until a

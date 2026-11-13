@@ -216,6 +216,38 @@ pub fn poll_hotkey(buttons: &[bool]) -> Option<Hotkey> {
     held(RIGHT_TRIGGER).then_some(Hotkey::FastForward)
 }
 
+/// A hotkey a pad has just started holding, or just let go of (M7-17, #150).
+///
+/// The release half is here because a poll has no keyup: [`poll_hotkey`] is asked
+/// the same question every frame, and the only way to learn that the player has let
+/// go of the trigger is to compare two readings and say so. A keyboard does not need
+/// the second case - the browser sends one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyEvent {
+    /// This hotkey has just been asked for.
+    Pressed(Hotkey),
+    /// This hotkey is no longer being asked for.
+    Released(Hotkey),
+}
+
+/// The difference between two readings of one pad's [`poll_hotkey`], as the event
+/// that change is: the arrival of a hotkey, or the release of the one that has gone.
+///
+/// A pad that has moved straight from one hotkey to another is reported as the
+/// arrival, not as a release and a press in the wrong order. That is safe for the
+/// one hotkey this shell holds rather than taps: `poll_hotkey`'s other answer opens
+/// a menu, and `crate::menu::Menu::enter` lets go of fast forward for it.
+pub fn hotkey_change(previous: Option<Hotkey>, current: Option<Hotkey>) -> Option<HotkeyEvent> {
+    if current == previous {
+        return None;
+    }
+    match (previous, current) {
+        (_, Some(hotkey)) => Some(HotkeyEvent::Pressed(hotkey)),
+        (Some(hotkey), None) => Some(HotkeyEvent::Released(hotkey)),
+        (None, None) => None,
+    }
+}
+
 /// Moves one pad's held buttons in `input` from `previous` to `next`.
 ///
 /// Only the difference is reported, because [`InputState::set`] is a press or a
@@ -587,6 +619,48 @@ mod tests {
         assert_eq!(poll_hotkey(&press(START)), None);
         assert_eq!(poll_hotkey(&press(SELECT)), None);
         assert_eq!(poll_hotkey(&[true; 5]), None);
+    }
+
+    /// Fast forward is held rather than tapped, so the end of the hold is as much
+    /// news as its start: a pad that has let go of the trigger has to be heard,
+    /// or the console runs on at 4x for the rest of the session.
+    #[test]
+    fn a_held_hotkey_is_reported_at_both_ends() {
+        assert_eq!(
+            hotkey_change(None, Some(Hotkey::FastForward)),
+            Some(HotkeyEvent::Pressed(Hotkey::FastForward))
+        );
+        assert_eq!(
+            hotkey_change(Some(Hotkey::FastForward), None),
+            Some(HotkeyEvent::Released(Hotkey::FastForward))
+        );
+    }
+
+    /// A trigger held across sixty frames is one press, not sixty: `poll_hotkey`
+    /// says the same thing twice and the second time is not a change.
+    #[test]
+    fn a_hotkey_that_has_not_changed_is_not_reported_again() {
+        assert_eq!(
+            hotkey_change(Some(Hotkey::FastForward), Some(Hotkey::FastForward)),
+            None
+        );
+        assert_eq!(hotkey_change(None, None), None);
+    }
+
+    /// Moving straight from one hotkey to the other is the arrival of the new one.
+    /// The departure of the old one is not reported, which is safe because the
+    /// only hotkey a pad reports other than fast forward opens a menu, and
+    /// `crate::menu::Menu::enter` lets go of fast forward for it.
+    #[test]
+    fn moving_from_one_hotkey_to_another_reports_the_arrival() {
+        assert_eq!(
+            hotkey_change(Some(Hotkey::ToggleMenu), Some(Hotkey::FastForward)),
+            Some(HotkeyEvent::Pressed(Hotkey::FastForward))
+        );
+        assert_eq!(
+            hotkey_change(Some(Hotkey::FastForward), Some(Hotkey::ToggleMenu)),
+            Some(HotkeyEvent::Pressed(Hotkey::ToggleMenu))
+        );
     }
 
     #[test]

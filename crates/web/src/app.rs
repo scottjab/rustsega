@@ -28,6 +28,7 @@ use crate::rom_picker::window_drop_target;
 use crate::scale::Aspect;
 use crate::scale::ScaleMode;
 use crate::screen::use_screen;
+use crate::settings::FastForwardSpeed;
 use crate::settings::Settings;
 use crate::theme::Theme;
 use crate::touch_events::TouchOverlay;
@@ -289,6 +290,20 @@ pub fn App() -> impl IntoView {
                         }
                     })
                 }}
+                // The fast forward badge: the console is running faster than its own
+                // rate while the hotkey is held, which is otherwise invisible - the
+                // picture just looks like a sped-up game and the sound is gone
+                // entirely (M7-17, #150).
+                {move || {
+                    console.fast_forward.get().then(|| {
+                        let speed = settings.with(|settings| settings.fast_forward_speed.label());
+                        view! {
+                            <span class="chip chip--fast-forward" role="status">
+                                {format!("⏩ {speed}")}
+                            </span>
+                        }
+                    })
+                }}
                 <nav class="topbar__actions" aria-label="Console">
                     {console_buttons}
                     {move || {
@@ -374,6 +389,21 @@ pub fn App() -> impl IntoView {
                     >
                     </canvas>
                 </Show>
+                // The FPS overlay: what the console is really running at and what a
+                // frame of it costs, in the corner of the picture, for the player who
+                // asked for it in here or with `` ` `` (M7-17, #150). A reading rather
+                // than a control, so it takes neither the pointer nor the focus.
+                {move || {
+                    settings
+                        .with(|settings| settings.fps_overlay)
+                        .then(|| {
+                            view! {
+                                <p class="fps-overlay" role="status">
+                                    {move || console.fps.get()}
+                                </p>
+                            }
+                        })
+                }}
                 <RomFileInput/>
             </main>
 
@@ -497,6 +527,51 @@ pub fn App() -> impl IntoView {
                     <p class="settings-section__note">
                         Sound waits for a click, because no browser will start an audio
                         clock until the page has had one.
+                    </p>
+                </section>
+
+                <section class="settings-section">
+                    <h3 class="settings-section__title">Playback</h3>
+                    <Toggle
+                        label="FPS overlay".to_string()
+                        checked=Signal::derive(move || {
+                            settings.with(|settings| settings.fps_overlay)
+                        })
+                        on_toggle=Callback::new(move |()| {
+                            settings
+                                .update(|settings| settings.fps_overlay = !settings.fps_overlay);
+                        })
+                    />
+                    {
+                        let settings = settings;
+                        let choices = options(&FastForwardSpeed::ALL, |speed| speed.label());
+                        let chosen = Signal::derive(move || {
+                            position(
+                                &FastForwardSpeed::ALL,
+                                settings.with(|settings| settings.fast_forward_speed),
+                            )
+                        });
+                        view! { <Select label="Fast forward".to_string() options=choices selected=chosen on_change=Callback::new(move |value: String| {
+                            let speed = FastForwardSpeed::ALL
+                                .get(value.parse::<usize>().unwrap_or(0))
+                                .copied()
+                                .unwrap_or_default();
+                            settings.update(|settings| settings.fast_forward_speed = speed);
+                        })/> }
+                    }
+                    <Toggle
+                        label="Pause when tab is hidden".to_string()
+                        checked=Signal::derive(move || {
+                            settings.with(|settings| settings.pause_when_hidden)
+                        })
+                        on_toggle=Callback::new(move |()| {
+                            settings.update(|settings| {
+                                settings.pause_when_hidden = !settings.pause_when_hidden;
+                            });
+                        })
+                    />
+                    <p class="settings-section__note">
+                        "The backquote key (`) toggles the overlay. Tab, or a pad's right trigger, runs the console at this speed while it is held; letting go returns to normal sound."
                     </p>
                 </section>
 

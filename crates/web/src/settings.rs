@@ -113,6 +113,73 @@ impl TouchOverlayMode {
     }
 }
 
+/// How many times as fast as normal the console runs while the fast forward hotkey
+/// is held (M7-17, #150).
+///
+/// An enum rather than a number because the drawer offers a list of speeds, and a
+/// list of options needs values that cannot hold a speed the loop would not run -
+/// 1 is not a fast forward and 9 is not a thing the frame loop caps itself at.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FastForwardSpeed {
+    /// Twice the console rate.
+    TwoX,
+    /// Three times the console rate.
+    ThreeX,
+    /// Four times the console rate, which is what a new tab gets: enough to skip
+    /// ahead visibly and short enough that the loop still has room to run the
+    /// frames of a tick inside one animation frame.
+    #[default]
+    FourX,
+    /// Five times the console rate.
+    FiveX,
+    /// Six times the console rate.
+    SixX,
+    /// Seven times the console rate.
+    SevenX,
+    /// Eight times the console rate, the fastest the loop will run.
+    EightX,
+}
+
+impl FastForwardSpeed {
+    /// Every speed, in the order the settings select lists them.
+    pub const ALL: [Self; 7] = [
+        Self::TwoX,
+        Self::ThreeX,
+        Self::FourX,
+        Self::FiveX,
+        Self::SixX,
+        Self::SevenX,
+        Self::EightX,
+    ];
+
+    /// The label for this speed in the settings drawer and the fast forward badge.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TwoX => "2x",
+            Self::ThreeX => "3x",
+            Self::FourX => "4x",
+            Self::FiveX => "5x",
+            Self::SixX => "6x",
+            Self::SevenX => "7x",
+            Self::EightX => "8x",
+        }
+    }
+
+    /// What to multiply a tick's frames by: the same number [`label`] prints.
+    pub fn multiplier(self) -> u32 {
+        match self {
+            Self::TwoX => 2,
+            Self::ThreeX => 3,
+            Self::FourX => 4,
+            Self::FiveX => 5,
+            Self::SixX => 6,
+            Self::SevenX => 7,
+            Self::EightX => 8,
+        }
+    }
+}
+
 /// Everything the shell remembers between loads.
 ///
 /// Plain data, `Copy` where it can be, and `Serialize`/`Deserialize` under
@@ -164,6 +231,19 @@ pub struct Settings {
     /// this switch existed, so `false` is the default (M7-12, #145).
     #[serde(default)]
     pub smoothing: bool,
+    /// Whether the corner of the screen says what the console is running at
+    /// (M7-17, #150). Off by default: it is a measuring instrument, not a picture.
+    #[serde(default)]
+    pub fps_overlay: bool,
+    /// How far to run the console while the fast forward hotkey is held
+    /// (M7-17, #150).
+    #[serde(default)]
+    pub fast_forward_speed: FastForwardSpeed,
+    /// Hold the console when the tab goes to the background, and let it go again
+    /// when the tab comes back - only if nothing else had stopped it first
+    /// (M7-17, #150).
+    #[serde(default = "default_pause_when_hidden")]
+    pub pause_when_hidden: bool,
     /// `navigator.vibrate` on an overlay press, on browsers that have it.
     #[serde(default = "default_haptics")]
     pub haptics: bool,
@@ -194,6 +274,9 @@ impl Default for Settings {
             renderer: RendererSetting::default(),
             filter: FilterSetting::default(),
             smoothing: false,
+            fps_overlay: false,
+            fast_forward_speed: FastForwardSpeed::default(),
+            pause_when_hidden: true,
             haptics: true,
             hide_touch_with_controller: true,
             version: SETTINGS_VERSION,
@@ -209,6 +292,13 @@ fn default_volume() -> f64 {
 /// [`Settings::haptics`]'s default: on, because a phone that cannot buzz you
 /// about a press has no way to say the overlay worked at all.
 fn default_haptics() -> bool {
+    true
+}
+
+/// [`Settings::pause_when_hidden`]'s default: on, because a tab in the background
+/// that is being emulated at full speed is a fan, a battery drain, and a game that
+/// went on without the player (M7-17, #150).
+fn default_pause_when_hidden() -> bool {
     true
 }
 
@@ -295,6 +385,9 @@ impl Settings {
             renderer: Self::field(value, "renderer", RendererSetting::default),
             filter: Self::field(value, "filter", FilterSetting::default),
             smoothing: Self::field(value, "smoothing", bool::default),
+            fps_overlay: Self::field(value, "fps_overlay", bool::default),
+            fast_forward_speed: Self::field(value, "fast_forward_speed", FastForwardSpeed::default),
+            pause_when_hidden: Self::field(value, "pause_when_hidden", default_pause_when_hidden),
             haptics: Self::field(value, "haptics", default_haptics),
             hide_touch_with_controller: Self::field(
                 value,
@@ -468,6 +561,9 @@ mod tests {
         assert!(!settings.smoothing);
         assert!(settings.haptics);
         assert!(settings.hide_touch_with_controller);
+        assert!(!settings.fps_overlay);
+        assert_eq!(settings.fast_forward_speed, FastForwardSpeed::FourX);
+        assert!(settings.pause_when_hidden);
         assert_eq!(settings.version, SETTINGS_VERSION);
     }
 
@@ -547,6 +643,9 @@ mod tests {
             filter: FilterSetting::Crt,
             smoothing: true,
             haptics: false,
+            fps_overlay: true,
+            fast_forward_speed: FastForwardSpeed::SevenX,
+            pause_when_hidden: false,
             ..Settings::default()
         };
         settings.bindings.rebind_key(1, PadButton::Start, "Space");
@@ -655,6 +754,60 @@ mod tests {
         assert_eq!(settings.filter, FilterSetting::Crt);
         let settings = Settings::from_json(r#"{"renderer":"canvas"}"#);
         assert_eq!(settings.renderer, RendererSetting::Canvas);
+    }
+
+    /// The three playback fields of M7-17 (#150) are additive defaults, so a file
+    /// written before they existed still loads - and `version` stays at 1.
+    #[test]
+    fn a_file_without_the_playback_fields_still_loads_them_as_defaults() {
+        let settings = Settings::from_json(r#"{"theme":"dark","volume":0.5,"version":1}"#);
+        assert_eq!(
+            settings.theme,
+            Theme::Dark,
+            "the fields it did have survived"
+        );
+        assert!(
+            !settings.fps_overlay,
+            "the overlay is off until the player asks for it"
+        );
+        assert_eq!(settings.fast_forward_speed, FastForwardSpeed::FourX);
+        assert!(
+            settings.pause_when_hidden,
+            "a hidden tab is a held console by default"
+        );
+        assert_eq!(settings.version, SETTINGS_VERSION);
+    }
+
+    /// The fast forward tag is the variant's snake case, like every other enum in
+    /// this file, so it is pinned here rather than left to be inferred from the one
+    /// round trip below - which would also pass if both halves moved together.
+    #[test]
+    fn the_playback_fields_are_read_as_themselves() {
+        let settings = Settings::from_json(
+            r#"{"fps_overlay":true,"fast_forward_speed":"two_x","pause_when_hidden":false}"#,
+        );
+        assert!(settings.fps_overlay);
+        assert_eq!(settings.fast_forward_speed, FastForwardSpeed::TwoX);
+        assert!(!settings.pause_when_hidden);
+        assert_eq!(settings.fast_forward_speed.multiplier(), 2);
+        assert_eq!(settings.fast_forward_speed.label(), "2x");
+        assert_eq!(
+            serde_json::to_string(&settings.fast_forward_speed).unwrap(),
+            "\"two_x\"",
+            "the tag on disk is the variant's snake case"
+        );
+    }
+
+    #[test]
+    fn a_garbage_playback_field_costs_only_itself() {
+        let settings = Settings::from_json(
+            r#"{"fps_overlay":"yes","fast_forward_speed":"hundred","pause_when_hidden":3,"theme":"light","volume":0.25}"#,
+        );
+        assert!(!settings.fps_overlay);
+        assert_eq!(settings.fast_forward_speed, FastForwardSpeed::FourX);
+        assert!(settings.pause_when_hidden);
+        assert_eq!(settings.theme, Theme::Light, "the good fields survived");
+        assert_eq!(settings.volume, 0.25);
     }
 
     #[test]
