@@ -462,27 +462,76 @@ canvas {
   pointer-events: none;
 }
 
-/* The canvas keeps the Genesis 320x224 ratio at any window size. The width is
-   taken from the room the screen area has (`100dvh` minus the top bar and this
-   rule's own padding), and `max-width: 100%` takes over when the window is
-   narrow. Doing it this way, rather than with `height: 100%`, matters: Firefox
-   clamps a replaced element's two axes independently and stretches the box.
+/* The canvas's box, in both dimensions, comes from `crate::screen`: the largest
+   integer multiple of the frame that fits the screen area, or a 4:3 / square box
+   that fits, according to the Scale and Aspect settings (M7-12, #145).
+
+   Which is why `width`, `height` and `aspect-ratio` must not appear here. They
+   would be a second answer to "what size is the picture", and the two answers
+   disagree on every frame the core is not 320 wide: an H32 program is 256,
+   interlace is 448 lines tall, and a menu-driven frame can be either. A canvas
+   with two answers is a stretched one - and a player cannot tell a bad scaler
+   from a bad PPU, so the one thing a scaler may never do is lie about the size
+   it settled on. `style` belongs to the JS writer; `max-*` stays because a limit
+   is not a size, and it is what stops a rounding error from scrolling the page.
    M7-04 (#137) draws into this canvas. */
 .screen {
   position: relative;
-  width: min(
-    100%,
-    calc((100dvh - var(--topbar-height) - (var(--space-4) * 2)) * (320 / 224))
-  );
-  height: auto;
   max-width: 100%;
   max-height: 100%;
-  aspect-ratio: 320 / 224;
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
   background: var(--bg-screen);
   box-shadow: 0 12px 32px rgb(0 0 0 / 45%);
+  /* Point samples: the alternative is the browser's smooth filter over hard
+     320x224 pixels, which is grey soup. `Smoothing` is the deliberate
+     exception. */
   image-rendering: pixelated;
+}
+
+/* The Smoothing setting, off by default (M7-12, #145): the soft, CRT-adjacent
+   look, bought with every pixel edge in the picture. */
+.screen--smooth {
+  image-rendering: auto;
+}
+
+/* Fullscreen is the app shell, not the screen area. The ticket asks for the top
+   bar to go away and come back on mouse move, and only the fullscreen element and
+   its descendants are rendered - a bar outside the subtree could not be shown
+   again at all. The shell is the smallest element holding both (#145).
+
+   `:fullscreen`, the browser's own state, carries all of the structure, so a class
+   that the JS failed to clear can never hide a bar that should be seen:
+   `app--bar-shown` only says which half of this rule is in force. */
+.app:fullscreen {
+  /*
+   * One row, because the bar leaves the flow below: leaving the `--topbar-height`
+   * track in place puts the screen area - and so the canvas - in a 56px row, which
+   * is the whole reason this rule is here rather than the transform alone
+   * (M7-12, #145; found in the browser, not in the arithmetic).
+   */
+  grid-template-rows: 1fr;
+  background: var(--bg-app);
+}
+
+.app:fullscreen .topbar {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 1;
+  transform: translateY(-100%);
+  transition: transform var(--duration) var(--ease);
+}
+
+.app--bar-shown:fullscreen .topbar {
+  transform: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app:fullscreen .topbar {
+    transition: none;
+  }
 }
 
 /* While a file is over the page the whole screen area is the drop target, and
@@ -1004,10 +1053,6 @@ canvas {
   .app--touch .screen-area {
     padding-bottom: calc(var(--touch-band) + env(safe-area-inset-bottom));
     align-items: start;
-  }
-
-  .app--touch .screen {
-    width: 100%;
   }
 }
 

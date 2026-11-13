@@ -32,6 +32,7 @@ use crate::nav::UiAction;
 use crate::nav::UiEvent;
 use crate::nav::UiMode;
 use crate::nav::ui_action;
+use crate::screen::Screen;
 use crate::settings::Settings;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
@@ -65,6 +66,7 @@ pub fn use_keyboard(
     toasts: Toasts,
     settings: RwSignal<Settings>,
     capture: RwSignal<Option<CaptureTarget>>,
+    screen: Screen,
 ) {
     let pressed = {
         window_event_listener(ev::keydown, move |event: web_sys::KeyboardEvent| {
@@ -130,7 +132,7 @@ pub fn use_keyboard(
                 // nobody's: `Tab` in particular, which the browser still uses to
                 // move focus, and `F1` and friends still reach the shell.
                 if let KeyAction::Hotkey(hotkey) = action {
-                    hotkey_do(hotkey, menu, toasts);
+                    hotkey_do(hotkey, menu, toasts, screen);
                 }
                 return;
             }
@@ -141,7 +143,7 @@ pub fn use_keyboard(
                 KeyAction::Pad { port, button } => crate::input::with_state(|input| {
                     input.set(Source::Keyboard, port, button, true);
                 }),
-                KeyAction::Hotkey(hotkey) => hotkey_do(hotkey, menu, toasts),
+                KeyAction::Hotkey(hotkey) => hotkey_do(hotkey, menu, toasts, screen),
                 KeyAction::None => {}
             }
         })
@@ -207,14 +209,14 @@ fn takes_key_for_itself(event: &web_sys::KeyboardEvent) -> bool {
 /// `ToggleMenu` and `Pause` go through the [`Menu`] rather than straight at the
 /// drawer and the console, because inside a menu the first means "close the
 /// innermost thing" and either one changes who is holding the console.
-pub(crate) fn hotkey_do(hotkey: Hotkey, menu: Menu, toasts: Toasts) {
+pub(crate) fn hotkey_do(hotkey: Hotkey, menu: Menu, toasts: Toasts, screen: Screen) {
     match hotkey {
         Hotkey::Pause => menu.pause_by_hand(),
         Hotkey::ToggleMenu => menu.toggle_menu(),
-        Hotkey::Fullscreen => toasts.push(
-            ToastKind::Info,
-            "Fullscreen is not wired up in this build yet.",
-        ),
+        // The shell goes fullscreen, not the canvas: the top bar has to be inside
+        // what is fullscreen for it to hide and then come back on mouse move, and
+        // `Screen` is the one owner of that state (#145).
+        Hotkey::Fullscreen => screen.toggle_fullscreen(),
         Hotkey::SaveState => toasts.push(
             ToastKind::Info,
             "Save states are not wired up in this build yet.",

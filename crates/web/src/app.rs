@@ -20,6 +20,9 @@ use crate::rom_picker::EmptyScreen;
 use crate::rom_picker::RomFileInput;
 use crate::rom_picker::open_picker;
 use crate::rom_picker::window_drop_target;
+use crate::scale::Aspect;
+use crate::scale::ScaleMode;
+use crate::screen::use_screen;
 use crate::settings::Settings;
 use crate::theme::Theme;
 use crate::touch_events::TouchOverlay;
@@ -31,6 +34,8 @@ use crate::ui::icons;
 use crate::ui::select::Listboxes;
 use crate::ui::select::Select;
 use crate::ui::select::SelectOption;
+use crate::ui::select::options;
+use crate::ui::select::position;
 use crate::ui::slider::Slider;
 use crate::ui::toast::ToastArea;
 use crate::ui::toast::ToastKind;
@@ -85,6 +90,11 @@ pub fn App() -> impl IntoView {
     // pause state its buttons show.
     let canvas = NodeRef::<html::Canvas>::new();
     let console = use_cartridge(canvas);
+    // The two elements the screen's own half needs: the shell, which is what goes
+    // fullscreen, and the screen area, which is what reports how much room the
+    // picture has (M7-12, #145).
+    let shell = NodeRef::<html::Div>::new();
+    let screen_area = NodeRef::<html::Main>::new();
 
     // Window-wide drop handling; the screen area wears the result.
     let dragging = window_drop_target();
@@ -126,7 +136,12 @@ pub fn App() -> impl IntoView {
     // It takes the menu and the cartridge because a form and a game cannot
     // both have the arrow keys: while a game runs the keys are swallowed and go
     // to the pad, and while a menu is open they move its focus.
-    use_keyboard(menu, loaded, toasts, settings, capture);
+    // The canvas box, fullscreen, and the top bar's reveal - all from the same
+    // owner, because the F11 hotkey, the top bar's button and the browser's own
+    // `Escape` have to agree about what state the shell is in (#145).
+    let screen = use_screen(canvas, screen_area, shell, console, drawer_open);
+
+    use_keyboard(menu, loaded, toasts, settings, capture, screen);
 
     // Whether a controller is plugged in, which the touch overlay hides itself
     // behind and nothing else asks about (M7-09, #142).
@@ -136,7 +151,14 @@ pub fn App() -> impl IntoView {
     // long as the shell is up (M7-08, #141). No `loaded` this time: a pad that
     // is plugged in is a pad the player is holding, whether or not a cartridge
     // is in, and its connect/disconnect news is worth a toast either way.
-    use_gamepad(menu, toasts, controller_connected, settings, capture);
+    use_gamepad(
+        menu,
+        toasts,
+        controller_connected,
+        settings,
+        capture,
+        screen,
+    );
 
     // The on-screen controller: on for a phone, on for a desktop that asked, off
     // for a phone whose player picked up a pad. `coarse` is read once - a browser
@@ -183,7 +205,12 @@ pub fn App() -> impl IntoView {
     view! {
         // `app--touch` is what tells the screen area to give the controls room of
         // their own in portrait, where they sit below the picture rather than on it.
-        <div class="app" class:app--touch=move || touch_visible.get()>
+        <div
+            class="app"
+            node_ref=shell
+            class:app--touch=move || touch_visible.get()
+            class:app--bar-shown=move || screen.revealed.get()
+        >
             <header class="topbar">
                 <span class="wordmark">
                     {crate::app_title()}
@@ -252,7 +279,7 @@ pub fn App() -> impl IntoView {
                     <IconButton
                         label="Fullscreen".to_string()
                         path=icons::FULLSCREEN
-                        on_click=not_wired_yet(toasts, "Fullscreen")
+                        on_click=Callback::new(move |_| screen.toggle_fullscreen())
                     />
                     <IconButton
                         label="Settings".to_string()
@@ -262,11 +289,16 @@ pub fn App() -> impl IntoView {
                 </nav>
             </header>
 
-            <main class="screen-area" class:screen-area--drag=move || dragging.get()>
+            <main
+                class="screen-area"
+                node_ref=screen_area
+                class:screen-area--drag=move || dragging.get()
+            >
                 <Show when=move || loaded.get() fallback=|| view! { <EmptyScreen/> }>
                     <canvas
                         id="screen"
                         class="screen"
+                        class:screen--smooth=move || settings.with(|settings| settings.smoothing)
                         width=320
                         height=224
                         node_ref=canvas
@@ -292,6 +324,48 @@ pub fn App() -> impl IntoView {
                     <p class="settings-section__note">
                         "Every setting on this page is saved in this browser."
                     </p>
+                </section>
+
+                <section class="settings-section">
+                    <h3 class="settings-section__title">Picture</h3>
+                    // The same listbox as the theme and the save slots, so the d-pad
+                    // reaches the scaler too: a player in the drawer with a pad and
+                    // no mouse would otherwise be shut out of it (#144, #145).
+                    {
+                        let settings = settings;
+                        let choices = options(&ScaleMode::ALL, |mode| mode.label());
+                        let chosen = Signal::derive(move || {
+                            position(&ScaleMode::ALL, settings.with(|settings| settings.scale))
+                        });
+                        view! { <Select label="Scale".to_string() options=choices selected=chosen on_change=Callback::new(move |value: String| {
+                            let mode = ScaleMode::ALL
+                                .get(value.parse::<usize>().unwrap_or(0))
+                                .copied()
+                                .unwrap_or_default();
+                            settings.update(|settings| settings.scale = mode);
+                        })/> }
+                    }
+                    {
+                        let settings = settings;
+                        let choices = options(&Aspect::ALL, |aspect| aspect.label());
+                        let chosen = Signal::derive(move || {
+                            position(&Aspect::ALL, settings.with(|settings| settings.aspect))
+                        });
+                        view! { <Select label="Aspect".to_string() options=choices selected=chosen on_change=Callback::new(move |value: String| {
+                            let aspect = Aspect::ALL
+                                .get(value.parse::<usize>().unwrap_or(0))
+                                .copied()
+                                .unwrap_or_default();
+                            settings.update(|settings| settings.aspect = aspect);
+                        })/> }
+                    }
+                    <Toggle
+                        label="Smoothing".to_string()
+                        checked=Signal::derive(move || settings.with(|settings| settings.smoothing))
+                        on_toggle=Callback::new(move |()| {
+                            settings.update(|settings| settings.smoothing = !settings.smoothing);
+                        })
+                    />
                 </section>
 
                 <section class="settings-section">
