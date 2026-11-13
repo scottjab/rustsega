@@ -28,6 +28,7 @@ use crate::ui::button::IconButton;
 use crate::ui::drawer::Drawer;
 use crate::ui::hint::HintBar;
 use crate::ui::icons;
+use crate::ui::select::Listboxes;
 use crate::ui::select::Select;
 use crate::ui::select::SelectOption;
 use crate::ui::slider::Slider;
@@ -67,6 +68,11 @@ pub fn App() -> impl IntoView {
     // listeners are one.
     let capture = RwSignal::new(None::<CaptureTarget>);
     provide_context(capture);
+
+    // The settings page's lists of options, which are the innermost thing the Back
+    // button of a menu has to close (M7-11, #144).
+    let listboxes = Listboxes::new();
+    provide_context(listboxes);
 
     // The cartridge, if one has been opened. Context rather than a prop so M7-04
     // (run it) and M7-16 (the library) can react to it without the shell
@@ -114,7 +120,7 @@ pub fn App() -> impl IntoView {
     // The menu mode, mounted once for the shell (M7-11, #144): opening a menu
     // holds the console and takes the arrow keys off the game, and both the
     // keyboard and the pads have to ask the same one about it.
-    let menu = use_menu(console, drawer_open, capture);
+    let menu = use_menu(console, drawer_open, capture, listboxes);
 
     // The keyboard, on the window, for as long as the shell is up (M7-07, #140).
     // It takes the menu and the cartridge because a form and a game cannot

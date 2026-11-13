@@ -37,33 +37,74 @@ impl SelectOption {
 }
 
 thread_local! {
-    /// The listbox that is open, by its number, `None` when none is.
-    ///
-    /// A page-level fact rather than one signal per control, for two reasons: a
-    /// second list opening shuts the first the way a popup did while the browser
-    /// owned it, and [`close_open`] can hand the menu's Back rule the innermost
-    /// thing to close without the shell having built the control.
-    static OPEN: RwSignal<Option<usize>> = RwSignal::new(None);
     /// The number to hand out to the next [`Select`] mounted.
     static NEXT_NUMBER: Cell<usize> = const { Cell::new(1) };
 }
 
-/// The one list that is open, as a signal.
-fn open_list() -> RwSignal<Option<usize>> {
-    OPEN.with(|open| *open)
+/// Which of the page's [`Select`]s is open, in the shell's context.
+///
+/// A page-level fact rather than a signal per control, for two reasons: a second
+/// list opening shuts the first the way a popup did while the browser owned the
+/// whole control, and [`Listboxes::close_any`] can hand the menu's Back rule the
+/// innermost thing to close without the shell having built the control.
+///
+/// It is a context and not a thread-local because a signal belongs to the reactive
+/// owner that made it: a signal in a thread-local is made by whichever component
+/// happened to reach it first, and it is disposed with that component - which is a
+/// panic waiting on the other side of a re-render.
+#[derive(Clone, Copy)]
+pub struct Listboxes {
+    open: RwSignal<Option<usize>>,
 }
 
-/// Closes the list that is open, if there is one, and says whether there was one.
-///
-/// This is the menu's Back rule calling: a list of options is the innermost open
-/// thing a settings page has (M7-11, #144).
-pub fn close_open() -> bool {
-    let open = open_list();
-    let was_open = open.get_untracked().is_some();
-    if was_open {
-        open.set(None);
+impl Listboxes {
+    /// An empty set of lists, for the shell to create and provide.
+    pub fn new() -> Self {
+        Self {
+            open: RwSignal::new(None),
+        }
     }
-    was_open
+
+    /// Whether the list of the control numbered `number` is showing.
+    fn shown(self, number: usize) -> Signal<bool> {
+        Signal::derive(move || self.open.get() == Some(number))
+    }
+
+    /// Shows the list of `number`, and shuts it if it was already the one open:
+    /// the second click on a `<select>` used to close it again.
+    fn toggle(self, number: usize) {
+        self.open.update(|open| match *open {
+            Some(own) if own == number => *open = None,
+            _ => *open = Some(number),
+        });
+    }
+
+    /// Puts the list of `number` away, having picked from it.
+    fn shut(self, number: usize) {
+        self.open.update(|open| {
+            if *open == Some(number) {
+                *open = None;
+            }
+        });
+    }
+
+    /// Closes the list that is open, if there is one, and says whether there was.
+    ///
+    /// This is the menu's Back rule calling: a list of options is the innermost
+    /// open thing a settings page has (M7-11, #144).
+    pub fn close_any(self) -> bool {
+        let was_open = self.open.get_untracked().is_some();
+        if was_open {
+            self.open.set(None);
+        }
+        was_open
+    }
+}
+
+impl Default for Listboxes {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// A label, a button showing the choice, and the list of choices behind it.
@@ -83,12 +124,13 @@ pub fn Select(
     /// Called with the new value when the player picks an option.
     on_change: Callback<String>,
 ) -> impl IntoView {
+    let lists = expect_context::<Listboxes>();
     let number = NEXT_NUMBER.with(|next| {
         let number = next.get();
         next.set(number + 1);
         number
     });
-    let open = Signal::derive(move || open_list().get() == Some(number));
+    let open = lists.shown(number);
     let trigger = NodeRef::<html::Button>::new();
 
     // The choice whose value is current, or nothing when the settings store named
@@ -111,16 +153,7 @@ pub fn Select(
                 aria-expanded=move || open.get().to_string()
                 aria-label=label.clone()
                 node_ref=trigger
-                on:click=move |_| {
-                    let open = open_list();
-                    open.set(match open.get_untracked() {
-                        // A second click on the list that is showing shuts it, as
-                        // it did when it was a `<select>` and the player pressed
-                        // the key again.
-                        Some(own) if own == number => None,
-                        _ => Some(number),
-                    });
-                }
+                on:click=move |_| lists.toggle(number)
             >
                 {move || current.get().map(|option| option.label)}
             </button>
@@ -148,7 +181,7 @@ pub fn Select(
                                     attr:aria-selected=move || picked.get().to_string()
                                     on:click=move |_| {
                                         on_change.run(value.clone());
-                                        open_list().set(None);
+                                        lists.shut(number);
                                         if let Some(button) = trigger.get() {
                                             button.focus().ok();
                                         }

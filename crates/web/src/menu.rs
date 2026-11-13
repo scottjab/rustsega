@@ -17,6 +17,7 @@
 
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::HtmlElement;
 
@@ -31,7 +32,7 @@ use crate::nav::Rect;
 use crate::nav::UiAction;
 use crate::nav::UiMode;
 use crate::nav::next_focus;
-use crate::ui::select;
+use crate::ui::select::Listboxes;
 
 /// The page's focusable controls: real controls from M7-02 (#135), plus anything
 /// else that asks for the tab order.
@@ -40,6 +41,11 @@ const FOCUSABLE: &str = "button, input, select, [tabindex]:not([tabindex='-1'])"
 /// The class [`crate::ui::drawer::Drawer`] puts on itself while it is showing, and
 /// the selector [`inside_drawer`] asks controls about.
 const OPEN_DRAWER: &str = ".drawer--open";
+
+/// How many times [`Menu::focus_first`] asks for the focus before it gives up.
+const FOCUS_TRIES: u32 = 16;
+/// How long it waits between those asks, in ms.
+const FOCUS_WAIT_MS: i32 = 25;
 
 /// The shell's menu mode: the one place that turns a [`UiAction`] into something
 /// done to the page, and the one place that knows whether the menu or the player
@@ -55,6 +61,8 @@ pub struct Menu {
     pub drawer_open: RwSignal<bool>,
     /// The controls page's rebind capture: the innermost thing the page has.
     pub capture: RwSignal<Option<CaptureTarget>>,
+    /// The page's lists of options, so that [`Menu::back`] can close one.
+    lists: Listboxes,
     /// Which half of the page the shell is in.
     ///
     /// Derived from [`Menu::drawer_open`] rather than set beside it, because a
@@ -83,6 +91,7 @@ pub fn use_menu(
     console: Controls,
     drawer_open: RwSignal<bool>,
     capture: RwSignal<Option<CaptureTarget>>,
+    lists: Listboxes,
 ) -> Menu {
     let mode = Signal::derive(move || {
         if drawer_open.get() {
@@ -95,6 +104,7 @@ pub fn use_menu(
         console,
         drawer_open,
         capture,
+        lists,
         mode,
         hints: RwSignal::new(LastDevice::default()),
         paused_by_menu: RwSignal::new(MenuPause::default()),
@@ -150,7 +160,7 @@ impl Menu {
     /// drawer. A dialog goes between the capture and the drawer when there is one
     /// to close (M7-15, #148).
     pub fn back(self) {
-        if select::close_open() {
+        if self.lists.close_any() {
             return;
         }
         if self.capture.get().is_some() {
@@ -240,7 +250,42 @@ impl Menu {
 
     /// Puts the focus on the first control of the open drawer, which is the first
     /// thing a player who has just opened the menu is looking at.
+    ///
+    /// Tries a few times, because a drawer that is sliding in is still
+    /// `visibility: hidden` for the length of its transition - see the transition
+    /// on `.drawer` in `style.css`, which says it should flip at once on the way
+    /// in and in practice does not - and a hidden control cannot take the focus.
+    /// A retry lands as soon as the drawer is focusable and then stops, which is
+    /// what a guessed wait of exactly one transition would have been for.
     fn focus_first(self) {
+        self.focus_first_trying(FOCUS_TRIES);
+    }
+
+    fn focus_first_trying(self, tries: u32) {
+        if self.focus_first_now() || tries == 0 {
+            return;
+        }
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let menu = self;
+        let callback =
+            Closure::wrap(Box::new(move || menu.focus_first_trying(tries - 1)) as Box<dyn FnMut()>);
+        let on_fire: &js_sys::Function = callback.as_js_value().unchecked_ref();
+        if window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(on_fire, FOCUS_WAIT_MS)
+            .is_err()
+        {
+            return;
+        }
+        // The timer outlives this scope, so ownership of the closure goes to JS
+        // and the garbage collector frees it - the same bargain a toast's timer
+        // strikes (see [`crate::ui::toast`]).
+        callback.into_js_value();
+    }
+
+    /// One attempt at [`focus_first`], saying whether the focus moved.
+    fn focus_first_now(self) -> bool {
         let showing = web_sys::window()
             .and_then(|window| window.document())
             .and_then(|document| document.query_selector(OPEN_DRAWER).ok())
@@ -249,8 +294,12 @@ impl Menu {
         let first = focusables()
             .into_iter()
             .find(|(element, _)| !showing || inside_drawer(element));
-        if let Some((element, _)) = first {
-            self.focus(&element);
+        match first {
+            Some((element, _)) => {
+                self.focus(&element);
+                true
+            }
+            None => false,
         }
     }
 
