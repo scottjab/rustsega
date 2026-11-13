@@ -41,6 +41,10 @@ pub enum Hotkey {
     SaveState,
     /// `F4`: read a save state (M7-15, #148).
     LoadState,
+    /// `F2`: one slot earlier (M7-15, #148).
+    PreviousSlot,
+    /// `F3`: one slot later (M7-15, #148).
+    NextSlot,
     /// `F11`: the screen fills the window (M7-12, #145).
     Fullscreen,
     /// `Tab`, held: run the console faster (M7-17, #150).
@@ -53,9 +57,11 @@ pub enum Hotkey {
 ///
 /// Looked up before the pad bindings, so a hotkey wins a key that a binding
 /// table also claims - see [`map_key`].
-const HOTKEYS: [(&str, Hotkey); 6] = [
+const HOTKEYS: [(&str, Hotkey); 8] = [
     ("Escape", Hotkey::ToggleMenu),
     ("F1", Hotkey::SaveState),
+    ("F2", Hotkey::PreviousSlot),
+    ("F3", Hotkey::NextSlot),
     ("F4", Hotkey::LoadState),
     ("F11", Hotkey::Fullscreen),
     ("Tab", Hotkey::FastForward),

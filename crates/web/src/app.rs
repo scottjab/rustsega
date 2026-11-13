@@ -11,6 +11,7 @@ use leptos::prelude::*;
 
 use crate::controls::CaptureTarget;
 use crate::controls::Controls;
+use crate::emulator::Slots;
 use crate::emulator::use_cartridge;
 use crate::gamepad_events::use_gamepad;
 use crate::keyboard_events::use_keyboard;
@@ -30,6 +31,7 @@ use crate::settings::Settings;
 use crate::theme::Theme;
 use crate::touch_events::TouchOverlay;
 use crate::touch_events::coarse_pointer;
+use crate::ui::button::Button;
 use crate::ui::button::IconButton;
 use crate::ui::drawer::Drawer;
 use crate::ui::hint::HintBar;
@@ -40,20 +42,13 @@ use crate::ui::select::SelectOption;
 use crate::ui::select::options;
 use crate::ui::select::position;
 use crate::ui::slider::Slider;
+use crate::ui::slot_panel::SlotPanel;
 use crate::ui::toast::ToastArea;
-use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
 use crate::ui::toggle::Toggle;
 
 /// Shown in the top bar's centre where the game title goes when nothing is loaded.
 const NO_CARTRIDGE: &str = "No cartridge loaded";
-
-/// A control whose action belongs to a later M7 ticket: it reports that through
-/// a toast rather than doing nothing at all when pressed.
-fn not_wired_yet(toasts: Toasts, what: &str) -> Callback<()> {
-    let text = format!("{what} is not wired up in this build yet.");
-    Callback::new(move |_| toasts.push(ToastKind::Info, text.clone()))
-}
 
 /// Root component of the app.
 #[component]
@@ -95,6 +90,10 @@ pub fn App() -> impl IntoView {
     let canvas = NodeRef::<html::Canvas>::new();
     let canvas_gl = NodeRef::<html::Canvas>::new();
     let console = use_cartridge(canvas, canvas_gl);
+    // The save state panel's own open signal, and the four slots the quick keys
+    // work on. `Slots` is a `Copy` handle over the console, so the keyboard, the
+    // pads and the cards all move the same one (M7-15, #148).
+    let slots_open = RwSignal::new(false);
     // The two elements the screen's own half needs: the shell, which is what goes
     // fullscreen, and the screen area, which is what reports how much room the
     // picture has (M7-12, #145).
@@ -135,7 +134,8 @@ pub fn App() -> impl IntoView {
     // The menu mode, mounted once for the shell (M7-11, #144): opening a menu
     // holds the console and takes the arrow keys off the game, and both the
     // keyboard and the pads have to ask the same one about it.
-    let menu = use_menu(console, drawer_open, capture, listboxes);
+    let slots = Slots::new(console);
+    let menu = use_menu(console, drawer_open, slots_open, capture, listboxes);
 
     // The keyboard, on the window, for as long as the shell is up (M7-07, #140).
     // It takes the menu and the cartridge because a form and a game cannot
@@ -146,7 +146,7 @@ pub fn App() -> impl IntoView {
     // `Escape` have to agree about what state the shell is in (#145).
     let screen = use_screen(canvas, canvas_gl, screen_area, shell, console, drawer_open);
 
-    use_keyboard(menu, loaded, toasts, settings, capture, screen);
+    use_keyboard(menu, loaded, toasts, settings, capture, screen, slots);
 
     // Whether a controller is plugged in, which the touch overlay hides itself
     // behind and nothing else asks about (M7-09, #142).
@@ -163,6 +163,7 @@ pub fn App() -> impl IntoView {
         settings,
         capture,
         screen,
+        slots,
     );
 
     // The on-screen controller: on for a phone, on for a desktop that asked, off
@@ -292,7 +293,7 @@ pub fn App() -> impl IntoView {
                     <IconButton
                         label="Save states".to_string()
                         path=icons::SAVE
-                        on_click=not_wired_yet(toasts, "Save states")
+                        on_click=Callback::new(move |_| menu.open_states())
                     />
                     <IconButton
                         label="Fullscreen".to_string()
@@ -302,7 +303,12 @@ pub fn App() -> impl IntoView {
                     <IconButton
                         label="Settings".to_string()
                         path=icons::SETTINGS
-                        on_click=Callback::new(move |_| drawer_open.update(|open| *open = !*open))
+                        on_click=Callback::new(move |_| {
+                            // The two panels are one depth apart and mutually
+                            // exclusive: see [`crate::menu::Menu::open_states`].
+                            slots_open.set(false);
+                            drawer_open.update(|open| *open = !*open);
+                        })
                     />
                 </nav>
             </header>
@@ -345,7 +351,11 @@ pub fn App() -> impl IntoView {
                 <RomFileInput/>
             </main>
 
-            <Drawer title="Settings".to_string() open=drawer_open>
+            <Drawer
+                title="Settings".to_string()
+                open=drawer_open
+                close_label="Close settings".to_string()
+            >
                 <section class="settings-section">
                     <h3 class="settings-section__title">Appearance</h3>
                     <Select
@@ -464,6 +474,16 @@ pub fn App() -> impl IntoView {
                     </p>
                 </section>
 
+                <section class="settings-section">
+                    <h3 class="settings-section__title">Save states</h3>
+                    <p class="settings-section__note">
+                        "Four slots per game, each holding the whole machine: press a slot's button, or use F1 to save and F4 to load the one that is highlighted."
+                    </p>
+                    <Button on_click=Callback::new(move |_| menu.open_states())>
+                        "Open save states"
+                    </Button>
+                </section>
+
                 <Controls drawer_open=drawer_open />
 
                 // What the buttons of whichever device is in hand do in here,
@@ -476,6 +496,10 @@ pub fn App() -> impl IntoView {
             <Show when=move || touch_visible.get()>
                 <TouchOverlay settings=settings drawer_open=drawer_open />
             </Show>
+
+            // The save state panel, mounted beside the settings drawer and open
+            // one or the other at a time (M7-15, #148).
+            <SlotPanel open=slots_open slots=slots />
 
             <ToastArea/>
         </div>

@@ -11,5 +11,6 @@ pub mod hint;
 pub mod icons;
 pub mod select;
 pub mod slider;
+pub mod slot_panel;
 pub mod toast;
 pub mod toggle;

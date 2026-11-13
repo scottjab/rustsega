@@ -51,6 +51,7 @@ use crate::render::webgl::gl_lost;
 use crate::render::webgl::webgl2_supported;
 use crate::rom::LoadedRom;
 use crate::settings::Settings;
+use crate::slots;
 use crate::storage;
 use crate::storage::SramWatcher;
 use crate::ui::toast::ToastKind;
@@ -270,14 +271,14 @@ struct Save {
 ///
 /// The watcher is seeded with the RAM as it stands *after* the save is loaded, so
 /// a cart that is loaded, played and never written to is never written back.
-fn install_save(genesis: &mut Genesis, saved: Option<SavedSram>, rom_id: &str) -> Option<Save> {
+fn install_save(genesis: &mut Genesis, saved: Option<&SavedSram>, rom_id: &str) -> Option<Save> {
     genesis.sram()?;
-    let SavedSram { db, stored } = saved?;
-    if let Some(stored) = stored {
-        genesis.load_sram(&stored);
+    let saved = saved?;
+    if let Some(stored) = &saved.stored {
+        genesis.load_sram(stored);
     }
     Some(Save {
-        db,
+        db: saved.db.clone(),
         rom_id: rom_id.to_string(),
         watcher: SramWatcher::new(genesis.sram().unwrap_or_default(), now_ms()),
     })
@@ -602,6 +603,129 @@ impl Controls {
     /// Natively there is no timer to arm, as with a toast's.
     #[cfg(not(target_arch = "wasm32"))]
     fn hide_saved_after_chip(self) {}
+
+    /// This cart's save state slots, or `None` when there is no cart or this
+    /// browser would not open IndexedDB (M7-15, #148).
+    pub fn slot_target(self) -> Option<SlotTarget> {
+        let emulator = running()?;
+        let emulator = emulator.borrow_mut();
+        let store = emulator.slot_store.as_ref()?;
+        Some(SlotTarget {
+            db: store.db.clone(),
+            rom_id: store.rom_id.clone(),
+        })
+    }
+
+    /// Writes the running console to `slot`: the machine and a card's picture of
+    /// it, encoded by [`slots::encode`], into one record.
+    ///
+    /// The machine is copied out of the console before anything is awaited and the
+    /// write is spawned, exactly as a cart's RAM is (see [`Emulator::flush_sram`],
+    /// which is the same shape for the same reason: #387). A save is not on the
+    /// frame loop - it happens because a person pressed a key - but it is started
+    /// from a click or a keypress handler that is holding nothing, and a state is
+    /// a hundredfold bigger than the SRAM a flush already copies.
+    pub fn save_slot(self, slot: u32) {
+        let Some(emulator) = running() else { return };
+        let (written, toasts) = {
+            let emulator = emulator.borrow_mut();
+            (emulator.capture_slot(), emulator.toasts)
+        };
+        let Some((store, record)) = written else {
+            toasts.push(
+                ToastKind::Warn,
+                "This browser will not let rustsega keep save states",
+            );
+            return;
+        };
+        let key = store.key(slot);
+        let bytes = slots::encode(&record);
+        spawn_local(write_slot(store.db, key, bytes, slot, toasts));
+    }
+
+    /// Reads `slot` back into the running console, and leaves the console alone if
+    /// it cannot: a slot that will not load is one toast and a game that is still
+    /// where it was (M7-15, #148).
+    ///
+    /// The record is read, checked and decoded off the frame loop, and the console
+    /// is only borrowed once the bytes are in hand - so nothing is borrowed across
+    /// the `.await`, and a slot that IndexedDB is still thinking about holds no
+    /// lock on the machine (#387).
+    pub fn load_slot(self, slot: u32) {
+        let Some(emulator) = running() else { return };
+        let (target, toasts) = {
+            let emulator = emulator.borrow_mut();
+            (emulator.slot_store.clone(), emulator.toasts)
+        };
+        let Some(store) = target else {
+            toasts.push(
+                ToastKind::Warn,
+                "This browser will not let rustsega keep save states",
+            );
+            return;
+        };
+        spawn_local(read_slot(store, slot, toasts));
+    }
+}
+
+/// The IndexedDB half of one cart's slots, handed to whoever is showing the
+/// cards: see [`Controls::slot_target`].
+#[derive(Clone)]
+pub struct SlotTarget {
+    /// The database to read them from.
+    pub db: storage::Db,
+    /// The cart they belong to, which is the prefix of every one of their keys.
+    pub rom_id: String,
+}
+
+impl SlotTarget {
+    /// The key of `slot` of this cart.
+    pub fn key(&self, slot: u32) -> String {
+        storage::state_key(&self.rom_id, slot)
+    }
+}
+
+/// The write of one slot, off the frame loop.
+async fn write_slot(db: storage::Db, key: String, bytes: Vec<u8>, slot: u32, toasts: Toasts) {
+    match db.put(storage::Store::States, &key, &bytes).await {
+        Ok(()) => toasts.push(ToastKind::Ok, format!("Saved to slot {}", slot + 1)),
+        Err(error) => toasts.push(ToastKind::Danger, error.to_string()),
+    }
+}
+
+/// The read of one slot: the bytes, their record, and only then the console.
+///
+/// Every failure is a toast and leaves the machine playing - a slot that is
+/// damaged, from an older build, or for another dump of the same game says which
+/// one it was ([`slots::state_error_toast`]) and the game does not care (M7-15,
+/// #148).
+async fn read_slot(store: SlotStore, slot: u32, toasts: Toasts) {
+    let key = store.key(slot);
+    let bytes = match store.db.get(storage::Store::States, &key).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            toasts.push(ToastKind::Info, format!("Slot {} is empty", slot + 1));
+            return;
+        }
+        Err(error) => {
+            toasts.push(ToastKind::Danger, error.to_string());
+            return;
+        }
+    };
+    let record = match slots::decode(&bytes) {
+        Ok(record) => record,
+        Err(error) => {
+            toasts.push(ToastKind::Danger, error.to_string());
+            return;
+        }
+    };
+    let Some(emulator) = running() else {
+        return;
+    };
+    let outcome = emulator.borrow_mut().apply_slot(&record);
+    if let Err(error) = outcome {
+        toasts.push(ToastKind::Danger, slots::state_error_toast(error));
+    }
 }
 
 /// Runs the cartridge in [`LoadedRom`] context on `canvas`, for as long as the
@@ -680,6 +804,100 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
     console
 }
 
+/// Where one cart's save state slots are kept, and what they are keyed by
+/// (M7-15, #148).
+///
+/// Deliberately not part of [`Save`]: that one is `None` for a cart with no
+/// battery-backed RAM, and a cart with no save still has a save *state* - the
+/// whole point of a slot is that it is a picture of the machine rather than the
+/// cartridge's own idea of where the player is.
+#[derive(Clone)]
+struct SlotStore {
+    db: storage::Db,
+    rom_id: String,
+}
+
+impl SlotStore {
+    /// The record `slot` of this cart is stored at.
+    fn key(&self, slot: u32) -> String {
+        storage::state_key(&self.rom_id, slot)
+    }
+}
+
+/// One cart's save state slots, as the shell sees them: which one the quick keys
+/// answer to, and the running console that can read and write them.
+///
+/// `Copy` and holding signals, like [`Controls`], because the top bar, the panel
+/// and the keyboard all need the same one - and `Hotkey::NextSlot` has to be
+/// visible to a player who never opens the panel.
+#[derive(Clone, Copy)]
+pub struct Slots {
+    /// The slot F1 writes and F4 reads, `0..`[`slots::SLOT_COUNT`].
+    pub current: RwSignal<u32>,
+    /// Bumped by every write, so a panel that is showing four cards knows when
+    /// they have gone stale.
+    pub changed: RwSignal<u32>,
+    /// The console the slots belong to.
+    pub console: Controls,
+}
+
+impl Slots {
+    /// The shell's handle on the slots of the console it is running: slot 0 to
+    /// begin with, and nothing written that the shell knows about yet.
+    pub fn new(console: Controls) -> Self {
+        Self {
+            current: RwSignal::new(0),
+            changed: RwSignal::new(0),
+            console,
+        }
+    }
+
+    /// The slot a quick key is about to act on, one step on in `delta`, wrapping
+    /// over the four: F2 and F3.
+    pub fn step(self, delta: i32, toasts: Toasts) {
+        let next = slots::next_slot(self.current.get_untracked(), delta);
+        self.current.set(next);
+        toasts.push(ToastKind::Info, format!("Slot {}", next + 1));
+    }
+
+    /// The current slot: what F1 writes.
+    pub fn save_here(self) {
+        let slot = self.current.get_untracked();
+        self.save(slot);
+    }
+
+    /// The current slot: what F4 reads.
+    pub fn load_here(self) {
+        let slot = self.current.get_untracked();
+        self.load(slot);
+    }
+
+    /// Writes the running console to `slot`, replacing what was there.
+    pub fn save(self, slot: u32) {
+        self.console.save_slot(slot);
+        self.changed.update(|count| *count += 1);
+    }
+
+    /// Reads `slot` back into the running console.
+    pub fn load(self, slot: u32) {
+        self.console.load_slot(slot);
+    }
+}
+
+/// How many blocks of sound to swallow after a load, and no more.
+///
+/// Loading puts the machine's own audio clock back in time, and the mixer - the
+/// host's output path, no part of which is in a save state - is not. So the first
+/// block out of [`Genesis::drain_audio`](genesis::Genesis::drain_audio) after a
+/// load is either nothing at all, for a console that has been running since the
+/// state was written, or everything the mixer had not yet mixed up to the moment
+/// the state was written: measured on a console reloaded from a page load, one
+/// state ten seconds old came back as 962,840 samples at once (#362). Dropping
+/// one block is what keeps that burst off the speakers; a fixed count is what
+/// keeps it from ever becoming a way to lose audio permanently, and a state whose
+/// audio did not come back after this is the mixer's bug, not this drop's.
+const AUDIO_BACKLOG_BLOCKS: u32 = 1;
+
 /// One running console: the machine, the path it is drawn with, and the
 /// animation frame that drives it.
 struct Emulator {
@@ -699,6 +917,16 @@ struct Emulator {
     console: Controls,
     /// The cart's RAM, if it has any and if this browser can keep it: see [`Save`].
     save: Option<Save>,
+    /// The store this game's save state slots live in, and the ROM id they are
+    /// keyed by: `None` only for a browser that would not open IndexedDB at all
+    /// (M7-15, #148).
+    slot_store: Option<SlotStore>,
+    /// Blocks of sound to hand to the output and forget, which is how a console
+    /// whose mixer is now ahead of - or behind - the machine it has just been
+    /// loaded with stops sending that difference to the speakers. One load sets
+    /// this to [`AUDIO_BACKLOG_BLOCKS`], and it is spent, so nothing is ever
+    /// dropped twice: see [`Emulator::apply_state`].
+    drop_audio_blocks: u32,
     /// When the loop last asked [`SramWatcher`] about this cart's RAM, on the
     /// animation frame's clock - the once a second of [`SRAM_CHECK_INTERVAL_MS`].
     sram_checked: f64,
@@ -818,7 +1046,15 @@ impl Emulator {
         // The saved RAM goes in here, before the loop is armed: `install_save` is
         // the one place a cart is given its save, and it is the reason `start` is
         // called only once storage has answered (M7-14, #147).
-        let save = install_save(&mut genesis, saved, &rom.id);
+        let save = install_save(&mut genesis, saved.as_ref(), &rom.id);
+        // The slot store is the same database and the same ROM id, and unlike
+        // [`Save`] it is here for every cart: a save state is a picture of the
+        // machine, so a game with no battery-backed RAM saves and loads just the
+        // same as one with it.
+        let slot_store = saved.map(|saved| SlotStore {
+            db: saved.db,
+            rom_id: rom.id.clone(),
+        });
 
         let target_hz = target_hz(&config, &rom.bytes);
         // One read of the canvas, and both the baseline `paint` compares against
@@ -831,6 +1067,8 @@ impl Emulator {
             settings,
             console,
             save,
+            slot_store,
+            drop_audio_blocks: 0,
             sram_checked: now_ms(),
             toasts,
             samples: Vec::new(),
@@ -948,6 +1186,65 @@ impl Emulator {
         ));
     }
 
+    /// What one slot would hold if it were written now: the machine as
+    /// [`Genesis::save_state`](genesis::Genesis::save_state) has it, and a card's
+    /// picture taken from the frame that is already converted in [`Emulator::rgba`].
+    ///
+    /// The CPU-side buffer, never the canvas: the WebGL path draws through a
+    /// shader, and a read back from a canvas that has been drawn with is not the
+    /// picture a person is looking at (#146 measured that the hard way).
+    ///
+    /// `None` when this cart has nowhere to keep slots, or when no frame has been
+    /// painted yet - the first frame of a cartridge is a moment with no picture to
+    /// put on a card, and an empty thumbnail says so on the card rather than
+    /// lying about the game's first frame.
+    fn capture_slot(&self) -> Option<(SlotStore, slots::SlotRecord)> {
+        let store = self.slot_store.clone()?;
+        let (thumb_rgba, thumb_w, thumb_h) =
+            slots::make_thumbnail(&self.rgba, self.drawn.0, self.drawn.1);
+        Some((
+            store,
+            slots::SlotRecord {
+                created_ms: crate::slots::clock_ms() as u64,
+                thumb_rgba,
+                thumb_w,
+                thumb_h,
+                state: self.genesis.save_state(),
+            },
+        ))
+    }
+
+    /// Puts a slot's state back into the machine, and the console back on screen
+    /// and on the speakers (M7-15, #148).
+    ///
+    /// Three things happen once [`Genesis::load_state`] has said yes - and nothing
+    /// happens before it has, because a refused load is required to leave the
+    /// machine alone and is:
+    ///
+    /// * the sound that was already on its way to the speakers stops, because it
+    ///   is the sound of the moment the console has just left, and
+    ///   [`crate::audio::AudioOut::discard`] is the only way to call it back;
+    /// * the first block the mixer hands out afterwards is dropped - see
+    ///   [`AUDIO_BACKLOG_BLOCKS`], which is the web half of
+    ///   [#362](https://github.com/scottjab/rustsega/issues/362);
+    /// * the cart's RAM is offered to storage, because a state carries the
+    ///   cartridge's save with it and a player who loads an older save means the
+    ///   older battery save too. The watcher decides whether anything actually
+    ///   moved (M7-14, #147).
+    ///
+    /// Then a frame is painted, so a player who loads while held sees the moment
+    /// they went back to rather than the one they left.
+    fn apply_slot(&mut self, record: &slots::SlotRecord) -> Result<(), genesis::StateError> {
+        self.genesis.load_state(&record.state)?;
+        if let Some(audio) = self.audio.as_mut() {
+            audio.discard();
+        }
+        self.drop_audio_blocks = AUDIO_BACKLOG_BLOCKS;
+        self.paint();
+        self.flush_sram(now_ms(), true);
+        Ok(())
+    }
+
     /// Reports the page's merged pad state to the console, once per frame.
     ///
     /// Before [`genesis::Genesis::run_frame`], because that call reads the pads
@@ -1008,6 +1305,16 @@ impl Emulator {
         }
         self.samples.clear();
         self.genesis.drain_audio(&mut self.samples);
+        if self.drop_audio_blocks > 0 {
+            self.drop_audio_blocks -= 1;
+            if !self.samples.is_empty() {
+                // The whole of the backlog in one `Vec` is the point: dropping it
+                // has to free the bytes, or a single load has cost the page the
+                // age of the state in audio it will never hear.
+                self.samples = Vec::new();
+            }
+            return;
+        }
         if !audio.push(&self.samples) {
             // The context would not take this block, so it will not take the next
             // one either: fall back to the frame pacer, and let a later gesture

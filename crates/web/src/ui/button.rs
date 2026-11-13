@@ -31,6 +31,11 @@ pub fn Button(
     /// Visual weight; [`ButtonVariant::Ghost`] unless the caller says otherwise.
     #[prop(optional)]
     variant: ButtonVariant,
+    /// Inert: the real `disabled` attribute, so the button is out of the tab
+    /// order as well as unclickable. A control for something that is not there
+    /// yet says so - an empty save slot has nothing to load (M7-15, #148).
+    #[prop(optional, into)]
+    disabled: Signal<bool>,
     /// Called when the button is activated: click, Enter or Space.
     on_click: Callback<()>,
     children: Children,
@@ -39,6 +44,7 @@ pub fn Button(
         <button
             type="button"
             class=variant.class()
+            disabled=disabled
             on:click=move |_| on_click.run(())
         >
             {children()}
