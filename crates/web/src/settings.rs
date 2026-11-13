@@ -346,8 +346,12 @@ impl Settings {
 }
 
 /// This profile's `localStorage`, if there is a window to hang it on.
+///
+/// Shared with [`crate::recents`], which keeps its own key here on the same
+/// terms: a write the browser refused is a write both ignore rather than a
+/// second way to fail.
 #[cfg(target_arch = "wasm32")]
-fn storage() -> Option<web_sys::Storage> {
+pub(crate) fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
 }
 
