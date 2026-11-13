@@ -31,6 +31,7 @@ use crate::input::PadButton;
 use crate::input::Source;
 use crate::input::gamepad;
 use crate::input::touch::{self, Control, ControlBox, DpadDir, TouchTracker};
+use crate::settings::Settings;
 use crate::ui::icons;
 
 /// The port the overlay drives.
@@ -49,59 +50,11 @@ const VIBRATE_MS: u32 = 10;
 /// The media query that says the browser's least precise pointer is a finger.
 const COARSE_QUERY: &str = "(pointer: coarse)";
 
-/// The overlay's settings, as signals and nothing else.
-///
-/// M7-10 (#143) is what stores these and builds the settings page that owns them;
-/// they are one struct so that it has one thing to lift.
-#[derive(Clone, Copy)]
-pub struct TouchSettings {
-    /// Show the overlay even when the browser reports a precise pointer: how a
-    /// desktop player tries it on, and what a tablet with a keyboard attached
-    /// needs.
-    pub show: RwSignal<bool>,
-    /// `navigator.vibrate` on a press, on browsers that have it.
-    pub vibrate: RwSignal<bool>,
-    /// Hide the overlay while a physical controller is connected, because a player
-    /// holding a pad does not want a translucent set of buttons under their thumbs.
-    pub hide_with_controller: RwSignal<bool>,
-}
-
-/// The defaults a new tab gets: no overlay on a desktop, and a buzz on a phone.
-///
-/// `show` is off because [`coarse_pointer`] already turns the overlay on for the
-/// devices that need it, and a desktop visitor should not be handed a set of buttons
-/// they have no thumb for. Both the other two are the answer the ticket gives.
-impl Default for TouchSettings {
-    fn default() -> Self {
-        Self {
-            show: RwSignal::new(false),
-            vibrate: RwSignal::new(true),
-            hide_with_controller: RwSignal::new(true),
-        }
-    }
-}
-
-impl TouchSettings {
-    /// The settings of a new tab, as [`Default`] has them.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Whether the overlay belongs on screen.
-    ///
-    /// Wanted by the device or by the player, and not cancelled by a controller
-    /// having turned up. The controller rule only applies while it is switched on.
-    pub fn visible(&self, coarse: bool, controller_connected: bool) -> bool {
-        let wanted = self.show.get() || coarse;
-        wanted && !(self.hide_with_controller.get() && controller_connected)
-    }
-}
-
 /// Whether this browser's pointer is a finger.
 ///
 /// `matchMedia` is the only way to ask, and it answers about the device rather than
 /// about the current gesture: a touch-capable laptop says `true` the moment it has a
-/// touchscreen, which is why the [`TouchSettings::show`] setting exists beside it
+/// touchscreen, which is why the [`Settings::touch_overlay`] setting exists beside it
 /// rather than instead of it. `false` when there is no window, or no `matchMedia`.
 pub fn coarse_pointer() -> bool {
     web_sys::window()
@@ -128,7 +81,7 @@ struct Overlay {
     layout: Vec<ControlOnScreen>,
     /// Whether a press buzzes. Read at the press rather than captured at mount:
     /// it is a setting, so the player can change their mind mid-game.
-    vibrate: RwSignal<bool>,
+    settings: RwSignal<Settings>,
 }
 
 impl Overlay {
@@ -271,7 +224,7 @@ fn mark(overlay: &mut Overlay, buzz: bool) -> Decision {
     let held = overlay.tracker.held();
     Decision {
         changed,
-        buzz: buzz && overlay.vibrate.get(),
+        buzz: buzz && overlay.settings.with(|settings| settings.haptics),
         marks: overlay
             .layout
             .iter()
@@ -318,15 +271,15 @@ fn release_everything() {
 /// The on-screen controller: the nine controls, the menu button, and the pointer
 /// listeners for exactly as long as it is on screen.
 ///
-/// Mounted by [`crate::app`] behind [`TouchSettings::visible`], so its listeners
+/// Mounted by [`crate::app`] behind [`Settings::touch_visible`], so its listeners
 /// exist while - and only while - the player can see the controls. `on_cleanup`
 /// takes them away with every held button, because the overlay can be unmounted
 /// under a finger: a controller connecting is enough.
 #[component]
 pub fn TouchOverlay(
-    /// Only [`TouchSettings::vibrate`] is read here; the other two decide whether
-    /// this component is mounted at all.
-    settings: TouchSettings,
+    /// Only [`Settings::haptics`] is read here; the rest decide whether this
+    /// component is mounted at all (M7-10, #143, which is also what stores them).
+    settings: RwSignal<Settings>,
     /// Opened by the menu button, because a phone has no Escape key and in
     /// landscape the top bar is behind the picture.
     drawer_open: RwSignal<bool>,
@@ -336,7 +289,7 @@ pub fn TouchOverlay(
             tracker: TouchTracker::new(),
             held: Vec::new(),
             layout: Vec::new(),
-            vibrate: settings.vibrate,
+            settings,
         });
     });
 
@@ -539,52 +492,6 @@ fn ControlButton(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The settings, with the reactive owner they need to be read under - and the
-    /// owner comes back with them, because a signal read on a disposed signal is a
-    /// panic and it is the owner's lifetime that decides that.
-    fn settings() -> (TouchSettings, Owner) {
-        let owner = Owner::new();
-        owner.set();
-        (TouchSettings::new(), owner)
-    }
-
-    #[test]
-    fn a_new_tab_wants_no_overlay_on_a_desktop_and_a_buzz_on_a_phone() {
-        let (settings, _owner) = settings();
-        assert!(!settings.show.get());
-        assert!(settings.vibrate.get());
-        assert!(settings.hide_with_controller.get());
-    }
-
-    #[test]
-    fn a_coarse_pointer_shows_the_overlay_and_a_precise_one_does_not() {
-        let (settings, _owner) = settings();
-        assert!(settings.visible(true, false));
-        assert!(!settings.visible(false, false));
-    }
-
-    #[test]
-    fn the_setting_shows_the_overlay_on_a_desktop_too() {
-        let (settings, _owner) = settings();
-        settings.show.set(true);
-        assert!(settings.visible(false, false));
-    }
-
-    #[test]
-    fn a_connected_controller_hides_the_overlay_by_default() {
-        let (settings, _owner) = settings();
-        assert!(!settings.visible(true, true));
-        // Asked for by the player beats a controller they also happen to have.
-        settings.show.set(true);
-        assert!(!settings.visible(false, true));
-        // ... unless they have said the overlay stays.
-        settings.hide_with_controller.set(false);
-        assert!(settings.visible(false, true));
-        // And a controller changes nothing when there is no overlay to hide.
-        settings.show.set(false);
-        assert!(!settings.visible(false, true));
-    }
 
     #[test]
     fn every_control_has_a_selector_and_the_menu_button_is_not_one() {

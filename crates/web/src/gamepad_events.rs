@@ -28,16 +28,23 @@ use web_sys::GamepadButton;
 use web_sys::GamepadEvent;
 use web_sys::GamepadMappingType;
 
+use crate::controls::CaptureDevice;
+use crate::controls::CaptureTarget;
+use crate::controls::bind_pad;
 use crate::emulator::Controls;
-use crate::input::Bindings;
 use crate::input::PadButton;
 use crate::input::Source;
 use crate::input::gamepad;
 use crate::input::gamepad::PadSlots;
 use crate::input::keyboard::Hotkey;
 use crate::keyboard_events::hotkey_do;
+use crate::settings::Settings;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
+
+/// The baseline a Controller-cell capture is measured against: the capture it
+/// belongs to, and every pad's held button indices as of the last frame.
+type CaptureBaseline = (CaptureTarget, Vec<(u8, Vec<u8>)>);
 
 /// One port's pad, as the last animation frame read it.
 #[derive(Default)]
@@ -53,10 +60,17 @@ struct PadSeen {
 /// and the shell a pad can reach through a hotkey.
 struct Watcher {
     slots: PadSlots,
-    /// One table, read on every reading and written by nobody until the controls
-    /// page (M7-10, #143) - the same arrangement as the keyboard's in
+    /// The store the controls page writes, read on every reading so a rebind
+    /// lands on the next frame - the same arrangement as the keyboard's in
     /// [`crate::keyboard_events`].
-    bindings: Bindings,
+    settings: RwSignal<Settings>,
+    /// The cell of the controls page waiting for a pad button, if there is one.
+    capture: RwSignal<Option<CaptureTarget>>,
+    /// Each pad's held button indices as of the last frame, kept only while a
+    /// Controller cell is capturing, and paired with the capture they belong to
+    /// so that arming a new cell throws the old baseline away. See
+    /// [`gamepad::newly_pressed`] for why the capture wants the edge.
+    capture_baseline: Option<CaptureBaseline>,
     /// Indexed by port, and reset whenever a pad takes a slot, so a pad cannot
     /// inherit the held buttons of the pad that left it.
     seen: Vec<PadSeen>,
@@ -110,8 +124,14 @@ impl Watcher {
     /// One pad's reading: move its port in [`crate::input`] to what it reports
     /// now, and return the hotkey it has just started asking for.
     fn poll_pad(&mut self, pad: &Reading) -> Option<Hotkey> {
+        // Before the port is looked up: the shared gamepad map is keyed by button
+        // index rather than by pad, so whichever pad just pressed a button is the
+        // one that finishes the capture (M7-10, #143).
+        self.capture_press(pad);
         let port = self.slots.port_of(pad.index)?;
-        let buttons = gamepad::poll_snapshot(&pad.buttons, &pad.axes, &self.bindings);
+        let buttons = self.settings.with_untracked(|settings| {
+            gamepad::poll_snapshot(&pad.buttons, &pad.axes, &settings.bindings)
+        });
         let hotkey = gamepad::poll_hotkey(&pad.buttons);
         let seen = &mut self.seen[port];
         let previous = std::mem::take(&mut seen.buttons);
@@ -124,6 +144,66 @@ impl Watcher {
         let last = std::mem::replace(&mut seen.hotkey, hotkey);
         if hotkey != last { hotkey } else { None }
     }
+
+    /// One frame of one pad, spent on the controls page's capture: bind the first
+    /// button this pad newly pressed and stop waiting.
+    ///
+    /// Does nothing at all - and allocates nothing - while no cell is waiting,
+    /// which is every frame of a normal game.
+    fn capture_press(&mut self, pad: &Reading) {
+        let Some(target) = self.capture_target() else {
+            self.capture_baseline = None;
+            return;
+        };
+        let held = held_indices(&pad.buttons);
+        let previous = self
+            .capture_baseline
+            .as_ref()
+            .filter(|(captured, _)| *captured == target)
+            .and_then(|(_, pads)| pads.iter().find(|(index, _)| *index == pad.index))
+            .map(|(_, held)| held.clone());
+        self.set_capture_baseline(target, pad.index, held.clone());
+        let Some(index) = gamepad::newly_pressed(&held, previous.as_deref()) else {
+            return;
+        };
+        bind_pad(target, index, self.settings, self.toasts);
+        self.capture.set(None);
+    }
+
+    /// The pad button the controls page is waiting for, `None` when it is waiting
+    /// for a key or for nothing.
+    fn capture_target(&self) -> Option<CaptureTarget> {
+        self.capture
+            .get()
+            .filter(|target| target.device == CaptureDevice::Gamepad)
+    }
+
+    /// Records this pad's held buttons as the baseline of `target` for the next
+    /// frame, keeping the other pads' readings and starting a fresh table when
+    /// the capture itself changed.
+    fn set_capture_baseline(&mut self, target: CaptureTarget, index: u8, held: Vec<u8>) {
+        let mut pads = self
+            .capture_baseline
+            .take()
+            .filter(|(captured, _)| *captured == target)
+            .map(|(_, pads)| pads)
+            .unwrap_or_default();
+        match pads.iter_mut().find(|(seen, _)| *seen == index) {
+            Some(entry) => entry.1 = held,
+            None => pads.push((index, held)),
+        }
+        self.capture_baseline = Some((target, pads));
+    }
+}
+
+/// The pressed button indices of one pad, for [`gamepad::newly_pressed`].
+fn held_indices(buttons: &[bool]) -> Vec<u8> {
+    buttons
+        .iter()
+        .enumerate()
+        .filter(|(_, pressed)| **pressed)
+        .map(|(index, _)| u8::try_from(index).unwrap_or(u8::MAX))
+        .collect()
 }
 
 thread_local! {
@@ -143,6 +223,9 @@ fn with_watcher<T>(f: impl FnOnce(&mut Watcher) -> T) -> Option<T> {
 /// On the `window`, because a pad is not a document resource: it belongs to the
 /// browser, and its events arrive with no interesting target.
 ///
+/// `settings` is the store the controls page writes, read on every reading;
+/// `capture` is the cell of that page waiting for a pad button, if there is one.
+///
 /// `console`, `drawer_open` and `toasts` are the shell's, so that the two hotkeys
 /// a pad asks for - `home` and the right trigger - reach the same places the
 /// keyboard's hotkeys do (see [`crate::input::gamepad::poll_hotkey`]).
@@ -156,11 +239,15 @@ pub fn use_gamepad(
     drawer_open: RwSignal<bool>,
     toasts: Toasts,
     controller_connected: RwSignal<bool>,
+    settings: RwSignal<Settings>,
+    capture: RwSignal<Option<CaptureTarget>>,
 ) {
     WATCHER.with(|watcher| {
         *watcher.borrow_mut() = Some(Watcher {
             slots: PadSlots::new(),
-            bindings: Bindings::default(),
+            settings,
+            capture,
+            capture_baseline: None,
             seen: (0..crate::input::PORTS)
                 .map(|_| PadSeen::default())
                 .collect(),

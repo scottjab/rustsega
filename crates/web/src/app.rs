@@ -9,7 +9,8 @@
 use leptos::html;
 use leptos::prelude::*;
 
-use crate::audio::AudioSettings;
+use crate::controls::CaptureTarget;
+use crate::controls::Controls;
 use crate::emulator::use_cartridge;
 use crate::gamepad_events::use_gamepad;
 use crate::keyboard_events::use_keyboard;
@@ -18,9 +19,9 @@ use crate::rom_picker::EmptyScreen;
 use crate::rom_picker::RomFileInput;
 use crate::rom_picker::open_picker;
 use crate::rom_picker::window_drop_target;
+use crate::settings::Settings;
 use crate::theme::Theme;
 use crate::touch_events::TouchOverlay;
-use crate::touch_events::TouchSettings;
 use crate::touch_events::coarse_pointer;
 use crate::ui::button::IconButton;
 use crate::ui::drawer::Drawer;
@@ -49,15 +50,21 @@ pub fn App() -> impl IntoView {
     let toasts = Toasts::default();
     provide_context(toasts);
 
-    let theme = RwSignal::new(Theme::default());
     let drawer_open = RwSignal::new(false);
 
-    // Volume and mute, provided before the console is mounted because
-    // [`use_cartridge`] reads them as it starts a console (M7-05, #138). The
-    // drawer and the top bar write them; `use_cartridge` is what tells the
-    // running console, and M7-10 (#143) is what makes them stick.
-    let audio = AudioSettings::default();
-    provide_context(audio);
+    // The one settings store the shell reads: theme, volume, bindings, pad type
+    // and all (M7-10, #143). Loaded from `localStorage` before anything reads it,
+    // and provided before the console is mounted because [`use_cartridge`] reads
+    // it as it starts a console (M7-05, #138).
+    let settings = RwSignal::new(Settings::load_local());
+    provide_context(settings);
+
+    // The controls page's capture: the cell waiting for its next key or pad
+    // button, which the keyboard listener and the pad poll both have to know
+    // about. A context because the cell is three components down and the
+    // listeners are one.
+    let capture = RwSignal::new(None::<CaptureTarget>);
+    provide_context(capture);
 
     // The cartridge, if one has been opened. Context rather than a prop so M7-04
     // (run it) and M7-16 (the library) can react to it without the shell
@@ -76,7 +83,19 @@ pub fn App() -> impl IntoView {
 
     // Writes `data-theme` on `<html>` now, and again whenever the theme changes.
     Effect::new(move |_| {
-        theme.get().apply_to_document();
+        settings.get().theme.apply_to_document();
+    });
+
+    // Everything the player changes is saved as it changes. No debounce: a
+    // `Settings` is a few hundred bytes of JSON, and `localStorage` is
+    // synchronous anyway (M7-10, #143).
+    Effect::new(move |_| settings.get().save_local());
+
+    // The d-pad conflict rule lives in the store and is applied to the page's
+    // input state, which is where [`crate::input::InputState::buttons`] reads it.
+    Effect::new(move |_| {
+        let socd = settings.get().socd;
+        crate::input::with_state(|input| input.set_socd_mode(socd));
     });
 
     // What the top bar and the screen area show for the cartridge. Read with
@@ -94,7 +113,7 @@ pub fn App() -> impl IntoView {
     // It takes the drawer and the cartridge because a form and a game cannot
     // both have the arrow keys: while a game runs the keys are swallowed and go
     // to the pad, and while the drawer is open they are the drawer's.
-    use_keyboard(console, drawer_open, loaded, toasts);
+    use_keyboard(console, drawer_open, loaded, toasts, settings, capture);
 
     // Whether a controller is plugged in, which the touch overlay hides itself
     // behind and nothing else asks about (M7-09, #142).
@@ -104,15 +123,23 @@ pub fn App() -> impl IntoView {
     // long as the shell is up (M7-08, #141). No `loaded` this time: a pad that
     // is plugged in is a pad the player is holding, whether or not a cartridge
     // is in, and its connect/disconnect news is worth a toast either way.
-    use_gamepad(console, drawer_open, toasts, controller_connected);
+    use_gamepad(
+        console,
+        drawer_open,
+        toasts,
+        controller_connected,
+        settings,
+        capture,
+    );
 
     // The on-screen controller: on for a phone, on for a desktop that asked, off
     // for a phone whose player picked up a pad. `coarse` is read once - a browser
     // does not change what kind of pointer the machine has while the page is open,
     // and the setting is there for the machine that does (M7-09, #142).
-    let touch = TouchSettings::new();
     let coarse = coarse_pointer();
-    let touch_visible = Signal::derive(move || touch.visible(coarse, controller_connected.get()));
+    let touch_visible = Signal::derive(move || {
+        settings.with(|settings| settings.touch_visible(coarse, controller_connected.get()))
+    });
 
     // The two console controls. Re-rendered as a unit because both the icon of
     // one and the `disabled` of the other follow the console, and an icon-only
@@ -145,7 +172,7 @@ pub fn App() -> impl IntoView {
         .iter()
         .map(|option| SelectOption::new(option.to_string(), option.label()))
         .collect();
-    let selected_theme = Signal::derive(move || theme.get().to_string());
+    let selected_theme = Signal::derive(move || settings.get().theme.to_string());
 
     view! {
         // `app--touch` is what tells the screen area to give the controls room of
@@ -190,7 +217,7 @@ pub fn App() -> impl IntoView {
                 <nav class="topbar__actions" aria-label="Console">
                     {console_buttons}
                     {move || {
-                        let muted = audio.muted.get();
+                        let muted = settings.with(|settings| settings.muted);
                         let (label, path) = if muted {
                             ("Unmute", icons::VOLUME_OFF)
                         } else {
@@ -201,7 +228,7 @@ pub fn App() -> impl IntoView {
                                 label=label.to_string()
                                 path=path
                                 on_click=Callback::new(move |_| {
-                                    audio.muted.update(|state| *state = !*state);
+                                    settings.update(|settings| settings.muted = !settings.muted);
                                 })
                             />
                         }
@@ -252,12 +279,12 @@ pub fn App() -> impl IntoView {
                         selected=selected_theme
                         on_change=Callback::new(move |value: String| {
                             if let Ok(next) = value.parse::<Theme>() {
-                                theme.set(next);
+                                settings.update(|settings| settings.theme = next);
                             }
                         })
                     />
                     <p class="settings-section__note">
-                        Settings live in this tab: M7-10 (#143) is what makes them stick.
+                        "Every setting on this page is saved in this browser."
                     </p>
                 </section>
 
@@ -268,39 +295,31 @@ pub fn App() -> impl IntoView {
                         min=0.0
                         max=1.0
                         step=0.05
-                        value=audio.volume
+                        value=Signal::derive(move || settings.with(|settings| settings.volume))
+                        on_input=Callback::new(move |volume: f64| {
+                            settings.update(|settings| settings.volume = volume);
+                        })
                     />
-                    <Toggle label="Mute".to_string() checked=audio.muted />
+                    <Toggle
+                        label="Mute".to_string()
+                        checked=Signal::derive(move || settings.with(|settings| settings.muted))
+                        on_toggle=Callback::new(move |()| {
+                            settings.update(|settings| settings.muted = !settings.muted);
+                        })
+                    />
                     <p class="settings-section__note">
                         Sound waits for a click, because no browser will start an audio
                         clock until the page has had one.
                     </p>
                 </section>
 
-                <section class="settings-section">
-                    <h3 class="settings-section__title">Controls</h3>
-                    <p class="settings-section__note">
-                        "Press any button on your controller: no browser gives a page a pad
-                        until it has had one. Two controllers become ports 1 and 2, in the
-                        order they arrived."
-                    </p>
-                    <Toggle label="Show touch controls".to_string() checked=touch.show />
-                    <Toggle
-                        label="Hide touch controls when a controller is connected".to_string()
-                        checked=touch.hide_with_controller
-                    />
-                    <Toggle label="Vibrate on press".to_string() checked=touch.vibrate />
-                    <p class="settings-section__note">
-                        "The on-screen pad appears by itself when the browser says your
-                        pointer is a finger."
-                    </p>
-                </section>
+                <Controls drawer_open=drawer_open />
             </Drawer>
 
             // The touch overlay, mounted exactly while it is on screen: its pointer
             // listeners and its release-on-unmount come and go with it.
             <Show when=move || touch_visible.get()>
-                <TouchOverlay settings=touch drawer_open=drawer_open />
+                <TouchOverlay settings=settings drawer_open=drawer_open />
             </Show>
 
             <ToastArea/>

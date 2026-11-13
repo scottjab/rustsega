@@ -4,12 +4,18 @@
 use leptos::prelude::*;
 
 /// A two-state switch bound to a `bool` signal.
+///
+/// Read and write are separate - a [`Signal`] and a [`Callback`] rather than an
+/// `RwSignal` - because the settings store (M7-10, #143) is one struct behind one
+/// signal and a switch is one field of it. Same shape as [`crate::ui::select::Select`].
 #[component]
 pub fn Toggle(
     /// The switch's visible label, also its accessible name.
     label: String,
-    /// The state the switch reads and writes.
-    checked: RwSignal<bool>,
+    /// The state the switch reads.
+    checked: Signal<bool>,
+    /// Called when the switch is activated: click, Space or Enter.
+    on_toggle: Callback<()>,
 ) -> impl IntoView {
     view! {
         <button
@@ -17,7 +23,7 @@ pub fn Toggle(
             class="toggle"
             role="switch"
             attr:aria-checked=move || checked.get().to_string()
-            on:click=move |_| checked.update(|state| *state = !*state)
+            on:click=move |_| on_toggle.run(())
         >
             <span class="toggle__track" aria-hidden="true">
                 <span class="toggle__thumb"></span>

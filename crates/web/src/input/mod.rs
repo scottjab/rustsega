@@ -36,8 +36,11 @@ pub mod touch;
 use std::cell::RefCell;
 
 use genesis::Buttons;
+use serde::Deserialize;
+use serde::Serialize;
 
 pub use bindings::Bindings;
+pub use bindings::Displaced;
 pub use button::PadButton;
 
 /// The control ports the page drives: the console's two pad ports.
@@ -82,13 +85,31 @@ pub enum Source {
 /// A physical d-pad cannot press both of a pair, and games that see both do
 /// unpredictable things with it - which is why [`SocdMode::Neutral`] is the
 /// default rather than "report both and hope".
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `serde` names are the ones the settings store writes (M7-10, #143), so they
+/// are snake_case and stable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SocdMode {
     /// Opposing directions cancel: holding Left and Right reports neither.
     #[default]
     Neutral,
     /// The direction pressed most recently wins, even across sources.
     LastWins,
+}
+
+impl SocdMode {
+    /// Every rule, in the order the settings select lists them.
+    pub const ALL: [Self; 2] = [Self::Neutral, Self::LastWins];
+
+    /// The label for this rule in the settings drawer, in the player's words
+    /// rather than the acronym (M7-10, #143).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Neutral => "Opposite directions cancel",
+            Self::LastWins => "Last press wins",
+        }
+    }
 }
 
 /// One button held down by one source.

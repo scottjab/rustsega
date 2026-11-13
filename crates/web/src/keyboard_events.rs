@@ -12,16 +12,28 @@ use leptos::ev;
 use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
+use crate::controls::CaptureDevice;
+use crate::controls::CaptureTarget;
+use crate::controls::bind_key;
 use crate::emulator::Controls;
-use crate::input::Bindings;
 use crate::input::Source;
+use crate::input::keyboard::CaptureKey;
 use crate::input::keyboard::Hotkey;
 use crate::input::keyboard::KeyAction;
+use crate::input::keyboard::capture_key;
 use crate::input::keyboard::element_takes_key;
 use crate::input::keyboard::map_key;
 use crate::input::keyboard::should_prevent_default;
+use crate::settings::Settings;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
+
+/// What a player is told when they try to bind one of the shell's fixed keys.
+///
+/// [`map_key`] gives a hotkey its key whatever the bindings say, so the binding
+/// would be dead the moment it was written; saying so is cheaper than a row in
+/// the table that does nothing (M7-10, #143).
+const REFUSED_KEY: &str = "That key stays the shell's: Escape, Tab, F1, F4, F11 and P are fixed.";
 
 /// Listens to the keyboard for as long as the component that calls this is
 /// mounted: `keydown` and `keyup` to move the pad, and `blur` to let go of it.
@@ -32,23 +44,49 @@ use crate::ui::toast::Toasts;
 /// second reason either - it is unmounted and remounted around the empty screen
 /// (`app.rs`), and a key held across that change would be held by nothing.
 ///
-/// `bindings` is [`Bindings::default`] until the controls page (M7-10, #143)
-/// stores a table of the player's own; `playing` is whether a cartridge is
-/// loaded, which decides how much of the page's keyboard the game gets - see
+/// `settings` is the store the controls page writes, read on every event so a
+/// rebind takes effect on the next keypress rather than the next page load;
+/// `capture` is the cell of that page waiting for a key, if there is one, and it
+/// outranks everything below it. `playing` is whether a cartridge is loaded,
+/// which decides how much of the page's keyboard the game gets - see
 /// [`should_prevent_default`].
 pub fn use_keyboard(
     console: Controls,
     drawer_open: RwSignal<bool>,
     playing: Signal<bool>,
     toasts: Toasts,
+    settings: RwSignal<Settings>,
+    capture: RwSignal<Option<CaptureTarget>>,
 ) {
-    // One table, read on every event and written by nobody until M7-10 (#143).
-    let bindings = Bindings::default();
-
     let pressed = {
-        let bindings = bindings.clone();
         window_event_listener(ev::keydown, move |event: web_sys::KeyboardEvent| {
-            let action = map_key(&event.code(), &bindings);
+            let code = event.code();
+            // A cell of the controls page is capturing, so it gets the key ahead
+            // of the hotkeys - `Escape` cancels the rebind rather than shutting
+            // the drawer, and a key that is only a hotkey is refused rather than
+            // bound to something it can never drive. Before the focus rule,
+            // because a click on a cell leaves the focus wherever it was.
+            if let Some(target) = capture.get() {
+                match capture_key(&code) {
+                    CaptureKey::Cancel => {
+                        event.prevent_default();
+                        capture.set(None);
+                    }
+                    CaptureKey::Bind { code } => {
+                        // `Tab` would move the focus out of the drawer mid-rebind
+                        // and an arrow key would scroll it, so the browser is
+                        // told nothing about a key the player is spending here.
+                        event.prevent_default();
+                        if target.device == CaptureDevice::Keyboard {
+                            bind_key(target, &code, settings, toasts);
+                            capture.set(None);
+                        }
+                    }
+                    CaptureKey::Refused => toasts.push(ToastKind::Warn, REFUSED_KEY),
+                }
+                return;
+            }
+            let action = settings.with(|settings| map_key(&code, &settings.bindings));
             if takes_key_for_itself(&event) {
                 // A key aimed at a text entry or a `select` is that element's
                 // business, so the pad never hears of it. Saying nothing here is
@@ -72,14 +110,14 @@ pub fn use_keyboard(
     };
 
     let released = {
-        let bindings = bindings.clone();
         window_event_listener(ev::keyup, move |event: web_sys::KeyboardEvent| {
             // No focus rule and no `preventDefault` here: a release always
             // belongs to the game. A direction held on the way into a field -
             // the player clicked the theme list without letting go of
             // `ArrowDown` - has to stop when the key does, or the game walks on
             // for the rest of the session.
-            if let KeyAction::Pad { port, button } = map_key(&event.code(), &bindings) {
+            let action = settings.with(|settings| map_key(&event.code(), &settings.bindings));
+            if let KeyAction::Pad { port, button } = action {
                 crate::input::with_state(|input| input.set(Source::Keyboard, port, button, false));
             }
         })

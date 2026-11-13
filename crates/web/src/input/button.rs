@@ -69,6 +69,30 @@ impl PadButton {
         Self::Mode,
     ];
 
+    /// The name the pad prints beside this button, for the controls page
+    /// (M7-10, #143).
+    ///
+    /// Written out per variant next to [`PadButton::buttons`] for the same
+    /// reason: the order of `B`, `C` and `A` on a Mega Drive pad is neither
+    /// alphabetical nor the enum's, and a generated list is where a label would
+    /// quietly go wrong.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::A => "A",
+            Self::B => "B",
+            Self::C => "C",
+            Self::Start => "Start",
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::Z => "Z",
+            Self::Mode => "Mode",
+        }
+    }
+
     /// The [`genesis::Buttons`] bit this button is.
     ///
     /// Written out per variant, and the test below checks all twelve: the bit
@@ -95,6 +119,13 @@ impl PadButton {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_button_names_itself_for_the_controls_page() {
+        for button in PadButton::ALL {
+            assert_eq!(button.label(), format!("{button:?}"));
+        }
+    }
 
     #[test]
     fn each_pad_button_is_the_genesis_bit_named_after_it() {
