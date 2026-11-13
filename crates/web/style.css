@@ -348,6 +348,15 @@ canvas {
   color: var(--text);
 }
 
+/* The region the header claims, beside the title: a fact, so smaller and
+   monospaced rather than part of the name (M7-03, #136). */
+.now-playing__region {
+  margin-left: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
 .topbar__actions {
   display: flex;
   gap: var(--space-1);
@@ -398,6 +407,70 @@ canvas {
   background: var(--bg-screen);
   box-shadow: 0 12px 32px rgb(0 0 0 / 45%);
   image-rendering: pixelated;
+}
+
+/* While a file is over the page the whole screen area is the drop target, and
+   says so (M7-03, #136). An outline rather than a border: `border` would add
+   3px to a grid cell whose content is sized from the space left to it. */
+.screen-area--drag {
+  outline: 3px dashed var(--accent);
+  outline-offset: -8px;
+}
+
+/* The empty state: what the screen area shows in place of the canvas until a
+   ROM arrives. It is a card, not a frame, so that the dashed edge reads as
+   "drop here" and not as a broken screen. */
+.empty-state {
+  position: relative;
+  display: grid;
+  justify-items: center;
+  gap: var(--space-3);
+  width: min(320px, 100%);
+  padding: var(--space-6) var(--space-4);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-card);
+  text-align: center;
+}
+
+.empty-state__icon {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+
+.empty-state__icon .icon {
+  width: 24px;
+  height: 24px;
+}
+
+.empty-state__title {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-emphasis);
+}
+
+.empty-state__hint {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* The file input every "Open ROM" button drives (see `rom_picker::open_picker`).
+   Off the layout but not `display: none`, which a scripted `click()` cannot be
+   relied on to open in every browser. */
+.file-input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  pointer-events: none;
 }
 
 /* ----------------------------------------------------- drawer and toasts -- */
