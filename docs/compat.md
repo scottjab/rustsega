@@ -8,6 +8,68 @@
 | Blank | 567 |
 | Panic | 97 |
 
+The tables here are the sweep of #124 as reswept after #349. The sweep has been run
+again since, at `1536bb5`, for the M6-13 triage (#133): **Boots 2112, Blank 567,
+Panic 96**. Three rows moved, all of them from #78's mapper work (`87981e3`):
+`Tom Clown (Taiwan) (En) (Unl).md` Panic -> Boots, and `Funny World & Balloon Boy
+(USA) (Unl).md` and `Whac-a-Critter (USA) (Unl).md` gained colours (26 -> 31 and 7
+-> 22). The tables below are not regenerated here, because #133 is a triage and not
+authorised to rewrite this page's data.
+
+## Known issues
+
+One issue per cause, from the M6-13 triage (#133): `just test-all`,
+`just test-commercial` and the 2775-ROM sweep. `just test-all` fails on exactly one
+test by design and `just test-commercial` on the same one, both until #362 is fixed.
+
+| Issue | Cause | ROMs |
+|---|---|---|
+| [#371](https://github.com/scottjab/rustsega/issues/371) | A mid-frame V28/V30 switch moves the VBlank line, so `run_frame`'s watchdog fires a frame early. 48 carts report `314 lines` (all PAL) and 35 report `263` (33 `usa`, 2 `japan`): the same event on the two rasters, since the guard is `lines_per_frame + 1`. [#354](https://github.com/scottjab/rustsega/issues/354) is the inventory of these 83 and should close into #371. | 83 |
+| [#355](https://github.com/scottjab/rustsega/issues/355) | Unimplemented 68000 opcodes: `4741` x9, `00FF` x3, `00FA` x1. Seven of the nine `4741` hits are five betas of `NFL '95` and two Pro Action Replay carts, so it is narrower than nine separate instruction gaps. `0AC6` is gone since #78. | 13 |
+| [#374](https://github.com/scottjab/rustsega/issues/374) | The SVP DSP in the `Virtua Racing` cartridge, which nothing in the tree models. `Virtua Racing (USA)` and `(Japan) (En)` stay `#000000` at every frame sampled. | 2 |
+| [#375](https://github.com/scottjab/rustsega/issues/375) | 28 retail carts that draw pure black at all 21 sampled frame counts, with and without input - diagnosis ticket, including the `QuackShot` rev pair where `-00` boots and `-01` does not. | 28 |
+| [#357](https://github.com/scottjab/rustsega/issues/357) | The 2 MB/4 MB Taiwan and China unlicensed carts, which are not a mapper problem. 26 of them are still in the never-drawing set; listed on the issue. | 26 |
+| [#373](https://github.com/scottjab/rustsega/issues/373) | **This is why the `Blank` number above should not be read as 567 broken games.** The sweep samples one frame, at 600, with no pad connected. Re-running the 536 non-BIOS `Blank` ROMs at other frame counts and with input shows 426 of them do draw: 379 at another frame with no input, 27 more only once a button is held, and 20 more at frame counts outside that first set (12 with no input, 8 only with input). | 426 |
+| [#362](https://github.com/scottjab/rustsega/issues/362) | The one failing test: `commercial_save_state_is_audible_after_a_load`. Loading a state leaves the mixer ahead of the machine, so the console goes silent for as many frames as it ran between the save and the load. | - |
+
+### Deliberately out of scope
+
+These are in `~/games/roms/genesis` and are counted as failures by the sweep, but
+they are not Mega Drive games this emulator can run, so they are listed rather than
+filed:
+
+- **31 BIOS images** (`[BIOS] *.md`): Sega CD 1/2, CDX, WonderMega, X'Eye, Teradrive
+  and the Mega Drive/Genesis boot ROMs. Sega CD and 32X are out of scope for the
+  project, and the rest need a lock-on or TMSS path rather than a bug fix.
+- **20 development, download and program carts**: `Sega Channel` x4,
+  `Sega Game Toshokan`, `Wonder Library`, `Wonder MIDI`, `Sega Art Tool`,
+  `Pro CDX`, `MD Soft Checker`, the seven `Sega Net Cartridge` / `Game no Kanzume`
+  net-cart images (`16t`, `Aworg`, `Hyper Marbles` and the four
+  `Phantasy Star II` scenario carts), and three HeartBeat Catalyst prototypes
+  (`NHLPA Hockey`, `Outworld 2375 A.D.`, `PGA Tour Golf II`). They need a modem, a
+  Mega CD, or dev hardware.
+- **8 re-release container images**: the four `Sonic Classic Collection` files, two
+  `Mega Drive Mini 2` files (`Futari de Puyo Puyo Sun`, `VS Puyo Puyo Sun`) and two
+  Virtual Console dumps (`Dyna Brothers 2 Special`, `Phantasy Star II (Rev A)`).
+  They do carry Mega Drive headers - the sweep reads titles and serials off them - so
+  unlike the entries above these may be real Mega Drive images. They are listed here
+  rather than filed only because a container-specific boot path is the obvious first
+  thing to rule out before anyone spends a session on them.
+- **1 lock-on-only image**: `Sonic & Knuckles (World) (Lock-on).bin`, which is the
+  lock-on child, not a standalone cart.
+- Betas and protos are not separately filed: the 25 in the never-drawing set are
+  builds of titles that draw fine in their retail form, and should fall with
+  whatever fixes their parent (#375, #357).
+
+### Method, so the numbers can be repeated
+
+`headless sweep ~/games/roms/genesis --jobs 24 --frames 600` takes 103 s wall clock
+on 28 cores. The wider per-ROM sampling behind #373 and #375 was
+`headless run <rom> --colours` at the frame counts 60, 120, 180, 240, 300, 420, 540,
+600, 700, 900, 1200, 1500, 2100, 2400, 2700 and 3600, with and without `--pad1`, and
+`identify -format %k` plus `convert ... txt:-` on `--dump-png` output to read back
+what the single colour actually was (`#000000`).
+
 ### Blank (567 - see the CSV for the full table)
 
 | ROM | Title | Notes |
