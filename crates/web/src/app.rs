@@ -1,12 +1,17 @@
 //! The app shell: top bar, screen area, settings drawer and toast area.
 //!
 //! The console screen is the hero: everything else is 56px of chrome above it
-//! or an overlay beside it. The shell's own state - theme, drawer, toasts - is
-//! held in signals here. ROM loading, emulation and persistence arrive in later
-//! M7 tickets.
+//! or an overlay beside it. The shell's own state - theme, drawer, toasts, the
+//! loaded cartridge - is held in signals here. Emulation and persistence arrive
+//! in later M7 tickets.
 
 use leptos::prelude::*;
 
+use crate::rom::LoadedRom;
+use crate::rom_picker::EmptyScreen;
+use crate::rom_picker::RomFileInput;
+use crate::rom_picker::open_picker;
+use crate::rom_picker::window_drop_target;
 use crate::theme::Theme;
 use crate::ui::button::IconButton;
 use crate::ui::drawer::Drawer;
@@ -36,13 +41,30 @@ pub fn App() -> impl IntoView {
     let theme = RwSignal::new(Theme::default());
     let drawer_open = RwSignal::new(false);
 
+    // The cartridge, if one has been opened. Context rather than a prop so M7-04
+    // (run it) and M7-16 (the library) can react to it without the shell
+    // carrying it down the tree (M7-03, #136).
+    let roms = RwSignal::new(None::<LoadedRom>);
+    provide_context(roms);
+
+    // Window-wide drop handling; the screen area wears the result.
+    let dragging = window_drop_target();
+
     // Writes `data-theme` on `<html>` now, and again whenever the theme changes.
     Effect::new(move |_| {
         theme.get().apply_to_document();
     });
 
-    // The top bar names the loaded cartridge; M7-03 (#136) fills this in.
-    let game_title = signal(None::<String>).0;
+    // What the top bar and the screen area show for the cartridge. Read with
+    // `with`, never `get`: a `LoadedRom` carries the whole image, which is
+    // megabytes.
+    //
+    // `loaded` chooses between the canvas and the empty state - an empty black
+    // frame is not worth the space until M7-04 (#137) has a frame to draw.
+    let loaded = Signal::derive(move || roms.with(|rom| rom.is_some()));
+    let title = Signal::derive(move || roms.with(|rom| rom.as_ref().map(|rom| rom.title.clone())));
+    let region =
+        Signal::derive(move || roms.with(|rom| rom.as_ref().map(|rom| rom.region.clone())));
 
     let theme_options = Theme::ALL
         .iter()
@@ -59,22 +81,25 @@ pub fn App() -> impl IntoView {
                 </span>
                 <p
                     class=move || {
-                        if game_title.get().is_some() {
+                        if loaded.get() {
                             "now-playing now-playing--loaded"
                         } else {
                             "now-playing"
                         }
                     }
                 >
-                    {move || game_title
-                        .get()
-                        .unwrap_or_else(|| NO_CARTRIDGE.to_string())}
+                    {move || title.get().unwrap_or_else(|| NO_CARTRIDGE.to_string())}
+                    {move || {
+                        region
+                            .get()
+                            .map(|region| view! { <span class="now-playing__region">{region}</span> })
+                    }}
                 </p>
                 <nav class="topbar__actions" aria-label="Console">
                     <IconButton
                         label="Open ROM".to_string()
                         path=icons::OPEN
-                        on_click=not_wired_yet(toasts, "Opening a ROM")
+                        on_click=Callback::new(move |_| open_picker())
                     />
                     <IconButton
                         label="Save states".to_string()
@@ -94,8 +119,11 @@ pub fn App() -> impl IntoView {
                 </nav>
             </header>
 
-            <main class="screen-area">
-                <canvas id="screen" class="screen" width=320 height=224></canvas>
+            <main class="screen-area" class:screen-area--drag=move || dragging.get()>
+                <Show when=move || loaded.get() fallback=|| view! { <EmptyScreen/> }>
+                    <canvas id="screen" class="screen" width=320 height=224></canvas>
+                </Show>
+                <RomFileInput/>
             </main>
 
             <Drawer title="Settings".to_string() open=drawer_open>

@@ -7,18 +7,33 @@ publish.workspace = true
 
 [dependencies]
 console_error_panic_hook = "0.1"
+# The console: its cartridge header parser is what `rom.rs` reads a ROM with
+# (M3-01, #61). It builds for wasm32 like every core crate.
+genesis = { path = "../genesis" }
 leptos = { version = "0.8", features = ["csr"] }
+# ROM identity for SRAM and save-state keys (M7-03, #136): pure Rust, so it
+# costs nothing on the way to wasm.
+sha1_smol = "1"
 # The workspace pin, `=0.2.130`, which is the dev shell's `wasm-bindgen
 # --version` (AGENTS.md 1). Needed for the `Closure` that arms a toast's
 # auto-dismiss timer (M7-02, #135).
 wasm-bindgen = { workspace = true }
 # For the `js_sys::Function` handle `Window::set_timeout_*` wants.
 js-sys = "0.3"
+# Already in the tree through leptos; a direct dependency because reading a
+# dropped `File` awaits `File::array_buffer()` with `JsFuture` (M7-03, #136).
+wasm-bindgen-futures = "0.4"
 # The same wasm-bindgen family as leptos itself, and the only way to reach
 # `document`/`window`: the theme writes `data-theme` on `<html>` (M7-02, #135).
 web-sys = { version = "0.3", features = [
+  "Blob",
+  "DataTransfer",
   "Document",
+  "DragEvent",
   "Element",
+  "File",
+  "FileList",
+  "HtmlInputElement",
   "HtmlSelectElement",
   "KeyboardEvent",
   "Window",
