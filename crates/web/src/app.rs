@@ -176,6 +176,15 @@ pub fn App() -> impl IntoView {
 
     use_keyboard(menu, loaded, toasts, settings, capture, screen, slots);
 
+    // Whether the picture has arrived, which is what the `screen--enter` class
+    // below fades in on: `loading` comes down the moment a console has been made,
+    // and `frame` is how an empty screen area knows it has no picture yet.
+    //
+    // Both signals, because the canvas element outlives a ROM swap: a class that
+    // only ever went from off to on would animate the first game and then sit
+    // there, so the second game would start with no fade at all.
+    let entered = Signal::derive(move || !console.loading.get() && console.frame.get() != (0, 0));
+
     // Whether a controller is plugged in, which the touch overlay hides itself
     // behind and nothing else asks about (M7-09, #142).
     let controller_connected = RwSignal::new(false);
@@ -360,6 +369,8 @@ pub fn App() -> impl IntoView {
                 node_ref=screen_area
                 class:screen-area--drag=move || dragging.get()
             >
+                // The canvas, or the empty state. The fade-in of the picture itself
+                // is `screen--enter` on the canvases below (M7-19, #152).
                 <Show
                     when=move || loaded.get()
                     fallback=|| view! { <RecentsGrid/> <EmptyScreen/> }
@@ -375,6 +386,7 @@ pub fn App() -> impl IntoView {
                         id="screen"
                         class="screen"
                         class:screen--smooth=move || settings.with(|settings| settings.smoothing)
+                        class:screen--enter=move || entered.get()
                         hidden=move || console.renderer.get() == RendererKind::Webgl
                         width=320
                         height=224
@@ -388,6 +400,7 @@ pub fn App() -> impl IntoView {
                         id="screen-webgl"
                         class="screen"
                         class:screen--smooth=move || settings.with(|settings| settings.smoothing)
+                        class:screen--enter=move || entered.get()
                         hidden=move || console.renderer.get() != RendererKind::Webgl
                         node_ref=canvas_gl
                     >

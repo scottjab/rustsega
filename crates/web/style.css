@@ -69,6 +69,9 @@
   /* Motion. Every transition that uses these sits behind the
      prefers-reduced-motion query at the bottom of this file. */
   --duration: 170ms;
+  /* The one thing that takes shorter than a transition: the picture arriving.
+     Long enough to read as a fade, short enough that nobody waits on it. */
+  --duration-enter: 150ms;
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
 
   color-scheme: dark;
@@ -1367,12 +1370,31 @@ canvas {
     animation: spin 900ms linear infinite;
   }
 
+  /* The screen fade-in of M7-19 (#152), on the class `app.rs` puts on the canvas
+     the moment the console is ready: `both` so the canvas cannot show its own bare
+     background between the class arriving and the first keyframe. The empty screen
+     area is not faded - it has had time enough, and a fade on a drop zone reads as
+     a page still loading. */
+  .screen--enter {
+    animation: screen-in var(--duration-enter) var(--ease) both;
+  }
+
   /* The "Saved" chip of M7-14 (#147) is taken off the page 1.5 s after a write
      lands; this spends the last third of that time going away, so the chip fades
      out rather than being cut off. With motion reduced it is simply there for
      1.5 s and then not, which is the same fact said less prettily. */
   .chip--saved {
     animation: chip-saved 1.5s var(--ease) both;
+  }
+}
+
+@keyframes screen-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
   }
 }
 
