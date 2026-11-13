@@ -45,12 +45,16 @@ const SECTOR_TAN: f64 = 0.414_213_56;
 /// The standard index of the right trigger, the pad's "run faster" button.
 const RIGHT_TRIGGER: u8 = 7;
 /// The standard index of `back`, which is the Genesis pad's `Mode`/`Select`.
-const SELECT: u8 = 8;
-/// The standard index of `start`.
-const START: u8 = 9;
+///
+/// `pub` because a menu is opened by `select` + `start` too - see
+/// [`super::super::nav::pad_actions`], which owns the same combination while a
+/// menu is open.
+pub const SELECT: u8 = 8;
+/// The standard index of `start`. See [`SELECT`].
+pub const START: u8 = 9;
 /// The standard index of the home button, which has no Genesis equivalent and so
-/// drives the menu instead.
-const HOME: u8 = 16;
+/// drives the menu instead. See [`SELECT`].
+pub const HOME: u8 = 16;
 
 /// The four directions of one analog stick, as `(up, down, left, right)`.
 ///

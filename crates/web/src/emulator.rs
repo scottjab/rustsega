@@ -440,7 +440,10 @@ impl Emulator {
             // (M7-08, #141); a reading can also ask for a hotkey, and a hotkey
             // can reach the console - which is a second `borrow_mut` inside the
             // one just below.
-            crate::gamepad_events::poll_gamepads();
+            // The frame's own clock travels with it: a direction held on a pad
+            // while a menu is open walks the focus on a timer, and this is the
+            // only clock in the page that a pad can be timed against (M7-11, #144).
+            crate::gamepad_events::poll_gamepads(now_ms);
             if let Some(emulator) = weak.upgrade() {
                 emulator.borrow_mut().tick(now_ms);
             }

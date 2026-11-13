@@ -31,13 +31,19 @@ use web_sys::GamepadMappingType;
 use crate::controls::CaptureDevice;
 use crate::controls::CaptureTarget;
 use crate::controls::bind_pad;
-use crate::emulator::Controls;
 use crate::input::PadButton;
 use crate::input::Source;
 use crate::input::gamepad;
 use crate::input::gamepad::PadSlots;
 use crate::input::keyboard::Hotkey;
 use crate::keyboard_events::hotkey_do;
+use crate::menu::Menu;
+use crate::nav::LastDevice;
+use crate::nav::RepeatTimer;
+use crate::nav::UiAction;
+use crate::nav::UiMode;
+use crate::nav::fresh_actions;
+use crate::nav::pad_actions;
 use crate::settings::Settings;
 use crate::ui::toast::ToastKind;
 use crate::ui::toast::Toasts;
@@ -66,6 +72,17 @@ struct Watcher {
     settings: RwSignal<Settings>,
     /// The cell of the controls page waiting for a pad button, if there is one.
     capture: RwSignal<Option<CaptureTarget>>,
+    /// What the pads were asking the menu for as of the last frame, while a menu
+    /// was open: the same difference trick as `PadSeen::buttons`, so that a press
+    /// is reported once (M7-11, #144).
+    ///
+    /// Held once for the page rather than once per port, because the focus the walk
+    /// moves is one thing for the page: a second pad driving it shares its timing
+    /// rather than queueing a second move behind the first.
+    menu_seen: Vec<UiAction>,
+    /// How a direction held on a d-pad or a stick walks the focus, which needs the
+    /// frame clock because a polled pad has no key repeat.
+    menu_repeat: RepeatTimer,
     /// Each pad's held button indices as of the last frame, kept only while a
     /// Controller cell is capturing, and paired with the capture they belong to
     /// so that arming a new cell throws the old baseline away. See
@@ -74,8 +91,10 @@ struct Watcher {
     /// Indexed by port, and reset whenever a pad takes a slot, so a pad cannot
     /// inherit the held buttons of the pad that left it.
     seen: Vec<PadSeen>,
-    console: Controls,
-    drawer_open: RwSignal<bool>,
+    /// The shell's menu mode, read once per frame to decide which half of the pad
+    /// this is: a pad drives the game, or a pad drives the menu, and never both
+    /// (M7-11, #144).
+    menu: Menu,
     toasts: Toasts,
     /// Whether any pad is plugged in at all, published for the touch overlay -
     /// which hides itself while a real controller is about (M7-09, #142).
@@ -121,8 +140,64 @@ impl Watcher {
             .push(ToastKind::Info, gamepad::disconnect_toast(port));
     }
 
-    /// One pad's reading: move its port in [`crate::input`] to what it reports
-    /// now, and return the hotkey it has just started asking for.
+    /// One frame of one pad spent on the menu instead of on the game (M7-11, #144).
+    ///
+    /// The pad's Genesis buttons are read and recorded but never sent: `InputState`
+    /// belongs to the game, and while a menu is open the game is not supposed to
+    /// hear the pad at all. Recording them anyway is what stops a direction held
+    /// into the menu from being a press on the way out - the poll reports
+    /// differences, and as far as this frame is concerned nothing changed.
+    ///
+    /// A rebind cell keeps the pad to itself while it is waiting, exactly as the
+    /// keyboard's does in [`crate::keyboard_events`]: the button a player is
+    /// binding is the button the menu must not spend on moving its focus.
+    fn poll_menu(&mut self, pad: &Reading, now_ms: f64) -> Vec<UiAction> {
+        // Before the port is looked up, because a pad that never got one is still a
+        // pad in the player's hands and still finishes a rebind.
+        self.capture_press(pad);
+        if let Some(port) = self.slots.port_of(pad.index) {
+            let held = self.settings.with_untracked(|settings| {
+                gamepad::poll_snapshot(&pad.buttons, &pad.axes, &settings.bindings)
+            });
+            self.seen[port].buttons = held;
+        }
+        if self.capture.get().is_some() {
+            self.menu_repeat.stop();
+            self.menu_seen = Vec::new();
+            return Vec::new();
+        }
+        let current = pad_actions(&pad.buttons, &pad.axes);
+        let mut actions = fresh_actions(&self.menu_seen, &current);
+        self.menu_seen = current.clone();
+        // A direction the player is holding walks the focus at its own pace: the
+        // first move is the fresh one above and the rest come from the timer, which
+        // a key does not need because the browser repeats the keydown for it.
+        let held_dir = current.iter().rev().find_map(|action| match action {
+            UiAction::Move(dir) => Some(*dir),
+            _ => None,
+        });
+        let moved = actions
+            .iter()
+            .any(|action| matches!(action, UiAction::Move(_)));
+        match held_dir {
+            Some(_) if moved => self.menu_repeat.start(now_ms),
+            Some(dir) => {
+                if self.menu_repeat.poll(now_ms) {
+                    actions.push(UiAction::Move(dir));
+                }
+            }
+            None => self.menu_repeat.stop(),
+        }
+        actions
+    }
+
+    /// One pad's reading in play: move its port in [`crate::input`] to what it
+    /// reports now, and return the hotkey it has just started asking for.
+    ///
+    /// The menu is not asked about here: while a game is running this is the only
+    /// thing that reads the pads, and [`gamepad::poll_hotkey`] is the owner of
+    /// `home` and `select` + `start` - see [`poll_gamepads`] for how the two halves
+    /// avoid a double toggle (M7-11, #144).
     fn poll_pad(&mut self, pad: &Reading) -> Option<Hotkey> {
         // Before the port is looked up: the shared gamepad map is keyed by button
         // index rather than by pad, so whichever pad just pressed a button is the
@@ -226,17 +301,17 @@ fn with_watcher<T>(f: impl FnOnce(&mut Watcher) -> T) -> Option<T> {
 /// `settings` is the store the controls page writes, read on every reading;
 /// `capture` is the cell of that page waiting for a pad button, if there is one.
 ///
-/// `console`, `drawer_open` and `toasts` are the shell's, so that the two hotkeys
-/// a pad asks for - `home` and the right trigger - reach the same places the
-/// keyboard's hotkeys do (see [`crate::input::gamepad::poll_hotkey`]).
+/// `menu` and `toasts` are the shell's, so that the two hotkeys a pad asks for -
+/// `home` and the right trigger - reach the same places the keyboard's hotkeys do
+/// (see [`crate::input::gamepad::poll_hotkey`]), and so that a pad can drive the
+/// menu itself while one is open (M7-11, #144).
 ///
 /// `controller_connected` says whether any pad is plugged in, which is the fact the
 /// touch overlay hides itself behind (M7-09, #142). The browser only reports a pad
 /// after the player has touched it, so an overlay that appears before that is not a
 /// bug: it is the player's first chance to press anything.
 pub fn use_gamepad(
-    console: Controls,
-    drawer_open: RwSignal<bool>,
+    menu: Menu,
     toasts: Toasts,
     controller_connected: RwSignal<bool>,
     settings: RwSignal<Settings>,
@@ -248,11 +323,12 @@ pub fn use_gamepad(
             settings,
             capture,
             capture_baseline: None,
+            menu_seen: Vec::new(),
+            menu_repeat: RepeatTimer::default(),
             seen: (0..crate::input::PORTS)
                 .map(|_| PadSeen::default())
                 .collect(),
-            console,
-            drawer_open,
+            menu,
             toasts,
             controller_connected,
         });
@@ -278,32 +354,57 @@ pub fn use_gamepad(
     });
 }
 
-/// Reads every pad the browser can see, once, into the page's input state, and
-/// runs the hotkey a pad started asking for.
+/// Reads every pad the browser can see, once, and gives the frame's answer to
+/// whichever half of the shell is listening.
+///
+/// In play that means the page's input state and the hotkey a pad started asking
+/// for. With a menu open it means [`UiAction`](crate::nav::UiAction)s instead, and
+/// nothing at all reaches the game (M7-11, #144).
+///
+/// `now_ms` is the animation frame's own timestamp, which is what a held
+/// direction is timed against - see [`RepeatTimer`](crate::nav::RepeatTimer).
 ///
 /// The Gamepad API is poll based: `get_gamepads()` is the only way to learn what
 /// a pad is doing, and a pad is not reported at all until the player has pressed
 /// something on the page ("Gamepad API", "Acquiring and processing events").
 /// This is the animation frame's first move, before the running console is
 /// borrowed and before it reads its ports (see [`crate::emulator`]).
-pub fn poll_gamepads() {
+pub fn poll_gamepads(now_ms: f64) {
     let asked = with_watcher(|watcher| {
-        let mut asked = Vec::new();
+        let mut hotkeys = Vec::new();
+        let mut actions = Vec::new();
+        // One mode per frame, and one owner per button: while a menu is open the
+        // pad belongs to [`Menu`](crate::menu) and `poll_hotkey` is not asked at
+        // all, because the menu's own `home` and `select` + `start` rule is
+        // [`nav::pad_actions`] and running both would be a drawer that opens and
+        // shuts itself in the same frame (M7-11, #144).
+        let mode = watcher.menu.mode.get_untracked();
         for reading in readings() {
-            if let Some(hotkey) = watcher.poll_pad(&reading) {
-                asked.push(hotkey);
+            match mode {
+                UiMode::Playing => hotkeys.extend(watcher.poll_pad(&reading)),
+                UiMode::Menu => actions.extend(watcher.poll_menu(&reading, now_ms)),
             }
         }
-        // The shell travels out with the hotkeys, so that they are run once the
-        // watcher is put back: a hotkey writes signals, and a signal write is a
-        // render.
-        (asked, watcher.console, watcher.drawer_open, watcher.toasts)
+        // The shell travels out with the answers, so that they are dealt with once
+        // the watcher is put back: a hotkey and a menu action both write signals,
+        // and a signal write is a render - which is the one thing that must not
+        // happen while the watcher is borrowed, for the reason
+        // [`crate::emulator`] spells out about the console.
+        (hotkeys, actions, watcher.menu, watcher.toasts)
     });
-    let Some((asked, console, drawer_open, toasts)) = asked else {
+    let Some((hotkeys, actions, menu, toasts)) = asked else {
         return;
     };
-    for hotkey in asked {
-        hotkey_do(hotkey, console, drawer_open, toasts);
+    if !actions.is_empty() {
+        // The pad that got this far is the pad the player is holding, which is
+        // what the hint bar wants to hear.
+        menu.announce(LastDevice::Gamepad);
+    }
+    for hotkey in hotkeys {
+        hotkey_do(hotkey, menu, toasts);
+    }
+    for action in actions {
+        menu.run(action);
     }
 }
 
