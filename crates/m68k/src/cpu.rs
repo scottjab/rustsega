@@ -763,87 +763,24 @@ impl M68k {
 mod tests {
     use super::*;
     use crate::sr::{SR_C, SR_INT_MASK, SR_N, SR_T, SR_V, SR_X};
-    use crate::testbus::cpu_with_program;
+    use crate::testbus::{TestBus, cpu_with_program};
 
     /// Where [`cpu_with_program`] loads its program words (its own
     /// `PROGRAM_ADDR`, which is private to `testbus`), so the queue tests can
     /// name the addresses the queue is reading.
     const PROGRAM_BASE: u32 = 0x0000_1000;
 
-    /// Minimal 64 KB RAM bus for these unit tests. M1-02 (#10) adds the real
-    /// `TestBus` with bus-transaction recording for the conformance suites;
-    /// this one only needs to remember the addresses it was asked about.
-    struct Ram64k {
-        mem: Vec<u8>,
-        /// Every address the CPU asked the bus about, in order.
-        accesses: Vec<u32>,
-    }
-
-    impl Ram64k {
-        fn new() -> Self {
-            Self {
-                mem: vec![0; 1 << 16],
-                accesses: Vec::new(),
-            }
-        }
-
-        /// Mirror of `M68k::read_*`: only ever called with 24 bit addresses in
-        /// these tests, so no masking here — that asymmetry is the point of
-        /// `address_is_masked_to_24_bits`.
-        fn peek_byte(&self, addr: u32) -> u8 {
-            self.mem[addr as usize]
-        }
-
-        fn peek_word(&self, addr: u32) -> u16 {
-            let i = addr as usize;
-            u16::from_be_bytes([self.mem[i], self.mem[i + 1]])
-        }
-
-        fn peek_long(&self, addr: u32) -> u32 {
-            let i = addr as usize;
-            u32::from_be_bytes([
-                self.mem[i],
-                self.mem[i + 1],
-                self.mem[i + 2],
-                self.mem[i + 3],
-            ])
-        }
-
-        fn poke_long(&mut self, addr: u32, value: u32) {
-            let i = addr as usize;
-            self.mem[i..i + 4].copy_from_slice(&value.to_be_bytes());
-        }
-    }
-
-    impl Bus for Ram64k {
-        fn read_byte(&mut self, addr: u32) -> u8 {
-            self.accesses.push(addr);
-            self.peek_byte(addr)
-        }
-
-        fn read_word(&mut self, addr: u32) -> u16 {
-            self.accesses.push(addr);
-            self.peek_word(addr)
-        }
-
-        fn write_byte(&mut self, addr: u32, value: u8) {
-            self.accesses.push(addr);
-            let i = addr as usize;
-            self.mem[i] = value;
-        }
-
-        fn write_word(&mut self, addr: u32, value: u16) {
-            self.accesses.push(addr);
-            let i = addr as usize;
-            self.mem[i..i + 2].copy_from_slice(&value.to_be_bytes());
-        }
-    }
-
     /// Bus with the reset vector table: SSP = 0x00FF_0000, PC = 0x0000_0200.
-    fn bus_with_reset_vector() -> Ram64k {
-        let mut bus = Ram64k::new();
-        bus.poke_long(0x0000_0000, 0x00FF_0000);
-        bus.poke_long(0x0000_0004, 0x0000_0200);
+    ///
+    /// The two vector writes are logged like any other access (they go through
+    /// [`Bus::write_word`], and the log records every [`Bus`] access), so the
+    /// log is emptied here: what the tests below assert on is what the CPU
+    /// asked for, not the setup that got the vectors into RAM.
+    fn bus_with_reset_vector() -> TestBus {
+        let mut bus = TestBus::new();
+        bus.write_long(0x0000_0000, 0x00FF_0000);
+        bus.write_long(0x0000_0004, 0x0000_0200);
+        bus.accesses.clear();
         bus
     }
 
@@ -957,8 +894,9 @@ mod tests {
 
     #[test]
     fn address_is_masked_to_24_bits() {
-        let mut bus = Ram64k::new();
-        bus.poke_long(0x0000_0004, 0xDEAD_BEEF);
+        let mut bus = TestBus::new();
+        bus.write_long(0x0000_0004, 0xDEAD_BEEF);
+        bus.accesses.clear();
         let mut cpu = M68k::new();
 
         assert_eq!(cpu.read_w(&mut bus, 0xFF00_0004), 0xDEAD);
@@ -975,14 +913,14 @@ mod tests {
         cpu.write_w(&mut bus, 0xFF00_000A, 0x3456);
         cpu.write_l(&mut bus, 0xFF00_000C, 0x789A_BCDE);
         assert_eq!(bus.accesses, [4, 4, 6, 8, 0x0A, 0x0C, 0x0E]);
-        assert_eq!(bus.peek_byte(0x0008), 0x12);
-        assert_eq!(bus.peek_word(0x000A), 0x3456);
-        assert_eq!(bus.peek_long(0x000C), 0x789A_BCDE);
+        assert_eq!(bus.read_byte(0x0008), 0x12);
+        assert_eq!(bus.read_word(0x000A), 0x3456);
+        assert_eq!(bus.read_long(0x000C), 0x789A_BCDE);
     }
 
     #[test]
     fn bus_helpers_charge_four_clocks_per_access() {
-        let mut bus = Ram64k::new();
+        let mut bus = TestBus::new();
         let mut cpu = M68k::new();
         assert_eq!(cpu.cycles, 0);
 
@@ -1156,7 +1094,7 @@ mod tests {
     // ---- step(): decode the queue front, dispatch, record the route ----
 
     /// Where a `step` that takes an exception pushes its frame, and the handler
-    /// the vector table points at — both inside [`Ram64k`], and both different
+    /// the vector table points at — both inside [`TestBus`], and both different
     /// from `PROGRAM_BASE`, so a test can tell a frame from a fetch.
     const STACK_TOP: u32 = 0x0000_2000;
     const ILLEGAL_HANDLER: u32 = 0x0000_3000;
@@ -1166,20 +1104,23 @@ mod tests {
     /// changed is the step's doing and not a coincidence of `M68k::new`. The
     /// vector table points every vector at [`ILLEGAL_HANDLER`] and the stack is
     /// inside the bus, because a route that takes an exception now writes both.
-    fn cpu_at_opcode(opcode: u16) -> (M68k, Ram64k) {
+    fn cpu_at_opcode(opcode: u16) -> (M68k, TestBus) {
         let mut cpu = M68k::new();
         cpu.pc = PROGRAM_BASE;
         cpu.prefetch = [opcode, 0x4E71];
         cpu.d[0] = 0x1111_2222;
         cpu.a[0] = 0x0010_4000;
         cpu.set_sr(0x2700);
-        let mut bus = Ram64k::new();
+        let mut bus = TestBus::new();
         cpu.ssp = STACK_TOP;
         cpu.a[7] = STACK_TOP;
         for slot in (0x00..=0x7Fu32).step_by(4) {
-            bus.poke_long(slot, ILLEGAL_HANDLER);
+            bus.write_long(slot, ILLEGAL_HANDLER);
         }
-        bus.poke_long(ILLEGAL_HANDLER, 0x1234_5678);
+        bus.write_long(ILLEGAL_HANDLER, 0x1234_5678);
+        // Only the step's own traffic is interesting here, and the vector
+        // table above is logged like any other write.
+        bus.accesses.clear();
         (cpu, bus)
     }
 
@@ -1215,12 +1156,12 @@ mod tests {
             // address of the opcode that could not execute, handler in `pc`.
             assert_eq!(cpu.a[7], STACK_TOP - 6, "{name} pushed a frame");
             assert_eq!(
-                bus.peek_word(STACK_TOP - 6),
+                bus.read_word(STACK_TOP - 6),
                 0x2700,
                 "{name}: SR word at SP, as it was before the exception"
             );
             assert_eq!(
-                bus.peek_long(STACK_TOP - 4),
+                bus.read_long(STACK_TOP - 4),
                 PROGRAM_BASE,
                 "{name}: PC long at SP + 2, pointing at the faulting opcode"
             );

@@ -1215,9 +1215,9 @@ mod tests {
         WriteWord(u32),
     }
 
-    /// A bus that keeps the addresses it was asked about, which
-    /// [`crate::testbus::TestBus`] deliberately does not: the only way to see a
-    /// read that throws its value away is to count it (as in
+    /// A bus that keeps the addresses it was asked about, tagged read or write.
+    /// `TestBus::accesses` (#184) keeps the addresses but not the tag, and the
+    /// only way to see a read that throws its value away is to count it (as in
     /// `arith::tests::clr_to_memory_reads_then_writes`, #22).
     struct RecordingBus {
         mem: Vec<u8>,

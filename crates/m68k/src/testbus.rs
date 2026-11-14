@@ -5,11 +5,20 @@
 //! than `#[cfg(test)]`: the integration suites under `crates/m68k/tests/` and
 //! other crates need it too.
 //!
-//! It is a test bus, not a device: no I/O, no side effects, no bus-transaction
-//! recording (out of scope for M1-02 — the SingleStepTests compare final state
-//! and cycle count only). Byte, word and long access is plain big endian RAM,
+//! It is a test bus, not a device: no I/O and no side effects beyond RAM and
+//! [`TestBus::accesses`]. Byte, word and long access is plain big endian RAM,
 //! so a test can put an opcode at an address, run the CPU and read the result
 //! back at the same address.
+//!
+//! # Access recording
+//!
+//! There is one rule, and it is the whole of it: every [`Bus`] read and write
+//! appends its address to [`TestBus::accesses`], in the order the bus received
+//! them, with the address the caller asked for rather than the masked one —
+//! so a test can assert the CPU masked an address by asserting what the bus
+//! was handed (#184, which retired the 64 KB `Ram64k` that used to be this
+//! log's only home). `int_ack` and `reset_devices` are not accesses and are
+//! not recorded.
 
 use crate::bus::{ADDR_MASK, Bus};
 use crate::cpu::M68k;
@@ -43,10 +52,20 @@ const STACK_TOP: u32 = 0x0001_0000;
 /// Fields are public so tests can poke memory directly and assert on it.
 /// `Debug` prints all 16 MiB, so assert on `&bus.mem[a..b]` slices rather than
 /// on the whole bus.
+///
+/// Records every access into [`TestBus::accesses`] under the one rule at the
+/// top of this module. The rule has no switch, and the inherent helpers
+/// ([`TestBus::load_words`], [`TestBus::write_long`], [`TestBus::read_long`])
+/// go through the [`Bus`] accessors, so they are recorded too: a test that
+/// sets memory up before running the CPU clears the log in between to keep its
+/// assertion about what the *CPU* asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestBus {
     /// Flat memory, indexed by the low 24 bits of the address.
     pub mem: Vec<u8>,
+    /// Every address the bus was asked about, in order — the recording rule is
+    /// on [the module docs](self#access-recording).
+    pub accesses: Vec<u32>,
     /// Vector number returned from [`Bus::int_ack`]. `None` (the default) is
     /// autovectoring, which is what a real Genesis always does.
     pub int_vector: Option<u8>,
@@ -55,10 +74,12 @@ pub struct TestBus {
 }
 
 impl TestBus {
-    /// 16 MiB of zeroed memory, autovectoring, no resets seen yet.
+    /// 16 MiB of zeroed memory, an empty [`TestBus::accesses`] log,
+    /// autovectoring, no resets seen yet.
     pub fn new() -> Self {
         Self {
             mem: vec![0; MEM_SIZE],
+            accesses: Vec::new(),
             int_vector: None,
             reset_count: 0,
         }
@@ -114,6 +135,7 @@ impl Default for TestBus {
 
 impl Bus for TestBus {
     fn read_byte(&mut self, addr: u32) -> u8 {
+        self.accesses.push(addr);
         self.mem[Self::index(addr)]
     }
 
@@ -124,15 +146,18 @@ impl Bus for TestBus {
     /// them even; an odd or top-of-space address here is a bug in the test and
     /// panics with an out-of-range index instead of silently wrapping.
     fn read_word(&mut self, addr: u32) -> u16 {
+        self.accesses.push(addr);
         let i = Self::index(addr);
         u16::from_be_bytes([self.mem[i], self.mem[i + 1]])
     }
 
     fn write_byte(&mut self, addr: u32, value: u8) {
+        self.accesses.push(addr);
         self.mem[Self::index(addr)] = value;
     }
 
     fn write_word(&mut self, addr: u32, value: u16) {
+        self.accesses.push(addr);
         let i = Self::index(addr);
         self.mem[i..i + 2].copy_from_slice(&value.to_be_bytes());
     }
@@ -242,6 +267,36 @@ mod tests {
 
         bus.reset_devices();
         assert_eq!(bus.reset_count, 1, "`RESET` instruction bumps it");
+    }
+
+    /// The recording rule in one test: every [`Bus`] read and write, in the
+    /// order the bus received them, with the address the caller asked for
+    /// rather than the masked one, reads and writes in the one list. The
+    /// inherent helpers appear in it too, because they go through the trait
+    /// accessors.
+    #[test]
+    fn accesses_are_recorded_in_order_as_they_were_asked_for() {
+        let mut bus = TestBus::new();
+
+        bus.write_word(0x0000_1000, 0x1234);
+        bus.write_long(0x0000_2000, 0xDEAD_BEEF);
+        assert_eq!(bus.read_long(0x0000_2000), 0xDEAD_BEEF);
+        bus.write_byte(0xFF00_0010, 0x5A);
+        assert_eq!(bus.read_byte(0x0000_0010), 0x5A, "aliased like the CPU");
+
+        assert_eq!(
+            bus.accesses,
+            [
+                0x0000_1000, // write_word
+                0x0000_2000, // write_long, high word
+                0x0000_2002, // write_long, low word
+                0x0000_2000, // read_long, high word
+                0x0000_2002, // read_long, low word
+                0xFF00_0010, // write_byte, as asked for, not masked
+                0x0000_0010, // read_byte
+            ],
+            "one list, in bus order, addresses as the caller asked for them"
+        );
     }
 
     #[test]

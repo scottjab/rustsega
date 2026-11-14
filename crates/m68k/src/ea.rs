@@ -813,13 +813,14 @@ mod tests {
     /// their program words (its `PROGRAM_ADDR`, which is private to `testbus`).
     const PROGRAM_BASE: u32 = 0x0000_1000;
 
-    /// Test-LOCAL RAM that records every address it was asked about, copied
-    /// from the pattern in `cpu.rs`'s test module: `testbus::TestBus`'s public
-    /// shape is deliberately fixed (no access recorder, see #10 / #183), so the
-    /// EA tests that need to count bus accesses keep their own.
+    /// Test-LOCAL RAM that records the addresses it was asked about, reads and
+    /// writes in separate lists. `testbus::TestBus` records too (#184), but
+    /// into one list with no read/write split, and the EA tests below need the
+    /// split: a mode that writes where it should read looks the same in one
+    /// list and wrong in two.
     ///
-    /// It covers the whole 24 bit space, unlike the 64 KB one in `cpu.rs`,
-    /// because the M1-06 modes deliberately reach the top of it: `abs.W` of
+    /// It covers the whole 24 bit space, because the M1-06 modes deliberately
+    /// reach the top of it: `abs.W` of
     /// 0x8000 sign extends to 0xFFFF_8000 and must arrive at the bus as
     /// 0x00FF_8000, which a 64 KB RAM cannot tell apart from a wrong address.
     struct Ram {
