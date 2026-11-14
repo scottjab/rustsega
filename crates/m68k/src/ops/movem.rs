@@ -515,10 +515,11 @@ mod tests {
         );
     }
 
-    /// `TestBus` records nothing, and the one MOVEM behaviour that leaves no trace
-    /// in the machine state is the extra word read a load issues after the last
-    /// register (M68000UM MOVEM, "Note"), so this test wraps `TestBus` in a logging
-    /// bus — the pattern `ea.rs`'s tests use — and reads the access list back.
+    /// `TestBus::accesses` does not say which way a transfer went, and the one
+    /// MOVEM behaviour that leaves no trace in the machine state is the extra
+    /// word read a load issues after the last register (M68000UM MOVEM,
+    /// "Note"), so this test wraps `TestBus` in a logging bus — the pattern
+    /// `ea.rs`'s tests use — and reads the access list back.
     ///
     /// `MOVEM.W (A0)+,D0-D1` moves two words and touches memory three times: the
     /// extra read is the one at `A0 + 4`, above the last transfer. The store has no
@@ -566,9 +567,10 @@ mod tests {
             .collect()
     }
 
-    /// A [`TestBus`] that records every access. `TestBus` deliberately has no log
-    /// (its docs say so), and MOVEM is the first instruction whose extra bus traffic
-    /// is worth pinning.
+    /// A [`TestBus`] wrapper that records every access with its direction.
+    /// `TestBus::accesses` (#184) is one list of addresses with no direction,
+    /// and MOVEM is the first instruction whose extra bus traffic is worth
+    /// pinning — traffic that is a read, so the direction is the point.
     struct Log {
         bus: TestBus,
         accesses: Vec<(bool, u32)>,

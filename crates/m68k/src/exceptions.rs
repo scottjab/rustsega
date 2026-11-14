@@ -290,9 +290,10 @@ mod tests {
     use crate::sr::{SR_C, SR_INT_MASK, SR_N, SR_V, SR_X, SR_Z};
     use crate::{EXC_CHK, EXC_DIV_ZERO, EXC_TRAPV};
 
-    /// 64 KB RAM that also records every address it was asked about, in order:
-    /// the public `TestBus` deliberately records nothing, so bus-activity
-    /// assertions need a test-local bus (the pattern in `cpu.rs` and `ea.rs`).
+    /// 64 KB RAM that records every access it was asked about, in order, with
+    /// its direction and value: the public `TestBus` logs addresses only
+    /// (#184), so an assertion about what a bus saw needs a test-local bus (the
+    /// pattern in `ea.rs` and `ops/movem.rs`).
     struct Ram {
         mem: Vec<u8>,
         /// `(kind, address, value)` for every access, in order.

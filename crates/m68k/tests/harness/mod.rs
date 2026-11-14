@@ -417,16 +417,24 @@ impl Machine {
     }
 
     /// Zero the bytes the previous case touched, so cases cannot see each
-    /// other's memory.
+    /// other's memory, and drop the access log the previous case left behind.
     ///
     /// Only the touched bytes need clearing: the suite lists in `initial.ram`
     /// every byte its model reads, so a byte no case poked is a byte no case
     /// can read. Repeated addresses in `touched` just write zero twice.
+    ///
+    /// The [`TestBus::accesses`] log has to be dropped rather than kept: one
+    /// bus lives across a whole file and every case writes and reads through
+    /// it, so a log nobody reads would grow for the whole sweep (the MOVE files
+    /// alone are 120 975 cases). Clearing it after the loop above discards that
+    /// loop's writes too, leaving the log describing exactly the case that runs
+    /// next.
     fn clear(&mut self) {
         for addr in self.touched.iter().copied() {
             self.bus.write_byte(addr, 0);
         }
         self.touched.clear();
+        self.bus.accesses.clear();
     }
 }
 
