@@ -605,6 +605,43 @@ mod tests {
         (cpu, z80, bus)
     }
 
+    /// Lines [`run_until_handler_runs`] will cross looking for a handler before it
+    /// calls it missing: the VINT is taken within one line of the VBlank that
+    /// raises it - the exception entry, `ADDQ.L #1,D0` and `RTE` are about twenty
+    /// 68000 clocks, and a line is 488 - so eight is the event plus seven, and far
+    /// short of the 38 lines of blanking left before the next VBlank would make
+    /// this loop mean something else.
+    const HANDLER_LINES: u32 = 8;
+
+    /// Step whole lines until [`Scheduler::run_frame`] has let the 68000 take the
+    /// VINT it is being offered, and return how many handler entries have run.
+    ///
+    /// A frame ends on the VBlank line (#371), so the interrupt that line raises is
+    /// answered at the top of the next frame rather than at the tail of this one -
+    /// the handler runs at the same physical instant it always did, and only which
+    /// `run_frame` call contains it moved. These tests therefore step until the
+    /// handler has run instead of assuming which side of a frame boundary it falls
+    /// on, and say nothing about how many lines that took: what is under test is
+    /// that it is exactly one per frame, which [`HANDLER_LINES`] is wide enough to
+    /// tell from never, twice, or not at all.
+    fn run_until_handler_runs(
+        s: &mut Scheduler,
+        cpu: &mut M68k,
+        z80: &mut Z80,
+        bus: &mut Bus,
+        entries: u32,
+    ) -> u32 {
+        for _ in 0..HANDLER_LINES {
+            if cpu.d[0] != entries {
+                return cpu.d[0];
+            }
+            s.run_line(cpu, z80, bus);
+        }
+        panic!(
+            "the level 6 handler did not run within {HANDLER_LINES} lines of the frame that raised its VINT"
+        );
+    }
+
     /// One frame is 262 lines of 3420 master clocks, and the 68k must have been run
     /// for all of it: 3420 / 7 is 488.57 68k clocks a line, so the line's budget can
     /// only be met by carrying the remainder into the next line rather than rounding
@@ -853,21 +890,38 @@ mod tests {
 
     /// genvdp.txt section 4 "Vertical interrupts": "a level 6 interrupt will occur
     /// when the V counter is at line E0h", once per frame. With R1 bit 5 (IE0) set
-    /// by the program and vector 30 aimed at a handler that counts, three frames is
-    /// three counts.
+    /// by the program and vector 30 aimed at a handler that counts, every frame
+    /// gives the 68000 exactly one level 6 through vector 30 - which is what this
+    /// measures, one frame at a time rather than one total at the end.
+    ///
+    /// The counting starts one frame after the interrupting VBlank and stops at the
+    /// frame boundary, both for the same reason (#371): `run_frame` ends on the line
+    /// the VINT is raised on, so the exception is taken at the top of the following
+    /// frame. The raster is still whole - `run_frame_spans_a_moved_vblank_line` and
+    /// `no_drift_over_100_frames` hold the line counts and the master clock - and
+    /// the handler still runs at the same instant it always ran, immediately after
+    /// VBlank is asserted; only which `run_frame` call contains it is different. So
+    /// the loop steps until the handler has run ([`run_until_handler_runs`]) and
+    /// asserts the *increment* is one per frame, which is the part that would go
+    /// silently wrong - twice a frame, or never - if the boundary move were wrong.
     #[test]
     fn vint_reaches_68k() {
         // Register 1 = $60: display on (bit 6) and IE0 (bit 5).
         let (mut cpu, mut z80, mut bus) = interrupt_machine(&[(1, 0x60)]);
         let mut s = Scheduler::new(Region::Usa);
 
-        for _ in 0..3 {
+        let mut per_frame = Vec::new();
+        for _ in 0..5 {
             s.run_frame(&mut cpu, &mut z80, &mut bus);
+            let entries = cpu.d[0];
+            let taken = run_until_handler_runs(&mut s, &mut cpu, &mut z80, &mut bus, entries);
+            per_frame.push(taken - entries);
         }
 
         assert_eq!(
-            cpu.d[0], 3,
-            "one level 6 per frame, taken through vector 30"
+            per_frame,
+            vec![1, 1, 1, 1, 1],
+            "one level 6 per frame, taken through vector 30 - never none and never twice"
         );
         assert_eq!(cpu.d[1], 0, "and no HINT: R0 bit 4 is clear");
     }
@@ -920,12 +974,20 @@ mod tests {
             "and the VDP stopped offering it"
         );
 
-        // And the same thing through the loop: a frame in which the handler ran
-        // leaves nothing pending, because the CPU acknowledged on entry.
+        // And the same thing through the loop: once the handler has run there is
+        // nothing pending, because the CPU acknowledged on entry. Stepped to rather
+        // than assumed: a frame ends on the line the VINT is raised on (#371), so
+        // the handler runs at the top of the next frame, and asking after that - but
+        // well inside the blanking, before the next VBlank offers the level again -
+        // is the same question the bare chip above answers.
         let (mut cpu, mut z80, mut bus) = interrupt_machine(&[(1, 0x60)]);
         let mut s = Scheduler::new(Region::Usa);
         s.run_frame(&mut cpu, &mut z80, &mut bus);
-        assert_eq!(cpu.d[0], 1, "the level 6 handler ran");
+        assert_eq!(
+            run_until_handler_runs(&mut s, &mut cpu, &mut z80, &mut bus, 0),
+            1,
+            "the level 6 handler ran, once"
+        );
         assert_eq!(
             bus.vdp.pending_irq(),
             None,
