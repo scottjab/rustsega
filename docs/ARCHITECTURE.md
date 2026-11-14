@@ -378,6 +378,13 @@ frame buffer) and what that means after a load, is
   derivation). `nix build .#static`, which `just build-static` runs, produces the
   same binary for `x86_64-unknown-linux-musl`, fully static (M8-05b, #159), so it
   runs on a Linux box with no nix on it.
+- `nixosModules.default`, and the same module as `nixosModules.rustsega`, is the
+  NixOS module of #161: `services.rustsega` with `enable`, `package`, `bind`,
+  `port`, `romDir`, `openFirewall` and `logLevel`, each one handed to the server
+  as the flag of the same name by a unit that runs as a dynamic user with the ROM
+  directory read-only. `nix/module.nix` is the module and `nix/module-test.nix`
+  the VM test that boots it, `nix build .#checks.x86_64-linux.nixos-module`.
+  A reverse proxy and TLS are M8-08 (#163).
 
 ## Reference material
 

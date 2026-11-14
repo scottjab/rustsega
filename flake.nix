@@ -11,7 +11,16 @@
   };
 
   outputs = { self, nixpkgs, rust-overlay, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
+    let
+      # The NixOS module (M8-06, #161), applied to this flake: `module.nix` takes
+      # `self` for nothing but the default of `services.rustsega.package`, and it
+      # is applied here rather than inside `eachDefaultSystem` because
+      # `nixosModules` is a top-level output of a flake - per-system is not a
+      # shape the module system knows - and the system it needs for that default
+      # is the one the module is eventually imported on, `pkgs.system`.
+      nixosModule = import ./nix/module.nix self;
+    in
+    (flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
@@ -113,6 +122,12 @@
         # Only x86_64-linux has the package and its check (#159); macOS, Windows
         # and aarch64 are out of scope.
         supportsStatic = pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isx86_64;
+
+        # The NixOS module test of #161 is gated the same way and for the same
+        # reason: `runNixOSTest` builds a VM image and boots it with QEMU, so it
+        # is a test of a Linux system, and x86_64 is the only one this flake
+        # promises a binary for.
+        supportsNixosTest = pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isx86_64;
 
         # The pinned toolchain of `rust-toolchain.toml` plus the musl target. A
         # `rust.override` replaces the target list rather than adding to it, so
@@ -324,6 +339,16 @@
             touch $out
           '';
 
+          # The NixOS module (M8-06, #161). Like the two checks below this is a
+          # test of the packaging rather than of the emulator: it boots the
+          # service this flake's module installs and asks it the three questions
+          # a deployment would, so `nix/module-test.nix` needs the flake's own
+          # `nixosModules` output and builds the server from source.
+          ${if supportsNixosTest then "nixos-module" else null} =
+            pkgs.testers.runNixOSTest (
+              import ./nix/module-test.nix { module = self.nixosModules.default; inherit pkgs; }
+            );
+
           # The portable binary test (M8-05b, #159). The point of the static
           # build is that it carries no dynamic dependencies at all, and that is
           # a property of the binary rather than of the machine running it, so
@@ -388,5 +413,15 @@
         };
 
         formatter = pkgs.nixpkgs-fmt;
-      });
+      }))
+    // {
+      # The module under two names (#161): `default` for
+      # `imports = [ rustsega.nixosModules.default ]`, `rustsega` for whoever
+      # names the flake input after something else. One value, so the two cannot
+      # drift apart.
+      nixosModules = {
+        default = nixosModule;
+        rustsega = nixosModule;
+      };
+    };
 }
