@@ -196,7 +196,10 @@ pub fn run(args: RunArgs) -> Result<()> {
 
     // The frame the report describes, and so the only frame worth counting pixels
     // on unless `--max-colours` asked for every one of them.
-    let sample = args.sample_frame.unwrap_or(args.frames).clamp(1, args.frames);
+    let sample = args
+        .sample_frame
+        .unwrap_or(args.frames)
+        .clamp(1, args.frames);
     let want_peak = args.max_colours;
     let mut peak_colours = 0;
     // The reported frame, kept as bytes rather than as a borrow of `machine`, so

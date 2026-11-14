@@ -331,8 +331,8 @@ pub fn sweep_with(exe: &Path, args: &SweepArgs) -> Result<Vec<RomResult>> {
     }
     let jobs = args.jobs.unwrap_or_else(default_jobs).max(1);
     let timeout = Duration::from_secs(args.timeout_secs.max(1));
-    let frames = args.frames;
     let watch = watch_frames(args);
+    let sample = args.frames;
     let gate = input_gate(args);
     let total = candidates.len();
     let scratch = scratch_dir()?;
@@ -358,7 +358,13 @@ pub fn sweep_with(exe: &Path, args: &SweepArgs) -> Result<Vec<RomResult>> {
                     break;
                 }
                 let path = &candidates[index];
-                let result = one(&exe, path, index, frames, watch, gate.as_deref(), timeout, &scratch);
+                let pass = Pass {
+                    frames: watch,
+                    sample,
+                    timeout,
+                    scratch: &scratch,
+                };
+                let result = one(&exe, path, index, &pass, gate.as_deref());
                 let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if finished.is_multiple_of(100) || finished == total {
                     eprintln!(
@@ -411,6 +417,21 @@ fn scratch_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// What every child of the sweep is run with, so that `one` and [`run_child`] do
+/// not each take another four arguments to say the same thing.
+#[derive(Clone, Copy)]
+struct Pass<'a> {
+    /// How long the child runs: the watched run, longer than the checkpoint.
+    frames: u32,
+    /// The frame its `colours=` and `frame_hash=` report, i.e. the `--frames`
+    /// checkpoint the CSV columns are taken at (#373).
+    sample: u32,
+    /// The wall-clock limit of one child.
+    timeout: Duration,
+    /// Where the child's stdout and stderr go.
+    scratch: &'a Path,
+}
+
 /// One ROM: read its header, run it in a child, and say how it went.
 ///
 /// Never fails. Every way this can go wrong is a row of the report, because one
@@ -420,16 +441,7 @@ fn scratch_dir() -> Result<PathBuf> {
 /// no picture at all does a second pass run it again with `gate` held, and only if
 /// *that* produced a picture does the row name the gate: the cart then boots, but
 /// the report says what it took (#373).
-fn one(
-    exe: &Path,
-    path: &Path,
-    index: usize,
-    frames: u32,
-    watch: u32,
-    gate: Option<&str>,
-    timeout: Duration,
-    scratch: &Path,
-) -> RomResult {
+fn one(exe: &Path, path: &Path, index: usize, pass: &Pass<'_>, gate: Option<&str>) -> RomResult {
     let started = Instant::now();
     let file = file_name(path);
     let seconds = || started.elapsed().as_secs_f64();
@@ -459,7 +471,7 @@ fn one(
         return row;
     }
 
-    let first = run_child(exe, path, watch, frames, None, timeout, scratch, index);
+    let first = run_child(exe, path, None, index, pass);
     let (frame_hash, colours, max_colours) = parse_report(&first.stdout);
     let attempt = Attempt {
         timed_out: first.timed_out,
@@ -471,32 +483,23 @@ fn one(
     let (mut status, mut notes) = classify(&attempt);
     let mut input_gate = String::new();
 
-    if status == Status::Blank {
-        if let Some(gate) = gate {
-            let second = run_child(
-                exe,
-                path,
-                watch,
-                frames,
-                Some(gate),
-                timeout,
-                scratch,
-                index,
-            );
-            let (_, _, gate_colours) = parse_report(&second.stdout);
-            let gate_attempt = Attempt {
-                timed_out: second.timed_out,
-                code: second.code,
-                colours,
-                max_colours: gate_colours,
-                stderr: &second.stderr,
-            };
-            if classify(&gate_attempt).0 == Status::Boots {
-                let drew = gate_colours.unwrap_or(0);
-                status = Status::Boots;
-                input_gate = gate.to_string();
-                notes = format!("{drew} colours with {gate}");
-            }
+    if status == Status::Blank
+        && let Some(gate) = gate
+    {
+        let second = run_child(exe, path, Some(gate), index, pass);
+        let (_, _, gate_colours) = parse_report(&second.stdout);
+        let gate_attempt = Attempt {
+            timed_out: second.timed_out,
+            code: second.code,
+            colours,
+            max_colours: gate_colours,
+            stderr: &second.stderr,
+        };
+        if classify(&gate_attempt).0 == Status::Boots {
+            let drew = gate_colours.unwrap_or(0);
+            status = Status::Boots;
+            input_gate = gate.to_string();
+            notes = format!("{drew} colours with {gate}");
         }
     }
 
@@ -536,16 +539,13 @@ fn file_name(path: &Path) -> String {
 /// Returns `(timed_out, exit code, stdout, stderr)`. The exit code is `None` when
 /// the child could not be started or was killed by a signal, which is what
 /// distinguishes "it panicked" from "we stopped it" in [`classify`].
-fn run_child(
-    exe: &Path,
-    rom: &Path,
-    frames: u32,
-    sample: u32,
-    pad1: Option<&str>,
-    timeout: Duration,
-    scratch: &Path,
-    index: usize,
-) -> Child {
+fn run_child(exe: &Path, rom: &Path, pad1: Option<&str>, index: usize, pass: &Pass<'_>) -> Child {
+    let Pass {
+        frames,
+        sample,
+        timeout,
+        scratch,
+    } = *pass;
     // One scratch pair per (ROM, pass): `one` runs a ROM twice when the first pass
     // drew nothing, and the two passes of one ROM must not share a file with each
     // other - or delete it out from under the other, which is how a run that said
@@ -572,7 +572,10 @@ fn run_child(
             if let Some(pad1) = pad1 {
                 command.arg("--pad1").arg(pad1);
             }
-            command.stdout(Stdio::from(out)).stderr(Stdio::from(err)).spawn()
+            command
+                .stdout(Stdio::from(out))
+                .stderr(Stdio::from(err))
+                .spawn()
         });
     let mut child = match child {
         Ok(child) => child,
@@ -760,8 +763,7 @@ fn parse_report(stdout: &str) -> (Option<u64>, Option<usize>, Option<usize>) {
 /// #124, so a resweep diffs against the committed table; `max_colours` and
 /// `input_gate` are #373's additions and are what a row now reads as "did this
 /// cartridge ever draw, and did it need a button held".
-const CSV_HEADER: &str =
-    "file,title,serial,region,status,distinct_colors,max_colours,input_gate,frame_hash,seconds,notes";
+const CSV_HEADER: &str = "file,title,serial,region,status,distinct_colors,max_colours,input_gate,frame_hash,seconds,notes";
 
 /// Write the full per-ROM table.
 pub fn write_csv(path: &Path, rows: &[RomResult]) -> Result<()> {
@@ -855,7 +857,10 @@ pub fn markdown(rows: &[RomResult], frames: u32, watch: u32, timeout_secs: u64) 
 
     // Carts that only drew once a button was held: `Boots`, but the report says so
     // rather than folding them in (#373).
-    let gated: Vec<&RomResult> = rows.iter().filter(|row| !row.input_gate.is_empty()).collect();
+    let gated: Vec<&RomResult> = rows
+        .iter()
+        .filter(|row| !row.input_gate.is_empty())
+        .collect();
     if !gated.is_empty() {
         out.push_str(&format!(
             "### Boots with input ({} - drew nothing unperturbed, drew once {gate} was held)\n\n",
@@ -983,7 +988,10 @@ mod tests {
     fn classify_calls_a_rom_that_drew_away_from_the_checkpoint_boots() {
         let (status, notes) = classify(&run_at(Some(2), Some(33)));
         assert_eq!(status, Status::Boots, "a frame of the run was a picture");
-        assert_eq!(notes, "33 colours", "the note names the widest frame: {notes}");
+        assert_eq!(
+            notes, "33 colours",
+            "the note names the widest frame: {notes}"
+        );
     }
 
     #[test]
