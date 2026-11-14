@@ -813,6 +813,48 @@ mod tests {
         assert_eq!(entry_at(&all, &shown, 99), None);
     }
 
+    /// The whole chain one row of the list is drawn from: `filter_roms`, then
+    /// `visible_window`, then [`entry_at`]. A row of a searched list shows the entry
+    /// that search left at that place, and a row launches the entry it shows - so this
+    /// is what keeps "press Enter on `Sonic 2`" from starting the first file in the
+    /// directory instead.
+    #[test]
+    fn a_row_of_a_searched_list_names_the_game_it_launches() {
+        let all = collection();
+        let cases = [
+            ("", RegionFilter::All),
+            ("sonic", RegionFilter::All),
+            ("sonic 2", RegionFilter::All),
+            ("", RegionFilter::Europe),
+            ("sonic", RegionFilter::Japan),
+            ("nothing matches this", RegionFilter::All),
+        ];
+        for (query, region) in cases {
+            let shown = filter_roms(&all, query, region);
+            let window = visible_window(shown.len(), 0.0, ROW_HEIGHT_PX, 400.0, OVERSCAN);
+            for row in window {
+                let entry = entry_at(&all, &shown, row)
+                    .unwrap_or_else(|| panic!("{query:?} {region:?}: row {row} has no entry"));
+                // The entry of the row is the entry `shown` names at that place,
+                // and it is one the search and the chip both left in.
+                assert_eq!(all[shown[row]].id, entry.id, "{query:?} {region:?} row {row}");
+                let name = entry.name.to_lowercase();
+                assert!(
+                    query
+                        .to_lowercase()
+                        .split_whitespace()
+                        .all(|word| name.contains(word)),
+                    "{query:?} row {row} shows {entry:?}, which the search would not leave"
+                );
+                assert!(
+                    region.matches(&entry.name),
+                    "{region:?} row {row} shows {}, which is not in that region",
+                    entry.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn sizes_are_said_in_binary_steps() {
         let cases = [
