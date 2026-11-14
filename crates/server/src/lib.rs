@@ -119,7 +119,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-/// Answer one request out of the asset tree.
+/// Answer one request out of the asset tree: [`resolve`] is the whole routing
+/// rule, including that an unknown `/api/` path is a 404 and not the app.
 async fn serve(State(state): State<Arc<AppState>>, request: Request) -> Response {
     match resolve(&state.assets, request.uri().path()) {
         Some(served) => asset_response(served),
@@ -167,8 +168,17 @@ struct Served {
 
 /// Resolve a request path to an asset: the file itself, or `index.html` when the
 /// path is a client-side route rather than a request for a file.
+///
+/// Returns `None` - so a 404 - for anything in the `api` namespace. A request for
+/// a real endpoint is matched by [`router`] and never gets here, so what is left
+/// under `/api/` is an endpoint that does not exist, and answering it with the app
+/// shell at 200 made a mistyped endpoint or a probe look like a successful API
+/// call to everything except a JSON parser (#418).
 fn resolve(source: &Arc<dyn AssetSource>, path: &str) -> Option<Served> {
     let key = asset_key(path)?;
+    if is_api(&key) {
+        return None;
+    }
     if let Some(asset) = source.get(&key) {
         return Some(Served { key, asset });
     }
@@ -213,6 +223,17 @@ fn asset_key(path: &str) -> Option<String> {
         key.push_str("index.html");
     }
     Some(key)
+}
+
+/// Whether an asset key is the API's namespace rather than the frontend's.
+///
+/// Tested on the normalized [`asset_key`] rather than on the request path, so a
+/// request that spells the same tree differently (`//api/romss`) gets the same
+/// answer. Case is not folded: the router matches its routes case-sensitively
+/// too, so `/Api/roms` never reached an endpoint either, and folding case here
+/// would be a second rule about who counts as asking for the API.
+fn is_api(key: &str) -> bool {
+    key == "api" || key.starts_with("api/")
 }
 
 /// Whether the last component of `key` names a file with an extension.

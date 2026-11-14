@@ -121,14 +121,20 @@ async fn hashed_wasm_is_typed_and_cached_forever() {
 
 #[tokio::test]
 async fn unknown_route_without_an_extension_falls_back_to_index() {
-    let response = get("/settings/buttons").await;
+    // `/library/sonic` is the shape the fallback exists for (#155): a route the
+    // frontend owns rather than a file. `/api/` is the one namespace it must not
+    // claim, and `unknown_api_path_is_404_not_the_shell` is the other half of
+    // this contract.
+    for uri in ["/settings/buttons", "/library/sonic"] {
+        let response = get(uri).await;
 
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(header(&response, CONTENT_TYPE), "text/html; charset=utf-8");
-    // The fallback *is* index.html, so it inherits its cache rule: serving a
-    // stale shell is how the app never updates.
-    assert_eq!(header(&response, CACHE_CONTROL), "no-cache");
-    assert_eq!(body(response).await, INDEX);
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(header(&response, CONTENT_TYPE), "text/html; charset=utf-8");
+        // The fallback *is* index.html, so it inherits its cache rule: serving a
+        // stale shell is how the app never updates.
+        assert_eq!(header(&response, CACHE_CONTROL), "no-cache", "{uri}");
+        assert_eq!(body(response).await, INDEX, "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -136,6 +142,35 @@ async fn unknown_file_with_an_extension_is_404() {
     let response = get("/missing-9a8b7c.css").await;
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn unknown_api_path_is_404_not_the_shell() {
+    // The `/api/` namespace belongs to the handlers of `router()`. Anything in it
+    // that did not reach one is an endpoint that does not exist (#418), and the
+    // app shell at 200 was indistinguishable from a good API response until a
+    // JSON parser looked at it.
+    for uri in [
+        "/api",
+        "/api/",
+        "/api/romss",
+        "/api/inf",
+        "/api/roms/....//....//etc/passwd",
+        "/api/v1/library/scan",
+        "//api/romss",
+    ] {
+        let response = get(uri).await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+        // The same answer the library gives an id it does not know, so one client
+        // reads both: plain text, so nothing has to parse it to notice the 404.
+        assert_eq!(
+            header(&response, CONTENT_TYPE),
+            "text/plain; charset=utf-8",
+            "{uri}"
+        );
+        assert_eq!(body(response).await, b"not found".to_vec(), "{uri}");
+    }
 }
 
 #[tokio::test]

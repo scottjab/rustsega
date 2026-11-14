@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{Request, Response, StatusCode};
+use axum::http::{Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use server::AppState;
 use server::assets::PlaceholderAssets;
@@ -29,8 +29,17 @@ fn state() -> Arc<AppState> {
 }
 
 async fn get(state: Arc<AppState>, uri: &str) -> Response<Body> {
+    request(state, Method::GET, uri).await
+}
+
+async fn request(state: Arc<AppState>, method: Method, uri: &str) -> Response<Body> {
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(Body::empty())
+        .unwrap();
     server::router(state)
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        .oneshot(request)
         .await
         .expect("the router answers without failing")
 }
@@ -100,4 +109,30 @@ async fn api_info_reports_a_library_when_one_was_asked_for() {
             env!("CARGO_PKG_VERSION")
         )
     );
+}
+
+/// A path that is an endpoint is not an unknown path, whatever method it arrives
+/// with: axum's `MethodRouter` answers 405 for it, and #418 must not have turned
+/// that into the 404 of an unknown `/api/` path. The two are different news, and
+/// an operator or a client is entitled to hear which one it is.
+#[tokio::test]
+async fn wrong_method_on_an_api_route_is_method_not_allowed() {
+    for (method, uri) in [
+        (Method::POST, "/api/info"),
+        (Method::PUT, "/api/info"),
+        (Method::POST, "/api/roms"),
+        (Method::GET, "/api/roms/rescan"),
+        (
+            Method::DELETE,
+            "/api/roms/0000000000000000000000000000000000000000",
+        ),
+    ] {
+        let response = request(state(), method.clone(), uri).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {uri}"
+        );
+    }
 }
