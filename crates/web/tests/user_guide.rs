@@ -34,13 +34,16 @@ fn user_guide() -> String {
 /// The default keyboard bindings that no line of `guide` names, each as
 /// `"<button> (<keycap>)"` for the failure message.
 ///
-/// A binding is documented when one line carries both the button's own
-/// [`web::input::PadButton::label`] and its [`keycap_label`], which is what a row
-/// of the guide's keyboard table does. Pairing them is the point: a page that
-/// mentions `Enter` somewhere and `Start` somewhere else has not told anyone that
-/// Enter is Start.
+/// A binding is documented when one of the guide's table rows carries both the
+/// button's own [`web::input::PadButton::label`] and its [`keycap_label`]. Pairing
+/// them on one row is the point: a page that mentions `Enter` in a sentence and
+/// `Start` in another has not told anybody that Enter is Start. Prose rows do not
+/// count, so "press A to jump" cannot document the `A` button.
 fn undocumented_bindings(guide: &str) -> Vec<String> {
-    let lines: Vec<&str> = guide.lines().collect();
+    let lines: Vec<&str> = guide
+        .lines()
+        .filter(|line| line.trim_start().starts_with('|'))
+        .collect();
     Bindings::default()
         .keyboard
         .iter()
