@@ -390,10 +390,10 @@ const TRAVERSAL_IDS: &[&str] = &[
     "/api/roms/sub%2Fd.gen",
 ];
 
-/// Requests that are not id-shaped at all, so they miss the library route and land
-/// on the frontend fallback (`..` is refused as an asset key, and the rest get the
-/// app shell). Which of those two answers is the frontend's business; that none of
-/// them is answered with a file is this one.
+/// Requests that are not id-shaped at all, so they miss the library route and are
+/// answered by the fallback. That none of them is answered with a file has always
+/// been this file's claim; that they are 404 rather than the app shell at 200 is
+/// #418's, and both are asserted below.
 const NOT_IDS: &[&str] = &[
     "/api/roms/",
     "/api/roms/....//....//etc/passwd",
@@ -431,6 +431,10 @@ async fn no_request_that_is_not_an_id_is_answered_with_a_file() {
 
     for attempt in NOT_IDS {
         let response = get(Arc::clone(&state), attempt).await;
+        // #418: one slash off an endpoint is a request for an endpoint that does
+        // not exist, not a client-side route, so the fallback answers it 404 under
+        // `/api/` instead of handing back the shell at 200.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{attempt}");
         let bytes = body(response).await;
         assert!(
             !bytes.starts_with(SECRET),

@@ -374,6 +374,13 @@ frame buffer) and what that means after a load, is
   SHA-1 of the path relative to it. That id is the only way a request can name a
   file: nothing a request says is ever joined to the rom dir, and a symlink that
   resolves outside it is not listed at all.
+- Everything else is the frontend: a built file is served as itself, and a path
+  whose last component has no extension is served `index.html`, so a client-side
+  route like `/library/sonic` survives a refresh (M8-01, #155). `/api/` is the
+  exception: an unknown path under it is an endpoint that does not exist, so it
+  gets the same plain-text `not found` 404 the library gives an unknown id rather
+  than the app shell at 200 (#418). A real endpoint with the wrong method is a
+  405 from axum, settled before the fallback is reached.
 - `nix build` produces the single binary (frontend built in the same
   derivation). `nix build .#static`, which `just build-static` runs, produces the
   same binary for `x86_64-unknown-linux-musl`, fully static (M8-05b, #159), so it
