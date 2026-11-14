@@ -481,7 +481,7 @@ fn one(
                 Some(gate),
                 timeout,
                 scratch,
-                index + 1,
+                index,
             );
             let (_, _, gate_colours) = parse_report(&second.stdout);
             let gate_attempt = Attempt {
@@ -546,8 +546,13 @@ fn run_child(
     scratch: &Path,
     index: usize,
 ) -> Child {
-    let out_path = scratch.join(format!("{index}.out"));
-    let err_path = scratch.join(format!("{index}.err"));
+    // One scratch pair per (ROM, pass): `one` runs a ROM twice when the first pass
+    // drew nothing, and the two passes of one ROM must not share a file with each
+    // other - or delete it out from under the other, which is how a run that said
+    // something came back saying nothing.
+    let tag = if pad1.is_some() { "gate" } else { "run" };
+    let out_path = scratch.join(format!("{index}-{tag}.out"));
+    let err_path = scratch.join(format!("{index}-{tag}.err"));
     let child = File::create(&out_path)
         .and_then(|out| File::create(&err_path).map(|err| (out, err)))
         .and_then(|(out, err)| {
