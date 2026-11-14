@@ -1165,7 +1165,8 @@ mod tests {
     /// both running: the machine the Z80 contention tests measure, the two counters
     /// being the two things a wait can take away.
     fn z80_contender(addr: u16) -> (M68k, Z80, Bus) {
-        let mut bus = Bus::new(rom_image(), VERSION);        bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it.
+        let mut bus = Bus::new(rom_image(), VERSION);
+        bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it.
         let program = z80_read_loop(addr);
         bus.z80.ram[..program.len()].copy_from_slice(&program);
         release_z80_reset(&mut bus);

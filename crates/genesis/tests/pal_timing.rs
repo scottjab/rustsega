@@ -448,3 +448,153 @@ fn europe_only_commercial_rom_boots_a_240_line_frame() {
         "the 240 line frame is a picture rather than a blank"
     );
 }
+
+// --- A frame is one VBlank-to-VBlank interval (#371) ----------------------------
+
+/// Master clocks of `lines` of the raster, for a test that counts a frame the
+/// way the scheduler runs one: `Scheduler::master_clock` before and after.
+fn mclk(lines: u64) -> u64 {
+    lines * MASTER_CLOCKS_PER_LINE
+}
+
+/// Run `lines` scanlines without ending the frame, and say how many lines that
+/// was, so a test can add them to the frame it measures next.
+///
+/// Asserts the VDP stayed quiet: these are the lines *between* the two VBlank
+/// lines a frame is measured between, and a flag among them would mean the
+/// interval being built had already ended.
+fn walk(
+    scheduler: &mut Scheduler,
+    cpu: &mut M68k,
+    z80: &mut Z80,
+    bus: &mut Bus,
+    lines: u64,
+) -> u64 {
+    for _ in 0..lines {
+        scheduler.run_line(cpu, z80, bus);
+        assert!(
+            !bus.vdp.frame_done(),
+            "the flag came up inside the walk, not at the end of the interval"
+        );
+    }
+    lines
+}
+
+/// One [`Scheduler::run_frame`], in scanlines: what the scheduler says a frame
+/// was, counted off its own master clock.
+fn frame_lines(scheduler: &mut Scheduler, cpu: &mut M68k, z80: &mut Z80, bus: &mut Bus) -> u64 {
+    let start = scheduler.master_clock;
+    scheduler.run_frame(cpu, z80, bus);
+    (scheduler.master_clock - start) / MASTER_CLOCKS_PER_LINE
+}
+
+/// The console-level rule of #371: `run_frame` ends on the VBlank the VDP offers,
+/// so a PAL frame whose VBlank line moved mid-frame is 329 lines one way and 297
+/// the other, `run_frame` returns normally across both, and the frames after them
+/// are the plain 313 again with no drift.
+///
+/// The two intervals are what `Story of Thor, The (Europe)` and
+/// `Sensible Soccer, (Europe)` reach on the chip - see
+/// `vdp::timing::tests::v30_set_ahead_of_the_beam_makes_a_329_line_interval` -
+/// and before #371 the wait stopped at `lines_per_frame` and panicked, because
+/// the scheduler was counting a raster rather than the distance between the two
+/// VBlank lines it was waiting for.
+#[test]
+fn run_frame_spans_a_moved_vblank_line() {
+    let (mut cpu, mut z80, mut bus, mut scheduler) = console(Region::Europe);
+
+    assert_eq!(
+        frame_lines(&mut scheduler, &mut cpu, &mut z80, &mut bus),
+        PAL_LINES,
+        "from the VBlank the beam was parked on, a frame is still the raster"
+    );
+
+    // V30 at line 120, 104 lines ahead of the V28 line it moves off: the frame
+    // boundary moves to 240 and the interval is 313 + 16.
+    let mut interval = walk(&mut scheduler, &mut cpu, &mut z80, &mut bus, 89 + 120);
+    bus.vdp.write_register(1, R1_DISPLAY | R1_VINT | R1_V30);
+    interval += frame_lines(&mut scheduler, &mut cpu, &mut z80, &mut bus);
+    assert_eq!(interval, 329, "the frame that ends on line 240");
+
+    // And cleared at line 24, again ahead of the beam: 313 - 16.
+    let mut interval = walk(&mut scheduler, &mut cpu, &mut z80, &mut bus, 73 + 24);
+    bus.vdp.write_register(1, R1_DISPLAY | R1_VINT);
+    interval += frame_lines(&mut scheduler, &mut cpu, &mut z80, &mut bus);
+    assert_eq!(interval, 297, "the frame that ends back on line 224");
+
+    // Nothing was borrowed from the frames after it: with the line back where it
+    // started, every frame is the raster and the master clock is exact.
+    let start = scheduler.master_clock;
+    for _ in 0..10 {
+        assert_eq!(
+            frame_lines(&mut scheduler, &mut cpu, &mut z80, &mut bus),
+            PAL_LINES,
+            "and after the mode change, a frame is the raster again"
+        );
+    }
+    assert_eq!(
+        scheduler.master_clock - start,
+        mclk(10 * PAL_LINES),
+        "ten frames are exactly ten rasters of clocks, with nothing carried or lost"
+    );
+}
+
+/// A state taken after the mode switch round-trips (#371).
+///
+/// The scheduler's position is in the save state, and it is no longer 0 where a
+/// frame ended once the VBlank line has moved - the scheduler counts the raster
+/// and the frame boundary is the VBlank line, so after the 329-line frame of a
+/// boot that flips into V30 the counter is 16 and the chip's beam is on line
+/// 240. A state that lost either half would resume the raster a fifth of a frame
+/// out and draw the rest of the run one line away from where it belonged.
+#[test]
+fn state_round_trip_across_a_mode_switch() {
+    let rom = cart(Region::Europe, &[0x60FE]);
+    let mut first = Genesis::new(
+        &rom,
+        Config {
+            region: RegionSetting::Force(Region::Europe),
+            ..Config::default()
+        },
+    )
+    .expect("a ROM with a header loads");
+
+    // The frame the cart's V30 write moves, and one after it.
+    first.run_frame();
+    first.run_frame();
+    assert!(first.bus().vdp.v30_mode(), "the cart got its V30");
+    let state = first.save_state();
+
+    let mut fresh = Genesis::new(
+        &rom,
+        Config {
+            region: RegionSetting::Force(Region::Europe),
+            ..Config::default()
+        },
+    )
+    .expect("the same ROM again");
+    assert_ne!(
+        fresh.save_state(),
+        state,
+        "a console that has run two frames and one that has not must differ"
+    );
+    fresh.load_state(&state).expect("the state loads");
+    assert_eq!(
+        fresh.save_state(),
+        state,
+        "loading the state did not put the console back exactly where it was saved"
+    );
+
+    // And the two go on agreeing: every frame after the load is the same machine
+    // state as the one that was never interrupted, which is what says the
+    // scheduler position came back rather than being restarted.
+    for _ in 0..5 {
+        first.run_frame();
+        fresh.run_frame();
+        assert_eq!(
+            fresh.save_state(),
+            first.save_state(),
+            "a frame after the load diverged"
+        );
+    }
+}

@@ -401,9 +401,9 @@ impl Vdp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hv::MCLKS_PER_LINE;
     use crate::WIDTH_H32;
     use crate::color::color;
+    use crate::hv::MCLKS_PER_LINE;
     use crate::planes::testutil::{
         CELL_TILE_ROWS, PLANE_A_BASE, PLANE_B_BASE, PLANE_COLUMNS, PLANE_ROWS, fill_tile_row,
         fill_tile_row_of_height, plane_vdp, put_entry, put_word,

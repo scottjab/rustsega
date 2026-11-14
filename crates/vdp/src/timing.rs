@@ -776,7 +776,10 @@ mod tests {
             if vdp.frame_done() {
                 return lines;
             }
-            assert!(lines <= V30_SAFETY, "{lines} lines and no VBlank line at all");
+            assert!(
+                lines <= V30_SAFETY,
+                "{lines} lines and no VBlank line at all"
+            );
         }
     }
 

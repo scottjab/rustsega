@@ -983,6 +983,50 @@ mod tests {
     /// of host audio every time it runs, and a rate that is kept by rounding the
     /// per-frame count is off by the fraction it threw away every frame for ever.
     #[test]
+    /// A frame whose VBlank line moved ahead of the beam is 16 lines longer than
+    /// the region's raster (#371): the reservation has to cover that frame without
+    /// growing, and has to cover it exactly - a buffer that filled up mid-frame
+    /// would allocate in the middle of a running machine, and one that was
+    /// reserved a raster longer than the longest frame is a third of a megabyte
+    /// of sound nobody can hear.
+    #[test]
+    fn the_longest_frame_fills_the_reservation_without_growing_it() {
+        let lines = u64::from(LINES_PER_FRAME_PAL) + u64::from(VBLANK_LINE_SHIFT);
+        let mut audio = Audio::new();
+        let ym_capacity = audio.ym_samples.capacity();
+        let psg_capacity = audio.psg_samples.capacity();
+
+        audio.advance_to(lines * MASTER_CLOCKS_PER_LINE);
+
+        assert_eq!(
+            audio.ym_samples.len(),
+            (lines * MASTER_CLOCKS_PER_LINE / YM_SAMPLE_MCLK) as usize,
+            "one YM sample per {} master clocks over a {lines}-line frame",
+            YM_SAMPLE_MCLK
+        );
+        assert_eq!(
+            audio.psg_samples.len(),
+            (lines * MASTER_CLOCKS_PER_LINE / PSG_TICK_MCLK) as usize,
+            "one PSG tick per {} master clocks over the same frame",
+            PSG_TICK_MCLK
+        );
+        assert_eq!(
+            audio.ym_samples.capacity(),
+            ym_capacity,
+            "the YM2612 buffer grew to hold a frame whose VBlank line moved"
+        );
+        assert_eq!(
+            audio.psg_samples.capacity(),
+            psg_capacity,
+            "the PSG buffer grew to hold a frame whose VBlank line moved"
+        );
+        assert!(
+            audio.ym_samples.capacity() - audio.ym_samples.len() < YM_SAMPLE_MCLK as usize,
+            "the reservation is an upper bound, not a round number twice as big              as it needs to be: {} over",
+            audio.ym_samples.capacity() - audio.ym_samples.len()
+        );
+    }
+
     fn output_count_exact_over_one_second() {
         let mut audio = Audio::new();
         let mut mixer = mixer(Config::default());
