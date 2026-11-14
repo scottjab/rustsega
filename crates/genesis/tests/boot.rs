@@ -551,3 +551,107 @@ fn virtua_racing_boots_to_non_blank_screen() {
         colours
     );
 }
+
+/// The four carts #375 names, one `#[ignore]`d boot test each, so that "one cause or
+/// four?" is answered by a test run rather than by an afternoon at a disassembler.
+///
+/// **All four fail on `main`, and are `#[ignore]`d for that reason** and not because
+/// the ROM is missing - the same shape as
+/// [`virtua_racing_boots_to_non_blank_screen`] above. They are landed before the
+/// fixes, as the measurement the fixes get judged on; each assertion names the cause
+/// the cart was diagnosed into, and every number quoted is this tree's
+/// `headless run <rom> --frames 1800 --colours --max-colours` output.
+///
+/// They ask for their ROM by exact file name through [`testkit::commercial_rom`]
+/// rather than by prefix through `find_commercial_rom`, because prefix matching takes
+/// the first name in sorted order and the collection holds a `QuackShot ... (Rev A)
+/// (Alt)` image that sorts before the `(Rev A)` image under test - and the Alt is a
+/// complete dump that boots, so a prefix would test the wrong cart and pass.
+///
+/// Run one with
+/// `cargo nextest run -p genesis --run-ignored only --test boot <name>`.
+///
+/// `QuackShot (Rev A)`: the 68000 never gets as far as the VDP because the cart's own
+/// boot self-test fails, and it fails because the image is not complete. The header
+/// declares a ROM size of `0x13FFFF` - 1.25 MB - and the file is `0x80000`, so the
+/// self-test's pass over the mirrored upper half reads the `0xFF` filler above the end
+/// of the image (`Bus::read_rom_byte`) and sums wrong; the cart then parks on
+/// `NOP; NOP; BRA.S $200` from frame 30 on, with R1 bit 6 clear and 0 of 64 CRAM words
+/// written. The `(Alt)` dump of the same revision is `0x140000`, verifies, and draws 33
+/// colours; so does the unmodified `-00` image, which is also `0x80000` but declares a
+/// matching `0x07FFFF`. Filed as
+/// [#435](https://github.com/scottjab/rustsega/issues/435).
+#[test]
+#[ignore = "needs a commercial ROM, and #435: this dump is short of the size its header declares, so the cart's own ROM check fails and it halts before the VDP"]
+fn quackshot_rev_a_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom(
+        "QuackShot Starring Donald Duck (World) (En,Ja) (Rev A).md"
+    ));
+    let colours = colour_count(&path, 300, "quackshot_rev_a_300.png");
+    assert!(
+        colours > BLANK,
+        "300 frames in, QuackShot (Rev A) is {colours} distinct colours: the image declares \
+         a ROM size past its own end, the boot self-test fails on the filler read there, and \
+         the 68000 halts at $200 without touching the VDP (#435)"
+    );
+}
+
+/// `Krusty's Super Fun House (USA, Europe)`: the same colour count, a different cause.
+/// The display is enabled and 2348 VRAM bytes are loaded, but 0 of 64 CRAM words are
+/// ever written, and the cart reports region `usa`. Forcing `--region europe` draws 30
+/// colours where `usa` and `japan` both stay at 1 - so this cart takes one of two
+/// branches off a read of the version register at `0xA10001` and only the PAL branch
+/// finishes. Filed as [#438](https://github.com/scottjab/rustsega/issues/438).
+#[test]
+#[ignore = "needs a commercial ROM, and #438: its start-up does not finish in the region its header reports, so it never loads a palette; forced to PAL it draws"]
+fn krystys_super_fun_house_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom(
+        "Krusty's Super Fun House (USA, Europe).md"
+    ));
+    let colours = colour_count(&path, 300, "krystys_super_fun_house_300.png");
+    assert!(
+        colours > BLANK,
+        "300 frames in, Krusty's Super Fun House is {colours} distinct colours: the display \
+         is on and CRAM is empty, and the same image forced to --region europe draws 30 (#438)"
+    );
+}
+
+/// `Time Killers (USA)`: the 68000 is stopped, but by a hardware read rather than by
+/// itself. All 1800 frames are one three-instruction loop - `MOVE.W $A11100,D0` /
+/// `BTST #$0,D0` / `BNE.S $40E` - which is the plutiedev "Using the Z80" poll between
+/// asking the sound CPU for its bus and touching the sound side. The flag is bit 0 of
+/// that read, and `Bus::read_z80_ctrl_word` answers a *word* read with the flag in bit
+/// 8 and a fixed `1` in bit 0 whether or not the Z80 has been stopped, so the
+/// condition the cart is waiting on is never reported. Filed as
+/// [#437](https://github.com/scottjab/rustsega/issues/437).
+#[test]
+#[ignore = "needs a commercial ROM, and #437: it spins for ever on bit 0 of the word read of 0xA11100, which our bus-request read-back holds at 1"]
+fn time_killers_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom("Time Killers (USA).md"));
+    let colours = colour_count(&path, 300, "time_killers_300.png");
+    assert!(
+        colours > BLANK,
+        "300 frames in, Time Killers is {colours} distinct colours: it polls bit 0 of the \
+         word at $A11100 for the Z80 to release its bus, and that bit never reads 0 here (#437)"
+    );
+}
+
+/// `Lemmings 2 - The Tribes (USA)`: the one of the four with no cause established yet.
+/// The 68000 is running - `pc` moves and the cycle counter advances - the display is
+/// enabled and 2348 VRAM bytes are loaded, but 0 CRAM words are written across 1800
+/// frames and `pc` is at `$00125E` at 1789 of them. Region forcing does not move it and
+/// it is not waiting on a register, so it is carried on the inventory of measured carts
+/// with no cause, [#440](https://github.com/scottjab/rustsega/issues/440). The test is
+/// landed anyway, so that whatever the cause turns out to be arrives with a guard
+/// already attached to this cart.
+#[test]
+#[ignore = "needs a commercial ROM, and #440: measured to the frame boundary with no cause established, so this fails on main"]
+fn lemmings_2_tribes_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom("Lemmings 2 - The Tribes (USA).md"));
+    let colours = colour_count(&path, 300, "lemmings2_tribes_300.png");
+    assert!(
+        colours > BLANK,
+        "300 frames in, Lemmings 2 - The Tribes is {colours} distinct colours: display on, \
+         VRAM loaded, CRAM never written, cause not established (#440)"
+    );
+}
