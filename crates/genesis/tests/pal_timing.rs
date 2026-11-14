@@ -30,8 +30,8 @@ const MASTER_CLOCKS_PER_LINE: u64 = 3420;
 /// Kabuto's hardware notes, "Timing table - General", gives the PAL V counter
 /// progression as `0x000-0x102, 0x1CA-0x1FF`: 259 lines plus 54 is 313. The
 /// NTSC row of the same table, `0x000-0x0EA, 0x1E5-0x1FF`, is 235 plus 27, and
-/// that is the 262 of [`NTSC_LINES`]. `crates/vdp/src/hv.rs` reads the two
-/// progressions as the same two jumps.
+/// that is the 262 of [`NTSC_LINES`]. `crates/vdp/src/hv.rs` reads the two V28
+/// progressions as the same two jumps; its NTSC V30 row has no jump at all.
 const PAL_LINES: u64 = 313;
 /// Scanlines in one NTSC raster, the control that keeps the PAL number honest.
 const NTSC_LINES: u64 = 262;
@@ -223,17 +223,22 @@ fn assert_hz(measured: f64, expected: f64, what: &str) {
     );
 }
 
-/// The VINT lands on V counter `0xF0`, line 240, on a PAL chip in V30, and on
-/// `0xE0`, line 224, in V28.
+/// The VINT lands on V counter `0xF0`, line 240, in V30 and on `0xE0`, line
+/// 224, in V28 - in either region.
 ///
 /// genvdp.txt section 4 names only `E0h` - "a level 6 interrupt will occur when
 /// the V counter is at line E0h" - because it never discusses V30 at all.
 /// Kabuto's hardware notes do, in the "Interrupts - VBlank set" row of the
 /// timing table: `Vcounter changes from 0xDF to 0xE0` in V28 and `from 0xEF to
 /// 0xF0` in V30, which is the same interrupt on the first line past the 240
-/// lines V30 scans. `crates/vdp/src/timing.rs` starts VBlank on
-/// [`vdp::Vdp::active_height`] for exactly that reason, so this checks the chip
-/// against the table rather than against itself.
+/// lines V30 scans. `crates/vdp/src/timing.rs` starts VBlank on its own
+/// `vblank_line` for exactly that reason, so this checks the chip against the
+/// table rather than against itself.
+///
+/// The NTSC assertion is #446: the row of the table names no region, so an NTSC
+/// chip in V30 takes its VINT on 240 like a PAL one. What it does *not* say is
+/// that NTSC then draws 240 lines - see [`v30_frame_height_240`], which is the
+/// display half and is still unmodelled.
 #[test]
 fn v30_vint_at_line_240() {
     assert_eq!(
@@ -248,8 +253,13 @@ fn v30_vint_at_line_240() {
     );
     assert_eq!(
         vint_v_counter_on(Region::Usa, R1_DISPLAY | R1_VINT | R1_V30),
+        240,
+        "NTSC in V30 takes it there too: Kabuto's row is about the counter, not the region"
+    );
+    assert_eq!(
+        vint_v_counter_on(Region::Usa, R1_DISPLAY | R1_VINT),
         224,
-        "NTSC is V28 whatever bit 3 says: see `v30_frame_height_240`"
+        "and NTSC in V28 keeps 0xE0, so it is bit 3 that moved and not the region"
     );
 }
 
@@ -295,6 +305,11 @@ fn vint_v_counter_on(region: Region, reg1: u8) -> u16 {
 /// produce (M4-19, #97; `vdp::Vdp::active_height` carries the same note). What
 /// the hardware does instead - a rolling picture, and no bottom border on a
 /// capture - is the thing this test records as deliberately not modelled.
+///
+/// Only the picture half, and since #446 that is all this holds. The counters of
+/// the same NTSC V30 column - no V counter jump, and VBlank set at `0xEF ->
+/// 0xF0` on line 240 - are modelled, so an NTSC chip in V30 now ends its frame
+/// 16 lines later than before while still drawing and handing over 224 of them.
 #[test]
 fn v30_frame_height_240() {
     let pal = running_machine(Region::Europe);
