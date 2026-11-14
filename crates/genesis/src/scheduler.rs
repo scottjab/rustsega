@@ -86,6 +86,12 @@ const MAX_SLICES_PER_LINE: u32 = MASTER_CLOCKS_PER_LINE as u32;
 const LINES_PER_FRAME_NTSC: u16 = 262;
 /// Scanlines in one PAL frame.
 pub(crate) const LINES_PER_FRAME_PAL: u16 = 313;
+/// How far the VBlank line moves when R1 bit 3 is written: [`vdp::Vdp::active_height`]
+/// is 224 in V28 and 240 in V30, and `vdp::timing::start_line` compares the beam
+/// against it live, so a mid-frame write moves the frame boundary by this much
+/// (#371). [`Scheduler::max_frame_lines`] and the frame buffers of [`crate::Audio`]
+/// are both sized off it.
+pub(crate) const VBLANK_LINE_SHIFT: u16 = 16;
 
 /// The line loop of the console: `docs/ARCHITECTURE.md`, "Clocks and timing".
 ///
@@ -257,38 +263,74 @@ impl Scheduler {
         self.vdp_clock = self.m68k_clock.min(self.z80_clock);
     }
 
-    /// Run one whole frame: [`Scheduler::run_line`] until the VDP says the frame is
-    /// drawn, and then the rest of the raster too.
+    /// Run one frame: [`Scheduler::run_line`] until the VDP says the frame is drawn,
+    /// which is one VBlank-to-VBlank interval and nothing more.
     ///
-    /// [`vdp::Vdp::frame_done`] is raised at VBlank start, which on NTSC is line 224
-    /// of 262, and once per frame after that. Ending the frame there would make the
-    /// first call 224 lines long and every later one 262 - which is not a difference
-    /// the VDP can be blamed for, since it is simply answering a question about where
-    /// its own beam is. So the flag is what ends the waiting, and the line counter
-    /// wrapping is what ends the frame: one `run_frame` is one raster of
-    /// [`Scheduler::lines_per_frame`] lines, and it takes exactly one `frame_done`
-    /// with it (`run_frame_ends_at_vblank` holds the two together).
+    /// [`vdp::Vdp::frame_done`] is raised when the beam enters
+    /// [`vdp::Vdp::active_height`], 224 in V28 and 240 in V30, and R1 bit 3 can be
+    /// written on any line - so the interval, not the raster, is what a frame is.
+    /// Kabuto's hardware notes, "V28/V30 tricks", describe programs that move the
+    /// border by writing the bit mid-frame, and on the PAL carts of #371 that makes
+    /// the interval 329 lines (`Story of Thor, The (Europe)`, V30 set at line 120)
+    /// or 297 (`Sensible Soccer (Europe)`, V30 cleared at line 24) inside a raster
+    /// that is still 313 lines long. Ending the call at the flag is what keeps those
+    /// two numbers one frame: the raster is not a frame boundary, the VBlank line is,
+    /// and counting a fixed number of lines instead would either stop 16 lines short
+    /// of the flag or run 16 lines past it and take the next frame's flag with it.
+    ///
+    /// Nothing here depends on [`Scheduler::line`] any more, which is what lets a
+    /// frame be a different length every time: the counter keeps the raster position
+    /// the VDP is at (see [`Scheduler::restart_frame`] and [`Self::max_frame_lines`]),
+    /// and a machine that has moved its VBlank line ends a frame with the counter
+    /// somewhere other than 0.
     pub fn run_frame(&mut self, cpu: &mut M68k, z80: &mut Z80, bus: &mut Bus) {
         // A frame of sound starts with the frame of picture: the buffers hold what
         // this raster produces and nothing older (see [`crate::Audio::start_frame`]).
         bus.audio.start_frame();
+        let limit = self.max_frame_lines();
         let mut lines = 0_u32;
-        while !bus.vdp.frame_done() {
+        loop {
             lines += 1;
-            // The line counter is what ends the frame below, so a VDP that never
-            // raises the flag would spin here forever: the same kind of guard
-            // [`Scheduler::slice_bound`] is, on the outer loop instead of the inner
-            // one, and a panic naming itself rather than a hung test.
+            // A VDP that never raises the flag would spin here forever, so the wait
+            // is bounded: the same kind of guard [`Scheduler::slice_bound`] is, on
+            // the outer loop instead of the inner one, and a panic naming itself
+            // rather than a hung test.
             assert!(
-                lines <= u32::from(self.lines_per_frame),
+                lines <= limit,
                 "{} lines and the VDP has not raised `frame_done`",
                 lines,
             );
             self.run_line(cpu, z80, bus);
+            if bus.vdp.frame_done() {
+                break;
+            }
         }
-        while self.line != 0 {
-            self.run_line(cpu, z80, bus);
-        }
+    }
+
+    /// The longest one VBlank-to-VBlank interval can be, which is the bound
+    /// [`Scheduler::run_frame`] waits on: a raster, plus the 16 lines the VBlank
+    /// line moves when R1 bit 3 is written ahead of the beam, plus one whole raster
+    /// of slack.
+    ///
+    /// The two halves are measured on the chip, not guessed:
+    ///
+    /// * a raster plus the shift is a mode change the beam has not reached, which
+    ///   moves the flag to the other candidate line - PAL 329 lines one way and 297
+    ///   the other (`vdp::timing::tests::v30_set_ahead_of_the_beam_makes_a_329_line_interval`);
+    /// * the slack is the mode change the beam *has* passed: set the bit before
+    ///   line 224 and clear it between 224 and 240 and this raster raises no flag at
+    ///   all, so one interval runs to the next raster's VBlank line and is 626 lines
+    ///   long (`vdp::timing::tests::v30_inside_the_passed_window_shortens_or_skips_the_frame`).
+    ///
+    /// A frame that long is 16 lines more of audio than [`crate::Audio`]'s frame
+    /// buffers are reserved for, which is why their capacity is `LINES_PER_FRAME_PAL
+    /// + VBLANK_LINE_SHIFT` rather than the region's raster, and a frame longer than
+    /// this bound is a chip that has lost its VBlank line outright rather than a mode
+    /// change (#371).
+    pub(crate) fn max_frame_lines(&self) -> u32 {
+        let raster = u32::from(self.lines_per_frame);
+        let interval = raster + u32::from(VBLANK_LINE_SHIFT);
+        interval + raster
     }
 
     /// Walk the VDP to the time the two CPUs agree has passed, so that the beam and

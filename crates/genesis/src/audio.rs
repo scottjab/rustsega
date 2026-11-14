@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use sn76489::Sn76489;
 use ym2612::Ym2612;
 
-use crate::scheduler::{LINES_PER_FRAME_PAL, MASTER_CLOCKS_PER_LINE};
+use crate::scheduler::{LINES_PER_FRAME_PAL, MASTER_CLOCKS_PER_LINE, VBLANK_LINE_SHIFT};
 
 /// Master clocks between two YM2612 output samples: 144 68000 clocks at
 /// [`crate::scheduler::MASTER_CLOCKS_PER_68K`] each, about 53267 Hz
@@ -62,16 +62,21 @@ pub const YM_SAMPLE_MCLK: u64 = 144 * 7;
 /// "Clocks and timing").
 pub const PSG_TICK_MCLK: u64 = 16 * 15;
 
-/// Samples one PAL frame can hold, which is the capacity the buffers are reserved
-/// at: PAL is the slower frame but the longer one, and the chips run on the
-/// master clock rather than on seconds, so it is the one that needs the most
-/// entries. Rounding up is deliberate - the reservation is an upper bound, and a
-/// push that had to grow is a silent allocation rather than a loud failure.
+/// The longest frame one reservation has to hold: the PAL raster - the slower
+/// frame but the longer one, and the chips run on the master clock rather than on
+/// seconds, so it is the region that needs the most entries - plus the 16 lines a
+/// mid-frame V30 write can add to a frame whose VBlank line moves ahead of the
+/// beam (#371, [`crate::Scheduler::run_frame`]).
+const LINES_PER_LONGEST_FRAME: usize = (LINES_PER_FRAME_PAL + VBLANK_LINE_SHIFT) as usize;
+/// Samples one frame of [`LINES_PER_LONGEST_FRAME`] can hold, which is the capacity
+/// the buffers are reserved at. Rounding up is deliberate - the reservation is an
+/// upper bound, and a push that had to grow is a silent allocation rather than a
+/// loud failure.
 const YM_FRAME_CAPACITY: usize =
-    (LINES_PER_FRAME_PAL as usize * MASTER_CLOCKS_PER_LINE as usize) / YM_SAMPLE_MCLK as usize + 1;
+    (LINES_PER_LONGEST_FRAME * MASTER_CLOCKS_PER_LINE as usize) / YM_SAMPLE_MCLK as usize + 1;
 /// The same for the PSG, whose tick is a little over four times finer.
 const PSG_FRAME_CAPACITY: usize =
-    (LINES_PER_FRAME_PAL as usize * MASTER_CLOCKS_PER_LINE as usize) / PSG_TICK_MCLK as usize + 1;
+    (LINES_PER_LONGEST_FRAME * MASTER_CLOCKS_PER_LINE as usize) / PSG_TICK_MCLK as usize + 1;
 
 /// The console's sound hardware: the two chips, how far each has been run, and
 /// the samples they produced this frame.
