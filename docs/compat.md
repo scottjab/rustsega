@@ -13,14 +13,17 @@ These tables are the #373 resweep: every cart runs for the 600-frame checkpoint 
 ## Known issues
 
 One issue per cause, from the M6-13 triage (#133): `just test-all`,
-`just test-commercial` and the 2775-ROM sweep. `just test-all` fails on exactly one
-test by design and `just test-commercial` on the same one, both until #362 is fixed.
+`just test-commercial` and the 2775-ROM sweep. `just test-all` fails on two tests by
+design: `commercial_save_state_is_audible_after_a_load` until #362 is fixed, and -
+only where the commercial collection is on disk - `virtua_racing_boots_to_non_blank_screen`
+until [#433](https://github.com/scottjab/rustsega/issues/433) gives `Virtua Racing`
+its SVP. `just test-commercial` runs the first of the two but not the second.
 
 | Issue | Cause | ROMs |
 |---|---|---|
 | [#371](https://github.com/scottjab/rustsega/issues/371) | A mid-frame V28/V30 switch moves the VBlank line, so `run_frame`'s watchdog fires a frame early. 48 carts report `314 lines` (all PAL) and 35 report `263` (33 `usa`, 2 `japan`): the same event on the two rasters, since the guard is `lines_per_frame + 1`. [#354](https://github.com/scottjab/rustsega/issues/354) is the inventory of these 83 and should close into #371. | 83 |
 | [#355](https://github.com/scottjab/rustsega/issues/355) | Unimplemented 68000 opcodes: `4741` x9, `00FF` x3, `00FA` x1. Seven of the nine `4741` hits are five betas of `NFL '95` and two Pro Action Replay carts, so it is narrower than nine separate instruction gaps. `0AC6` is gone since #78. | 13 |
-| [#374](https://github.com/scottjab/rustsega/issues/374) | The SVP DSP in the `Virtua Racing` cartridge, which nothing in the tree models. `Virtua Racing (USA)` and `(Japan) (En)` stay `#000000` at every frame sampled. | 2 |
+| [#374](https://github.com/scottjab/rustsega/issues/374) | **A named gap, not an unexplained one:** the SVP - the Fujitsu SSP1601 DSP, its program ROM and its 2 KB of DRAM that the `Virtua Racing` cartridge carries and the 68k addresses at `0xA15000` and `0x300000` - is unemulated, so `Virtua Racing (USA)` and `(Japan) (En)` are expected to be blank. Measured on this tree: `headless run "Virtua Racing (USA).md" --frames 1800 --max-colours` is `max_colours=1` with no input, and the `17 colours` in the START-gated table below is the same cart poked, not its 3D layer. `virtua_racing_boots_to_non_blank_screen` in `crates/genesis/tests/boot.rs` is the measurement, and [#433](https://github.com/scottjab/rustsega/issues/433) is what is left. | 2 |
 | [#375](https://github.com/scottjab/rustsega/issues/375) | 28 retail carts that draw pure black at all 21 sampled frame counts, with and without input - diagnosis ticket, including the `QuackShot` rev pair where `-00` boots and `-01` does not. | 28 |
 | [#357](https://github.com/scottjab/rustsega/issues/357) | The 2 MB/4 MB Taiwan and China unlicensed carts, which are not a mapper problem. 26 of them are still in the never-drawing set; listed on the issue. | 26 |
 | [#373](https://github.com/scottjab/rustsega/issues/373) | **Fixed by the resweep below.** The sweep sampled one frame, at 600, with no pad connected; watching the whole run and holding START moves 416 of these carts to `Boots`, 13 of them only with the START press. Nothing here is a fix to the emulator: the measurement was wrong. | 416 |

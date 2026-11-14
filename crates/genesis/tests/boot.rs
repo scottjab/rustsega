@@ -425,6 +425,16 @@ fn sonic_boots_to_non_blank_screen() {
 /// `require_data!` is not used here because it leaves the test early, and this is a
 /// helper rather than a test: each test asks for its own ROM and passes it in.
 fn realtec_colours(path: &std::path::Path, frames: u32) -> usize {
+    colour_count(path, frames, "realtec_prefix.png")
+}
+
+/// Boots `path` for `frames` and returns how many distinct colours its last frame
+/// holds, writing that frame to `target/test-output/<name>`.
+///
+/// The body of [`realtec_colours`], split out so that a cart outside the Realtec
+/// family can be measured the same way - the number is the point, and a
+/// before/after pair of numbers is what settles whether a cart-side change helped.
+fn colour_count(path: &std::path::Path, frames: u32, name: &str) -> usize {
     use std::collections::HashSet;
 
     let rom = std::fs::read(path).expect("the cart is readable");
@@ -439,7 +449,8 @@ fn realtec_colours(path: &std::path::Path, frames: u32) -> usize {
     let colours: HashSet<u32> = pixels.iter().copied().collect();
     testkit::dump_png(
         &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/test-output/realtec_prefix.png"),
+            .join("../../target/test-output/")
+            .join(name),
         pixels,
         frame.width,
         frame.height,
@@ -510,6 +521,33 @@ fn tom_clown_boots_to_non_blank_screen() {
     assert!(
         colours > BLANK,
         "300 frames in, Tom Clown is {} distinct colours",
+        colours
+    );
+}
+
+/// Virtua Racing, the one cart of the collection that carries the SVP: a Fujitsu
+/// SSP1601 DSP with its own program ROM and 2 KB of DRAM, which the 68k talks to
+/// through `0xA15000`-`0xA15009` and `0x300000`-`0x31FFFF` (notaz *SVP doc*
+/// section 3 "Memory map").
+///
+/// Nothing in this tree models the SVP, so the cart waits on a DSP that never
+/// answers and the frame stays `#000000` however long it runs - `1 colours` in
+/// docs/compat.md, and the only two carts of the 2775 that never draw a pixel
+/// (#374). This test therefore **fails on `main` and is `#[ignore]`d** for that
+/// reason, not because the ROM is missing: it is the measurement the SVP work is
+/// judged on, and un-ignoring it is the acceptance criterion of #374.
+///
+/// Run it with
+/// `cargo nextest run -p genesis --run-ignored only --test boot virtua_racing`.
+#[test]
+#[ignore = "needs a commercial ROM, and #374: the SVP is unemulated, so this fails on main"]
+fn virtua_racing_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom("Virtua Racing (USA)"));
+    let colours = colour_count(&path, 300, "virtua_racing_300.png");
+    assert!(
+        colours > BLANK,
+        "300 frames in, Virtua Racing is {} distinct colours: the cart is waiting on \
+         its SVP DSP, which nothing here models (#374)",
         colours
     );
 }

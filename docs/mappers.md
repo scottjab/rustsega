@@ -227,6 +227,23 @@ gigabyte. So detection in this module is keyed on what cannot lie — the actual
 image length, and the location of a `SEGA` system signature (`0x100` for a plain
 cart, `0x7E100` for a Realtec) — and never on a declared size.
 
+## Not a mapper, but the one cart-side gap worth naming here: the SVP (#374)
+
+The SVP (Sega Virtual Processor) - the Fujitsu SSP1601 DSP, its own program ROM
+and 2 KB of DRAM that the `Virtua Racing` cartridge carries, which the 68k
+addresses at `0xA15000`-`0xA15009` and `0x300000`-`0x31FFFF` (notaz *SVP doc*
+section 3 "Memory map") - is unemulated, and `Virtua Racing (USA)` and
+`Virtua Racing (Japan) (En)` are therefore expected to draw a blank frame.
+
+It is in none of the groups above because it translates nothing: the game ROM is
+read whole, at the offsets the cart area already gives it. The alias people get
+wrong - the SVP program IRAM at `0x000000`-`0x0007FF`, which must read the game
+image at the same offsets - is already right here for the plainest reason, that
+range is `Region::Rom`. What is missing is the other two windows: `0xA15000` is
+[`Region::Unmapped`](../crates/genesis/src/bus.rs) and reads open bus, and
+`0x300000` is cart ROM, so nothing there can be written and read back. The work
+is [#433](https://github.com/scottjab/rustsega/issues/433).
+
 ## Follow-up issues opened from this survey
 
 - **#356 - cart: implement J-CART, and decide who owns the shared bank/EEPROM
