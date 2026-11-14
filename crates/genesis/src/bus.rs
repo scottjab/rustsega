@@ -2098,6 +2098,36 @@ mod tests {
         assert_eq!(bus.read_word(0x000004), OPEN_BUS_WORD);
     }
 
+    /// The SVP's IRAM window is the game image, read at the same offsets.
+    ///
+    /// notaz *SVP doc* section 3 "Memory map" gives `0x000000`-`0x0007FF` to the
+    /// SVP's program IRAM and `0x000800`-`0x1FFFFF` to the SVP program ROM, read
+    /// from the same offsets of the 2 MB game ROM, and names that first mapping as
+    /// the one descriptions get wrong ("There were reports that SVP has internal
+    /// ROM, but fortunately they were wrong"). Nothing SVP-shaped is needed to
+    /// hold it: the window is the cart area, so the [`Region::Rom`] decode above is
+    /// exactly what the SVP reads. The document's other two windows - the DRAM at
+    /// `0x300000` and the status registers at `0xA15000` - are not satisfied this
+    /// way, and are #433.
+    #[test]
+    fn svp_iram_window_reads_the_game_image_at_the_same_offset() {
+        let rom = rom_image(0x200_000);
+        let mut bus = Bus::new(rom.clone(), TEST_VERSION);
+
+        for offset in [0x000000_u32, 0x000001, 0x000100, 0x0007FE, 0x0007FF] {
+            let at = offset as usize;
+            assert_eq!(bus.read_byte(offset), rom[at], "byte at {offset:#08x}");
+        }
+        for offset in [0x000000_u32, 0x000002, 0x0007FC] {
+            let at = offset as usize;
+            assert_eq!(
+                bus.read_word(offset),
+                u16::from_be_bytes([rom[at], rom[at + 1]]),
+                "word at {offset:#08x}",
+            );
+        }
+    }
+
     #[test]
     fn unmapped_reads_return_open_bus_placeholder() {
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
