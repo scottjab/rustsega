@@ -85,9 +85,9 @@ impl AppState {
     }
 }
 
-/// A router serving `state`: the health check, the info endpoint, one handler for
-/// every other GET, then the headers every response carries, then compression,
-/// then a trace of the request.
+/// A router serving `state`: the health check, the info endpoint, the ROM library,
+/// then one handler for every other GET, then the headers every response carries,
+/// then compression, then a trace of the request.
 ///
 /// Layers are added innermost-first, so the security headers are on the response
 /// before the compressor looks at it, and tracing sees the finished response.
