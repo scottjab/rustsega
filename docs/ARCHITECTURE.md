@@ -354,6 +354,19 @@ frame buffer) and what that means after a load, is
 - `axum` + `tokio`. Embeds `crates/web/dist` at compile time (`rust-embed`
   or `include_dir`). Serves it with correct MIME types (`application/wasm`)
   and compression.
+- Configured by flags, each with an environment variable, and a flag beats the
+  variable (M8-02, #156): `--bind` / `RUSTSEGA_BIND` (default `127.0.0.1`),
+  `--port` / `RUSTSEGA_PORT` (default `8080`, and `0` means any free one),
+  `--rom-dir` / `RUSTSEGA_ROM_DIR`, `--log` / `RUSTSEGA_LOG` (a `tracing` level,
+  default `info`). An unusable `--rom-dir` is a startup error with status 2
+  rather than a server with an empty library.
+- `RUSTSEGA_ROM_DIR` is the same variable `testkit::rom_dir` and the test suite
+  use for the owner's collection, so inside `nix develop` the server starts with
+  that library already configured. It still binds loopback unless told otherwise,
+  and TLS is the reverse proxy's job, not this binary's.
+- `GET /healthz` answers `ok`, and `GET /api/info`
+  `{ "version": "<crate version>", "library": <bool> }` (#156). Both are answered
+  from the shared `AppState` and neither touches the asset tree.
 - Optional `--rom-dir <path>`: exposes `GET /api/roms` (list) and
   `GET /api/roms/{id}` (bytes) so the UI can show a library.
 - `nix build` produces the single binary (frontend built in the same
