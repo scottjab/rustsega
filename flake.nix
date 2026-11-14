@@ -169,7 +169,11 @@
           default = rustsega;
         };
 
-        apps.default = flake-utils.lib.mkApp { drv = rustsega; };
+        # `nix run` starts the server. The `meta` is not decoration: `nix flake
+        # check` reads it for every app of a flake and warns when there is none.
+        apps.default = (flake-utils.lib.mkApp { drv = rustsega; }) // {
+          meta.description = "Serve the rustsega web app from the built binary";
+        };
 
         # The packaging tests (M8-05, #160). There is no Rust test for this: the
         # thing to prove is that `nix build` produces a working single binary,
