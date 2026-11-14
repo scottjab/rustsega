@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use sn76489::Sn76489;
 use ym2612::Ym2612;
 
-use crate::scheduler::{LINES_PER_FRAME_PAL, MASTER_CLOCKS_PER_LINE};
+use crate::scheduler::{LINES_PER_FRAME_PAL, MASTER_CLOCKS_PER_LINE, VBLANK_LINE_SHIFT};
 
 /// Master clocks between two YM2612 output samples: 144 68000 clocks at
 /// [`crate::scheduler::MASTER_CLOCKS_PER_68K`] each, about 53267 Hz
@@ -62,16 +62,21 @@ pub const YM_SAMPLE_MCLK: u64 = 144 * 7;
 /// "Clocks and timing").
 pub const PSG_TICK_MCLK: u64 = 16 * 15;
 
-/// Samples one PAL frame can hold, which is the capacity the buffers are reserved
-/// at: PAL is the slower frame but the longer one, and the chips run on the
-/// master clock rather than on seconds, so it is the one that needs the most
-/// entries. Rounding up is deliberate - the reservation is an upper bound, and a
-/// push that had to grow is a silent allocation rather than a loud failure.
+/// The longest frame one reservation has to hold: the PAL raster - the slower
+/// frame but the longer one, and the chips run on the master clock rather than on
+/// seconds, so it is the region that needs the most entries - plus the 16 lines a
+/// mid-frame V30 write can add to a frame whose VBlank line moves ahead of the
+/// beam (#371, [`crate::Scheduler::run_frame`]).
+const LINES_PER_LONGEST_FRAME: usize = (LINES_PER_FRAME_PAL + VBLANK_LINE_SHIFT) as usize;
+/// Samples one frame of [`LINES_PER_LONGEST_FRAME`] can hold, which is the capacity
+/// the buffers are reserved at. Rounding up is deliberate - the reservation is an
+/// upper bound, and a push that had to grow is a silent allocation rather than a
+/// loud failure.
 const YM_FRAME_CAPACITY: usize =
-    (LINES_PER_FRAME_PAL as usize * MASTER_CLOCKS_PER_LINE as usize) / YM_SAMPLE_MCLK as usize + 1;
+    (LINES_PER_LONGEST_FRAME * MASTER_CLOCKS_PER_LINE as usize) / YM_SAMPLE_MCLK as usize + 1;
 /// The same for the PSG, whose tick is a little over four times finer.
 const PSG_FRAME_CAPACITY: usize =
-    (LINES_PER_FRAME_PAL as usize * MASTER_CLOCKS_PER_LINE as usize) / PSG_TICK_MCLK as usize + 1;
+    (LINES_PER_LONGEST_FRAME * MASTER_CLOCKS_PER_LINE as usize) / PSG_TICK_MCLK as usize + 1;
 
 /// The console's sound hardware: the two chips, how far each has been run, and
 /// the samples they produced this frame.
@@ -967,6 +972,50 @@ mod tests {
     /// The root mean square of `signal`.
     fn rms(signal: &[f64]) -> f64 {
         (signal.iter().map(|v| v * v).sum::<f64>() / signal.len() as f64).sqrt()
+    }
+
+    /// A frame whose VBlank line moved ahead of the beam is 16 lines longer than
+    /// the region's raster (#371): the reservation has to cover that frame without
+    /// growing, and has to cover it exactly - a buffer that filled up mid-frame
+    /// would allocate in the middle of a running machine, and one that was
+    /// reserved a raster longer than the longest frame is a third of a megabyte
+    /// of sound nobody can hear.
+    #[test]
+    fn the_longest_frame_fills_the_reservation_without_growing_it() {
+        let lines = u64::from(LINES_PER_FRAME_PAL) + u64::from(VBLANK_LINE_SHIFT);
+        let mut audio = Audio::new();
+        let ym_capacity = audio.ym_samples.capacity();
+        let psg_capacity = audio.psg_samples.capacity();
+
+        audio.advance_to(lines * MASTER_CLOCKS_PER_LINE);
+
+        assert_eq!(
+            audio.ym_samples.len(),
+            (lines * MASTER_CLOCKS_PER_LINE / YM_SAMPLE_MCLK) as usize,
+            "one YM sample per {} master clocks over a {lines}-line frame",
+            YM_SAMPLE_MCLK
+        );
+        assert_eq!(
+            audio.psg_samples.len(),
+            (lines * MASTER_CLOCKS_PER_LINE / PSG_TICK_MCLK) as usize,
+            "one PSG tick per {} master clocks over the same frame",
+            PSG_TICK_MCLK
+        );
+        assert_eq!(
+            audio.ym_samples.capacity(),
+            ym_capacity,
+            "the YM2612 buffer grew to hold a frame whose VBlank line moved"
+        );
+        assert_eq!(
+            audio.psg_samples.capacity(),
+            psg_capacity,
+            "the PSG buffer grew to hold a frame whose VBlank line moved"
+        );
+        assert!(
+            audio.ym_samples.capacity() - audio.ym_samples.len() < YM_SAMPLE_MCLK as usize,
+            "the reservation is an upper bound, not a round number twice as big              as it needs to be: {} over",
+            audio.ym_samples.capacity() - audio.ym_samples.len()
+        );
     }
 
     /// The one test that goes through the real [`Audio`] rather than through

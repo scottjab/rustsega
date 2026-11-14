@@ -241,6 +241,9 @@ impl Vdp {
             self.in_vblank = true;
             self.vint_pending = true;
             self.frame_ready = true;
+            // The frame is over, so the frame buffer is sized for the picture it
+            // just drew rather than for the next one: see [`Vdp::size_frame_buffer`].
+            self.size_frame_buffer();
         } else if self.line == self.frame_lines() - 1 {
             // genvdp.txt clears the flag partway through the last line, at H
             // counter cycle AAh; the line is where the ticket puts it, and
@@ -730,6 +733,182 @@ mod tests {
         assert_eq!(
             vdp.odd_frame, first,
             "and back again, so it is a toggle and not a clock"
+        );
+    }
+
+    // --- The VBlank line moving mid-frame (#371) --------------------------------
+    //
+    // [`Vdp::start_line`] compares the beam against [`Vdp::vblank_line`] read
+    // live, and R1 bit 3 can be written on any line, so a write can move the
+    // frame boundary out from under the beam. These tests hold the chip to the
+    // VBlank-to-VBlank intervals that measures - 329, 297, 16 and the skipped
+    // frame - because `genesis::Scheduler::run_frame` has to be built for them.
+
+    /// R1 of [`running`], with and without bit 3 (V30).
+    const R1_V28: u8 = 0x60;
+    /// [`R1_V28`] with V30.
+    const R1_V30: u8 = 0x60 | (1 << 3);
+    /// Lines in a PAL raster: the raster does not change with the VBlank line,
+    /// only the position of the line inside it.
+    const PAL_RASTER: u32 = 313;
+    /// The distance [`Vdp::vblank_line`] moves when bit 3 moves: 240 - 224.
+    const V30_SHIFT: u32 = 16;
+
+    /// Walk `lines` whole lines, failing if the frame flag comes up among them.
+    fn advance_no_flag(vdp: &mut Vdp, lines: u32) -> u32 {
+        for _ in 0..lines {
+            vdp.advance(MCLKS_PER_LINE);
+            assert!(!vdp.frame_done(), "the flag came up before the mode change");
+        }
+        lines
+    }
+
+    /// Whole lines until the next `frame_done`, which is consumed.
+    ///
+    /// Bounded by [`V30_SAFETY`] because one of the intervals below is the
+    /// skipped frame, and a chip that lost its flag forever is the failure this
+    /// loop is written to notice rather than cause.
+    fn lines_to_frame_done(vdp: &mut Vdp) -> u32 {
+        let mut lines = 0;
+        loop {
+            vdp.advance(MCLKS_PER_LINE);
+            lines += 1;
+            if vdp.frame_done() {
+                return lines;
+            }
+            assert!(
+                lines <= V30_SAFETY,
+                "{lines} lines and no VBlank line at all"
+            );
+        }
+    }
+
+    /// The bound [`lines_to_frame_done`] will accept: two rasters, for the flag
+    /// that can be skipped outright, plus the shift of the line it is raised on.
+    const V30_SAFETY: u32 = 2 * PAL_RASTER + V30_SHIFT;
+
+    /// Kabuto's hardware notes, "Interrupts - VBlank set": VBlank is taken as the
+    /// V counter changes `0xDF -> 0xE0` in V28 and `0xEF -> 0xF0` in V30, and
+    /// "V28/V30 tricks" describes programs writing the bit mid-frame to move the
+    /// border ("having V28 active for a single VDP cycle during line 224 or V30
+    /// for line 240 will start the border").
+    ///
+    /// The raster stays 313 lines whatever bit 3 says, so moving the VBlank line
+    /// inside it moves the VBlank-to-VBlank interval with it: 313 + 16 when the
+    /// bit is set ahead of the beam, which is what `Story of Thor, The (Europe)`
+    /// does on its second frame (V30 at line 120) and what the `genesis`
+    /// scheduler of #371 panicked on.
+    #[test]
+    fn v30_set_ahead_of_the_beam_makes_a_329_line_interval() {
+        let mut vdp = running(true);
+
+        vdp.advance(224 * MCLKS_PER_LINE);
+        assert!(vdp.frame_done(), "V28 takes its flag on line 224");
+
+        // Line 120 of the next raster: 89 lines of this one, then 120 of the
+        // next, and no flag in between because the candidate line is still ahead.
+        let mut interval = advance_no_flag(&mut vdp, 89 + 120);
+        vdp.write_register(1, R1_V30);
+        interval += lines_to_frame_done(&mut vdp);
+
+        assert_eq!(
+            interval, 329,
+            "the flag comes on line 240 of the second raster, 329 lines after the one on 224"
+        );
+    }
+
+    /// The same rule in the other direction: a chip running in V30 that is put
+    /// back in V28 ahead of the beam takes its next flag 16 lines early, so one
+    /// interval is 313 - 16 = 297 lines - `Sensible Soccer (Europe)`, frame 57,
+    /// V30 cleared at line 24.
+    #[test]
+    fn v30_cleared_ahead_of_the_beam_makes_a_297_line_interval() {
+        let mut vdp = running(true);
+        vdp.write_register(1, R1_V30);
+
+        vdp.advance(240 * MCLKS_PER_LINE);
+        assert!(vdp.frame_done(), "V30 takes its flag on line 240");
+
+        let mut interval = advance_no_flag(&mut vdp, 73 + 24);
+        vdp.write_register(1, R1_V28);
+        interval += lines_to_frame_done(&mut vdp);
+
+        assert_eq!(
+            interval, 297,
+            "line 224 of the next raster, 297 lines after the flag on 240"
+        );
+    }
+
+    /// A write inside the window the beam has already passed moves the boundary
+    /// forward rather than back, and the two ends of that are a 16-line interval
+    /// and a frame whose flag is skipped entirely.
+    ///
+    /// Both are the same per-line rule as the two tests above, and together they
+    /// are what bounds the wait: the shortest interval a mode change can leave is
+    /// the 16 lines between the two candidate lines, and the longest is a raster
+    /// longer than the 329 of a moved line, because the flag that would have
+    /// ended the frame is not raised at all.
+    #[test]
+    fn v30_inside_the_passed_window_shortens_or_skips_the_frame() {
+        let mut vdp = running(true);
+        vdp.advance(224 * MCLKS_PER_LINE);
+        assert!(vdp.frame_done());
+        vdp.write_register(1, R1_V30);
+        assert_eq!(
+            lines_to_frame_done(&mut vdp),
+            V30_SHIFT,
+            "written as its own flag goes up, the next one is the distance between the two VBlank lines away"
+        );
+
+        // Set before line 224 and cleared between 224 and 240: the line moves
+        // ahead of the beam and then back behind it, so this raster raises no
+        // flag and the interval runs to the next raster's V28 line.
+        let mut vdp = running(true);
+        vdp.advance(224 * MCLKS_PER_LINE);
+        assert!(vdp.frame_done());
+
+        let mut interval = advance_no_flag(&mut vdp, 89 + 200);
+        vdp.write_register(1, R1_V30);
+        interval += advance_no_flag(&mut vdp, 30);
+        vdp.write_register(1, R1_V28);
+        interval += lines_to_frame_done(&mut vdp);
+        assert_eq!(
+            interval,
+            2 * PAL_RASTER,
+            "a skipped flag costs the whole raster it was skipped in"
+        );
+    }
+
+    /// The frame buffer is resized on the frame boundary the scheduler uses - the
+    /// VBlank line - and not on raster line 0, so a frame whose VBlank line moved
+    /// hands over the picture it actually drew (#371).
+    ///
+    /// `compose` used to take the size on line 0 of the frame being drawn, which
+    /// is only the same moment as the end of the frame when the VBlank line has
+    /// not moved: with bit 3 written mid-frame the two are 16 lines apart, and a
+    /// host that runs one frame of a console that has just asked for V30 got the
+    /// 224 lines of the frame before it.
+    #[test]
+    fn frame_buffer_is_sized_on_the_vblank_line() {
+        let mut vdp = running(true);
+        vdp.write_register(1, R1_V30);
+
+        // Line 100 of the first raster: the mode is already V30, but the frame
+        // now being drawn is still measured by the frame buffer, and it is the
+        // 224 lines of the V28 frame before this one until the frame ends.
+        vdp.advance(100 * MCLKS_PER_LINE);
+        assert_eq!(vdp.frame().height, crate::LINES_V28);
+        assert!(
+            !vdp.frame_done(),
+            "the frame boundary is ahead of the beam, not behind it"
+        );
+
+        vdp.advance(140 * MCLKS_PER_LINE);
+        assert!(vdp.frame_done(), "line 240, the V30 VBlank line");
+        assert_eq!(
+            vdp.frame().height,
+            crate::LINES_V30,
+            "and the frame that drew 240 lines hands over 240 of them"
         );
     }
 }

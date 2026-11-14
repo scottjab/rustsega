@@ -365,7 +365,7 @@ impl Vdp {
     ///
     /// The 64 KiB of VRAM is the only allocation, and it is on the heap.
     pub fn new(pal: bool) -> Self {
-        Self {
+        let mut vdp = Self {
             vram: vec![0; VRAM_SIZE].into_boxed_slice(),
             cram: [0; CRAM_WORDS],
             vsram: [0; VSRAM_WORDS],
@@ -400,7 +400,12 @@ impl Vdp {
             color_lut: Box::new(ColorLut::new()),
             frame_buffer: FrameBuffer::new(),
             pal,
-        }
+        };
+        // The frame buffer is sized on the frame boundary (`timing::start_line`),
+        // and a chip that has never reached one still needs the stride of the mode
+        // it reset into to draw its first frame (#371).
+        vdp.size_frame_buffer();
+        vdp
     }
 
     /// The frame the VDP has produced, as the frontend and the golden tests see
@@ -908,10 +913,13 @@ mod tests {
     }
 
     #[test]
-    fn new_frame_buffer_is_320x224_with_room_for_320x480() {
+    fn new_frame_buffer_is_the_reset_mode_with_room_for_320x480() {
         let vdp = Vdp::new(false);
         let frame = vdp.frame();
-        assert_eq!(frame.width, 320);
+        // The reset mode, which is H32: the size of a frame buffer is decided on
+        // the frame boundary, and a chip that has never crossed one still has to
+        // draw its first frame at the stride of the mode it reset into (#371).
+        assert_eq!(frame.width, 256);
         assert_eq!(frame.height, 224);
         assert_eq!(frame.pixels.len(), 320 * 480);
         assert!(frame.pixels.iter().all(|&p| p == 0));

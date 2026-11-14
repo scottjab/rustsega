@@ -86,6 +86,12 @@ const MAX_SLICES_PER_LINE: u32 = MASTER_CLOCKS_PER_LINE as u32;
 const LINES_PER_FRAME_NTSC: u16 = 262;
 /// Scanlines in one PAL frame.
 pub(crate) const LINES_PER_FRAME_PAL: u16 = 313;
+/// How far the VBlank line moves when R1 bit 3 is written: [`vdp::Vdp::active_height`]
+/// is 224 in V28 and 240 in V30, and `vdp::timing::start_line` compares the beam
+/// against it live, so a mid-frame write moves the frame boundary by this much
+/// (#371). [`Scheduler::max_frame_lines`] and the frame buffers of [`crate::Audio`]
+/// are both sized off it.
+pub(crate) const VBLANK_LINE_SHIFT: u16 = 16;
 
 /// The line loop of the console: `docs/ARCHITECTURE.md`, "Clocks and timing".
 ///
@@ -257,38 +263,73 @@ impl Scheduler {
         self.vdp_clock = self.m68k_clock.min(self.z80_clock);
     }
 
-    /// Run one whole frame: [`Scheduler::run_line`] until the VDP says the frame is
-    /// drawn, and then the rest of the raster too.
+    /// Run one frame: [`Scheduler::run_line`] until the VDP says the frame is drawn,
+    /// which is one VBlank-to-VBlank interval and nothing more.
     ///
-    /// [`vdp::Vdp::frame_done`] is raised at VBlank start, which on NTSC is line 224
-    /// of 262, and once per frame after that. Ending the frame there would make the
-    /// first call 224 lines long and every later one 262 - which is not a difference
-    /// the VDP can be blamed for, since it is simply answering a question about where
-    /// its own beam is. So the flag is what ends the waiting, and the line counter
-    /// wrapping is what ends the frame: one `run_frame` is one raster of
-    /// [`Scheduler::lines_per_frame`] lines, and it takes exactly one `frame_done`
-    /// with it (`run_frame_ends_at_vblank` holds the two together).
+    /// [`vdp::Vdp::frame_done`] is raised when the beam enters
+    /// [`vdp::Vdp::active_height`], 224 in V28 and 240 in V30, and R1 bit 3 can be
+    /// written on any line - so the interval, not the raster, is what a frame is.
+    /// Kabuto's hardware notes, "V28/V30 tricks", describe programs that move the
+    /// border by writing the bit mid-frame, and on the PAL carts of #371 that makes
+    /// the interval 329 lines (`Story of Thor, The (Europe)`, V30 set at line 120)
+    /// or 297 (`Sensible Soccer (Europe)`, V30 cleared at line 24) inside a raster
+    /// that is still 313 lines long. Ending the call at the flag is what keeps those
+    /// two numbers one frame: the raster is not a frame boundary, the VBlank line is,
+    /// and counting a fixed number of lines instead would either stop 16 lines short
+    /// of the flag or run 16 lines past it and take the next frame's flag with it.
+    ///
+    /// Nothing here depends on [`Scheduler::line`] any more, which is what lets a
+    /// frame be a different length every time: the counter keeps the raster position
+    /// the VDP is at (see [`Scheduler::restart_frame`] and [`Self::max_frame_lines`]),
+    /// and a machine that has moved its VBlank line ends a frame with the counter
+    /// somewhere other than 0.
     pub fn run_frame(&mut self, cpu: &mut M68k, z80: &mut Z80, bus: &mut Bus) {
         // A frame of sound starts with the frame of picture: the buffers hold what
         // this raster produces and nothing older (see [`crate::Audio::start_frame`]).
         bus.audio.start_frame();
+        let limit = self.max_frame_lines();
         let mut lines = 0_u32;
-        while !bus.vdp.frame_done() {
+        loop {
             lines += 1;
-            // The line counter is what ends the frame below, so a VDP that never
-            // raises the flag would spin here forever: the same kind of guard
-            // [`Scheduler::slice_bound`] is, on the outer loop instead of the inner
-            // one, and a panic naming itself rather than a hung test.
+            // A VDP that never raises the flag would spin here forever, so the wait
+            // is bounded: the same kind of guard [`Scheduler::slice_bound`] is, on
+            // the outer loop instead of the inner one, and a panic naming itself
+            // rather than a hung test.
             assert!(
-                lines <= u32::from(self.lines_per_frame),
+                lines <= limit,
                 "{} lines and the VDP has not raised `frame_done`",
                 lines,
             );
             self.run_line(cpu, z80, bus);
+            if bus.vdp.frame_done() {
+                break;
+            }
         }
-        while self.line != 0 {
-            self.run_line(cpu, z80, bus);
-        }
+    }
+
+    /// The longest one VBlank-to-VBlank interval can be, which is the bound
+    /// [`Scheduler::run_frame`] waits on: a raster, plus the 16 lines the VBlank
+    /// line moves when R1 bit 3 is written ahead of the beam, plus one whole raster
+    /// of slack.
+    ///
+    /// The two halves are measured on the chip, not guessed:
+    ///
+    /// * a raster plus the shift is a mode change the beam has not reached, which
+    ///   moves the flag to the other candidate line - PAL 329 lines one way and 297
+    ///   the other (`vdp::timing::tests::v30_set_ahead_of_the_beam_makes_a_329_line_interval`);
+    /// * the slack is the mode change the beam *has* passed: set the bit before
+    ///   line 224 and clear it between 224 and 240 and this raster raises no flag at
+    ///   all, so one interval runs to the next raster's VBlank line and is 626 lines
+    ///   long (`vdp::timing::tests::v30_inside_the_passed_window_shortens_or_skips_the_frame`).
+    ///
+    /// The frame buffers of [`crate::Audio`] are reserved for the moved-line case
+    /// rather than this bound, so a frame that reaches the slack allocates rather
+    /// than failing; a frame longer still is a chip that has lost its VBlank line
+    /// outright, which is a bug to name rather than a frame to run (#371).
+    pub(crate) fn max_frame_lines(&self) -> u32 {
+        let raster = u32::from(self.lines_per_frame);
+        let interval = raster + u32::from(VBLANK_LINE_SHIFT);
+        interval + raster
     }
 
     /// Walk the VDP to the time the two CPUs agree has passed, so that the beam and
@@ -434,6 +475,7 @@ mod tests {
     /// one test that needs the TMSS of [`Bus`] as well as its clocks.
     fn machine_at(version: u8) -> (M68k, Z80, Bus) {
         let mut bus = Bus::new(rom_image(), version);
+        bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it.
         // `INC A; JR -3` at $0000 of sound RAM, where a reset Z80 starts (`Z80::reset`
         // puts PC at 0, and plutiedev "Using the Z80" loads its program there).
         bus.z80.ram[0..3].copy_from_slice(&[0x3C, 0x18, 0xFD]);
@@ -561,6 +603,43 @@ mod tests {
             );
         }
         (cpu, z80, bus)
+    }
+
+    /// Lines [`run_until_handler_runs`] will cross looking for a handler before it
+    /// calls it missing: the VINT is taken within one line of the VBlank that
+    /// raises it - the exception entry, `ADDQ.L #1,D0` and `RTE` are about twenty
+    /// 68000 clocks, and a line is 488 - so eight is the event plus seven, and far
+    /// short of the 38 lines of blanking left before the next VBlank would make
+    /// this loop mean something else.
+    const HANDLER_LINES: u32 = 8;
+
+    /// Step whole lines until [`Scheduler::run_frame`] has let the 68000 take the
+    /// VINT it is being offered, and return how many handler entries have run.
+    ///
+    /// A frame ends on the VBlank line (#371), so the interrupt that line raises is
+    /// answered at the top of the next frame rather than at the tail of this one -
+    /// the handler runs at the same physical instant it always did, and only which
+    /// `run_frame` call contains it moved. These tests therefore step until the
+    /// handler has run instead of assuming which side of a frame boundary it falls
+    /// on, and say nothing about how many lines that took: what is under test is
+    /// that it is exactly one per frame, which [`HANDLER_LINES`] is wide enough to
+    /// tell from never, twice, or not at all.
+    fn run_until_handler_runs(
+        s: &mut Scheduler,
+        cpu: &mut M68k,
+        z80: &mut Z80,
+        bus: &mut Bus,
+        entries: u32,
+    ) -> u32 {
+        for _ in 0..HANDLER_LINES {
+            if cpu.d[0] != entries {
+                return cpu.d[0];
+            }
+            s.run_line(cpu, z80, bus);
+        }
+        panic!(
+            "the level 6 handler did not run within {HANDLER_LINES} lines of the frame that raised its VINT"
+        );
     }
 
     /// One frame is 262 lines of 3420 master clocks, and the 68k must have been run
@@ -741,7 +820,10 @@ mod tests {
         assert_eq!(Scheduler::new(Region::Usa).lines_per_frame, 262);
 
         // And the line loop uses it, rather than it being a field nothing reads.
-        let (mut cpu, mut z80, mut bus) = machine();
+        // A PAL scheduler on a PAL chip: `Bus::new` builds the VDP from the
+        // version register, so the 0xA0 of [`machine`] was a 262-line NTSC beam
+        // under a scheduler that counted 313 (#371 is what made that visible).
+        let (mut cpu, mut z80, mut bus) = machine_at(0xE0);
         let mut s = Scheduler::new(Region::Europe);
         run_frame(&mut s, &mut cpu, &mut z80, &mut bus);
         assert_eq!(s.line, 0, "the PAL frame wraps at its 313th line");
@@ -808,21 +890,38 @@ mod tests {
 
     /// genvdp.txt section 4 "Vertical interrupts": "a level 6 interrupt will occur
     /// when the V counter is at line E0h", once per frame. With R1 bit 5 (IE0) set
-    /// by the program and vector 30 aimed at a handler that counts, three frames is
-    /// three counts.
+    /// by the program and vector 30 aimed at a handler that counts, every frame
+    /// gives the 68000 exactly one level 6 through vector 30 - which is what this
+    /// measures, one frame at a time rather than one total at the end.
+    ///
+    /// The counting starts one frame after the interrupting VBlank and stops at the
+    /// frame boundary, both for the same reason (#371): `run_frame` ends on the line
+    /// the VINT is raised on, so the exception is taken at the top of the following
+    /// frame. The raster is still whole - `run_frame_spans_a_moved_vblank_line` and
+    /// `no_drift_over_100_frames` hold the line counts and the master clock - and
+    /// the handler still runs at the same instant it always ran, immediately after
+    /// VBlank is asserted; only which `run_frame` call contains it is different. So
+    /// the loop steps until the handler has run ([`run_until_handler_runs`]) and
+    /// asserts the *increment* is one per frame, which is the part that would go
+    /// silently wrong - twice a frame, or never - if the boundary move were wrong.
     #[test]
     fn vint_reaches_68k() {
         // Register 1 = $60: display on (bit 6) and IE0 (bit 5).
         let (mut cpu, mut z80, mut bus) = interrupt_machine(&[(1, 0x60)]);
         let mut s = Scheduler::new(Region::Usa);
 
-        for _ in 0..3 {
+        let mut per_frame = Vec::new();
+        for _ in 0..5 {
             s.run_frame(&mut cpu, &mut z80, &mut bus);
+            let entries = cpu.d[0];
+            let taken = run_until_handler_runs(&mut s, &mut cpu, &mut z80, &mut bus, entries);
+            per_frame.push(taken - entries);
         }
 
         assert_eq!(
-            cpu.d[0], 3,
-            "one level 6 per frame, taken through vector 30"
+            per_frame,
+            vec![1, 1, 1, 1, 1],
+            "one level 6 per frame, taken through vector 30 - never none and never twice"
         );
         assert_eq!(cpu.d[1], 0, "and no HINT: R0 bit 4 is clear");
     }
@@ -875,12 +974,20 @@ mod tests {
             "and the VDP stopped offering it"
         );
 
-        // And the same thing through the loop: a frame in which the handler ran
-        // leaves nothing pending, because the CPU acknowledged on entry.
+        // And the same thing through the loop: once the handler has run there is
+        // nothing pending, because the CPU acknowledged on entry. Stepped to rather
+        // than assumed: a frame ends on the line the VINT is raised on (#371), so
+        // the handler runs at the top of the next frame, and asking after that - but
+        // well inside the blanking, before the next VBlank offers the level again -
+        // is the same question the bare chip above answers.
         let (mut cpu, mut z80, mut bus) = interrupt_machine(&[(1, 0x60)]);
         let mut s = Scheduler::new(Region::Usa);
         s.run_frame(&mut cpu, &mut z80, &mut bus);
-        assert_eq!(cpu.d[0], 1, "the level 6 handler ran");
+        assert_eq!(
+            run_until_handler_runs(&mut s, &mut cpu, &mut z80, &mut bus, 0),
+            1,
+            "the level 6 handler ran, once"
+        );
         assert_eq!(
             bus.vdp.pending_irq(),
             None,
@@ -914,6 +1021,7 @@ mod tests {
         program[0x79] = 0xFB;
 
         let mut bus = Bus::new(rom_image(), VERSION);
+        bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it.
         bus.z80.ram[..program.len()].copy_from_slice(&program);
         release_z80_reset(&mut bus);
         // Releasing reset is the edge `run_line` answers with `Z80::reset`, and that
@@ -1119,6 +1227,7 @@ mod tests {
     /// being the two things a wait can take away.
     fn z80_contender(addr: u16) -> (M68k, Z80, Bus) {
         let mut bus = Bus::new(rom_image(), VERSION);
+        bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it.
         let program = z80_read_loop(addr);
         bus.z80.ram[..program.len()].copy_from_slice(&program);
         release_z80_reset(&mut bus);

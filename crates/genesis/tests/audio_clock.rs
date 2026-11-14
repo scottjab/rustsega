@@ -70,6 +70,7 @@ fn rom_image() -> Vec<u8> {
 /// therefore both sound paths have clocks to spend.
 fn machine() -> (m68k::M68k, Z80Cpu, Bus) {
     let mut bus = Bus::new(rom_image(), VERSION);
+    bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it
     bus.z80.ram[0..3].copy_from_slice(&[0x3C, 0x18, 0xFD]);
     bus.write_word(Z80_RESET, 0x0100);
     let mut cpu = m68k::M68k::new();
@@ -169,6 +170,7 @@ fn psg_tick_count_per_frame() {
 #[test]
 fn write_mid_frame_lands_at_right_sample() {
     let mut bus = Bus::new(Vec::new(), VERSION);
+    bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it
     // 100 whole PSG ticks, plus a bit: a write that is not on a tick boundary, so
     // that "the tick it lands on" is `X / 240` rather than something the test
     // could pass by rounding.
@@ -218,6 +220,7 @@ fn write_mid_frame_lands_at_right_sample() {
 #[test]
 fn z80_ym_write_works() {
     let mut bus = Bus::new(Vec::new(), VERSION);
+    bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it
     bus.audio.set_now(0);
 
     assert_eq!(
@@ -251,6 +254,7 @@ fn z80_ym_write_works() {
 #[test]
 fn ym_status_read_catches_the_chip_up() {
     let mut bus = Bus::new(Vec::new(), VERSION);
+    bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it
     bus.audio.set_now(0);
     assert_eq!(
         z80_ym_status(&mut bus) & STATUS_BUSY,
@@ -288,6 +292,7 @@ fn ym_status_read_catches_the_chip_up() {
 #[test]
 fn both_cpus_write_the_same_chips() {
     let mut bus = Bus::new(Vec::new(), VERSION);
+    bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it
     bus.audio.set_now(0);
     // The 68k owns the sound side only while it holds the Z80's bus.
     bus.write_word(0xA11_100, 0x0100);
