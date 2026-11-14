@@ -5,7 +5,9 @@
 //! without running the instruction and without a bus. It asks [`crate::decode`]
 //! what the opcode is and formats what the decoder already knows; an opcode the
 //! decoder does not implement has no operands to name, so it prints as data
-//! (`DC.W $FFFF`) and occupies one word.
+//! (`DC.W $FFFF`) and occupies one word. Every length here counts words rather
+//! than bytes; [`disassemble`] carries the contract and the loop that walks a
+//! program.
 //!
 //! # Syntax
 //!
@@ -40,24 +42,76 @@ use crate::ea::Size;
 
 /// Disassemble the instruction at `words[0]`, as though it were at `pc`.
 ///
-/// Returns the text and the number of words the instruction occupies: one for
-/// `NOP`, three for `JSR $123456`. `pc` is only used for the branch-family
-/// target, which is where it looks like a jump rather than an offset.
+/// Returns the text and the number of **words** — 16-bit units, not bytes — the
+/// instruction occupies: one for `NOP`, three for `JSR $123456`. `pc` is only
+/// used for the branch-family target, which is where it looks like a jump rather
+/// than an offset.
 ///
 /// ```text
 /// MOVEQ #$1,D0          MOVE.L $012345,D0     MOVEM.L D0-D1/A0,-(A7)
 /// BNE.S $001004         JSR $012345            MOVEM.W $10(A2),D0/A2
 /// ```
+///
+/// # Walking a program
+///
+/// Because the count is in words, a walk steps `len` words and `2 * len` bytes:
+///
+/// ```text
+/// let mut at = 0;
+/// let mut pc = start;
+/// while at < words.len() {
+///     let (text, len) = disassemble(&words[at..], pc);
+///     at += len;             // words
+///     pc += 2 * len as u32;  // bytes
+/// }
+/// ```
+///
+/// Halving `len` does not convert it to anything: one word is the width of most
+/// of the instruction set, and of every word this function does not recognise,
+/// so `at += len / 2` advances nothing and the loop never ends (#430).
+///
+/// # The length contract
+///
+/// The loop above terminates, because on every input:
+///
+/// * `len >= 1`. The opcode word is always counted, so the caller always moves.
+///   An encoding with no instruction behind it prints as data (`DC.W $00C0`) and
+///   occupies exactly that one word; an opcode the decoder knows prints its
+///   operands and counts exactly the extension words it names.
+/// * `len <= words.len()` whenever `words` is not empty. A slice that stops
+///   before the instruction does truncates the count, and the text stays
+///   complete — see the module docs.
+/// * when `words` does hold the whole instruction, `len` is exactly the width of
+///   what was printed: the opcode plus one word per operand-named extension,
+///   counted by the same cursor that formats the operands and not from a length
+///   table.
+///
+/// An empty `words` has no instruction to read: it returns `("DC.W $0000", 1)`,
+/// a word of data that was not there. A caller that has run out of words must
+/// not step on — the loop above stops before it asks.
 pub fn disassemble(words: &[u16], pc: u32) -> (String, usize) {
     let Some(&opcode) = words.first() else {
         return (data(0), 1);
     };
     let mut r = Reader { words, next: 1, pc };
     let text = format_op(&mut r, opcode);
+    debug_assert!(
+        r.next >= 1,
+        "${opcode:04X} formatted without counting its own opcode word"
+    );
     // An instruction reads exactly the words its operands name (see
     // `Reader`), which is how execution lengths itself too: `Cpu::fetch_ext_word`
-    // / `fetch_ext_long` are called once per extension word and no further.
-    (text, r.next.min(words.len()).max(1))
+    // / `fetch_ext_long` are called once per extension word and no further. The
+    // clamps are the caller's guarantee rather than padding: `min` is the
+    // truncated-slice rule, and `max` keeps `len` a step forward even in a
+    // release build, where this check is compiled out (#430).
+    let len = r.next.min(words.len()).max(1);
+    debug_assert!(
+        len <= words.len(),
+        "${opcode:04X} claims {len} words from a {}-word slice",
+        words.len()
+    );
+    (text, len)
 }
 
 /// One word the disassembler has no instruction for.
@@ -1036,6 +1090,119 @@ mod tests {
         }
         // Nothing at all is not a panic either.
         disassemble(&[], 0x1000);
+    }
+
+    /// The longest encoding the formatter has is three words (`JSR $012345`),
+    /// so an eight-word program is never what makes a count look right.
+    const PROGRAM_WORDS: usize = 8;
+
+    /// The walk from [`disassemble`]'s docs, run to the end of `words`.
+    ///
+    /// The iteration cap is what lets a hang fail this assertion instead of
+    /// eating the runner's memory the way it ate the reporter's (#430). Returns
+    /// each instruction as `(text, words)` and the word index the walk stopped
+    /// at, which must be `words.len()`.
+    fn walk_program(words: &[u16], start: u32) -> (Vec<(String, usize)>, usize) {
+        let cap = words.len();
+        let mut at = 0usize;
+        let mut pc = start;
+        let mut seen = Vec::new();
+        while at < words.len() && seen.len() <= cap {
+            let (text, len) = disassemble(&words[at..], pc);
+            assert!(
+                (1..=words.len() - at).contains(&len),
+                "word {at}: ${:04X} claims {len} of {} words",
+                words[at],
+                words.len() - at
+            );
+            at += len;
+            pc += 2 * len as u32;
+            seen.push((text, len));
+        }
+        (seen, at)
+    }
+
+    /// A program of `PROGRAM_WORDS` words, beginning with `opcode` and
+    /// otherwise `NOP`s: enough room for any extension word a first word can
+    /// legitimately ask for.
+    fn program_starting_with(opcode: u16) -> [u16; PROGRAM_WORDS] {
+        let mut words = [0x4E71; PROGRAM_WORDS];
+        words[0] = opcode;
+        words
+    }
+
+    /// Every one of the 65536 possible first words, measured (#430): the width a
+    /// caller walks by is never zero and never more than the caller handed over.
+    /// One call per opcode, so the whole sweep is a few milliseconds.
+    #[test]
+    fn every_opcode_reports_a_progressive_word_count() {
+        for opcode in 0..=u16::MAX {
+            let words = program_starting_with(opcode);
+            let (t, n) = disassemble(&words, 0x1000);
+            assert!(!t.is_empty(), "${opcode:04X} disassembled to nothing");
+            assert!(
+                (1..=words.len()).contains(&n),
+                "${opcode:04X} claims {n} words from {}",
+                words.len()
+            );
+        }
+    }
+
+    /// The other half of the contract: an opcode with no instruction behind it is
+    /// data, and data is one word wide. Between them these two tests are what a
+    /// caller walking a program relies on.
+    #[test]
+    fn unknown_opcodes_are_exactly_one_data_word() {
+        for opcode in 0..=u16::MAX {
+            if is_real_op(opcode) {
+                continue;
+            }
+            let words = program_starting_with(opcode);
+            let (t, n) = disassemble(&words, 0x1000);
+            assert_eq!(t, format!("DC.W ${opcode:04X}"));
+            assert_eq!(n, 1, "${opcode:04X} printed as data is one word");
+        }
+    }
+
+    /// The documented walk, run from every possible first word: it reaches the
+    /// end of the program instead of looping. A `len` of 0, or a `len` read as
+    /// bytes, hangs this — which is exactly how #430 was reported.
+    #[test]
+    fn the_documented_walk_terminates_from_every_opcode() {
+        for opcode in 0..=u16::MAX {
+            let words = program_starting_with(opcode);
+            let (_, end) = walk_program(&words, 0x1000);
+            assert_eq!(end, words.len(), "${opcode:04X}: walk stopped early");
+        }
+    }
+
+    /// The program from #430, walked the way its reporter walked it.
+    #[test]
+    fn the_documented_walk_reads_the_reported_program() {
+        // move.b ($C00008).L,D0 ; cmpi.b #$FF,D0 ; beq.b -12
+        let words = [0x1039, 0x00C0, 0x0008, 0x0C00, 0x00FF, 0x67F4];
+        let (seen, end) = walk_program(&words, 0x1000);
+        assert_eq!(end, words.len());
+        assert_eq!(
+            seen,
+            [
+                (String::from("MOVE.B $C00008,D0"), 3),
+                (String::from("CMPI.B #$FF,D0"), 2),
+                (String::from("BEQ.S $001000"), 1),
+            ]
+        );
+        // The ticket writes the branch as `67 FFF4`, which is a `.W`
+        // displacement: one more word, one more step, same termination.
+        let wide = [0x1039, 0x00C0, 0x0008, 0x0C00, 0x00FF, 0x6700, 0xFFF4];
+        let (seen, end) = walk_program(&wide, 0x1000);
+        assert_eq!(end, wide.len());
+        assert_eq!(seen[2], (String::from("BEQ.W $001000"), 2));
+    }
+
+    /// Nothing to read is data, not a hang: one word, as documented.
+    #[test]
+    fn empty_input_is_one_data_word() {
+        assert_eq!(disassemble(&[], 0x1000), (String::from("DC.W $0000"), 1));
     }
 
     #[test]
