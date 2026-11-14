@@ -974,15 +974,6 @@ mod tests {
         (signal.iter().map(|v| v * v).sum::<f64>() / signal.len() as f64).sqrt()
     }
 
-    /// The one test that goes through the real [`Audio`] rather than through
-    /// samples made in this file: 60 NTSC rasters of silence have to come out as
-    /// exactly the number of output samples that much master clock is worth.
-    ///
-    /// The count is the whole of what "no drift" means: an output rate that is
-    /// right on average but wrong on one frame either gaps or duplicates a frame
-    /// of host audio every time it runs, and a rate that is kept by rounding the
-    /// per-frame count is off by the fraction it threw away every frame for ever.
-    #[test]
     /// A frame whose VBlank line moved ahead of the beam is 16 lines longer than
     /// the region's raster (#371): the reservation has to cover that frame without
     /// growing, and has to cover it exactly - a buffer that filled up mid-frame
@@ -1027,6 +1018,15 @@ mod tests {
         );
     }
 
+    /// The one test that goes through the real [`Audio`] rather than through
+    /// samples made in this file: 60 NTSC rasters of silence have to come out as
+    /// exactly the number of output samples that much master clock is worth.
+    ///
+    /// The count is the whole of what "no drift" means: an output rate that is
+    /// right on average but wrong on one frame either gaps or duplicates a frame
+    /// of host audio every time it runs, and a rate that is kept by rounding the
+    /// per-frame count is off by the fraction it threw away every frame for ever.
+    #[test]
     fn output_count_exact_over_one_second() {
         let mut audio = Audio::new();
         let mut mixer = mixer(Config::default());

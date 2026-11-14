@@ -322,11 +322,10 @@ impl Scheduler {
     ///   all, so one interval runs to the next raster's VBlank line and is 626 lines
     ///   long (`vdp::timing::tests::v30_inside_the_passed_window_shortens_or_skips_the_frame`).
     ///
-    /// A frame that long is 16 lines more of audio than [`crate::Audio`]'s frame
-    /// buffers are reserved for, which is why their capacity is `LINES_PER_FRAME_PAL
-    /// + VBLANK_LINE_SHIFT` rather than the region's raster, and a frame longer than
-    /// this bound is a chip that has lost its VBlank line outright rather than a mode
-    /// change (#371).
+    /// The frame buffers of [`crate::Audio`] are reserved for the moved-line case
+    /// rather than this bound, so a frame that reaches the slack allocates rather
+    /// than failing; a frame longer still is a chip that has lost its VBlank line
+    /// outright, which is a bug to name rather than a frame to run (#371).
     pub(crate) fn max_frame_lines(&self) -> u32 {
         let raster = u32::from(self.lines_per_frame);
         let interval = raster + u32::from(VBLANK_LINE_SHIFT);
