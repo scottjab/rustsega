@@ -249,10 +249,7 @@ impl Machine {
 /// not run. Skipping rather than failing is what keeps a bare checkout green,
 /// and it is what [`harness`](super::harness) does for the JSON suites.
 pub fn load(name: &str) -> Option<Vec<u8>> {
-    let dir = testkit::test_rom_dir().join(SUITE_DIR);
-    if !dir.is_dir() {
-        return None;
-    }
+    let dir = testkit::test_dir(SUITE_DIR)?;
     let path: PathBuf = dir.join(format!("{name}.com"));
     match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),

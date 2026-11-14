@@ -244,10 +244,9 @@ fn data_root() -> PathBuf {
 /// there. The root is a parameter rather than read from the environment so that
 /// the harness's own tests can cover a missing or synthetic suite;
 /// `std::env::set_var` is `unsafe` in edition 2024 and the workspace forbids
-/// `unsafe`. Same reason `testkit::test_rom_in` exists.
+/// `unsafe`. Same reason `testkit::test_dir_in` exists.
 pub fn suite_dir_in(base: &Path) -> Option<PathBuf> {
-    let dir = base.join(SUITE_DIR);
-    dir.is_dir().then_some(dir)
+    testkit::test_dir_in(base, SUITE_DIR)
 }
 
 /// [`suite_dir_in`] against the real data root.
