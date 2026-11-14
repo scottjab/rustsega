@@ -6,7 +6,9 @@
 //! `HashMap` and neither trunk nor `crates/web/dist` is involved.
 
 pub mod assets;
+pub mod cli;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -33,6 +35,9 @@ const LONG_CACHE: &str = "public, max-age=31536000, immutable";
 /// fixed name. Both have to be revalidated before every use.
 const NO_CACHE: &str = "no-cache";
 
+/// The content type of `/api/info`.
+const JSON: &str = "application/json";
+
 /// The document policy of every response: same-origin for everything, with wasm
 /// allowed to compile (`wasm-unsafe-eval`) and inline styles allowed because
 /// Leptos writes `style=` attributes.
@@ -53,15 +58,45 @@ pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'
 /// The CSP header name, which the `http` crate does not define for us.
 const CONTENT_SECURITY_POLICY_HEADER: &str = "content-security-policy";
 
-/// A router serving `source`: one handler for every GET, then the headers every
-/// response carries, then compression, then a trace of the request.
+/// What every handler shares, behind an `Arc` because the router clones its state
+/// for each request.
+///
+/// A router gets exactly one state type, so the frontend and the ROM library
+/// travel together and a handler takes the half it needs.
+#[derive(Clone)]
+pub struct AppState {
+    /// The frontend to serve: the embedded one, or the page that says it was
+    /// built without one.
+    pub assets: Arc<dyn AssetSource>,
+    /// The `--rom-dir` of this process, already checked by [`cli::check_rom_dir`].
+    ///
+    /// `None` is no library, which is what `/api/info` reports as
+    /// `"library": false`. M8-03 (#157) is the ticket that lists it.
+    pub rom_dir: Option<PathBuf>,
+}
+
+impl AppState {
+    /// State serving `assets` with no ROM library.
+    pub fn new(assets: Arc<dyn AssetSource>) -> Self {
+        Self {
+            assets,
+            rom_dir: None,
+        }
+    }
+}
+
+/// A router serving `state`: the health check, the info endpoint, one handler for
+/// every other GET, then the headers every response carries, then compression,
+/// then a trace of the request.
 ///
 /// Layers are added innermost-first, so the security headers are on the response
 /// before the compressor looks at it, and tracing sees the finished response.
-pub fn router(source: Arc<dyn AssetSource>) -> Router {
+pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/api/info", get(info))
         .fallback(get(serve))
-        .with_state(source)
+        .with_state(state)
         .layer(SetResponseHeaderLayer::overriding(
             X_CONTENT_TYPE_OPTIONS,
             HeaderValue::from_static("nosniff"),
@@ -81,12 +116,44 @@ pub fn router(source: Arc<dyn AssetSource>) -> Router {
         .layer(TraceLayer::new_for_http())
 }
 
-/// Answer one request out of `source`.
-async fn serve(State(source): State<Arc<dyn AssetSource>>, request: Request) -> Response {
-    match resolve(&source, request.uri().path()) {
+/// Answer one request out of the asset tree.
+async fn serve(State(state): State<Arc<AppState>>, request: Request) -> Response {
+    match resolve(&state.assets, request.uri().path()) {
         Some(served) => asset_response(served),
         None => not_found(),
     }
+}
+
+/// `GET /healthz`: alive, in three bytes.
+///
+/// For the probe of a container supervisor or a load balancer. It reads nothing -
+/// not the asset tree, not the ROM directory - because a health check that can
+/// fail for a reason unrelated to serving makes the whole server look like the
+/// thing that is broken.
+async fn healthz() -> Response {
+    (StatusCode::OK, "ok").into_response()
+}
+
+/// `GET /api/info`: what this binary is, for a status line in the frontend and
+/// for whoever is deploying it to curl.
+async fn info(State(state): State<Arc<AppState>>) -> Response {
+    let body = info_body(env!("CARGO_PKG_VERSION"), state.rom_dir.is_some());
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, HeaderValue::from_static(JSON))],
+        Body::from(body),
+    )
+        .into_response()
+}
+
+/// The `/api/info` body.
+///
+/// Written out rather than serialized: #156 allows one new dependency, `clap`,
+/// and a document of a version string and a `bool` has no escaping to get wrong.
+/// M8-03 (#157) is the ticket whose responses stop being two scalars; that one
+/// should bring `serde` and answer with `axum::Json`.
+fn info_body(version: &str, library: bool) -> String {
+    format!("{{\"version\":\"{version}\",\"library\":{library}}}")
 }
 
 /// A file that is going to be served, and the key it was found under - the key

@@ -15,6 +15,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderName, Request, Response, StatusCode};
 use http_body_util::BodyExt;
+use server::AppState;
 use server::assets::{Asset, AssetSource};
 use tower::ServiceExt;
 
@@ -48,6 +49,12 @@ impl AssetSource for MemoryAssets {
     }
 }
 
+/// The frontend behind the router state of #156, with no ROM directory: the
+/// asset tree is all this file asks the router about.
+fn state() -> Arc<AppState> {
+    Arc::new(AppState::new(frontend()))
+}
+
 /// `index.html` and two content-hashed assets, the way trunk names them.
 fn frontend() -> Arc<dyn AssetSource> {
     Arc::new(MemoryAssets(HashMap::from([
@@ -65,7 +72,7 @@ async fn request(uri: &str, headers: &[(HeaderName, &str)]) -> Response<Body> {
     for (name, value) in headers {
         builder = builder.header(name.clone(), *value);
     }
-    server::router(frontend())
+    server::router(state())
         .oneshot(builder.body(Body::empty()).unwrap())
         .await
         .expect("the router serves every request without failing")

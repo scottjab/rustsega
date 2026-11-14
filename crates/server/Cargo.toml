@@ -12,6 +12,10 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8"
+# The one dependency #156 adds. Its `env` feature is load-bearing: without it
+# clap compiles the `#[arg(env = ...)]` attributes in `src/cli.rs` and ignores
+# them, so `RUSTSEGA_*` would do nothing.
+clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tower-http = { version = "0.6", features = [
     "compression-gzip",
