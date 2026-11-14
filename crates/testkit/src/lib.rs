@@ -161,6 +161,16 @@ fn existing_file_in(base: &Path, rel: &str) -> Option<PathBuf> {
     if path.is_file() { Some(path) } else { None }
 }
 
+/// `rel` under `base`, or `None` if it isn't an existing directory.
+///
+/// The directory twin of [`existing_file_in`], for the same reason: a suite that
+/// reads a whole folder of data still has to skip, not fail, when the folder is
+/// absent.
+fn existing_dir_in(base: &Path, rel: &str) -> Option<PathBuf> {
+    let path = base.join(rel);
+    if path.is_dir() { Some(path) } else { None }
+}
+
 /// First file directly inside `base` whose name starts with `prefix`, taking
 /// the files in sorted name order so the result is stable.
 ///
@@ -193,6 +203,25 @@ pub fn test_rom(rel: &str) -> Option<PathBuf> {
 /// without touching the process-global environment.
 pub fn test_rom_in(base: &Path, rel: &str) -> Option<PathBuf> {
     existing_file_in(base, rel)
+}
+
+/// Public test-data subdirectory by path relative to [`test_rom_dir`], e.g.
+/// `"z80/v1"`. `None` means the directory is not present.
+///
+/// [`test_rom`] only accepts a readable *file*, so a harness that wants a whole
+/// suite folder had to do its own `test_rom_dir().join(rel).is_dir().then_some`
+/// check (noted while wiring the Z80 SingleStepTests harness, #45). This is the
+/// directory twin, so the skip convention of `docs/TESTING.md` ("External test
+/// data") stays in one place: a missing directory is `None`, which the
+/// `require_data!` macro reports as a skip.
+pub fn test_dir(rel: &str) -> Option<PathBuf> {
+    test_dir_in(&test_rom_dir(), rel)
+}
+
+/// [`test_dir`] against an explicit base dir. Public so tests can cover it
+/// without touching the process-global environment.
+pub fn test_dir_in(base: &Path, rel: &str) -> Option<PathBuf> {
+    existing_dir_in(base, rel)
 }
 
 /// Commercial ROM by exact file name, e.g.
@@ -428,6 +457,63 @@ mod tests {
         let dir = TempDir::new("test-rom-missing");
         assert_eq!(test_rom_in(&dir, "definitely-not-here.bin"), None);
         assert!(test_rom("definitely-not-here.bin").is_none());
+    }
+
+    #[test]
+    fn test_dir_in_finds_existing_directory() {
+        let dir = TempDir::new("test-dir");
+        fs::create_dir_all(dir.join("suite")).expect("create suite dir");
+        assert_eq!(test_dir_in(&dir, "suite"), Some(dir.join("suite")));
+    }
+
+    #[test]
+    fn test_dir_in_resolves_nested_paths() {
+        let dir = TempDir::new("test-dir-nested");
+        fs::create_dir_all(dir.join("z80/v1")).expect("create nested suite dir");
+        assert_eq!(test_dir_in(&dir, "z80/v1"), Some(dir.join("z80/v1")));
+    }
+
+    /// The point of the split from [`test_rom_in`]: a file is not a directory.
+    #[test]
+    fn test_dir_in_returns_none_when_rel_is_a_file() {
+        let dir = TempDir::new("test-dir-is-file");
+        write_stub(&dir.join("suite"), b"stub");
+        assert_eq!(test_dir_in(&dir, "suite"), None);
+    }
+
+    #[test]
+    fn test_dir_missing_returns_none() {
+        let dir = TempDir::new("test-dir-missing");
+        assert_eq!(test_dir_in(&dir, "definitely-not-here"), None);
+        assert!(test_dir("definitely-not-here").is_none());
+    }
+
+    /// `test_dir` must follow the same `RUSTSEGA_TEST_ROM_DIR` override (and the
+    /// same discovery fallback) as `test_rom`, so the two lookups cannot point at
+    /// different copies of the data. `set_var` is `unsafe` in edition 2024, so
+    /// this checks agreement with `test_rom_dir()` rather than setting the var.
+    #[test]
+    fn test_dir_uses_the_same_root_as_test_rom() {
+        let root = test_rom_dir();
+        let Some(name) = first_subdir(&root) else {
+            eprintln!("SKIPPED: no suite directory under {}", root.display());
+            return;
+        };
+        assert_eq!(test_dir(&name), test_dir_in(&root, &name));
+        assert_eq!(test_dir(&name), Some(root.join(&name)));
+    }
+
+    /// First directory directly inside `root`, for the test above. `None` when
+    /// the test data has not been fetched.
+    fn first_subdir(root: &Path) -> Option<String> {
+        let entries = std::fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                return Some(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        None
     }
 
     #[test]

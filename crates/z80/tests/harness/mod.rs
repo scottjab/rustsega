@@ -159,12 +159,8 @@ impl Mismatch {
 }
 
 /// The suite directory, or `None` when the data has not been fetched.
-///
-/// Checked as a directory rather than through [`testkit::test_rom`], which only
-/// accepts files.
 fn suite_dir() -> Option<PathBuf> {
-    let dir = testkit::test_rom_dir().join(SUITE_DIR);
-    dir.is_dir().then_some(dir)
+    testkit::test_dir(SUITE_DIR)
 }
 
 /// Parse one opcode file. `None` means the suite is not fetched, which callers
