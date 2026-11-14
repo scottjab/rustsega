@@ -1,0 +1,151 @@
+# The release pipeline (M8-07, #162): pushing a tag like `v0.1.0` builds the
+# portable static binary of M8-05b (#159) and attaches it, with its SHA-256, to a
+# GitHub release. `nix build .#static` is the whole build, so what a release
+# contains is exactly what `nix build .#static` produces locally, and a release
+# can only be cut from a commit whose flake.nix still builds.
+#
+# There is deliberately no cargo, rustup or apt step: the toolchain, trunk and
+# the musl linker all come from the flake, exactly as in ci.yml, which this file
+# copies the nix install and store-cache setup from.
+name: Release
+
+on:
+  # A tag push is the only thing that publishes.
+  push:
+    tags: ['v*']
+  # The same pipeline without the publish step: `gh workflow run release.yml
+  # --ref <ref>` builds the binary, checksums it and leaves the result as a
+  # draft release instead of a live one. This is how the path gets tested.
+  workflow_dispatch:
+
+# A release must not be cancelled halfway through by a later push, and only this
+# workflow needs write access to the repository: `gh release create` is a
+# contents:write operation, and it runs on the built-in GITHUB_TOKEN.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    # The static build is a full release build of the server plus a trunk build
+    # of the frontend, and on a cold store cache that is most of an hour. Step
+    # timeouts can only be shorter than the job's, so this is also the cap on
+    # `nix build` below.
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        # Same action and major as ci.yml (v7.0.1 as of 2026-11-05). The tag ref
+        # this was triggered by is what gets checked out, which is the commit the
+        # release is cut from.
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        # Same action, major and token argument as ci.yml (v31.11.3 as of
+        # 2026-11-05): enables nix-command and flakes, and makes the CI user a
+        # trusted user so the store cache below can write to it.
+        uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Nix store cache
+        # Same action and options as ci.yml (v15 as of 2026-11-05), and the same
+        # reason: zero config, zero secrets, and the artefacts of the build land
+        # in this repo's own Actions cache for the next run to reuse.
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-flakehub: false
+          use-gha-cache: enabled
+          diagnostic-endpoint: ""
+
+      - name: Resolve the tag
+        id: tag
+        # The guard the ticket asks for: a release is only ever built for the
+        # version the server crate carries, so `v9.9.9` -- which would publish a
+        # binary that prints a different version -- fails here, before the
+        # fifteen minutes of build, rather than in the release notes.
+        #
+        # `cargo metadata` is the tool that reads `crates/server/Cargo.toml`
+        # properly, and properly is what is needed: that manifest says
+        # `version.workspace = true`, so the number itself lives in the workspace
+        # root and a grep of the crate manifest would find nothing.
+        run: |
+          set -euo pipefail
+          version=$(nix develop -c cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "server") | .version')
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "cargo metadata printed no version for the server crate" >&2
+            exit 1
+          fi
+          expected="v${version}"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" != "$expected" ]; then
+            {
+              echo "tag $GITHUB_REF_NAME does not match the version of crates/server/Cargo.toml"
+              echo "expected $expected: bump the workspace version, or retag"
+            } >&2
+            exit 1
+          fi
+          echo "tag=$expected" >> "$GITHUB_OUTPUT"
+          echo "release tag: $expected"
+
+      - name: Build the portable binary
+        # M8-05b (#159). `--print-build-logs` because this is the long step and a
+        # silent fifteen minutes is indistinguishable from a hung runner.
+        run: nix build .#static --print-build-logs
+
+      - name: Stage the release files
+        run: |
+          set -euo pipefail
+          name="rustsega-${{ steps.tag.outputs.tag }}-x86_64-linux"
+          mkdir dist
+          # `result` is a symlink into the nix store, and store files are
+          # read-only; the upload wants a plain file of its own, so copy it and
+          # keep the executable bit that `--no-preserve=mode` would otherwise
+          # leave to umask.
+          cp --dereference --no-preserve=mode result/bin/rustsega "dist/$name"
+          chmod 755 "dist/$name"
+          # Checksum in its own file, with the staged name inside it, so
+          # `sha256sum -c <name>.sha256` works in the download directory.
+          (cd dist && sha256sum "$name" > "$name.sha256")
+          # It is a static binary, so it runs on the runner: cheap proof that the
+          # staged file is the server and not an empty copy.
+          "dist/$name" --version
+          ls -l dist
+          cat "dist/$name.sha256"
+
+      - name: Publish the release
+        # Tag pushes only. The runner image ships the gh CLI, and GITHUB_TOKEN is
+        # good enough because of the `contents: write` permission above.
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --target "$GITHUB_SHA" \
+            --generate-notes \
+            dist/*
+
+      - name: "Dry run: leave it as a draft instead"
+        # workflow_dispatch only, so the build/checksum/upload path above can be
+        # exercised without publishing anything. The draft carries the same two
+        # files; delete it with
+        # `gh release delete <tag> --yes` once the run has been read.
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            --draft \
+            --target "$GITHUB_SHA" \
+            --notes "Dry run of .github/workflows/release.yml from ${GITHUB_REF_NAME}. Nothing was published." \
+            dist/*
+          gh release view "${{ steps.tag.outputs.tag }}" \
+            --json name,isDraft,url,assets \
+            --jq '{name, isDraft, url, assets: [.assets[].name]}'

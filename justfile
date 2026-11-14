@@ -9,13 +9,20 @@ vdp-debug := "-p vdp --features debug-views"
 default: check
 
 # Everything a commit must pass.
-check: fmt-check clippy test wasm-core wasm-web
+check: fmt-check actionlint clippy test wasm-core wasm-web
 
 fmt:
     cargo fmt --all
 
 fmt-check:
     cargo fmt --all --check
+
+# The workflow files of .github (M8-07, #162). In `check` rather than only in the
+# release workflow, because nothing else reads them until a tag is pushed and by
+# then a typo is a broken release rather than a red build. It is a single static
+# pass over two small YAML files, so it costs milliseconds.
+actionlint:
+    actionlint .github/workflows/*.yml
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
