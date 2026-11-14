@@ -109,6 +109,9 @@ web-sys = { version = "0.3", features = [
   # `OrientationLockType` are here for the call that is allowed to fail.
   "ResizeObserver",
   "ResizeObserverEntry",
+  # The ROM library's two round trips (M8-04, #158): `fetch` answers a `Response`,
+  # and its `json` and `array_buffer` are how the listing and the ROM arrive.
+  "Response",
   "Screen",
   "ScreenOrientation",
   "OrientationLockType",

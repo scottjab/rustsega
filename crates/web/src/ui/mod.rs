@@ -9,6 +9,7 @@ pub mod button;
 pub mod drawer;
 pub mod hint;
 pub mod icons;
+pub mod library_view;
 pub mod recents_grid;
 pub mod select;
 pub mod slider;

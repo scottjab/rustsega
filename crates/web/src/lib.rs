@@ -28,6 +28,7 @@ pub mod frame_pacer;
 pub mod gamepad_events;
 pub mod input;
 pub mod keyboard_events;
+pub mod library;
 pub mod menu;
 pub mod nav;
 pub mod perf;
