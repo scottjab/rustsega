@@ -274,11 +274,7 @@ pub fn visible_window(
 /// entry by way of `shown` - and the two are the same number only before a search.
 /// Confusing them is a list that shows one game and launches another, which is what
 /// the browser found the first time this was written.
-pub fn entry_at<'a>(
-    all: &'a [RomEntry],
-    shown: &'a [usize],
-    row: usize,
-) -> Option<&'a RomEntry> {
+pub fn entry_at<'a>(all: &'a [RomEntry], shown: &'a [usize], row: usize) -> Option<&'a RomEntry> {
     all.get(*shown.get(row)?)
 }
 
@@ -806,8 +802,14 @@ mod tests {
     fn a_row_of_the_window_is_a_row_of_the_filtered_list() {
         let all = collection();
         let shown = filter_roms(&all, "sonic", RegionFilter::Japan);
-        assert_eq!(entry_at(&all, &shown, 0).map(|entry| entry.name.as_str()), Some("Sonic The Hedgehog 2 (World)"));
-        assert_eq!(entry_at(&all, &shown, 1).map(|entry| entry.name.as_str()), Some("Sonic 3D Blast (Japan)"));
+        assert_eq!(
+            entry_at(&all, &shown, 0).map(|entry| entry.name.as_str()),
+            Some("Sonic The Hedgehog 2 (World)")
+        );
+        assert_eq!(
+            entry_at(&all, &shown, 1).map(|entry| entry.name.as_str()),
+            Some("Sonic 3D Blast (Japan)")
+        );
         assert_eq!(entry_at(&all, &shown, 2), None);
         // And past the end of a window the list simply stops.
         assert_eq!(entry_at(&all, &shown, 99), None);
@@ -837,7 +839,10 @@ mod tests {
                     .unwrap_or_else(|| panic!("{query:?} {region:?}: row {row} has no entry"));
                 // The entry of the row is the entry `shown` names at that place,
                 // and it is one the search and the chip both left in.
-                assert_eq!(all[shown[row]].id, entry.id, "{query:?} {region:?} row {row}");
+                assert_eq!(
+                    all[shown[row]].id, entry.id,
+                    "{query:?} {region:?} row {row}"
+                );
                 let name = entry.name.to_lowercase();
                 assert!(
                     query
