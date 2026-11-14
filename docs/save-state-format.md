@@ -94,7 +94,7 @@ Not in a state, and why:
 | The ROM | Named by checksum instead; see above | `Bus::rom`, `#[serde(skip)]` |
 | The VDP colour LUT | A fixed 3 × 512-entry table derived from the CRAM encoding; rebuilt on load | `vdp::Vdp::color_lut`, `#[serde(skip)]` |
 | The frame buffer's pixels | 320 × 480 `u32` of the picture the beam has already painted, which the next `run_frame` draws again from state that *is* saved. Its `width`/`height` are kept, because a line is written at `line * width` and the renderer only refreshes the geometry on line 0. | `vdp::frame_state` |
-| The audio mixer | The host's resampler, levels and filter, built from `Config`; not part of the machine, and a state written at 44.1 kHz must not rewrite the settings of a machine now running at 48 kHz. | `Genesis::load_state` leaves `self.mixer` alone |
+| The audio mixer | The host's resampler, levels and filter, built from `Config`; not part of the machine, and a state written at 44.1 kHz must not rewrite the settings of a machine now running at 48 kHz. Its *settings* are never touched by a load. Its *position* and its filter memory are not settings, and `Mixer::seek` re-derives both from the loaded machine rather than leaving them where the previous run had got to. | `Genesis::load_state` calls `audio::Mixer::seek`; `Mixer::state`, `out_clock`, `Stream::seek` |
 | TMSS boot ROM, `Config`, front-end state | Not machine state; the front end's own business | — |
 
 For scale: the machine of `tests/save_state.rs`'s fake ROM saves in 144 KiB, and
@@ -103,8 +103,32 @@ memories and registers of the rest. The frame buffer that is *not* in there is
 320 × 480 × 4 = 600 KiB, which is why a state is not five times the size.
 
 The practical consequences of those four rows are that after a load the first
-`run_frame` redraws the picture and the first `drain_audio` resumes the mixer
-from wherever this build of the front end had it. Nothing else.
+`run_frame` redraws the picture and the first `drain_audio` goes on making sound.
+Nothing else.
+
+That second half is worth spelling out, because the mixer's exclusion from a state
+can be read two ways (#362). A load *does* place the mixer: `Mixer::seek` moves its
+output position onto the mixer's own sample grid at or after the master clock the
+loaded machine has reached, empties the two chip streams, and resets the DC
+blocker and low-pass poles. Those are the mixer's memory of what it had mixed, and
+a machine put back in time has just un-mixed all of it, so all three are wrong in
+the same direction; a mixer that has mixed nothing has default poles, which is what
+`Mixer::new` gives. Leaving them alone does not fade out either - the DC blocker is
+an IIR filter, so the residue of a rolled-back future is a permanent fraction of the
+signal, and it showed up as last-bit differences dozens of frames after a load.
+
+What a restore therefore guarantees about audio is: the machine's own sound
+bit-exactly (both chips' samples and their clocks, which *are* in the state), and
+the mixer's output bit-exactly from the frame its filters have settled onto live
+signal, about an eighth of a second later - `MIXER_SETTLE_FRAMES` in
+`tests/save_state.rs` measures it at bit-exact from frame +8 on all nineteen carts,
+both restoring into the console that wrote the state and into one that never ran.
+The mixer's settings - rate, gains, filter coefficients - are the host's and no
+load can write them; its filter *memory* is not restored and is not asking to be.
+Anyone tempted to close the last quarter-second by putting `FilterState` in the
+format should read the row above first: those poles belong to this build's sample
+rate, so a state carrying them would be a state that changes what a console sounds
+like depending on where the slot came from, which is exactly what #127 ruled out.
 
 ## Errors
 
