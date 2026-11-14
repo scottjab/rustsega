@@ -9,6 +9,11 @@ app, so you copy one file and run it.
 Status: planning, no code yet (the first ticket creates the Cargo workspace). Work is tracked in GitHub issues; the issue labeled
 `tracking` lists every ticket in order.
 
+To play with it rather than read the code: the
+[user guide](docs/USER_GUIDE.md) covers the quick start, the NixOS service,
+running behind a reverse proxy, the controls, where saves live, and what to do
+when something is wrong.
+
 ## Goals
 
 - Accuracy first. Games should run the way they do on real hardware, and the
