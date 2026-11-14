@@ -13,21 +13,78 @@ These tables are the #373 resweep: every cart runs for the 600-frame checkpoint 
 ## Known issues
 
 One issue per cause, from the M6-13 triage (#133): `just test-all`,
-`just test-commercial` and the 2775-ROM sweep. `just test-all` fails on two tests by
-design: `commercial_save_state_is_audible_after_a_load` until #362 is fixed, and -
-only where the commercial collection is on disk - `virtua_racing_boots_to_non_blank_screen`
-until [#433](https://github.com/scottjab/rustsega/issues/433) gives `Virtua Racing`
-its SVP. `just test-commercial` runs the first of the two but not the second.
+`just test-commercial` and the 2775-ROM sweep. `just test-all` fails on six tests by
+design: `commercial_save_state_is_audible_after_a_load` until #362 is fixed,
+`virtua_racing_boots_to_non_blank_screen` until
+[#433](https://github.com/scottjab/rustsega/issues/433) gives `Virtua Racing` its SVP,
+and - all four of them, and only where the commercial collection is on disk - the
+#375 carts `quackshot_rev_a_boots_to_non_blank_screen`,
+`krystys_super_fun_house_boots_to_non_blank_screen`, `time_killers_boots_to_non_blank_screen`
+and `lemmings_2_tribes_boots_to_non_blank_screen`. `just test-commercial` filters on
+`commercial` in the test name, so it runs the first of those six and none of the other
+five.
 
 | Issue | Cause | ROMs |
 |---|---|---|
 | [#371](https://github.com/scottjab/rustsega/issues/371) | A mid-frame V28/V30 switch moves the VBlank line, so `run_frame`'s watchdog fires a frame early. 48 carts report `314 lines` (all PAL) and 35 report `263` (33 `usa`, 2 `japan`): the same event on the two rasters, since the guard is `lines_per_frame + 1`. [#354](https://github.com/scottjab/rustsega/issues/354) is the inventory of these 83 and should close into #371. | 83 |
 | [#355](https://github.com/scottjab/rustsega/issues/355) | Unimplemented 68000 opcodes: `4741` x9, `00FF` x3, `00FA` x1. Seven of the nine `4741` hits are five betas of `NFL '95` and two Pro Action Replay carts, so it is narrower than nine separate instruction gaps. `0AC6` is gone since #78. | 13 |
 | [#374](https://github.com/scottjab/rustsega/issues/374) | **A named gap, not an unexplained one:** the SVP - the Fujitsu SSP1601 DSP, its program ROM and its 2 KB of DRAM that the `Virtua Racing` cartridge carries and the 68k addresses at `0xA15000` and `0x300000` - is unemulated, so `Virtua Racing (USA)` and `(Japan) (En)` are expected to be blank. Measured on this tree: `headless run "Virtua Racing (USA).md" --frames 1800 --max-colours` is `max_colours=1` with no input, and the `17 colours` in the START-gated table below is the same cart poked, not its 3D layer. `virtua_racing_boots_to_non_blank_screen` in `crates/genesis/tests/boot.rs` is the measurement, and [#433](https://github.com/scottjab/rustsega/issues/433) is what is left. | 2 |
-| [#375](https://github.com/scottjab/rustsega/issues/375) | 28 retail carts that draw pure black at all 21 sampled frame counts, with and without input - diagnosis ticket, including the `QuackShot` rev pair where `-00` boots and `-01` does not. | 28 |
+| [#375](https://github.com/scottjab/rustsega/issues/375) | **Diagnosed; the causes are [#435](https://github.com/scottjab/rustsega/issues/435)-[#441](https://github.com/scottjab/rustsega/issues/441) and they are not one bug.** 28 retail carts that draw pure black at all 21 sampled frame counts, with and without input. Where it started and what it turned out to be is the section below. | 28 |
 | [#357](https://github.com/scottjab/rustsega/issues/357) | The 2 MB/4 MB Taiwan and China unlicensed carts, which are not a mapper problem. 26 of them are still in the never-drawing set; listed on the issue. | 26 |
 | [#373](https://github.com/scottjab/rustsega/issues/373) | **Fixed by the resweep below.** The sweep sampled one frame, at 600, with no pad connected; watching the whole run and holding START moves 416 of these carts to `Boots`, 13 of them only with the START press. Nothing here is a fix to the emulator: the measurement was wrong. | 416 |
 | [#362](https://github.com/scottjab/rustsega/issues/362) | The one failing test: `commercial_save_state_is_audible_after_a_load`. Loading a state leaves the mixer ahead of the machine, so the console goes silent for as many frames as it ran between the save and the load. | - |
+
+### The 28 black carts of #375, and what they turned out to be
+
+[#375](https://github.com/scottjab/rustsega/issues/375) was the diagnosis ticket for the
+largest block of never-drawing retail carts: 28 of them, black at every one of the sweep's
+21 sampled frame counts, with and without a START press. It asked one question - **did the
+68000 ever get as far as initialising the VDP** - and the answer is that 26 of the 28 never
+write a single word of CRAM, so for those the VDP is not involved at all: it is sitting in
+its reset state, displaying the black backdrop of a disabled display, because the program
+that was going to set it up stopped first.
+
+**The single most useful measurement is not a colour count, it is "how many of the 64 CRAM
+words are non-zero"**, taken from the public `Genesis::bus().vdp` fields at every frame
+boundary alongside the 68000's `pc`. 24 of the 28 have zero CRAM words and a `pc` histogram
+that is one or two addresses wide, which is a stopped program, not a broken pipeline. Only
+two of the 28 ever load a palette, and those two are the render problem the ticket expected
+rather than the boot problem it feared.
+
+The causes, one issue each, and the cart that measures them:
+
+| Cause | Issue | Carts |
+|---|---|---|
+| **The image is not the cart.** The header declares a ROM size past the end of the file, the cart's own boot self-test reads the mirrored space up there, gets the `0xFF` filler of `Bus::read_rom_byte`, and fails. `QuackShot Starring Donald Duck (World) (En,Ja) (Rev A)` is the proof rather than the suspicion: it is `0x80000` and declares `0x13FFFF`, while `(Rev A) (Alt)` is `0x140000`, declares the same `0x13FFFF`, verifies, and draws 33 colours. Same revision, same code, complete dump. | [#435](https://github.com/scottjab/rustsega/issues/435) | 4 |
+| **The 68000 stops itself.** Within 30 frames the program reaches a `NOP; NOP; BRA.S $self`, a `BRA.S $self`, or a `STOP #$2700` in its own start-up code and never leaves it - so no R1 display enable, no palette, nothing. The halt sits in the same block of start-up code as the security write (`MOVE.L #$53454741` - `SEGA` - to `$A14000`), so it is a boot-check failure exit; which check fails is what is left to establish. Forcing the region does not move any of them. | [#436](https://github.com/scottjab/rustsega/issues/436) | 7 |
+| **The Z80 bus-request read never says what the cart is waiting for.** `Time Killers` spins for 100% of its frames in `MOVE.W $A11100,D0` / `BTST #0,D0` / `BNE -6`: the documented poll between asking the sound CPU for its bus and touching the sound side. A *word* read of that register answers the flag in bit 8 and leaves bit 0 a fixed `1` (`busreq_word` in `crates/genesis/src/bus.rs`), so bit 0 of the word can never be the `0` the cart is polling for. | [#437](https://github.com/scottjab/rustsega/issues/437) | 2 |
+| **It only boots in a region it does not ask for.** `usa` and `japan` give 1 colour, `europe` gives 12 and 30. Region forcing is a diagnostic, not a fix - it is the cart's own branch off a read of `0xA10001` that is the question. | [#438](https://github.com/scottjab/rustsega/issues/438) | 3 |
+| **A busy-wait on a VDP read that never changes.** `Mega lo Mania` and `Tyrants` (one engine, `MEGA lo MANIA`) sit on `MOVE.W $C00004,D0` / `BTST #7,D0`; `Bubble and Squeak` sits on `CMPI.B #$E0,$C00008`, waiting for the beam to reach line 224. This is the "waiting on a status bit that never clears" branch of the triage, and for these three the wait is disassembled rather than inferred - which of #302/#303 or #77/#308 is responsible is not yet established. | [#439](https://github.com/scottjab/rustsega/issues/439) | 3 |
+| **Measured, and no cause yet.** Ten carts run at 1800 frames with a `pc` histogram, a CRAM/VRAM count and a three-region sweep and still do not sort into a cause. Filed as an inventory rather than filed under a guess. | [#440](https://github.com/scottjab/rustsega/issues/440) | 10 |
+| **The VDP is set up and the picture is still black.** `Al Michaels Announces HardBall III` and `Janou Touryuumon` are the only two of the 28 whose display is enabled *and* whose palette is loaded - 60 and 28 non-zero CRAM words, 2558 and 17552 non-zero VRAM bytes - and whose frame is 2 colours after 1800 of them. That is the branch the ticket called much easier, and it is a render/enable question, not a boot one. | [#441](https://github.com/scottjab/rustsega/issues/441) | 2 |
+
+Three of the carts of the first row are worth naming because they change what to look for
+next, and one of them is a false lead that cost time:
+
+- `Triple Play - Gold Edition` and `Triple Play 96` are `0x300000` images declaring
+  `0x3FFFFF`, and they are the `00FF` opcode of the #355 row. Padding one of them to the
+  `0x400000` its header declares **removes the panic** - so `00FF` is being executed past
+  the end of the data the dump holds, and #355 is being triggered by a short image rather
+  than by a real instruction gap on those carts. It still draws one colour, because
+  padding is not the missing data.
+- `Phantasy Star Fukkokuban (Japan)` has a size field of `0x2120C211`, which is not a size,
+  and its `pc` runs away to `$D3BFC9FF` - an odd, unmapped address - rather than halting.
+- Rewriting a header checksum to the value this tree computes for it does **not** unstick
+  `Warrior of Rome II` or `Caesar no Yabou II`, both of which fail their own checksum
+  check, so "the checksum is what is wrong" is not a general answer here either. It is
+  recorded on [#436](https://github.com/scottjab/rustsega/issues/436) so nobody retries it.
+
+The method, so it can be repeated: `headless run <rom> --frames 1800 --colours
+--max-colours` for the colour count, the same under `--region usa|japan|europe` for the
+region column, and a throwaway probe over the public `Genesis::cpu()` /
+`Genesis::bus().vdp` fields for the `pc`-at-frame-boundary histogram and the CRAM and VRAM
+counts. The probe was deleted rather than committed: it is a diagnostic, and the four
+`#[ignore]`d boot tests in `crates/genesis/tests/boot.rs` are what replaces it.
 
 ### Deliberately out of scope
 
