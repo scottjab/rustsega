@@ -375,7 +375,9 @@ frame buffer) and what that means after a load, is
   file: nothing a request says is ever joined to the rom dir, and a symlink that
   resolves outside it is not listed at all.
 - `nix build` produces the single binary (frontend built in the same
-  derivation).
+  derivation). `nix build .#static`, which `just build-static` runs, produces the
+  same binary for `x86_64-unknown-linux-musl`, fully static (M8-05b, #159), so it
+  runs on a Linux box with no nix on it.
 
 ## Reference material
 

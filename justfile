@@ -96,6 +96,13 @@ web:
 build: web
     cargo build --release -p server --features embed-web
 
+# The portable single binary (M8-05b, #159): `result/bin/rustsega`, a static
+# x86_64-linux-musl build of `just build`'s binary. It carries its own C library,
+# so it runs on a Linux box with no nix and no glibc match - copy that one file.
+# nix does the build, so this one runs `nix` rather than `cargo`.
+build-static:
+    nix build .#static
+
 # Serve the frontend with trunk's dev server (autoreload) on http://127.0.0.1:8081.
 # This is the debug build: fast to compile, ~13x the wasm, not a thing to measure fps on.
 web-serve:
