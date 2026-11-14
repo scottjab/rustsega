@@ -101,13 +101,14 @@ impl Library {
                 let file_type = child.file_type()?;
                 let path = child.path();
                 if file_type.is_dir() {
-                    // `file_type` does not follow links, so a symlinked directory
-                    // is not pushed: one that pointed above the root would make
-                    // this never finish. Its target is still offered, as a file.
+                    // `file_type` does not resolve links, so this is a real
+                    // subdirectory only: a link to a directory is not followed - one
+                    // that pointed above the root would make this never finish - and
+                    // a link to a file is offered or refused by `offer` below.
                     directories.push(path);
                     continue;
                 }
-                if let Some(entry) = offer(&root, &path, file_type.is_symlink())? {
+                if let Some(entry) = offer(&root, &path, file_type)? {
                     entries.push(entry);
                 }
             }
@@ -180,11 +181,11 @@ impl From<Library> for LibrarySlot {
 
 /// Decide whether one directory entry is a ROM, and list it if it is.
 ///
-/// `is_link` comes from the walk's own `DirEntry::file_type`, which does not
-/// resolve links, so this is what knows the difference between a file and a link
-/// without another `lstat`.
-fn offer(root: &Path, path: &Path, is_link: bool) -> io::Result<Option<Entry>> {
-    let metadata = if is_link {
+/// `file_type` is the walk's own [`fs::FileType`], which does not resolve links: a
+/// link and a file are told apart without another `lstat`, so a plain file costs
+/// one `stat` and 2,775 of them cost one system call each.
+fn offer(root: &Path, path: &Path, file_type: fs::FileType) -> io::Result<Option<Entry>> {
+    let metadata = if file_type.is_symlink() {
         // A link is offered only when what it resolves to is in the root too: the
         // id lookup already keeps a request out of the filesystem, and this is
         // what keeps the listing off the rest of the disk.
@@ -194,12 +195,15 @@ fn offer(root: &Path, path: &Path, is_link: bool) -> io::Result<Option<Entry>> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         }
-    } else if path.is_file() {
+    } else if file_type.is_file() {
         path.metadata()?
     } else {
         // A fifo, a socket, a device: not a cartridge.
         return Ok(None);
     };
+    // `is_file` because a link to a directory inside the root resolves to
+    // something that is not a cartridge, and the size cap is the ticket's: a
+    // Genesis ROM is nowhere near 10 MiB.
     if !metadata.is_file() || metadata.len() > MAX_SIZE {
         return Ok(None);
     }
