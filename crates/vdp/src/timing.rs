@@ -19,7 +19,7 @@
 //! time (`dma::Vdp::dma_clock`, M4-22 #101).
 
 use crate::hv::MCLKS_PER_LINE;
-use crate::{InterlaceMode, Vdp};
+use crate::{InterlaceMode, LINES_V28, LINES_V30, Vdp};
 
 /// Interrupt level 6: the vertical interrupt (genvdp.txt section 4
 /// "Interrupts": "The only hardware interrupts available are 2, 4, and 6", and
@@ -320,16 +320,29 @@ impl Vdp {
         }
     }
 
-    /// The first line of VBlank: the first line past the active display, 224 in
-    /// V28 and 240 in V30.
+    /// The first line of VBlank: 224 in V28 and 240 in V30, in either region.
     ///
-    /// genvdp.txt names line E0h, 224, and never discusses V30 at all; the
-    /// `active_height` rule is the ticket's, and the same shift `hv`'s V counter
-    /// tables assume for PAL. Inferred for V30 (M4-20, #98).
+    /// genvdp.txt names line E0h, 224, and never discusses V30 at all. Kabuto's
+    /// hardware notes do, and the "Interrupts - VBlank set" row of their timing
+    /// table is region-free: VBlank is taken as the V counter changes `0xDF ->
+    /// 0xE0` in V28 and `0xEF -> 0xF0` in V30. #132 took that row for PAL and
+    /// #446 for NTSC, and `hv`'s V counter tables read the same table's
+    /// progression rows the same way.
+    ///
+    /// This is not [`Vdp::active_height`], and the two only part company on NTSC
+    /// in V30: there the beam runs to line 240 while the picture stays the 224
+    /// lines of V28, because what a chip draws with 240 lines of picture inside a
+    /// 262 line frame - a rolling picture, no bottom border on a capture - is the
+    /// half of NTSC V30 that #446 leaves for a golden run against a real capture.
+    /// Everywhere else the VBlank line and the last line drawn are the same line.
     #[inline]
     fn vblank_line(&self) -> u16 {
-        // `active_height` is 224 or 240, both of which fit a `u16`.
-        self.active_height() as u16
+        // 224 and 240, both of which fit a `u16`.
+        if self.v30_mode() {
+            LINES_V30 as u16
+        } else {
+            LINES_V28 as u16
+        }
     }
 
     /// The highest interrupt the VDP is offering the 68000: level 6 for a
@@ -472,6 +485,64 @@ mod tests {
         }
 
         assert_eq!(fired, vec![224], "once, and on the first line of VBlank");
+    }
+
+    /// NTSC in V30 takes its VBlank line from the same row of Kabuto's timing
+    /// table as PAL does: "Interrupts - VBlank set" says VBlank is taken as the V
+    /// counter changes `0xEF -> 0xF0` in V30, whatever region the chip is clocked
+    /// for. #446 is that half of the NTSC column; the 224-line picture of
+    /// [`Vdp::active_height`] is deliberately not, and is what
+    /// [`ntsc_v30_draws_224_lines_to_its_240_line_vblank`] holds.
+    #[test]
+    fn ntsc_v30_vint_is_at_line_240() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(1, 0x68);
+        let mut fired = Vec::new();
+
+        for _ in 0..262 {
+            vdp.advance(MCLKS_PER_LINE);
+            if vdp.vint_pending {
+                fired.push(vdp.line);
+                vdp.ack_irq(6);
+            }
+        }
+
+        assert_eq!(
+            fired,
+            vec![240],
+            "an NTSC chip in V30 takes VBlank on the 0xF0 of Kabuto's table, not on 224"
+        );
+    }
+
+    /// The half of NTSC V30 that #446 leaves unmodelled, pinned from the other
+    /// side: the beam scans to the 240th line, but the picture is still the 224
+    /// lines of V28 and the frame handed to the host is 224 lines tall.
+    ///
+    /// What hardware does with 240 lines of picture inside a 262 line frame - a
+    /// rolling picture, and no bottom border on a capture - wants a golden run
+    /// against a real capture, so `render_line` is still called for
+    /// `active_height()` lines and `active_height()` is still 224 on NTSC.
+    #[test]
+    fn ntsc_v30_draws_224_lines_to_its_240_line_vblank() {
+        let mut vdp = running(false);
+        vdp.write_register(1, R1_V30);
+        vdp.cram[0] = 0x0240;
+        vdp.advance(262 * MCLKS_PER_LINE);
+
+        assert_eq!(vdp.active_height(), crate::LINES_V28, "the display half");
+        assert_eq!(vdp.frame().height, crate::LINES_V28);
+        let frame = vdp.frame();
+        let backdrop = vdp.backdrop_pixel();
+        let painted: Vec<usize> = (0..MAX_HEIGHT)
+            .filter(|&y| {
+                (0..frame.width).all(|x| frame.pixels[frame.pixel_index(x, y)] == backdrop)
+            })
+            .collect();
+        assert_eq!(
+            painted,
+            (0..crate::LINES_V28).collect::<Vec<usize>>(),
+            "240 lines of beam, 224 of them drawn"
+        );
     }
 
     /// PAL in V30 has a 240-line display, so its VBlank starts a sixteen lines

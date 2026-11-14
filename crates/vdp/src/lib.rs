@@ -826,18 +826,25 @@ impl Vdp {
     /// at all there, `0x000-0x1FF`, and VBlank is still set at `0xEF` to `0xF0`,
     /// which is 22 lines from the end of a 262 line frame.
     ///
-    /// None of it is modelled: an NTSC chip with the bit set draws the 224 lines
-    /// of V28 and nothing is said about it. The bit is legal to write, a game
-    /// may hold it set across a mode change, and there is no console-side
-    /// diagnostic to warn (M4-19, #97). `crates/genesis/tests/pal_timing.rs`
-    /// pins both halves of that decision - 240 on PAL, 224 on NTSC - against
-    /// these citations (M6-12, #132).
+    /// The counters are modelled, the display is not (#446). An NTSC chip with
+    /// the bit set counts the frame without the V28 jump - `hv::v_count` - and
+    /// takes VBlank on line 240 - `timing::vblank_line` - both from that same
+    /// NTSC V30 column; but it still draws the 224 lines of V28 and hands the host
+    /// a 224 line frame, and nothing is said about it. What hardware does with the
+    /// other 16 lines - a rolling picture, no bottom border on a capture - needs a
+    /// golden run against a real capture before it moves, and until then this is
+    /// the height of the *picture* on NTSC rather than of the beam that scans it.
+    /// The bit is legal to write, a game may hold it set across a mode change, and
+    /// there is no console-side diagnostic to warn (M4-19, #97).
+    /// `crates/genesis/tests/pal_timing.rs` pins the picture half of that decision
+    /// - 240 on PAL, 224 on NTSC - against these citations (M6-12, #132).
     ///
-    /// This is the height of the *beam*: the number of lines the raster scans
-    /// before VBlank, which is what `timing` starts VBlank on and what
-    /// [`Vdp::render_line`] is called with. Interlace mode 2 does not change it -
-    /// it draws two lines of the picture per line of the beam, and
-    /// [`Vdp::frame_height`] is the height of the picture those lines make (#98).
+    /// Everywhere but there, this is also the line `timing` starts VBlank on: it is
+    /// the number of lines the raster scans before blanking and the number
+    /// [`Vdp::render_line`] is called with, and only NTSC in V30 splits the two.
+    /// Interlace mode 2 does not change it - it draws two lines of the picture per
+    /// line of the beam, and [`Vdp::frame_height`] is the height of the picture
+    /// those lines make (#98).
     #[inline]
     pub fn active_height(&self) -> usize {
         if self.pal && self.v30_mode() {

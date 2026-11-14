@@ -170,15 +170,16 @@ const H_JUMP_H32: u8 = 0xE9;
 /// 0xB5.
 const H_JUMP_H40: u8 = 0xE4;
 
-/// First line whose V counter has jumped, NTSC.
+/// First line whose V counter has jumped, NTSC in V28.
 ///
 /// "The V counter counts up from 00h to EAh, then it jumps back to E5h and
 /// continues counting up to FFh. This allows it to cover the entire 262 line
 /// display" (genvdp.txt section 5). 0x00..=0xEA is 235 lines and 0xE5..=0xFF
 /// the last 27, so line `0xEB` - one past the last line counted normally - is
-/// where the jump lands on 0xE5.
+/// where the jump lands on 0xE5. NTSC in V30 has no jump at all, and is handled
+/// ahead of this table in [`v_count`] - genvdp.txt only ever described V28.
 const V_JUMP_NTSC_LINE: u16 = 0xEB;
-/// Value the V counter jumps to, NTSC (genvdp.txt section 5, as above).
+/// Value the V counter jumps to, NTSC in V28 (genvdp.txt section 5, as above).
 const V_JUMP_NTSC: u8 = 0xE5;
 
 /// First line whose V counter has jumped, PAL in V28.
@@ -231,18 +232,29 @@ fn h_count(pixel: u32, h40: bool) -> u8 {
 
 /// The V counter byte on frame line `line`, before the interlace transform.
 ///
-/// One count per line of the frame, and the last line of the frame counts
-/// 0xFF: see [`V_JUMP_NTSC_LINE`] for the NTSC table and
-/// [`V_JUMP_PAL_V28_LINE`] for the two PAL ones.
+/// One count per line of the frame, and - except in NTSC V30, which has no jump
+/// to spend the end of the frame on - the last line of it counts 0xFF. See
+/// [`V_JUMP_NTSC_LINE`] for the NTSC V28 table and [`V_JUMP_PAL_V28_LINE`] for
+/// the two PAL ones.
 ///
-/// NTSC has no V30. R1 bit 3 "will select between a PAL (240) and NTSC (224
-/// lines) display" (genvdp.txt section 17 "$01"), and an NTSC frame is still
-/// 262 lines however that bit is set, so the counter cannot jump anywhere else
-/// and NTSC reads the NTSC table whatever `v30` says. The display is what
-/// rolls when a game asks for it (plutiedev "$81xx": "V30 mode only works
-/// properly on PAL systems"); [`Vdp::active_height`] is where the picture side
-/// of that is decided.
+/// NTSC in V30 does not jump at all. R1 bit 3 "will select between a PAL (240)
+/// and NTSC (224 lines) display" (genvdp.txt section 17 "$01"), and genvdp.txt
+/// only ever describes the V28 counter - but "Timing table - General" of
+/// Kabuto's hardware notes gives four progressions, and the NTSC V30 one is
+/// `0x000-0x1FF`: a frame counted straight through, with no repeat and no jump
+/// to land on. A 262 line frame therefore ends on `0x105` and the port answers
+/// the low byte of it, `0x05`.
+///
+/// Only the counter is modelled this way. The display is what rolls when a game
+/// asks for it (plutiedev "$81xx": "V30 mode only works properly on PAL
+/// systems"), and [`Vdp::active_height`] is where the picture side of that is
+/// decided - it stays the 224 lines of V28 on NTSC until #446's golden run
+/// against a real capture says what those 240 lines are drawn as.
 fn v_count(line: u16, pal: bool, v30: bool) -> u8 {
+    if !pal && v30 {
+        // The `0x000-0x1FF` of Kabuto's NTSC V30 column, as `line & 0xFF`.
+        return (line & 0xFF) as u8;
+    }
     let (jump_line, jump) = if !pal {
         (V_JUMP_NTSC_LINE, V_JUMP_NTSC)
     } else if v30 {
@@ -590,34 +602,80 @@ mod tests {
         assert_eq!(v_count(312, true, true), 0xFF);
     }
 
+    /// NTSC in V30 has no V counter jump at all.
+    ///
+    /// Kabuto's hardware notes, "Timing table - General", give the NTSC V counter
+    /// progression as `0x000-0x0EA, 0x1E5-0x1FF` in V28 and `0x000-0x1FF` in V30:
+    /// the second one is counted straight through, so the byte the port answers
+    /// with is the low eight bits of the nine-bit count - 262 lines of it, ending
+    /// on `0x105`. This row is what #446 replaces the "NTSC reads the NTSC table
+    /// whatever `v30` says" reading with; the PAL half of the same table went in
+    /// with #371.
     #[test]
-    fn ntsc_v30_is_ntsc_v28_as_far_as_the_counter_goes() {
+    fn ntsc_v30_counter_runs_the_frame_with_no_jump() {
         for line in 0..262 {
             assert_eq!(
                 v_count(line, false, true),
-                v_count(line, false, false),
-                "line {line}: an NTSC frame is 262 lines whatever R1 bit 3 says"
+                (line & 0xFF) as u8,
+                "line {line}: an NTSC V30 frame counts straight through"
             );
         }
+
+        assert_eq!(v_count(0xEA, false, true), 0xEA, "one line before the jump");
+        assert_eq!(v_count(0xEB, false, true), 0xEB, "where V28 lands on 0xE5");
+        assert_eq!(
+            v_count(261, false, true),
+            0x05,
+            "the last line of 262 is 0x105 of the nine-bit count"
+        );
+        assert_ne!(
+            v_count(0xEB, false, true),
+            v_count(0xEB, false, false),
+            "and that is the whole difference from V28: bit 3 removes the jump"
+        );
+    }
+
+    /// The same rule read through the port rather than through [`v_count`], so
+    /// the `v30_mode()` argument of `hv_counter_now` is held to as well as the
+    /// table itself.
+    #[test]
+    fn ntsc_v30_counter_on_the_bus_has_no_jump_either() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(1, 1 << 3);
+
+        vdp.set_position(0xEA, 0);
+        assert_eq!(vdp.hv_counter() >> 8, 0xEA, "V28 reads 0xEA here too");
+        vdp.set_position(0xEB, 0);
+        assert_eq!(vdp.hv_counter() >> 8, 0xEB, "V28 would read 0xE5");
+        vdp.set_position(261, 0);
+        assert_eq!(
+            vdp.hv_counter() >> 8,
+            0x05,
+            "and the last line of the frame"
+        );
     }
 
     /// Where each table stops counting up: the line whose V counter is not one
     /// more than the line before it, counting 0xFF to 0x00 as one on since the
-    /// counter is a byte. NTSC has the one jump of genvdp.txt section 5 at 0xEB,
-    /// and a PAL table the one of its own at 259 and 267 - the 0xFF to 0x00
+    /// counter is a byte. NTSC V28 has the one jump of genvdp.txt section 5 at
+    /// 0xEB, a PAL table the one of its own at 259 and 267 - the 0xFF to 0x00
     /// repeat of line 256 is not a third, and the jump then runs to 0xFF at the
-    /// last line of the frame.
+    /// last line of the frame. NTSC V30 has no jump at all - Kabuto's "Timing
+    /// table - General" is `0x000-0x1FF` there - so it is the one mode that ends a
+    /// frame on a value other than 0xFF: the frame is 262 lines and the count gets
+    /// only to `0x105`.
     #[test]
     fn v_counter_counts_the_frame_to_ff_and_jumps_where_the_table_says() {
-        for (pal, v30, lines, jumps_at) in [
-            (false, false, 262, vec![0xEBusize]),
-            (true, false, 313, vec![259]),
-            (true, true, 313, vec![267]),
+        for (pal, v30, lines, jumps_at, ends_on) in [
+            (false, false, 262, vec![0xEBusize], 0xFF_u8),
+            (false, true, 262, vec![], 0x05),
+            (true, false, 313, vec![259], 0xFF),
+            (true, true, 313, vec![267], 0xFF),
         ] {
             let reads = v_frame(pal, v30);
             assert_eq!(reads.len(), lines, "pal={pal} v30={v30}");
             assert_eq!(reads[0], 0x00, "pal={pal} v30={v30}");
-            assert_eq!(*reads.last().unwrap(), 0xFF, "pal={pal} v30={v30}");
+            assert_eq!(*reads.last().unwrap(), ends_on, "pal={pal} v30={v30}");
 
             let jumps: Vec<usize> = (1..reads.len())
                 .filter(|&n| reads[n] != reads[n - 1].wrapping_add(1))
