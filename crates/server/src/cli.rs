@@ -66,8 +66,8 @@ pub struct Args {
     ///
     /// Has to exist, and be a directory, before the server starts: a typo would
     /// otherwise be an empty library, which is not the kind of thing that reports
-    /// itself. Listing it is M8-03 (#157); until then this only decides what
-    /// `/api/info` reports.
+    /// itself. It is scanned once at startup and served as `GET /api/roms`
+    /// (M8-03, #157).
     ///
     /// `RUSTSEGA_ROM_DIR` is the name this repo already uses for the owner's
     /// collection (`docs/TESTING.md`), so inside `nix develop` there is a ROM

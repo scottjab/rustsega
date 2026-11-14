@@ -16,7 +16,7 @@ axum = "0.8"
 # clap compiles the `#[arg(env = ...)]` attributes in `src/cli.rs` and ignores
 # them, so `RUSTSEGA_*` would do nothing.
 clap = { version = "4", features = ["derive", "env"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["fs", "rt-multi-thread", "macros", "net", "signal"] }
 tower-http = { version = "0.6", features = [
     "compression-gzip",
     "compression-br",
@@ -25,6 +25,13 @@ tower-http = { version = "0.6", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# The library responses of M8-03 (#157): a list of entries is a document with a
+# name in it, so it gets serialized rather than formatted.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The `id` of a ROM (M8-03, #157). `crates/web` already hashes a ROM with this
+# one, so a browser and this server agree on what a ROM is called.
+sha1_smol = "1"
 # Only pulled in by `embed-web`: `rust-embed` reads `../web/dist` at compile
 # time, and `just check` runs before trunk has produced it.
 rust-embed = { version = "8", features = ["mime-guess"], optional = true }
@@ -33,6 +40,9 @@ rust-embed = { version = "8", features = ["mime-guess"], optional = true }
 # `ServiceExt::oneshot`, to drive the router without a socket.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# A fake `--rom-dir` for `tests/library.rs`, deleted by itself: a test never
+# touches `$RUSTSEGA_ROM_DIR`.
+tempfile = "3"
 
 [features]
 default = []

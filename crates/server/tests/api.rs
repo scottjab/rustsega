@@ -12,7 +12,6 @@
 //! filled in from the command line and the environment is a started process's
 //! business, and it is `crates/server/tests/running_binary.rs`.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -21,6 +20,7 @@ use axum::http::{Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use server::AppState;
 use server::assets::PlaceholderAssets;
+use server::library::LibrarySlot;
 use tower::ServiceExt;
 
 /// State with no ROM library: what `rustsega` is with no `--rom-dir`.
@@ -82,10 +82,12 @@ async fn api_info_reports_the_binary_version_and_no_library() {
 
 #[tokio::test]
 async fn api_info_reports_a_library_when_one_was_asked_for() {
-    // Only whether there is a library is M8-02's business; listing it is #157.
+    // Whether there is a library is M8-02's business; the directory is scanned
+    // here rather than named, because from #157 a library is a scan.
+    let rom_dir = tempfile::tempdir().expect("a temp dir to pretend to be a collection");
     let with_library = Arc::new(AppState {
         assets: Arc::new(PlaceholderAssets),
-        rom_dir: Some(PathBuf::from("/tmp/roms")),
+        library: LibrarySlot::scan(rom_dir.path()).expect("the empty temp dir scans"),
     });
 
     let response = get(with_library, "/api/info").await;
