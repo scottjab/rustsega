@@ -476,6 +476,7 @@ mod tests {
     /// one test that needs the TMSS of [`Bus`] as well as its clocks.
     fn machine_at(version: u8) -> (M68k, Z80, Bus) {
         let mut bus = Bus::new(rom_image(), version);
+        bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it.
         // `INC A; JR -3` at $0000 of sound RAM, where a reset Z80 starts (`Z80::reset`
         // puts PC at 0, and plutiedev "Using the Z80" loads its program there).
         bus.z80.ram[0..3].copy_from_slice(&[0x3C, 0x18, 0xFD]);
@@ -783,7 +784,10 @@ mod tests {
         assert_eq!(Scheduler::new(Region::Usa).lines_per_frame, 262);
 
         // And the line loop uses it, rather than it being a field nothing reads.
-        let (mut cpu, mut z80, mut bus) = machine();
+        // A PAL scheduler on a PAL chip: `Bus::new` builds the VDP from the
+        // version register, so the 0xA0 of [`machine`] was a 262-line NTSC beam
+        // under a scheduler that counted 313 (#371 is what made that visible).
+        let (mut cpu, mut z80, mut bus) = machine_at(0xE0);
         let mut s = Scheduler::new(Region::Europe);
         run_frame(&mut s, &mut cpu, &mut z80, &mut bus);
         assert_eq!(s.line, 0, "the PAL frame wraps at its 313th line");
@@ -956,6 +960,7 @@ mod tests {
         program[0x79] = 0xFB;
 
         let mut bus = Bus::new(rom_image(), VERSION);
+        bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it.
         bus.z80.ram[..program.len()].copy_from_slice(&program);
         release_z80_reset(&mut bus);
         // Releasing reset is the edge `run_line` answers with `Z80::reset`, and that
@@ -1160,7 +1165,7 @@ mod tests {
     /// both running: the machine the Z80 contention tests measure, the two counters
     /// being the two things a wait can take away.
     fn z80_contender(addr: u16) -> (M68k, Z80, Bus) {
-        let mut bus = Bus::new(rom_image(), VERSION);
+        let mut bus = Bus::new(rom_image(), VERSION);        bus.vdp.start_in_vblank(); // #371: parked on the VBlank line, as `Bus::reset_devices` leaves it.
         let program = z80_read_loop(addr);
         bus.z80.ram[..program.len()].copy_from_slice(&program);
         release_z80_reset(&mut bus);
