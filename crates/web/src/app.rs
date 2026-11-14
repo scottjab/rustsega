@@ -17,6 +17,8 @@ use crate::emulator::Slots;
 use crate::emulator::use_cartridge;
 use crate::gamepad_events::use_gamepad;
 use crate::keyboard_events::use_keyboard;
+use crate::library::LibraryOpen;
+use crate::library::use_library;
 use crate::menu::use_menu;
 use crate::recents::Recents;
 use crate::render::FilterSetting;
@@ -41,6 +43,8 @@ use crate::ui::drawer::Drawer;
 use crate::ui::hint::HintBar;
 use crate::ui::hint::KeyCap;
 use crate::ui::icons;
+use crate::ui::library_view::LibraryEntry;
+use crate::ui::library_view::LibraryView;
 use crate::ui::recents_grid::RecentsGrid;
 use crate::ui::select::Listboxes;
 use crate::ui::select::Select;
@@ -94,6 +98,18 @@ pub fn App() -> impl IntoView {
     // it does not need (M7-16, #149).
     let recents = Recents::new(toasts);
     provide_context(recents);
+
+    // The ROM library of whoever is serving this page, asked for once (M8-04, #158).
+    // A page with no API behind it - `trunk serve`, any static host - gets an
+    // unanswered question, so `available` stays false and none of the three entry
+    // points below is ever drawn.
+    let library = use_library();
+    provide_context(library);
+    // Whether the library is on screen, which is also one of the things that puts the
+    // shell into its menu mode: the library is walked by the arrow keys and the d-pad
+    // exactly as the drawer is (see [`crate::menu`]).
+    let library_open = LibraryOpen::new();
+    provide_context(library_open);
 
     // The two canvases the console can draw to, and the loop that drives it. Both
     // exist because a canvas belongs to one context type for its whole life, so
@@ -166,7 +182,14 @@ pub fn App() -> impl IntoView {
     // holds the console and takes the arrow keys off the game, and both the
     // keyboard and the pads have to ask the same one about it.
     let slots = Slots::new(console);
-    let menu = use_menu(console, drawer_open, slots_open, capture, listboxes);
+    let menu = use_menu(
+        console,
+        drawer_open,
+        slots_open,
+        library_open,
+        capture,
+        listboxes,
+    );
 
     // The keyboard, on the window, for as long as the shell is up (M7-07, #140).
     // It takes the menu and the cartridge because a form and a game cannot
@@ -360,6 +383,25 @@ pub fn App() -> impl IntoView {
                                 />
                             }
                         }}
+                        // The library, for a server that has one (M8-04, #158). It is
+                        // a toggle rather than a one-way door: the same button that
+                        // opened the list puts the picture back.
+                        {move || {
+                            library
+                                .available
+                                .get()
+                                .then(|| {
+                                    view! {
+                                        <IconButton
+                                            label="Library".to_string()
+                                            path=icons::LIBRARY
+                                            on_click=Callback::new(move |_| {
+                                                library_open.0.update(|open| *open = !*open);
+                                            })
+                                        />
+                                    }
+                                })
+                        }}
                         <IconButton
                             label="Open ROM".to_string()
                             path=icons::OPEN
@@ -404,6 +446,7 @@ pub fn App() -> impl IntoView {
                         view! {
                             <div class="start-screen">
                                 <RecentsGrid/>
+                                <LibraryEntry/>
                                 <EmptyScreen/>
                             </div>
                         }
@@ -473,6 +516,10 @@ pub fn App() -> impl IntoView {
                 // screen area rather than beside it, because it replaces the
                 // picture - and over the loading spinner, which a panic has left
                 // waiting for a console that is never going to arrive (M7-19, #152).
+                // The library, over the picture rather than in place of it: the canvas
+                // underneath is held by `NodeRef` and unmounting one stops a console
+                // (M8-04, #158).
+                {move || library_open.0.get().then(|| view! { <LibraryView/> })}
                 {move || crashed.get().then(|| view! { <CrashCard/> })}
                 <RomFileInput/>
             </main>

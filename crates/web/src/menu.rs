@@ -25,6 +25,7 @@ use crate::controls::CaptureTarget;
 use crate::emulator::Controls;
 use crate::input::Source;
 use crate::input::with_state;
+use crate::library::LibraryOpen;
 use crate::nav::Dir;
 use crate::nav::LastDevice;
 use crate::nav::MenuPause;
@@ -41,6 +42,15 @@ const FOCUSABLE: &str = "button, input, select, [tabindex]:not([tabindex='-1'])"
 /// The class [`crate::ui::drawer::Drawer`] puts on itself while it is showing, and
 /// the selector [`inside_drawer`] asks controls about.
 const OPEN_DRAWER: &str = ".drawer--open";
+
+/// The control a menu focuses first when the page marks one (M8-04, #158).
+///
+/// The library's search box is the case: a walk that started on the top bar would
+/// leave the first keystroke nowhere, and a walk that always focused the first
+/// control of the page would put it on the Close button. Marking it is the view's
+/// business, so this is a selector rather than a list of components the menu knows
+/// about by name.
+const FOCUS_FIRST: &str = ".menu-focus-first";
 
 /// How many times [`Menu::focus_first`] asks for the focus before it gives up.
 const FOCUS_TRIES: u32 = 16;
@@ -60,6 +70,9 @@ pub struct Menu {
     /// Whether the save state panel is showing: the other menu this shell has,
     /// and the innermost thing `Escape` has to close (M7-15, #148).
     pub states_open: RwSignal<bool>,
+    /// Whether the ROM library is on screen (M8-04, #158): the third thing this
+    /// shell walks, and what makes the library's rows the d-pad's to move.
+    pub library_open: LibraryOpen,
     /// Whether the settings drawer is open, which is what `mode` is read from.
     pub drawer_open: RwSignal<bool>,
     /// The controls page's rebind capture: the innermost thing the page has.
@@ -68,10 +81,10 @@ pub struct Menu {
     lists: Listboxes,
     /// Which half of the page the shell is in.
     ///
-    /// Derived from [`Menu::drawer_open`] rather than set beside it, because a
-    /// second signal saying "a menu is open" is a second fact to keep true. The
-    /// drawer is the only menu this build has; a dialog will have to add itself
-    /// here, and to [`Menu::back`], when M7-15 (#148) brings one.
+    /// Derived from the three signals that can open something rather than set beside
+    /// them, because a fourth signal saying "a menu is open" is a fourth fact to keep
+    /// true. Anything new that takes the page - a dialog - adds itself here and to
+    /// [`Menu::back`].
     pub mode: Signal<UiMode>,
     /// What the player last touched, which decides the hint bar's glyphs.
     pub hints: RwSignal<LastDevice>,
@@ -94,11 +107,12 @@ pub fn use_menu(
     console: Controls,
     drawer_open: RwSignal<bool>,
     states_open: RwSignal<bool>,
+    library_open: LibraryOpen,
     capture: RwSignal<Option<CaptureTarget>>,
     lists: Listboxes,
 ) -> Menu {
     let mode = Signal::derive(move || {
-        if drawer_open.get() || states_open.get() {
+        if drawer_open.get() || states_open.get() || library_open.0.get() {
             UiMode::Menu
         } else {
             UiMode::Playing
@@ -108,6 +122,7 @@ pub fn use_menu(
         console,
         drawer_open,
         states_open,
+        library_open,
         capture,
         lists,
         mode,
@@ -192,6 +207,12 @@ impl Menu {
         }
         if self.drawer_open.get() {
             self.drawer_open.set(false);
+            return;
+        }
+        // The library is the outermost thing of all: it is the page behind the
+        // drawer, so it is the last thing `Back` reaches rather than the first.
+        if self.library_open.0.get() {
+            self.library_open.0.set(false);
         }
     }
 
@@ -277,8 +298,9 @@ impl Menu {
         }
     }
 
-    /// Puts the focus on the first control of the open drawer, which is the first
-    /// thing a player who has just opened the menu is looking at.
+    /// Puts the focus on the control the open page asks for, or on the first control
+    /// of the open drawer - which is the first thing a player who has just opened the
+    /// menu is looking at.
     ///
     /// Tries a few times, because a drawer that is sliding in is still
     /// `visibility: hidden` for the length of its transition - see the transition
@@ -320,12 +342,15 @@ impl Menu {
             .and_then(|document| document.query_selector(OPEN_DRAWER).ok())
             .flatten()
             .is_some();
-        let first = focusables()
-            .into_iter()
-            .find(|(element, _)| !showing || inside_drawer(element));
+        let focusables = focusables();
+        let reachable = |element: &HtmlElement| !showing || inside_drawer(element);
+        let marked = focusables.iter().find(|(element, _)| {
+            reachable(element) && element.matches(FOCUS_FIRST).unwrap_or(false)
+        });
+        let first = marked.or_else(|| focusables.iter().find(|(element, _)| reachable(element)));
         match first {
             Some((element, _)) => {
-                self.focus(&element);
+                self.focus(element);
                 true
             }
             None => false,

@@ -27,6 +27,8 @@ pub const KEYBOARD: &str =
     "M3 7h18v10H3z M6.5 10.5h.01 M10 10.5h.01 M13.5 10.5h.01 M17 10.5h.01 M8 13.5h8";
 pub const CLOSE: &str = "M6 6l12 12 M18 6 6 18";
 pub const MENU: &str = "M4 7h16 M4 12h16 M4 17h16";
+/// Three upright spines and one leaning: the library the server offers (M8-04, #158).
+pub const LIBRARY: &str = "M4 5v14 M9 5v14 M14 5v14 M17.5 5.8l3.2 12.8";
 
 /// Every icon the shell has, for validation and lookup.
 pub const ALL: &[Icon] = &[
@@ -81,6 +83,10 @@ pub const ALL: &[Icon] = &[
     Icon {
         name: "menu",
         path: MENU,
+    },
+    Icon {
+        name: "library",
+        path: LIBRARY,
     },
 ];
 
@@ -176,6 +182,7 @@ mod tests {
             "keyboard",
             "close",
             "menu",
+            "library",
         ] {
             assert!(by_name(name).is_some(), "missing icon: {name}");
         }
