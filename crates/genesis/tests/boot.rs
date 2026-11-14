@@ -604,11 +604,11 @@ fn quackshot_rev_a_boots_to_non_blank_screen() {
 /// finishes. Filed as [#438](https://github.com/scottjab/rustsega/issues/438).
 #[test]
 #[ignore = "needs a commercial ROM, and #438: its start-up does not finish in the region its header reports, so it never loads a palette; forced to PAL it draws"]
-fn krystys_super_fun_house_boots_to_non_blank_screen() {
+fn krustys_super_fun_house_boots_to_non_blank_screen() {
     let path = require_data!(testkit::commercial_rom(
         "Krusty's Super Fun House (USA, Europe).md"
     ));
-    let colours = colour_count(&path, 300, "krystys_super_fun_house_300.png");
+    let colours = colour_count(&path, 300, "krustys_super_fun_house_300.png");
     assert!(
         colours > BLANK,
         "300 frames in, Krusty's Super Fun House is {colours} distinct colours: the display \

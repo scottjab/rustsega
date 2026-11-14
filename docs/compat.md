@@ -19,7 +19,7 @@ design: `commercial_save_state_is_audible_after_a_load` until #362 is fixed,
 [#433](https://github.com/scottjab/rustsega/issues/433) gives `Virtua Racing` its SVP,
 and - all four of them, and only where the commercial collection is on disk - the
 #375 carts `quackshot_rev_a_boots_to_non_blank_screen`,
-`krystys_super_fun_house_boots_to_non_blank_screen`, `time_killers_boots_to_non_blank_screen`
+`krustys_super_fun_house_boots_to_non_blank_screen`, `time_killers_boots_to_non_blank_screen`
 and `lemmings_2_tribes_boots_to_non_blank_screen`. `just test-commercial` filters on
 `commercial` in the test name, so it runs the first of those six and none of the other
 five.
@@ -46,12 +46,16 @@ that was going to set it up stopped first.
 
 **The single most useful measurement is not a colour count, it is "how many of the 64 CRAM
 words are non-zero"**, taken from the public `Genesis::bus().vdp` fields at every frame
-boundary alongside the 68000's `pc`. 24 of the 28 have zero CRAM words and a `pc` histogram
-that is one or two addresses wide, which is a stopped program, not a broken pipeline. Only
-two of the 28 ever load a palette, and those two are the render problem the ticket expected
-rather than the boot problem it feared.
+boundary alongside the 68000's `pc`. 26 of the 28 have zero CRAM words, and for most of
+them the `pc` histogram over 1800 frames is one or two addresses wide - a stopped program,
+not a broken pipeline. Only two of the 28 ever load a palette, and those two are the render
+problem the ticket expected rather than the boot problem it feared.
 
-The causes, one issue each, and the cart that measures them:
+The causes, one issue each, and the cart that measures them. The `Carts` column counts per
+issue, so the three carts that sit under two causes - `QuackShot (Rev A)`, which halts and
+is also truncated, and `Caesar no Yabou II` and `Back to the Future Part III (Europe)`,
+which are named on the inventory of [#440](https://github.com/scottjab/rustsega/issues/440)
+as well - are counted twice; all 28 are covered, and no cart is left unassigned.
 
 | Cause | Issue | Carts |
 |---|---|---|
