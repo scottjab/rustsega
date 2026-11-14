@@ -155,9 +155,9 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          # The two tools of the trunk step, and the C linker of the musl link
-          # step. `muslCc` has to be an input, not just a path in a variable:
-          # nothing but an input puts it in the sandbox.
+          # The three tools of the trunk step, as in `rustsega`, and the C linker
+          # of the musl link step. `muslCc` has to be an input, not just a path in
+          # a variable: only an input puts it in the sandbox.
           nativeBuildInputs = [
             pkgs.trunk
             pkgs.wasm-bindgen-cli
@@ -355,10 +355,11 @@
                 ;;
             esac
 
-            # And `ldd` agrees. On a static binary it answers "not a dynamic
-            # executable" and exits 1, so the exit status says nothing here; what
-            # matters is that no shared library is resolved for it, which is what
-            # an `=>` line would be.
+            # And `ldd` agrees. A static binary gets "not a dynamic executable"
+            # or "statically linked" depending on the `ldd` in hand, and the first
+            # of those comes with exit status 1, so the status says nothing here;
+            # what matters is that no shared library is resolved for the binary,
+            # which is what an `=>` line would be.
             dynamic="$(ldd "$bin" 2>&1 || true)"
             echo "$dynamic"
             case "$dynamic" in
