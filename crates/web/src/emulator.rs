@@ -2,10 +2,10 @@
 //! (M7-04, #137).
 //!
 //! [`Emulator`] owns one running [`Genesis`] and the canvas it paints. It lives in
-//! a `thread_local!` behind an `Rc<RefCell<_>>` rather than in a Leptos signal,
-//! which is what the ticket asks for and for two reasons: the console is the size
-//! of the machine, so anything that read it as a value would clone megabytes per
-//! frame, and neither `Genesis` nor the canvas element it borrows is `Send` - and
+//! a `thread_local!` behind a [`TakeCell`] rather than in a Leptos signal, which is
+//! what the ticket asks for and for two reasons: the console is the size of the
+//! machine, so anything that read it as a value would clone megabytes per frame,
+//! and neither `Genesis` nor the canvas element it borrows is `Send` - and
 //! [`Callback`] holds a `Send + Sync` closure. So the console is owned by the
 //! component that mounts the canvas, and what the shell gets instead is
 //! [`Controls`]: a `Copy` handle over the pause state, which is a signal.
@@ -173,6 +173,96 @@ pub fn frame_to_rgba_bytes(frame: &FrameBuffer, out: &mut Vec<u8>) {
     }
 }
 
+/// A console shared by the frame loop and the shell, handed over by *moving out*
+/// rather than by lending a borrow.
+///
+/// This is the shape #387 needed, and `borrow_mut` across [`Emulator::tick`] was
+/// the bug it had: wasm cannot give a `RefCell` borrow back after a panic.
+/// `wasm32-unknown-unknown` is built `panic = "abort"` - the test
+/// `crates/web/tests/wasm_panic_strategy.rs` is that fact, checked on the target -
+/// so a frame that dies in the machine traps straight out to JavaScript with the
+/// borrow it had taken still held: no `Drop` runs, and `std::panic::catch_unwind`
+/// has nothing to catch, which is why the other shape #387 offered is not a fix
+/// here at all. A borrow held that way is a page that panics again on every later
+/// frame, keypress and click, which is how one core bug became a dead page.
+///
+/// A `TakeCell` cannot be held that way, because [`TakeCell::with`] is the only
+/// door it has: it moves the console out of the cell, makes the call, and moves it
+/// back, so nothing is borrowed while the machine is running. A caller arriving
+/// while a call is running, or after a panic took the machine, is told there is no
+/// console here - the answer every caller of [`running`] already gives a page with
+/// no cartridge on the canvas. The console a panic took is gone for good, which is
+/// the honest half of it: nobody can say what state its registers are in, and
+/// [`crate::crash`] is what tells the player the game is finished with.
+///
+/// Generic over its payload because the discipline is what needs the tests, and an
+/// `Emulator` needs a canvas, two renderers and a cartridge, so nothing that owns
+/// one can be built on the host.
+struct TakeCell<T> {
+    cell: Rc<RefCell<Option<T>>>,
+}
+
+impl<T> TakeCell<T> {
+    /// The cell holding `console`.
+    fn new(console: T) -> Self {
+        Self {
+            cell: Rc::new(RefCell::new(Some(console))),
+        }
+    }
+
+    /// A handle to the same console that does not keep it alive: for the
+    /// animation frame and the wake listeners, which have to stop of themselves
+    /// once their own console has been retired (see [`Emulator::start`]).
+    fn downgrade(&self) -> WeakTakeCell<T> {
+        WeakTakeCell {
+            cell: Rc::downgrade(&self.cell),
+        }
+    }
+
+    /// `call` on the console, or `None` when there is no console to call: none
+    /// loaded, one still inside another call, or one lost to a panic.
+    fn with<R>(&self, call: impl FnOnce(&mut T) -> R) -> Option<R> {
+        // The borrow of the cell is a temporary of this statement, so it is gone
+        // by the time `call` runs. That is the whole of #387, and why the console
+        // is moved out for the call instead of borrowed for it.
+        let mut console = self.cell.borrow_mut().take()?;
+        let answer = call(&mut console);
+        *self.cell.borrow_mut() = Some(console);
+        Some(answer)
+    }
+}
+
+impl<T> Clone for TakeCell<T> {
+    fn clone(&self) -> Self {
+        Self {
+            cell: self.cell.clone(),
+        }
+    }
+}
+
+/// A [`TakeCell`] handle that does not keep the console alive.
+struct WeakTakeCell<T> {
+    cell: Weak<RefCell<Option<T>>>,
+}
+
+impl<T> WeakTakeCell<T> {
+    /// `call` on the console for as long as it exists, exactly as
+    /// [`TakeCell::with`] - including the `None` for a console that is inside
+    /// another call or has been lost to a panic.
+    fn with<R>(&self, call: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let cell = self.cell.upgrade()?;
+        TakeCell { cell }.with(call)
+    }
+}
+
+impl<T> Clone for WeakTakeCell<T> {
+    fn clone(&self) -> Self {
+        Self {
+            cell: self.cell.clone(),
+        }
+    }
+}
+
 // The console this tab is running: `None` until a cartridge is on the canvas, and
 // replaced - never shared - when another ROM arrives.
 //
@@ -180,7 +270,7 @@ pub fn frame_to_rgba_bytes(frame: &FrameBuffer, out: &mut Vec<u8>) {
 // because the animation-frame callback, a file drop and a button click are all on
 // this one thread and need one owner.
 thread_local! {
-    static RUNNING: RefCell<Option<Rc<RefCell<Emulator>>>> = const { RefCell::new(None) };
+    static RUNNING: RefCell<Option<TakeCell<Emulator>>> = const { RefCell::new(None) };
     /// Counts ROM loads, so a load that was superseded while it was waiting for
     /// IndexedDB can see that and not install a console for a cartridge the
     /// player has already moved on from.
@@ -191,8 +281,10 @@ thread_local! {
     static LIFECYCLE: RefCell<Vec<LifecycleListener>> = const { RefCell::new(Vec::new()) };
 }
 
-/// The running console, if there is one.
-fn running() -> Option<Rc<RefCell<Emulator>>> {
+/// The running console, if there is one. Every reader of it goes through
+/// [`TakeCell::with`], which is what keeps a console that died mid-frame from
+/// being a page that panics forever (#387).
+fn running() -> Option<TakeCell<Emulator>> {
     RUNNING.with(|running| running.borrow().clone())
 }
 
@@ -223,12 +315,13 @@ fn stop() {
     // microtask after this borrow is gone.
     //
     // Taking it out of the slot before stopping it is what frees the machine -
-    // the loop itself only holds a `Weak` (see [`Emulator::start`]).
+    // the loop itself only holds a [`WeakTakeCell`] (see [`Emulator::start`]).
     let emulator = RUNNING.with(|running| running.borrow_mut().take());
     if let Some(emulator) = emulator {
-        let mut emulator = emulator.borrow_mut();
-        emulator.flush_sram(now_ms(), true);
-        emulator.stop();
+        let _ = emulator.with(|emulator| {
+            emulator.flush_sram(now_ms(), true);
+            emulator.stop();
+        });
     }
     // ... and a load still waiting on storage for the console that is going away
     // is a load nobody is waiting for any more.
@@ -239,7 +332,7 @@ fn stop() {
 /// and a save to make (M7-14, #147).
 fn flush_running_sram() {
     let Some(emulator) = running() else { return };
-    emulator.borrow_mut().flush_sram(now_ms(), true);
+    let _ = emulator.with(|emulator| emulator.flush_sram(now_ms(), true));
 }
 
 /// What storage had for a cartridge when it was loaded: the database to write
@@ -455,7 +548,7 @@ fn hold_for_visibility(hidden: bool) {
     let Some(emulator) = running() else {
         return;
     };
-    emulator.borrow_mut().page_visibility(hidden);
+    let _ = emulator.with(|emulator| emulator.page_visibility(hidden));
 }
 
 /// Takes the [`LIFECYCLE_EVENTS`] listeners off `window` again, which the shell's
@@ -545,11 +638,12 @@ impl Controls {
     /// the button is disabled in that case anyway, and a press must not invent a
     /// paused state for a game that is not running.
     pub fn toggle(self) {
-        let held = running().map(|emulator| {
-            let mut emulator = emulator.borrow_mut();
-            let held = !emulator.paused;
-            emulator.set_paused(held);
-            held
+        let held = running().and_then(|emulator| {
+            emulator.with(|emulator| {
+                let held = !emulator.paused;
+                emulator.set_paused(held);
+                held
+            })
         });
         if let Some(held) = held {
             self.paused.set(held);
@@ -568,17 +662,15 @@ impl Controls {
             return;
         }
         self.fast_forward.set(held);
-        if !held && let Some(emulator) = running() {
-            emulator.borrow_mut().end_fast_forward();
+        if !held {
+            let _ = running().and_then(|emulator| emulator.with(Emulator::end_fast_forward));
         }
     }
 
     /// The console's reset button: back to the start of the game, held or running
     /// as it was.
     pub fn reset(self) {
-        if let Some(emulator) = running() {
-            emulator.borrow_mut().reset();
-        }
+        let _ = running().and_then(|emulator| emulator.with(Emulator::reset));
     }
 
     /// Takes the running console's sound off autoplay.
@@ -587,9 +679,7 @@ impl Controls {
     /// [`WAKE_EVENTS`] listeners do the same thing for every other click and
     /// keypress, so this is the one the shell can call when it wants to be sure.
     pub fn enable_audio(self) {
-        if let Some(emulator) = running() {
-            emulator.borrow_mut().enable_audio();
-        }
+        let _ = running().and_then(|emulator| emulator.with(Emulator::enable_audio));
     }
 
     /// Tells the running console that the picture's box is now `css_w` x `css_h`
@@ -600,20 +690,16 @@ impl Controls {
     /// learn the size from its own drawing buffer, because following the buffer
     /// would be following the very thing being sized.
     pub fn resize(self, css_w: f64, css_h: f64, dpr: f64) {
-        if let Some(emulator) = running() {
-            emulator.borrow_mut().resize_surface(css_w, css_h, dpr);
-        }
+        let _ =
+            running().and_then(|emulator| emulator.with(|e| e.resize_surface(css_w, css_h, dpr)));
     }
 
     /// Which drawing path to use and what the picture should look like on it
     /// (M7-13, #146): the drawer's three picture settings, in one call because
     /// they are read out of one `Settings`.
     pub fn set_picture(self, renderer: RendererSetting, filter: FilterSetting, smoothing: bool) {
-        if let Some(emulator) = running() {
-            emulator
-                .borrow_mut()
-                .set_picture(renderer, filter, smoothing);
-        }
+        let _ = running()
+            .and_then(|emulator| emulator.with(|e| e.set_picture(renderer, filter, smoothing)));
     }
 
     /// Says what the console's frame is, which is what the picture is scaled from
@@ -634,16 +720,12 @@ impl Controls {
     /// has it. With no console there is nothing to turn, and the setting is not
     /// lost: a console made later reads [`Settings`] for itself.
     pub fn set_volume(self, volume: f64) {
-        if let Some(emulator) = running() {
-            emulator.borrow_mut().set_volume(volume as f32);
-        }
+        let _ = running().and_then(|emulator| emulator.with(|e| e.set_volume(volume as f32)));
     }
 
     /// Mutes or unmutes the running console, leaving its volume where it was.
     pub fn set_muted(self, muted: bool) {
-        if let Some(emulator) = running() {
-            emulator.borrow_mut().set_muted(muted);
-        }
+        let _ = running().and_then(|emulator| emulator.with(|e| e.set_muted(muted)));
     }
 
     /// Lights the "Saved" chip, for a second and a half.
@@ -676,13 +758,13 @@ impl Controls {
     /// This cart's save state slots, or `None` when there is no cart or this
     /// browser would not open IndexedDB (M7-15, #148).
     pub fn slot_target(self) -> Option<SlotTarget> {
-        let emulator = running()?;
-        let emulator = emulator.borrow_mut();
-        let store = emulator.slot_store.as_ref()?;
-        Some(SlotTarget {
-            db: store.db.clone(),
-            rom_id: store.rom_id.clone(),
-        })
+        let (db, rom_id) = running()?.with(|emulator| {
+            emulator
+                .slot_store
+                .as_ref()
+                .map(|store| (store.db.clone(), store.rom_id.clone()))
+        })??;
+        Some(SlotTarget { db, rom_id })
     }
 
     /// Writes the running console to `slot`: the machine and a card's picture of
@@ -696,9 +778,8 @@ impl Controls {
     /// a hundredfold bigger than the SRAM a flush already copies.
     pub fn save_slot(self, slot: u32) {
         let Some(emulator) = running() else { return };
-        let (written, toasts) = {
-            let emulator = emulator.borrow_mut();
-            (emulator.capture_slot(), emulator.toasts)
+        let Some((written, toasts)) = emulator.with(|e| (e.capture_slot(), e.toasts)) else {
+            return;
         };
         let Some((store, record)) = written else {
             toasts.push(
@@ -722,9 +803,8 @@ impl Controls {
     /// lock on the machine (#387).
     pub fn load_slot(self, slot: u32) {
         let Some(emulator) = running() else { return };
-        let (target, toasts) = {
-            let emulator = emulator.borrow_mut();
-            (emulator.slot_store.clone(), emulator.toasts)
+        let Some((target, toasts)) = emulator.with(|e| (e.slot_store.clone(), e.toasts)) else {
+            return;
         };
         let Some(store) = target else {
             toasts.push(
@@ -791,7 +871,9 @@ async fn read_slot(store: SlotStore, slot: u32, toasts: Toasts) {
     let Some(emulator) = running() else {
         return;
     };
-    let outcome = emulator.borrow_mut().apply_slot(&record);
+    let Some(outcome) = emulator.with(|emulator| emulator.apply_slot(&record)) else {
+        return;
+    };
     match outcome {
         Ok(()) => toasts.push(ToastKind::Info, format!("Loaded slot {}", slot + 1)),
         Err(error) => toasts.push(ToastKind::Danger, slots::state_error_toast(error)),
@@ -1071,9 +1153,10 @@ impl Emulator {
     ///
     /// The animation frame is requested before the callback is filed away, so
     /// that there is no moment in which a tick could arrive for a console that
-    /// cannot answer it. The callback holds a `Weak` for the same reason
+    /// cannot answer it. The callback holds a [`WeakTakeCell`] for the same reason
     /// [`stop`] can free the machine: a loop must not be what keeps a retired
-    /// console alive.
+    /// console alive, and a tick must not be what keeps a console's cell held
+    /// (#387).
     fn start(
         rom: &LoadedRom,
         canvas: &HtmlCanvasElement,
@@ -1082,7 +1165,7 @@ impl Emulator {
         settings: RwSignal<Settings>,
         saved: Option<SavedSram>,
         toasts: Toasts,
-    ) -> Result<Rc<RefCell<Self>>, StartError> {
+    ) -> Result<TakeCell<Self>, StartError> {
         // The drawing path first, because everything after this point has a
         // browser resource attached to it that a failed start would have to give
         // back - and because a console with nothing to draw with is not a console.
@@ -1145,7 +1228,7 @@ impl Emulator {
         // and the size the shell is told come from it (#145).
         let seeded = (canvas.width(), canvas.height());
         console.set_frame(seeded);
-        let emulator = Rc::new(RefCell::new(Self {
+        let emulator = TakeCell::new(Self {
             genesis,
             audio,
             settings,
@@ -1173,37 +1256,44 @@ impl Emulator {
             frame: None,
             tick: None,
             wake: Vec::new(),
-        }));
+        });
 
-        let weak = Rc::downgrade(&emulator);
+        let weak = emulator.downgrade();
         // Built before the tick closure, which is what takes the only move of
         // `weak`: the listeners need the same handle, and they only read it.
         let wake = wake_listeners(&weak);
         let callback = Closure::wrap(Box::new(move |now_ms: f64| {
-            // The gamepads first, and outside the borrow below. The Gamepad API
+            // The gamepads first, and outside the call below. The Gamepad API
             // is poll based, so this is the only place a pad's buttons change
             // (M7-08, #141); a reading can also ask for a hotkey, and a hotkey
-            // can reach the console - which is a second `borrow_mut` inside the
-            // one just below.
+            // can reach the console - which would be the console being asked for
+            // twice over, the frame holding it while the pad knocked on the door.
             // The frame's own clock travels with it: a direction held on a pad
             // while a menu is open walks the focus on a timer, and this is the
             // only clock in the page that a pad can be timed against (M7-11, #144).
             crate::gamepad_events::poll_gamepads(now_ms);
-            if let Some(emulator) = weak.upgrade() {
-                emulator.borrow_mut().tick(now_ms);
-            }
+            let _ = weak.with(|emulator| emulator.tick(now_ms));
         }) as Box<dyn FnMut(f64)>);
         let window = web_sys::window().ok_or(StartError::NoAnimationFrames)?;
         let frame = window
             .request_animation_frame(callback.as_js_value().unchecked_ref())
             .map_err(|_| StartError::NoAnimationFrames)?;
 
-        let mut this = emulator.borrow_mut();
-        this.tick = Some(callback);
-        this.frame = Some(frame);
-        this.wake = wake;
-        this.sync_sound();
-        drop(this);
+        // Filed away through the same door every other call uses - the `drop` that
+        // used to close this borrow is what putting the console back does (#387).
+        // A bound `let` rather than one `debug_assert!` because the call is the
+        // point of the statement and a release build drops a debug assert's
+        // argument: the console would start with no callback and no frame, which
+        // is a black screen rather than a broken assertion.
+        let filed = emulator.with(|this| {
+            this.tick = Some(callback);
+            this.frame = Some(frame);
+            this.wake = wake;
+            this.sync_sound();
+        });
+        // A console that has just been made is nobody else's to hold, so `None`
+        // here would be a `TakeCell` that has stopped answering to `with`.
+        debug_assert!(filed.is_some(), "a new console cannot already be held");
 
         Ok(emulator)
     }
@@ -1778,15 +1868,13 @@ fn make_renderer(
 /// and a context can be taken back by the browser - a tab that goes to the
 /// background, a device change - so a later gesture has to be worth listening for
 /// again.
-fn wake_listeners(weak: &Weak<RefCell<Emulator>>) -> Vec<Closure<dyn FnMut()>> {
+fn wake_listeners(weak: &WeakTakeCell<Emulator>) -> Vec<Closure<dyn FnMut()>> {
     WAKE_EVENTS
         .iter()
         .filter_map(|event| {
             let weak = weak.clone();
             let listener = Closure::wrap(Box::new(move || {
-                if let Some(emulator) = weak.upgrade() {
-                    emulator.borrow_mut().enable_audio();
-                }
+                let _ = weak.with(Emulator::enable_audio);
             }) as Box<dyn FnMut()>);
             let attached = web_sys::window()
                 .and_then(|window| {
@@ -1992,5 +2080,284 @@ mod tests {
         assert!(!controls.saved.get_untracked());
         controls.mark_saved();
         assert!(controls.saved.get_untracked());
+    }
+
+    // The tests below are the #387 half of this module: what a console cell has to
+    // do when a call into it does not come back. They are written against
+    // [`TakeCell`] rather than against [`Controls`] because a `Controls` needs a
+    // console and a console needs a canvas, two renderers and a cartridge, so the
+    // discipline is the narrowest thing here that can be tested at all.
+
+    /// A stand-in for [`Emulator`]: a frame that can die part way through it.
+    #[derive(Default)]
+    struct Machine {
+        /// Frames run, which is [`Emulator::tick`]'s `run_frame`.
+        frames: Rc<Cell<u32>>,
+        /// The number of the frame that dies. `0`, which [`Default`] gives, is a
+        /// frame that never happens, so a `Machine` never dies by itself.
+        dies: u32,
+        /// How many times the loop got as far as asking for the next frame.
+        armed: Rc<Cell<u32>>,
+    }
+
+    impl Machine {
+        /// One animation frame, ending the way [`Emulator::tick`] ends: run the
+        /// machine, then [`Emulator::arm`]. A frame that dies part way through has
+        /// not asked for the next one either, which is the whole of why the loop
+        /// stops by itself once a console is gone.
+        fn tick(&mut self) {
+            let frame = self.frames.get() + 1;
+            self.frames.set(frame);
+            assert_ne!(frame, self.dies, "the machine died in this frame");
+            self.armed.set(self.armed.get() + 1);
+        }
+    }
+
+    /// One animation frame in the shape the real loop runs it in - tick the
+    /// console if a console can be had at all - reporting whether there was one.
+    fn animation_frame(weak: &WeakTakeCell<Machine>) -> bool {
+        weak.with(|machine| machine.tick()).is_some()
+    }
+
+    /// What #387 asks of a call into the console: while it runs the cell is
+    /// neither borrowed nor handed to anybody else, so a panic halfway through the
+    /// call has no borrow that it is failing to give back.
+    #[test]
+    fn a_call_hands_the_machine_over_rather_than_borrowing_the_cell() {
+        let console = TakeCell::new(Machine::default());
+        let witness = console.with(|machine| {
+            machine.tick();
+            // This is the moment `tick` panics at in #387, and these are the two
+            // questions a caller arriving at it asks: does touching the cell
+            // panic, and is the machine being handed to us as well?
+            let borrowable = console.cell.try_borrow_mut().is_ok();
+            let handed_twice = console.with(|machine| machine.frames.get()).is_some();
+            (borrowable, handed_twice)
+        });
+        assert_eq!(
+            witness,
+            Some((true, false)),
+            "while a call runs the cell is unborrowed and its machine is already spoken for"
+        );
+    }
+
+    /// The state a wasm trap leaves behind: the machine is gone, and the cell is
+    /// nothing left to panic on.
+    ///
+    /// `catch_unwind` is the host's stand-in for the trap, and a fair one: on the
+    /// host the panic unwinds and the machine that was moved out of the cell is
+    /// dropped, and on wasm it aborts and that machine is leaked. Both leave the
+    /// cell empty and unborrowed, which is the only state the rest of the page can
+    /// be asked to handle.
+    #[test]
+    fn a_panic_takes_the_machine_and_leaves_the_cell_behind() {
+        let console = TakeCell::new(Machine {
+            dies: 1,
+            ..Default::default()
+        });
+        let weak = console.downgrade();
+        let escaped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            animation_frame(&weak);
+        }));
+        assert!(escaped.is_err(), "the frame really did die");
+        assert!(
+            console.cell.try_borrow_mut().is_ok(),
+            "the cell is left as empty as it was, not as borrowed"
+        );
+        assert!(
+            !animation_frame(&weak),
+            "a console lost to a panic ticks no more frames"
+        );
+        assert!(console.with(|machine| machine.tick()).is_none());
+    }
+
+    /// A frame that died in the machine asks for no other frame, is asked for none
+    /// itself, and can be replaced.
+    #[test]
+    fn a_frame_that_died_in_the_machine_asks_for_no_more_frames() {
+        let frames = Rc::new(Cell::new(0));
+        let armed = Rc::new(Cell::new(0));
+        let console = TakeCell::new(Machine {
+            frames: frames.clone(),
+            dies: 2,
+            armed: armed.clone(),
+        });
+        let weak = console.downgrade();
+        assert!(animation_frame(&weak), "the first frame runs");
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            animation_frame(&weak);
+        }));
+        assert!(died.is_err());
+        assert_eq!((frames.get(), armed.get()), (2, 1));
+        // Every later entry point - the next animation frame, a keypress, a
+        // Reset - is a no-op rather than the `RefCell already borrowed` panic
+        // that #387 repeated once per frame.
+        assert!(!animation_frame(&weak));
+        assert!(!animation_frame(&weak));
+        assert_eq!(
+            (frames.get(), armed.get()),
+            (2, 1),
+            "the loop stopped with the frame that died"
+        );
+        // ... and emptying a cell whose machine is already gone is a no-op too,
+        // which is what lets `stop` free a console that died and `start` put
+        // another cartridge where it was.
+        assert!(console.cell.borrow_mut().take().is_none());
+    }
+
+    /// The loop and the wake listeners hold a handle that cannot keep a console
+    /// alive, so a retired console is ticked no more: the shape #387 needed must
+    /// not have cost [`stop`] the way it frees the machine.
+    #[test]
+    fn a_retired_console_ticks_no_more_frames() {
+        let console = TakeCell::new(Machine::default());
+        let weak = console.downgrade();
+        assert!(animation_frame(&weak));
+        drop(console);
+        assert!(!animation_frame(&weak));
+    }
+}
+
+/// A real console in a real browser, which is the only place `Emulator` can be
+/// built and the only place #387 can actually happen.
+///
+/// The host tests above stand in for the state a wasm trap leaves a console cell.
+/// This is the other half, and the one that matters for the shape of the fix: the
+/// cell of #387 *moves* the console out and back on every call, twice a frame, and
+/// the console is what holds the animation-frame callback and the wake listeners
+/// that `window` is holding. So this starts a console on a real canvas, lets the
+/// browser drive it, and asks whether it is still running and still reachable.
+///
+/// Run by `just test-web` (M7-20, #153), which is the browser half of the harness;
+/// `just check` cannot see it, so a failure here reads as a broken browser rather
+/// than as a web bug.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod browser {
+    use super::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    /// A `<canvas>` from script and a cart to put on it: a 512 byte image with the
+    /// header [`target_hz`] reads and a two byte 68000 program, which is the least
+    /// a console can be given and still have a machine to run.
+    fn cartridge() -> (HtmlCanvasElement, LoadedRom) {
+        let document = web_sys::window()
+            .expect("a browser window")
+            .document()
+            .expect("a document");
+        let canvas = document
+            .create_element("canvas")
+            .expect("create a canvas")
+            .dyn_into::<HtmlCanvasElement>()
+            .expect("a `canvas` element is an HtmlCanvasElement");
+        // A size no VDP mode makes, so the frame the console reports is one it
+        // drew rather than the one the markup asked for (#145).
+        canvas.set_width(1);
+        canvas.set_height(1);
+        let mut rom = vec![0u8; 0x200];
+        rom[0x100..0x200].fill(b' ');
+        rom[0x100..0x110].copy_from_slice(b"SEGA GENESIS    ");
+        rom[0x1F0..0x1F3].copy_from_slice(b"JUE");
+        // The 68000 starts at the long at 0x04 with the stack at the long at 0x00,
+        // and the program below is `BRA *`, which is a cart that runs forever
+        // without touching anything: an all-zero image is garbage to the CPU and
+        // dies in `m68k` a few frames in, which is not what this is testing.
+        rom[0x00..0x04].copy_from_slice(&0xff_ff_fe_u32.to_be_bytes());
+        rom[0x04..0x08].copy_from_slice(&0x20_u32.to_be_bytes());
+        rom[0x20..0x22].copy_from_slice(&[0x60, 0xfe]);
+        let rom = LoadedRom {
+            bytes: rom,
+            id: "wasm-panic-strategy".into(),
+            title: "wasm-panic-strategy".into(),
+            region: "Genesis".into(),
+            file_name: "probe.md".into(),
+        };
+        (canvas, rom)
+    }
+
+    /// One trip round the browser's own animation frame, so that the console's own
+    /// callback (the one `window` holds after all the moving #387 does) has been
+    /// called once more than the test asked for.
+    async fn animation_frames(count: i32) {
+        for _ in 0..count {
+            let promise = js_sys::Promise::new(&mut |resolve, _reject| {
+                let resolve = resolve.clone();
+                let callback = Closure::wrap(Box::new(move |_now_ms: f64| {
+                    let _ = resolve.call0(&wasm_bindgen::JsValue::UNDEFINED);
+                }) as Box<dyn FnMut(f64)>);
+                let window = web_sys::window().expect("a browser window");
+                let _ = window
+                    .request_animation_frame(callback.as_ref().unchecked_ref())
+                    .expect("this browser gives animation frames");
+                // The frame is on its way, so the callback outlives this call. One
+                // per awaited frame is the harness's leak, not the page's.
+                callback.forget();
+            });
+            let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+        }
+    }
+
+    /// A console starts on a real canvas, runs machine frames, paints, and is still
+    /// answering the shell - all of it through the cell that hands the console over
+    /// by moving it (#387).
+    #[wasm_bindgen_test]
+    async fn a_console_runs_on_a_browser_out_of_the_cell_it_hands_over() {
+        let owner = Owner::new();
+        owner.set();
+        let (canvas, rom) = cartridge();
+        let controls = Controls {
+            paused: RwSignal::new(false),
+            sound_on: RwSignal::new(false),
+            frame: RwSignal::new((0, 0)),
+            renderer: RwSignal::new(RendererKind::Canvas),
+            saved: RwSignal::new(false),
+            fps: RwSignal::new(String::new()),
+            fast_forward: RwSignal::new(false),
+            loading: RwSignal::new(false),
+        };
+        let console = Emulator::start(
+            &rom,
+            &canvas,
+            &canvas,
+            controls,
+            RwSignal::new(Settings::default()),
+            None,
+            Toasts::default(),
+        )
+        .expect("a canvas in a browser takes a console");
+        RUNNING.with(|running| *running.borrow_mut() = Some(console.clone()));
+
+        // The browser drives the loop from here, and every one of those frames
+        // moves the console out of its cell and back.
+        animation_frames(20).await;
+
+        let painted = console.with(|emulator| !emulator.rgba.is_empty());
+        assert_eq!(
+            painted,
+            Some(true),
+            "a console in a browser cell converted a machine frame for the canvas"
+        );
+        // The shell was told what it drew, which is `Emulator::paint` reporting
+        // through a signal from inside the call (#145). The canvas is 1x1, so
+        // anything else is a frame the machine made.
+        assert_ne!(
+            controls.frame.get_untracked(),
+            (1, 1),
+            "the frame the console drew was reported to the shell"
+        );
+        // And `Controls` still reach it: the pause button is the one the player
+        // finds first, and a console that answered the loop but not the shell is
+        // its own dead page.
+        controls.toggle();
+        assert!(controls.paused.get_untracked());
+
+        // Retiring it is the last thing that has to work, and it is the one call
+        // that takes the callback off the browser: leaving a requested frame out
+        // there would call into a console that has gone.
+        stop();
+        assert!(running().is_none(), "the console has gone");
+        animation_frames(5).await;
     }
 }
