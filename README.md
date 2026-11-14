@@ -64,6 +64,31 @@ whole app, and it needs nothing else on disk to serve it. `nix flake check`
 builds that binary and runs a smoke test against it; inside `nix develop`,
 `just build` does the same two steps without Nix being in charge of them.
 
+### Running it as a NixOS service
+
+The flake carries a NixOS module, `nixosModules.default` (also under
+`nixosModules.rustsega`):
+
+```nix
+services.rustsega = {
+  enable = true;
+  romDir = "/srv/roms/genesis";
+  port = 8080;
+};
+```
+
+The unit runs as a dynamic user and reads `romDir` read-only, so the collection
+has to be readable by a user that does not exist until the service starts.
+`/srv/roms` is the place that is normally set up for that; `/home/<user>` is the
+place that is not, and needs the files group-readable or the directory bind
+mounted somewhere the service may read. `bind` says which address to answer on
+-- `127.0.0.1`, and so nobody but this machine, until told otherwise -- and
+`openFirewall` is the other half of that decision. TLS is not in this binary: it
+belongs to a reverse proxy in front of it.
+
+`nix build .#checks.x86_64-linux.nixos-module` boots this configuration in a
+virtual machine and asks it `/healthz`, `/api/info` and `/api/roms`.
+
 ## Working with agents
 
 Coding agents should read [AGENTS.md](AGENTS.md). Short version:
