@@ -655,3 +655,115 @@ fn lemmings_2_tribes_boots_to_non_blank_screen() {
          VRAM loaded, CRAM never written, cause not established (#440)"
     );
 }
+
+/// Boots `path`, runs it for `warm` frames, presses the console's Reset button,
+/// then runs `after` more frames.
+///
+/// Returns the distinct-colour count of the **first** frame after the reset and of
+/// the **last** one, in that order, and writes the last frame to
+/// `target/test-output/<name>`.
+///
+/// The pair is what #382 is about: a reset clears the VDP's memories, so the frame
+/// it restarts the cart into is blank, and the cart has to repaint from there. A
+/// reset that leaves the VDP unable to raise `frame_done` never gets past that
+/// first frame at all - `Scheduler::run_frame`'s own guard panics inside the loop
+/// below and the second number is never produced.
+///
+/// Why the guard used to fire, measured on `ddd9eb0` (the commit before #371) with
+/// the beam printed at every line of these two carts: [`vdp::Vdp::start_in_vblank`]
+/// parks a reset chip on the line `frame_done` is raised on, at clock 0 of it, and
+/// the scheduler's line boundaries are not re-phased to that position - so the
+/// scheduler line that ends a raster ends with the beam *inside* line 223 rather
+/// than on 224 (measured `line 223, mclk 3390` on Sonic and `line 223, mclk 3418`
+/// on Global Gladiators, both a few clocks short of the line end). The VBlank line
+/// is therefore one scheduler line further away than the raster, so a frame that
+/// starts at a reset can run `lines_per_frame + 1` lines: 263 on NTSC and 314 on
+/// PAL, the two numbers #382 quotes, both one past the bound this guard used to
+/// carry. #371 is what fixed it - a frame is one VBlank-to-VBlank interval and the
+/// bound is one interval plus a raster of slack - so those frames run and stop at
+/// the flag. These two tests are the guard that it stays that way, and they are the
+/// end-to-end half of it: a cart, a reset, and the frames after it. The mechanism
+/// itself is held by the `Scheduler::run_frame` tests, by
+/// `crates/genesis/tests/pal_timing.rs`'s `run_frame_spans_a_moved_vblank_line` and
+/// by the `vdp::timing` interval tests.
+fn post_reset_colours(path: &std::path::Path, warm: u32, after: u32, name: &str) -> (usize, usize) {
+    use std::collections::HashSet;
+
+    let rom = std::fs::read(path).expect("the cart is readable");
+    let mut machine = Genesis::new(&rom, Config::default()).expect("the cart loads");
+
+    for _ in 0..warm {
+        machine.run_frame();
+    }
+    machine.reset();
+
+    let mut first = 0_usize;
+    let mut last = 0_usize;
+    for frame in 0..after {
+        machine.run_frame();
+        let picture = machine.frame();
+        let pixels = &picture.pixels[..picture.width * picture.height];
+        let colours = pixels.iter().copied().collect::<HashSet<u32>>().len();
+        if frame == 0 {
+            first = colours;
+        }
+        last = colours;
+    }
+
+    let picture = machine.frame();
+    testkit::dump_png(
+        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-output/")
+            .join(name),
+        &picture.pixels[..picture.width * picture.height],
+        picture.width,
+        picture.height,
+    );
+    (first, last)
+}
+
+/// `Sonic The Hedgehog (USA, Europe)`: the Reset button mid-run, on an NTSC cart
+/// (#382).
+///
+/// Three hundred frames is past the point the cart has fully programmed the VDP -
+/// the same mark [`colour_count`] uses for the boot tests above - so the reset
+/// restarts a cart that is holding the chip in a mode, not one that is still
+/// setting it up.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn sonic_survives_a_reset() {
+    let path = require_data!(testkit::commercial_rom(
+        "Sonic The Hedgehog (USA, Europe).md"
+    ));
+    let (first, last) = post_reset_colours(&path, 300, 300, "sonic_post_reset.png");
+    assert!(
+        first <= BLANK,
+        "the frame a reset restarts Sonic into is {first} distinct colours: the VDP's memories \
+         go with the reset, so this frame should still be blank"
+    );
+    assert!(
+        last > BLANK,
+        "300 frames after a reset, Sonic is {last} distinct colours: the cart never repainted \
+         the chip it reset, so the machine is stopped rather than restarted (#382)"
+    );
+}
+
+/// `Global Gladiators (Europe)`: the same reset on a PAL cart, which is the other
+/// half of #382 because the raster and the VBlank line it ends on are both
+/// different (313 lines, and 240 in V30).
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn global_gladiators_survives_a_reset() {
+    let path = require_data!(testkit::commercial_rom("Global Gladiators (Europe).md"));
+    let (first, last) = post_reset_colours(&path, 300, 300, "global_gladiators_post_reset.png");
+    assert!(
+        first <= BLANK,
+        "the frame a reset restarts Global Gladiators into is {first} distinct colours: the \
+         VDP's memories go with the reset, so this frame should still be blank"
+    );
+    assert!(
+        last > BLANK,
+        "300 frames after a reset, Global Gladiators is {last} distinct colours: the cart never \
+         repainted the chip it reset (#382)"
+    );
+}
