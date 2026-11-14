@@ -13,8 +13,11 @@ These tables are the #373 resweep: every cart runs for the 600-frame checkpoint 
 ## Known issues
 
 One issue per cause, from the M6-13 triage (#133): `just test-all`,
-`just test-commercial` and the 2775-ROM sweep. `just test-all` fails on exactly one
-test by design and `just test-commercial` on the same one, both until #362 is fixed.
+`just test-commercial` and the 2775-ROM sweep. `just test-all` fails on two tests by
+design: `commercial_save_state_is_audible_after_a_load` until #362 is fixed, and -
+only where the commercial collection is on disk - `virtua_racing_boots_to_non_blank_screen`
+until [#433](https://github.com/scottjab/rustsega/issues/433) gives `Virtua Racing`
+its SVP. `just test-commercial` runs the first of the two but not the second.
 
 | Issue | Cause | ROMs |
 |---|---|---|
