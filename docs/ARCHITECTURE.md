@@ -367,8 +367,13 @@ frame buffer) and what that means after a load, is
 - `GET /healthz` answers `ok`, and `GET /api/info`
   `{ "version": "<crate version>", "library": <bool> }` (#156). Both are answered
   from the shared `AppState` and neither touches the asset tree.
-- Optional `--rom-dir <path>`: exposes `GET /api/roms` (list) and
-  `GET /api/roms/{id}` (bytes) so the UI can show a library.
+- Optional `--rom-dir <path>`: exposes `GET /api/roms` (list, with `?q=` to
+  filter by name), `GET /api/roms/{id}` (bytes) and `POST /api/roms/rescan` so the
+  UI can show a library (M8-03, #157). The directory is scanned once at startup -
+  `.md`, `.bin`, `.gen`, `.smd`, up to 10 MiB, recursively - and an id is the
+  SHA-1 of the path relative to it. That id is the only way a request can name a
+  file: nothing a request says is ever joined to the rom dir, and a symlink that
+  resolves outside it is not listed at all.
 - `nix build` produces the single binary (frontend built in the same
   derivation).
 

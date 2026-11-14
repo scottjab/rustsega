@@ -7,8 +7,8 @@
 
 pub mod assets;
 pub mod cli;
+pub mod library;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -18,12 +18,14 @@ use axum::extract::State;
 use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE, REFERRER_POLICY, X_CONTENT_TYPE_OPTIONS};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
+use serde::Serialize;
 use tower_http::compression::CompressionLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::assets::{Asset, AssetSource};
+use crate::library::LibrarySlot;
 
 /// Versioned files - every name trunk gives a script, a stylesheet and the wasm
 /// carries a content hash - are the same bytes forever, so a cache may hold one
@@ -34,9 +36,6 @@ const LONG_CACHE: &str = "public, max-age=31536000, immutable";
 /// the hashed ones, and `manifest.webmanifest` is fetched by the browser by its
 /// fixed name. Both have to be revalidated before every use.
 const NO_CACHE: &str = "no-cache";
-
-/// The content type of `/api/info`.
-const JSON: &str = "application/json";
 
 /// The document policy of every response: same-origin for everything, with wasm
 /// allowed to compile (`wasm-unsafe-eval`) and inline styles allowed because
@@ -68,11 +67,12 @@ pub struct AppState {
     /// The frontend to serve: the embedded one, or the page that says it was
     /// built without one.
     pub assets: Arc<dyn AssetSource>,
-    /// The `--rom-dir` of this process, already checked by [`cli::check_rom_dir`].
+    /// The `--rom-dir` of this process, scanned at startup from what
+    /// [`cli::check_rom_dir`] accepted.
     ///
-    /// `None` is no library, which is what `/api/info` reports as
-    /// `"library": false`. M8-03 (#157) is the ticket that lists it.
-    pub rom_dir: Option<PathBuf>,
+    /// Empty is no library, which is what `/api/info` reports as `"library":
+    /// false` and what every `/api/roms` handler answers with a 404.
+    pub library: LibrarySlot,
 }
 
 impl AppState {
@@ -80,14 +80,14 @@ impl AppState {
     pub fn new(assets: Arc<dyn AssetSource>) -> Self {
         Self {
             assets,
-            rom_dir: None,
+            library: LibrarySlot::empty(),
         }
     }
 }
 
-/// A router serving `state`: the health check, the info endpoint, one handler for
-/// every other GET, then the headers every response carries, then compression,
-/// then a trace of the request.
+/// A router serving `state`: the health check, the info endpoint, the ROM library,
+/// then one handler for every other GET, then the headers every response carries,
+/// then compression, then a trace of the request.
 ///
 /// Layers are added innermost-first, so the security headers are on the response
 /// before the compressor looks at it, and tracing sees the finished response.
@@ -95,6 +95,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/api/info", get(info))
+        .route("/api/roms", get(library::list))
+        .route("/api/roms/rescan", post(library::rescan))
+        .route("/api/roms/{id}", get(library::rom))
         .fallback(get(serve))
         .with_state(state)
         .layer(SetResponseHeaderLayer::overriding(
@@ -137,23 +140,22 @@ async fn healthz() -> Response {
 /// `GET /api/info`: what this binary is, for a status line in the frontend and
 /// for whoever is deploying it to curl.
 async fn info(State(state): State<Arc<AppState>>) -> Response {
-    let body = info_body(env!("CARGO_PKG_VERSION"), state.rom_dir.is_some());
-    (
-        StatusCode::OK,
-        [(CONTENT_TYPE, HeaderValue::from_static(JSON))],
-        Body::from(body),
-    )
-        .into_response()
+    let body = Info {
+        version: env!("CARGO_PKG_VERSION"),
+        library: state.library.is_configured(),
+    };
+    (StatusCode::OK, axum::Json(body)).into_response()
 }
 
 /// The `/api/info` body.
 ///
-/// Written out rather than serialized: #156 allows one new dependency, `clap`,
-/// and a document of a version string and a `bool` has no escaping to get wrong.
-/// M8-03 (#157) is the ticket whose responses stop being two scalars; that one
-/// should bring `serde` and answer with `axum::Json`.
-fn info_body(version: &str, library: bool) -> String {
-    format!("{{\"version\":\"{version}\",\"library\":{library}}}")
+/// Serialized from #157, which is the ticket that brought `serde`; `serde_json`
+/// writes an object with no spaces, so it is the byte-for-byte document #156
+/// started with.
+#[derive(Serialize)]
+struct Info<'a> {
+    version: &'a str,
+    library: bool,
 }
 
 /// A file that is going to be served, and the key it was found under - the key
@@ -268,7 +270,8 @@ fn content_type(mime: &str) -> HeaderValue {
 }
 
 /// 404 with a one-line body. Nothing from the request is echoed back, so there is
-/// nothing to reflect: the `AssetSource` either has the file or it does not.
-fn not_found() -> Response {
+/// nothing to reflect: the `AssetSource` either has the file or it does not, and
+/// the ROM library either knows the id or does not.
+pub(crate) fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }

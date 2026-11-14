@@ -8,6 +8,7 @@ use clap::Parser as _;
 use server::AppState;
 use server::assets;
 use server::cli::{self, Args};
+use server::library::LibrarySlot;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,12 +22,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = args.addr();
     let rom_dir = cli::check_rom_dir(args.rom_dir).unwrap_or_else(|error| error.exit());
 
+    // Scanned before the socket, and a scan that fails is as much a wrong command
+    // line as a directory that is not there. [`LibrarySlot::scan`] logs how many
+    // ROMs it found, which is the line that says what this server will offer.
+    let library = match rom_dir {
+        Some(dir) => LibrarySlot::scan(dir)?,
+        None => LibrarySlot::empty(),
+    };
+
     #[cfg(not(feature = "embed-web"))]
     tracing::warn!("built without `embed-web`: serving the placeholder page, use `just build`");
 
     let state = Arc::new(AppState {
         assets: assets::builtin(),
-        rom_dir,
+        library,
     });
     let app = server::router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;

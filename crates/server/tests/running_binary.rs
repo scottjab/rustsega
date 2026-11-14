@@ -2,10 +2,11 @@
 //!
 //! `crates/server/tests/cli.rs` drives the parser and `crates/server/tests/api.rs`
 //! drives the router; neither reaches what `main` does with them. This is the only
-//! place that checks the three things an in-process test cannot: that `clap`'s
+//! place that checks the four things an in-process test cannot: that `clap`'s
 //! `env` feature is switched on, so the `RUSTSEGA_*` variables are actually read;
 //! that an unusable `--rom-dir` leaves status 2 rather than a server with an empty
-//! library; and that `/api/info` reports the library the command line chose.
+//! library; that `/api/info` reports the library the command line chose; and that
+//! the `--rom-dir` it accepted is the one `GET /api/roms` lists (#157).
 //!
 //! Every child is started with `env_clear`. `nix develop` exports
 //! `RUSTSEGA_ROM_DIR` for `testkit`'s commercial-ROM lookup, so an inherited
@@ -13,6 +14,7 @@
 //! `std::env::set_var` is `unsafe` in edition 2024. A child of a Nix-built binary
 //! needs nothing else: no `PATH`, no `HOME`, no locale.
 
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
@@ -20,6 +22,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tempfile::tempdir;
 
 /// How long a test waits for anything: the binary is built before nextest runs,
 /// so anything past a few seconds is a hang rather than a slow start.
@@ -269,6 +272,45 @@ fn a_bind_the_environment_names_that_is_not_an_address_is_refused_too() {
     assert_eq!(output.status.code(), Some(2));
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(message.contains("--bind"), "{message}");
+}
+
+#[test]
+fn a_started_server_lists_and_serves_the_rom_dir_it_was_given() {
+    // `crates/server/tests/library.rs` shows the scan and the router agreeing; this
+    // shows that `main` ran the scan at all, which is the step in between that no
+    // in-process test can reach (#157).
+    let roms = tempdir().expect("a temp dir to point --rom-dir at");
+    let name = "Sonic The Hedgehog (USA, Europe).md";
+    fs::write(roms.path().join(name), b"rom bytes").expect("a fake cartridge");
+    let server = Server::start(
+        &[],
+        &[
+            "--rom-dir",
+            roms.path().to_str().expect("a UTF-8 temp path"),
+        ],
+    );
+
+    let response = get(server.addr, "/api/roms");
+    let (code, body) = split(&response);
+    assert_eq!(code, 200, "{response}");
+    let listing: Vec<serde_json::Value> =
+        serde_json::from_str(body).unwrap_or_else(|error| panic!("not JSON: {body}: {error}"));
+    assert_eq!(listing.len(), 1, "{body}");
+    assert_eq!(listing[0]["file"], name);
+    let id = listing[0]["id"]
+        .as_str()
+        .expect("an entry has an id")
+        .to_owned();
+    assert_eq!(
+        id,
+        sha1_smol::Sha1::from(name).digest().to_string(),
+        "what the browser is given is the hash of the path, never the path"
+    );
+
+    let response = get(server.addr, &format!("/api/roms/{id}"));
+    let (code, body) = split(&response);
+    assert_eq!(code, 200, "{response}");
+    assert_eq!(body, "rom bytes");
 }
 
 #[test]
