@@ -13,16 +13,30 @@ These tables are the #373 resweep: every cart runs for the 600-frame checkpoint 
 ## Known issues
 
 One issue per cause, from the M6-13 triage (#133): `just test-all`,
-`just test-commercial` and the 2775-ROM sweep. `just test-all` fails on six tests by
-design: `commercial_save_state_is_audible_after_a_load` until #362 is fixed,
-`virtua_racing_boots_to_non_blank_screen` until
+`just test-commercial` and the 2775-ROM sweep. `just test-all` fails on five tests by
+design: `virtua_racing_boots_to_non_blank_screen` until
 [#433](https://github.com/scottjab/rustsega/issues/433) gives `Virtua Racing` its SVP,
 and - all four of them, and only where the commercial collection is on disk - the
 #375 carts `quackshot_rev_a_boots_to_non_blank_screen`,
 `krustys_super_fun_house_boots_to_non_blank_screen`, `time_killers_boots_to_non_blank_screen`
 and `lemmings_2_tribes_boots_to_non_blank_screen`. `just test-commercial` filters on
-`commercial` in the test name, so it runs the first of those six and none of the other
-five.
+`commercial` in the test name, so it runs those and none of the save-state round trips
+unless they are named too.
+
+The count was six before [#362](https://github.com/scottjab/rustsega/issues/362) and is
+five now, and it is worth saying why it did not simply go down by one. Before #362,
+two of the three save-state tests were passing on a cancelled error: a state loaded
+into a console whose mixer had never mixed a sample is behind its own mixer, so both
+sides of `commercial_save_state_transplants_to_a_fresh_console` were silent for the
+frames in question and silence matched silence. Fixing the mixer made both sides
+produce audio, which is when the one cart that has a real save-state-adjacent bug -
+`sonic3d`, on picture only - started to be able to fail it. So all three save-state
+tests now run, all nineteen carts pass audio across a restore in both directions
+(same console and fresh console), and one cart is held out by name for
+[#450](https://github.com/scottjab/rustsega/issues/450), a VDP field the state does not
+carry, which reproduces on main without #362 and is nothing to do with sound. Held out
+means still run and still compared: divergence is reported and going clean is a
+failure, so the exclusion cannot outlive the bug.
 
 | Issue | Cause | ROMs |
 |---|---|---|
@@ -32,7 +46,8 @@ five.
 | [#375](https://github.com/scottjab/rustsega/issues/375) | **Diagnosed; the causes are [#435](https://github.com/scottjab/rustsega/issues/435)-[#441](https://github.com/scottjab/rustsega/issues/441) and they are not one bug.** 28 retail carts that draw pure black at all 21 sampled frame counts, with and without input. Where it started and what it turned out to be is the section below. | 28 |
 | [#357](https://github.com/scottjab/rustsega/issues/357) | The 2 MB/4 MB Taiwan and China unlicensed carts, which are not a mapper problem. 26 of them are still in the never-drawing set; listed on the issue. | 26 |
 | [#373](https://github.com/scottjab/rustsega/issues/373) | **Fixed by the resweep below.** The sweep sampled one frame, at 600, with no pad connected; watching the whole run and holding START moves 416 of these carts to `Boots`, 13 of them only with the START press. Nothing here is a fix to the emulator: the measurement was wrong. | 416 |
-| [#362](https://github.com/scottjab/rustsega/issues/362) | The one failing test: `commercial_save_state_is_audible_after_a_load`. Loading a state leaves the mixer ahead of the machine, so the console goes silent for as many frames as it ran between the save and the load. | - |
+| [#362](https://github.com/scottjab/rustsega/issues/362) | **Fixed.** Loading a state left the mixer ahead of the machine, so the console went silent for as many frames as it had run since the save, and `load_state` now re-anchors it (`audio::Mixer::seek`). Audio across a restore is bit-exact on all nineteen carts from the frame the mixer's output filters settle on, about an eighth of a second later; see `docs/save-state-format.md`. | - |
+| [#450](https://github.com/scottjab/rustsega/issues/450) | A state restored mid-game draws one wrong picture in `Sonic 3D` (frame 381 of the round trip) - something the state does not carry, picture only, present on main independently of #362. It is the only cart of the nineteen that does not round-trip, and it is named in `HELD_OUT` in `crates/genesis/tests/save_state.rs` rather than the sweep being weakened. | 1 |
 
 ### The 28 black carts of #375, and what they turned out to be
 

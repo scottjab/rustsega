@@ -655,6 +655,20 @@ impl Stream {
         offset >= 0 && (offset as usize) < self.count()
     }
 
+    /// Stand this stream at master clock `clock` holding nothing, for a machine
+    /// that has just been put back to that clock by [`Mixer::seek`].
+    ///
+    /// `clock / period` is where the chip's own clock says this stream's samples
+    /// have run out to - [`Audio::sync_ym`] and [`Audio::sync_psg`] leave
+    /// `ym_pos` and `psg_pos` on their grid, and an `end_clock` of `clock` down to
+    /// the period is the same position - so the frame a restored machine carries
+    /// sits *behind* the anchor and is not mixed again, and the frame after it is
+    /// pushed by [`Stream::align`] with no gap to fill.
+    fn seek(&mut self, clock: u64) {
+        self.samples.clear();
+        self.first = (clock / self.period) as i64;
+    }
+
     /// Drop the input samples up to `to` that no future output sample can reach,
     /// keeping the `taps - 2` before `to` that the next one still reads.
     ///
@@ -789,6 +803,94 @@ impl Mixer {
             dc_keep: 1.0 - one_pole(DC_BLOCK_HZ, rate),
             state: [FilterState::default(); 2],
         }
+    }
+
+    /// Stand the mixer where a machine that has been run to master clock `now`
+    /// leaves it, having mixed everything up to there and nothing past it, for
+    /// [`crate::Genesis::load_state`] to call on a machine it has just put back.
+    ///
+    /// Without this, `mix` mixes `while self.out_clock < end`, `end` being the
+    /// master clock the two chip streams have reached, and a machine put back `n`
+    /// frames is `n` frames behind a mixer that had already run past them: for
+    /// that many frames the console produces nothing at all, and
+    /// [`Stream::trim`] spends the samples the chips make meanwhile, so the sound
+    /// is lost rather than delayed
+    /// ([#362](https://github.com/scottjab/rustsega/issues/362)).
+    ///
+    /// What this moves, and what it must not.
+    ///
+    /// Moved: [`Mixer::out_clock`] and [`Mixer::out_frac`], the two streams'
+    /// contents, and [`Mixer::state`] - the DC blocker's pole and previous input
+    /// and the board's low-pass pole. Together those three are the mixer's memory
+    /// of what it has mixed, and a machine put back to `now` has just un-mixed
+    /// everything after `now`, so all three are wrong in the same direction: they
+    /// remember a future the console is no longer going to have.
+    ///
+    /// Not moved: the rate, the channel gains, the master clock, `low_pass` and
+    /// `dc_keep`. Those are the *coefficients*, and they are what the host asked
+    /// for when it built the mixer - which is the reason the mixer is in no state
+    /// at all (`docs/save-state-format.md`, "The audio mixer"), and why a load
+    /// reaching into them would be a save state writing a host setting. This is a
+    /// position and a memory, never a setting.
+    ///
+    /// Dropping [`Mixer::state`] is the part worth arguing for on its own, since
+    /// a filter's poles are not an obvious thing to reset. `Mixer::new` gives a
+    /// mixer `FilterState::default()`: a mixer that has mixed nothing has default
+    /// poles. So after a seek the loaded mixer and a mixer built a millisecond ago
+    /// are in the same condition - anchored to the machine, remembering nothing -
+    /// and the two produce the same samples from here. Leaving the poles alone
+    /// instead leaves the mixer carrying the tail of samples the machine has just
+    /// been reverted past, which is not the sound of the loaded console at all,
+    /// and which does not fade away: the DC blocker is an infinite-impulse-response
+    /// filter, so the error is a permanent fraction of the signal that happens to
+    /// be small, showing up as a last-bit difference dozens of frames after the
+    /// load rather than as anything a window can be drawn around.
+    ///
+    /// What it costs. The poles being dropped carry the level the mixer was at,
+    /// so the first frames after a load are the filters starting again from zero
+    /// instead of from wherever they had got to, and on a cart playing at full
+    /// level at the save that is real signal - measured at up to about 7500 of
+    /// the i16 range - not a rounding artefact. It is bounded by a few frames of
+    /// one load, it recovers on its own as the filters settle onto live signal,
+    /// and the alternative is a mixer whose output quietly belongs to a run that
+    /// was rolled back.
+    ///
+    /// `now` is the loaded machine's [`Audio::now`], and the position arrived at
+    /// is the one [`Mixer::mix`] itself leaves `out_clock` at - the next output
+    /// sample on the mixer's own grid, at or after the master clock the streams
+    /// have reached - rather than `now` itself. A sample is mixed *at* a position
+    /// and not merely after one, so a mixer stood at an arbitrary master clock
+    /// reads its kernels from a different set of phases than the same machine
+    /// mixed without interruption, and every sample after the load is then a
+    /// slightly different number: silence becomes a phase shift, which is a worse
+    /// thing to be wrong about because it is invisible in the sample counts.
+    pub fn seek(&mut self, now: u64) {
+        self.ym.seek(now);
+        self.psg.seek(now);
+        let end = self.ym.end_clock().min(self.psg.end_clock());
+        let (clock, frac) = self.grid_at_or_after(end);
+        self.out_clock = clock;
+        self.out_frac = frac;
+        self.state = [FilterState::default(); 2];
+    }
+
+    /// The mixer's own output position at or after master clock `end`: the pair
+    /// [`Mixer::out_clock`] and [`Mixer::out_frac`] of the `n`th output sample,
+    /// `n` the smallest with `n * master_hz / rate >= end`.
+    ///
+    /// `n * master_hz` is the product the mixer's own timekeeping never forms
+    /// because it overflows sooner than the scheduler's clock does; it is formed
+    /// here at `u128`, once per load, and divided straight back out again so that
+    /// what is stored is the same two pieces [`Mixer::mix` steps by](Mixer::new).
+    fn grid_at_or_after(&self, end: u64) -> (u64, u32) {
+        let master =
+            u128::from(self.clock_step) * u128::from(self.rate) + u128::from(self.frac_step);
+        let rate = u128::from(self.rate);
+        let end = u128::from(end);
+        // Ceiling divide: the position may not land before `end`, or `mix` would
+        // mix the last sample of the stretch just mixed all over again.
+        let position = (end * rate).div_ceil(master) * master;
+        ((position / rate) as u64, (position % rate) as u32)
     }
 
     /// Mix one frame's chip output and append the result to `out` as interleaved

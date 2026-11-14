@@ -143,6 +143,14 @@ pub(crate) fn decode(data: &[u8], machine: &mut Genesis) -> Result<(), StateErro
     machine.z80 = z80;
     machine.bus = bus;
     machine.scheduler = scheduler;
+    // The mixer is not in the state - it is the host's output path, and a state
+    // written at 44.1 kHz must not rewrite the settings of a machine now running
+    // at 48 - but it is now behind the machine it has to follow, because the
+    // machine has been put back. Re-derive its position from the machine that was
+    // just loaded and leave the settings alone: see [`crate::audio::Mixer::seek`]
+    // and #362.
+    let now = machine.bus.audio.now();
+    machine.mixer.seek(now);
     Ok(())
 }
 

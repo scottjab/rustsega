@@ -170,9 +170,22 @@ pub fn run_frames(rom: &Path, frames: u32, inputs: &[(u32, Buttons)]) -> Genesis
 
 /// The run behind [`run_frames`] and [`run_and_check`], for a caller that already
 /// has the image - which is what makes a skip and a run share one path.
+///
+/// The host's audio is taken after every frame, which is what a front end does
+/// and what [`Genesis::drain_audio`] is for: a frame's sound is handed out once.
+/// A caller that runs N frames without asking for it leaves the mixer behind the
+/// machine by N frames, which is invisible to a test that never looks at the
+/// mixer and decisive to `save_state.rs`, which compares `drain_audio` output
+/// frame by frame across a restore and so needs the mixer to be where the machine
+/// says it is on the frame the state is taken on.
+///
+/// This cannot change the machine: `drain_audio` reads the chips' frame and writes
+/// the caller's `Vec`, and touches no part of the emulated console. So no golden,
+/// picture or chip, moves - `just check` is the evidence.
 pub fn run_bytes(bytes: &[u8], frames: u32, inputs: &[(u32, Buttons)]) -> Genesis {
     let mut machine = Genesis::new(bytes, Config::default())
         .unwrap_or_else(|e| panic!("cannot load ROM image: {e:?}"));
+    let mut host = Vec::new();
     for frame in 1..=frames {
         let buttons = inputs
             .iter()
@@ -180,6 +193,7 @@ pub fn run_bytes(bytes: &[u8], frames: u32, inputs: &[(u32, Buttons)]) -> Genesi
             .map_or_else(Buttons::empty, |(_, buttons)| *buttons);
         machine.set_pad(0, buttons);
         machine.run_frame();
+        machine.drain_audio(&mut host);
     }
     machine
 }
