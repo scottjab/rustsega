@@ -241,7 +241,7 @@ fn a_directory_that_is_a_symlink_is_a_valid_root() {
     // `--rom-dir` may be a link to a mount: `cli::check_rom_dir` follows links, and
     // the scan has to agree with it rather than reject the same path.
     let target = tempdir().unwrap();
-    fs::write(target.path().join("a.md"), &[1]).unwrap();
+    fs::write(target.path().join("a.md"), [1]).unwrap();
     let links = tempdir().unwrap();
     let dir = links.path().join("roms");
     #[cfg(unix)]
@@ -444,7 +444,7 @@ async fn a_symlink_out_of_the_rom_dir_is_not_listed() {
     let outside = tempdir().unwrap();
     fs::write(outside.path().join("secret.md"), b"not for the library").unwrap();
     let dir = tempdir().unwrap();
-    fs::write(dir.path().join("a.md"), &[1]).unwrap();
+    fs::write(dir.path().join("a.md"), [1]).unwrap();
     link(
         &dir.path().join("link.md"),
         &outside.path().join("secret.md"),
@@ -501,7 +501,7 @@ async fn without_a_rom_dir_both_rom_endpoints_are_not_found() {
 async fn rescan_picks_up_a_file_added_after_startup() {
     let dir = rom_dir(&[("a.md", &[1])]);
     let state = state_with(dir.path());
-    fs::write(dir.path().join("new.md"), &[9]).unwrap();
+    fs::write(dir.path().join("new.md"), [9]).unwrap();
 
     let before = text(get(Arc::clone(&state), "/api/roms").await).await;
     assert_eq!(names(&before), ["a"]);
