@@ -5,7 +5,37 @@ edition.workspace = true
 version.workspace = true
 publish.workspace = true
 
+# The shipped binary is called `rustsega`, not `server` (M8-01, #155).
+[[bin]]
+name = "rustsega"
+path = "src/main.rs"
+
 [dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tower-http = { version = "0.6", features = [
+    "compression-gzip",
+    "compression-br",
+    "trace",
+    "set-header",
+] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# Only pulled in by `embed-web`: `rust-embed` reads `../web/dist` at compile
+# time, and `just check` runs before trunk has produced it.
+rust-embed = { version = "8", features = ["mime-guess"], optional = true }
+
+[dev-dependencies]
+# `ServiceExt::oneshot`, to drive the router without a socket.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+
+[features]
+default = []
+# Compile `crates/web/dist` into the binary. Off by default so that fmt, clippy,
+# nextest and the wasm builds never need the frontend to be built. `just build`
+# turns it on, after running trunk.
+embed-web = ["dep:rust-embed"]
 
 [lints]
 workspace = true
