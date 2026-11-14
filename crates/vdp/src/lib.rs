@@ -401,9 +401,11 @@ impl Vdp {
             frame_buffer: FrameBuffer::new(),
             pal,
         };
-        // The frame buffer is sized on the frame boundary (`timing::start_line`),
-        // and a chip that has never reached one still needs the stride of the mode
-        // it reset into to draw its first frame (#371).
+        // The height is sized on the frame boundary (`timing::start_line`) and the
+        // stride on the first line of a frame (`Vdp::size_frame_width`), and a chip
+        // that has never reached either still needs the size of the mode it reset
+        // into to draw its first frame (#371, #450).
+        vdp.size_frame_width();
         vdp.size_frame_buffer();
         vdp
     }

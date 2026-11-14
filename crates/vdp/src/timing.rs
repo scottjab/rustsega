@@ -241,8 +241,12 @@ impl Vdp {
             self.in_vblank = true;
             self.vint_pending = true;
             self.frame_ready = true;
-            // The frame is over, so the frame buffer is sized for the picture it
-            // just drew rather than for the next one: see [`Vdp::size_frame_buffer`].
+            // The frame is over, so the frame buffer's height is sized for the
+            // picture it just drew rather than for the next one: see
+            // [`Vdp::size_frame_buffer`]. The stride is not sized here, because a
+            // program changes the horizontal resolution in the blanking after this
+            // line and the stride belongs to the frame that follows - see
+            // [`Vdp::size_frame_width`] (#450).
             self.size_frame_buffer();
         } else if self.line == self.frame_lines() - 1 {
             // genvdp.txt clears the flag partway through the last line, at H
@@ -950,9 +954,11 @@ mod tests {
         );
     }
 
-    /// The frame buffer is resized on the frame boundary the scheduler uses - the
-    /// VBlank line - and not on raster line 0, so a frame whose VBlank line moved
-    /// hands over the picture it actually drew (#371).
+    /// The frame buffer's height is resized on the frame boundary the scheduler
+    /// uses - the VBlank line - and not on raster line 0, so a frame whose VBlank
+    /// line moved hands over the picture it actually drew (#371). The stride of the
+    /// same buffer is the other way round and follows the first line of the frame
+    /// it is written at (#450); `frame_height` is the number this boundary owns.
     ///
     /// `compose` used to take the size on line 0 of the frame being drawn, which
     /// is only the same moment as the end of the frame when the VBlank line has

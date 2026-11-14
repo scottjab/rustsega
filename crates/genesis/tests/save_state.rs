@@ -633,11 +633,7 @@ struct HeldOut {
     why: &'static str,
 }
 
-const HELD_OUT: &[HeldOut] = &[HeldOut {
-    key: "sonic3d",
-    issue: "[#450](https://github.com/scottjab/rustsega/issues/450)",
-    why: "one picture frame, 381, after a restore: something the state does not carry, \n           unrelated to saving or to sound, and present on main without #362",
-}];
+const HELD_OUT: &[HeldOut] = &[];
 
 /// How many of one game's diverging frames a failure names before the count of
 /// the rest stands in for them: a game that diverges at all usually diverges

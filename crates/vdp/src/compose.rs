@@ -310,13 +310,15 @@ impl Vdp {
     /// walked either, so a switched-off display spends no sprite slot and sets no
     /// SOVR or collision status of its own.
     ///
-    /// `frame.width` and `frame.height` are the mode of the first line of the
-    /// frame, latched by the `line == 0` call and left alone for the rest of it.
-    /// The stride of a row is the frame width, so a mid-frame mode change may not
-    /// move it or the lines already drawn would be read back at the wrong offset;
-    /// a line narrower than the frame is padded with the backdrop, by
-    /// [`compose_row`], and a line wider than it - the switch the other way, which
-    /// shows nothing of the extra 64 columns - is cut short.
+    /// `frame.width` is the horizontal resolution of the first line of the frame,
+    /// latched by [`Vdp::size_frame_width`] on the `line == 0` call and left alone
+    /// for the rest of it: the stride of a row is the frame width, so a mid-frame
+    /// mode change may not move it or the lines already drawn would be read back
+    /// at the wrong offset. A line narrower than the frame is padded with the
+    /// backdrop, by [`compose_row`], and a line wider than it - the switch the
+    /// other way, which shows nothing of the extra 64 columns - is cut short.
+    /// `frame.height` is sized on the frame boundary instead, by
+    /// [`Vdp::size_frame_buffer`] (#371).
     ///
     /// Everything else of the line is read from the latch of [`crate::latch`],
     /// taken at the start of this line's active display: R12, the window base and
@@ -329,11 +331,43 @@ impl Vdp {
             return;
         }
         self.begin_line(line);
+        if line == 0 {
+            self.size_frame_width();
+        }
         self.draw_line(line);
         self.end_line();
     }
 
-    /// Size the frame buffer for the frame that has just been drawn.
+    /// The stride of the frame being drawn: the horizontal resolution of its
+    /// first line, R12's resolution bits (genvdp.txt section 17 "$0C").
+    ///
+    /// [`FrameBuffer::width`] is the stride [`Vdp::draw_line`] lays a row out at
+    /// *and* the width the host reads the picture at, so the two are one number
+    /// and cannot be decided at two different times. Deciding it on the frame
+    /// boundary decides it a frame late: `timing::start_line` would sample the
+    /// mode it reaches the VBlank line with, and a program asks for a new
+    /// resolution in the blanking after that line, so the frame being drawn is in
+    /// the new mode while the stride is still the old one. Its rows then go down
+    /// 256 at a time while the picture is published 320 wide, and
+    /// `width * height - old_width * height` of that picture is nothing this
+    /// machine drew at all but whatever the buffer was holding. A save state
+    /// carries the size of the picture and none of its pixels
+    /// ([`crate::frame_state`]), so that part of the picture is exactly what a
+    /// restored machine cannot reproduce, and it is why a state restored into
+    /// Sonic 3D drew a different picture on the frame its resolution change
+    /// landed on (#450).
+    ///
+    /// Line 0 is the line that decides a frame's mode already ([`Vdp::begin_line`]
+    /// and [`crate::latch`]) and it is the first row written, so latching the
+    /// stride there gives every row of a frame one stride and every pixel of the
+    /// published picture to the frame that published it.
+    pub(crate) fn size_frame_width(&mut self) {
+        self.frame_buffer.width = self.active_width();
+    }
+
+    /// Size [`FrameBuffer::height`] for the frame that has just been drawn: the
+    /// frame boundary's half of the geometry, whose other half is
+    /// [`Vdp::size_frame_width`].
     ///
     /// One frame boundary, one rule: this is called on the VBlank line, where
     /// `timing::start_line` raises [`Vdp::frame_ready`] and where
@@ -342,8 +376,12 @@ impl Vdp {
     /// it mid-frame moves the VBlank line by 16 (#371): sized on line 0, a frame
     /// that had drawn 240 lines handed the host a 224-line buffer and the picture
     /// of the frame before it.
+    ///
+    /// The height is the one number that can be read that late, because nothing
+    /// has to be laid out with it: a row's start is `display_line * width`, which
+    /// is decided before the row is written, and the height only says how many of
+    /// the rows the host is meant to look at.
     pub(crate) fn size_frame_buffer(&mut self) {
-        self.frame_buffer.width = self.active_width();
         self.frame_buffer.height = self.frame_height();
     }
 
@@ -537,13 +575,14 @@ mod tests {
     /// [`COLOURS`] in CRAM: the base every `render_line` test below starts from.
     /// Cross the frame boundary that sizes the frame buffer (#371).
     ///
-    /// The buffer a line is drawn into is sized on the VBlank line, where
-    /// `timing::start_line` ends a frame and `genesis::Scheduler::run_frame`
+    /// The height of the buffer a line is drawn into is sized on the VBlank line,
+    /// where `timing::start_line` ends a frame and `genesis::Scheduler::run_frame`
     /// stops with it, and not on raster line 0: with R1 bit 3 written mid-frame
     /// the two are 16 lines apart and a chip that drew 240 lines handed over a
-    /// 224-line picture. A test that writes registers and then draws one line of
-    /// its own has to reach that boundary once for the mode it wrote to be the
-    /// size of the picture it draws.
+    /// 224-line picture (#371). The stride is the other half of the geometry and
+    /// is latched on line 0 ([`Vdp::size_frame_width`], #450), which a test that
+    /// draws line 0 itself gets for free and one that draws only a later line of
+    /// its own does not.
     fn sized(vdp: &mut Vdp) {
         // `active_height` is 224 or 240, both of which fit a `u16`.
         vdp.set_position(vdp.active_height() as u16 - 1, MCLKS_PER_LINE - 1);
@@ -791,6 +830,64 @@ mod tests {
         sized(&mut vdp); // #371
         vdp.render_line(0);
         assert_eq!(vdp.frame().width, 320, "R12 = 0x81 is the 40-cell one");
+    }
+
+    /// The frame that follows a mode change publishes a picture its own rows
+    /// wrote, all `width * height` of it.
+    ///
+    /// `FrameBuffer::width` is both the stride a row is written at and the width
+    /// the host reads the picture at, so they cannot move apart. Reading them
+    /// from the mode of the frame boundary only reads the mode the frame came
+    /// from, because a VBlank program writes R12 after that boundary and before
+    /// the first line of the frame it is setting up (genvdp.txt section 17
+    /// "$0C"): the frame of the switch then writes its rows at the stride of the
+    /// mode it left and publishes them at the width of the one it moved to, and
+    /// every pixel past `height * old_width` of the picture is whatever the frame
+    /// buffer held before the frame rather than anything the emulated hardware
+    /// had drawn. A save state keeps the size of the picture and none of its
+    /// pixels ([`crate::frame_state`]), so a restored console had nothing to put
+    /// there and drew black over the bottom 45 lines of the frame a game changed
+    /// the resolution on, while the run it was saved from drew what its earlier
+    /// frames had left behind (#450).
+    #[test]
+    fn the_frame_after_a_mode_change_publishes_only_what_it_wrote() {
+        // Rasters are 262 lines on NTSC (genvdp.txt section 5 "Timing").
+        const NTSC_RASTER_LINES: u32 = 262;
+        // A pixel no line can produce: every pixel of the picture carries an
+        // opaque alpha, so a transparent one means nothing wrote it.
+        const UNWRITTEN: u32 = 0x00DE_AD00;
+
+        let mut vdp = compose_vdp();
+        sized(&mut vdp); // an H32 frame boundary: the buffer is 256 wide
+        assert_eq!(vdp.frame().width, 256);
+
+        // The switch to the 40-cell display, in the blanking between the
+        // boundary that sized the buffer and the first line of the next frame.
+        vdp.write_register(12, 0x81);
+        for pixel in vdp.frame_buffer.pixels.iter_mut() {
+            *pixel = UNWRITTEN;
+        }
+
+        // One raster, from that VBlank line to the next one, which is where the
+        // picture is handed over.
+        vdp.advance(MCLKS_PER_LINE * NTSC_RASTER_LINES);
+
+        let frame = vdp.frame();
+        assert_eq!(
+            frame.width, 320,
+            "the frame is the mode its first line was drawn in"
+        );
+        let unwritten = frame.pixels[..frame.width * frame.height]
+            .iter()
+            .filter(|&&pixel| pixel == UNWRITTEN)
+            .count();
+        assert_eq!(
+            unwritten, 0,
+            "a {}x{} picture leaves {} pixels no frame of this chip wrote, so what \
+             the host sees of them is the history of the buffer and not the state \
+             of the machine",
+            frame.width, frame.height, unwritten
+        );
     }
 
     /// R1 bit 3 (M2) is V30, 30 cells of 8 lines: 240 lines on a PAL chip, and

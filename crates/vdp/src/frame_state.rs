@@ -8,12 +8,16 @@
 //! state of a Genesis emulator is written to a browser's storage (M6-07, #127).
 //!
 //! The `width` and `height` are kept, and they are not decoration. A line is
-//! written at `display_line * frame_buffer.width`, and `Vdp::draw_line` only
-//! refreshes the geometry on line 0 of a frame: a restored chip that started at
-//! [`FrameBuffer::new`]'s widest size would spend the rest of the frame writing
-//! rows with the stride of a mode it is not in. With the two numbers the first
-//! line the restored chip draws lands where the saved one would have put it, and
-//! only the rows nobody has redrawn yet read as black.
+//! written at `display_line * frame_buffer.width`, and `Vdp::size_frame_width`
+//! refreshes that stride on the first line of a frame: a restored chip that
+//! started at [`FrameBuffer::new`]'s widest size would spend the rest of the frame
+//! writing rows with the stride of a mode it is not in. With the two numbers the
+//! first line the restored chip draws lands where the saved one would have put
+//! it, and only the rows nobody has redrawn yet read as black.
+//!
+//! Keeping the size rather than the pixels is only sound while a frame writes
+//! every pixel of the picture it publishes, which is what tying the stride to the
+//! frame's own mode is for (#450).
 
 use serde::{Deserialize, Serialize};
 use serde::{Deserializer, Serializer};
