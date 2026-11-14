@@ -45,10 +45,10 @@
           ];
         };
 
-        # The same compiler for cargo and for rustc, and the dev shell's: the
-        # rust-overlay toolchain that `rust-toolchain.toml` pins, which is the one
-        # that carries the `wasm32-unknown-unknown` target the frontend needs. A
-        # plain `pkgs.rustPlatform` would be a second, unpinned rustc without it.
+        # cargo and rustc are the dev shell's own toolchain: the rust-overlay one
+        # that `rust-toolchain.toml` pins, which is the one that carries the
+        # `wasm32-unknown-unknown` target the frontend needs. `pkgs.rustPlatform`
+        # would be a second, unpinned rustc, without it.
         rustPlatform = pkgs.makeRustPlatform {
           cargo = rust;
           rustc = rust;
@@ -84,15 +84,15 @@
           '';
 
           # Step 2 of 2: the default cargo build, narrowed to the binary that
-          # ships. Every other crate of the workspace is either a dependency of
-          # `server` or part of the wasm build above, so nothing ships unbuilt
-          # and nothing that is not shipped gets compiled twice.
+          # ships. What is left out of that choice is `headless` and `testkit`,
+          # which are test tooling: every other crate of the workspace is either
+          # a dependency of `server` or part of the wasm build above.
           cargoBuildFlags = [ "-p" "server" ];
           buildFeatures = [ "embed-web" ];
 
           # Tests run in `nix develop -c just check` and in CI, where the test
-          # data, the ROM directories, nextest and Firefox are. In here they would
-          # need all three, and what is under test in this derivation is the
+          # data, the ROM directories, nextest and Firefox all are. In here they
+          # would need all of those, and what this derivation has to prove is the
           # packaging, not the emulator.
           doCheck = false;
 
