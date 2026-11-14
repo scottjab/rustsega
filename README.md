@@ -89,6 +89,31 @@ belongs to a reverse proxy in front of it.
 `nix build .#checks.x86_64-linux.nixos-module` boots this configuration in a
 virtual machine and asks it `/healthz`, `/api/info` and `/api/roms`.
 
+### Releasing
+
+A release is a tag. The version of the binary is the workspace version, which
+`crates/server/Cargo.toml` inherits, and pushing `v<version>` builds
+`nix build .#static` for that commit and puts the result on a GitHub release
+next to its SHA-256:
+
+```sh
+$EDITOR Cargo.toml                              # [workspace.package] version = "0.2.0"
+git commit -a -m "chore: release 0.2.0"
+git tag v0.2.0
+git push --follow-tags
+```
+
+The tag has to be exactly `v` and that version: the workflow reads it back out of
+the manifest with `cargo metadata` and fails a run that does not agree, so a tag
+that was cut before the bump is refused rather than releasing a binary that
+prints a different number from the one on the tin. The two files it attaches are
+`rustsega-<tag>-x86_64-linux` and `rustsega-<tag>-x86_64-linux.sha256`, and the
+second one is checked in place with `sha256sum -c`.
+
+To try all of that without publishing anything, `gh workflow run release.yml
+--ref <ref>` runs the same build and checksum and leaves them on a **draft**
+release, which is removed again with `gh release delete <tag> --yes`.
+
 ## Working with agents
 
 Coding agents should read [AGENTS.md](AGENTS.md). Short version:
