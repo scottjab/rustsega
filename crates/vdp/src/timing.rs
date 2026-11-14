@@ -241,6 +241,9 @@ impl Vdp {
             self.in_vblank = true;
             self.vint_pending = true;
             self.frame_ready = true;
+            // The frame is over, so the frame buffer is sized for the picture it
+            // just drew rather than for the next one: see [`Vdp::size_frame_buffer`].
+            self.size_frame_buffer();
         } else if self.line == self.frame_lines() - 1 {
             // genvdp.txt clears the flag partway through the last line, at H
             // counter cycle AAh; the line is where the ticket puts it, and
@@ -870,6 +873,39 @@ mod tests {
             interval,
             2 * PAL_RASTER,
             "a skipped flag costs the whole raster it was skipped in"
+        );
+    }
+
+    /// The frame buffer is resized on the frame boundary the scheduler uses - the
+    /// VBlank line - and not on raster line 0, so a frame whose VBlank line moved
+    /// hands over the picture it actually drew (#371).
+    ///
+    /// `compose` used to take the size on line 0 of the frame being drawn, which
+    /// is only the same moment as the end of the frame when the VBlank line has
+    /// not moved: with bit 3 written mid-frame the two are 16 lines apart, and a
+    /// host that runs one frame of a console that has just asked for V30 got the
+    /// 224 lines of the frame before it.
+    #[test]
+    fn frame_buffer_is_sized_on_the_vblank_line() {
+        let mut vdp = running(true);
+        vdp.write_register(1, R1_V30);
+
+        // Line 100 of the first raster: the mode is already V30, but the frame
+        // now being drawn is still measured by the frame buffer, and it is the
+        // 224 lines of the V28 frame before this one until the frame ends.
+        vdp.advance(100 * MCLKS_PER_LINE);
+        assert_eq!(vdp.frame().height, crate::LINES_V28);
+        assert!(
+            !vdp.frame_done(),
+            "the frame boundary is ahead of the beam, not behind it"
+        );
+
+        vdp.advance(140 * MCLKS_PER_LINE);
+        assert!(vdp.frame_done(), "line 240, the V30 VBlank line");
+        assert_eq!(
+            vdp.frame().height,
+            crate::LINES_V30,
+            "and the frame that drew 240 lines hands over 240 of them"
         );
     }
 }

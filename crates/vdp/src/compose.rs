@@ -333,6 +333,20 @@ impl Vdp {
         self.end_line();
     }
 
+    /// Size the frame buffer for the frame that has just been drawn.
+    ///
+    /// One frame boundary, one rule: this is called on the VBlank line, where
+    /// `timing::start_line` raises [`Vdp::frame_ready`] and where
+    /// `genesis::Scheduler::run_frame` ends a frame, and not on raster line 0.
+    /// The two are the same moment only while R1 bit 3 stays put, and a write of
+    /// it mid-frame moves the VBlank line by 16 (#371): sized on line 0, a frame
+    /// that had drawn 240 lines handed the host a 224-line buffer and the picture
+    /// of the frame before it.
+    pub(crate) fn size_frame_buffer(&mut self) {
+        self.frame_buffer.width = self.active_width();
+        self.frame_buffer.height = self.frame_height();
+    }
+
     /// The body of [`Vdp::render_line`], with [`Vdp::begin_line`] already run and
     /// [`Vdp::end_line`] owed after it.
     fn draw_line(&mut self, line: u16) {
@@ -342,10 +356,6 @@ impl Vdp {
         // field and leaves the other field's lines alone (#98).
         let display_line = self.display_line(line);
         let width = self.active_width();
-        if usize::from(line) == 0 {
-            self.frame_buffer.width = width;
-            self.frame_buffer.height = self.frame_height();
-        }
 
         let stride = self.frame_buffer.width;
         let start = usize::from(display_line) * stride;
@@ -391,6 +401,7 @@ impl Vdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hv::MCLKS_PER_LINE;
     use crate::WIDTH_H32;
     use crate::color::color;
     use crate::planes::testutil::{
@@ -524,6 +535,21 @@ mod tests {
 
     /// A VDP in H32 with the display on, [`BACKDROP`] as the backdrop palette and
     /// [`COLOURS`] in CRAM: the base every `render_line` test below starts from.
+    /// Cross the frame boundary that sizes the frame buffer (#371).
+    ///
+    /// The buffer a line is drawn into is sized on the VBlank line, where
+    /// `timing::start_line` ends a frame and `genesis::Scheduler::run_frame`
+    /// stops with it, and not on raster line 0: with R1 bit 3 written mid-frame
+    /// the two are 16 lines apart and a chip that drew 240 lines handed over a
+    /// 224-line picture. A test that writes registers and then draws one line of
+    /// its own has to reach that boundary once for the mode it wrote to be the
+    /// size of the picture it draws.
+    fn sized(vdp: &mut Vdp) {
+        // `active_height` is 224 or 240, both of which fit a `u16`.
+        vdp.set_position(vdp.active_height() as u16 - 1, MCLKS_PER_LINE - 1);
+        vdp.advance(1);
+    }
+
     fn compose_vdp() -> Vdp {
         let mut vdp = plane_vdp();
         vdp.write_register(1, 0x40);
@@ -616,6 +642,7 @@ mod tests {
         vdp.write_register(7, 0x05);
         vdp.cram[5] = 0x000E;
 
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);
 
         let red = 0xFF00_00FF;
@@ -638,6 +665,7 @@ mod tests {
         );
 
         vdp.write_register(12, 0x81);
+        sized(&mut vdp); // #371: the width, like the height, moves on the boundary
         vdp.render_line(0);
         assert_eq!(
             row(&vdp, 0),
@@ -665,6 +693,7 @@ mod tests {
             let mut vdp = compose_vdp();
             three_layers(&mut vdp, plane_b, plane_a, sprite);
 
+            sized(&mut vdp); // #371: the buffer is sized on the frame boundary
             vdp.render_line(0);
 
             let line = row(&vdp, 0);
@@ -691,6 +720,7 @@ mod tests {
         three_layers(&mut vdp, false, false, false);
         vdp.write_register(1, 0x00);
 
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);
 
         let backdrop = pixel_of(BACKDROP);
@@ -716,6 +746,7 @@ mod tests {
         vdp.write_register(17, 0x80 | 8);
         vdp.write_register(18, 0x80);
 
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);
 
         let line = row(&vdp, 0);
@@ -749,13 +780,15 @@ mod tests {
     /// bits: 256 for `00` and 320 for `0x81` (genvdp.txt section 17 "$0C", and
     /// [`Vdp::active_width`]).
     #[test]
-    fn line_zero_sizes_the_frame_to_the_horizontal_resolution() {
+    fn the_frame_boundary_sizes_the_frame_to_the_horizontal_resolution() {
         let mut vdp = compose_vdp();
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);
         assert_eq!(vdp.frame().width, 256, "R12 = 0 is the 32-cell display");
 
         let mut vdp = compose_vdp();
         vdp.write_register(12, 0x81);
+        sized(&mut vdp); // #371
         vdp.render_line(0);
         assert_eq!(vdp.frame().width, 320, "R12 = 0x81 is the 40-cell one");
     }
@@ -765,10 +798,11 @@ mod tests {
     /// picture with the bit set (genvdp.txt section 17 "$01"; plutiedev "$81xx":
     /// "V30 mode only works properly on PAL systems").
     #[test]
-    fn line_zero_sizes_the_frame_to_the_vertical_resolution_of_the_crystal() {
+    fn the_frame_boundary_sizes_the_frame_to_the_vertical_resolution_of_the_crystal() {
         for (pal, height) in [(true, 240), (false, 224)] {
             let mut vdp = Vdp::new(pal);
             vdp.write_register(1, 0x48);
+            sized(&mut vdp); // #371: the buffer is sized on the frame boundary
             vdp.render_line(0);
             assert_eq!(
                 vdp.frame().height,
@@ -794,6 +828,7 @@ mod tests {
         solid(&mut vdp, 4, COLOUR);
         put_sprite(&mut vdp, 0, 0, 0, entry(SPRITE, 4, true));
 
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);
         let plane_a = pixel_of((PLANE_A << 4) | COLOUR);
         let sprite = pixel_of((SPRITE << 4) | COLOUR);
@@ -825,6 +860,7 @@ mod tests {
         let mut vdp = compose_vdp();
         plane_a_everywhere(&mut vdp);
         vdp.write_register(12, 0x81);
+        sized(&mut vdp); // #371: the width, like the height, moves on the boundary
         vdp.render_line(0);
         vdp.write_register(12, 0x00);
         vdp.render_line(1);
@@ -917,6 +953,7 @@ mod tests {
         let mut vdp = shadow_vdp();
         shadow_background(&mut vdp, false);
 
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);
 
         let line = row(&vdp, 0);
@@ -941,6 +978,7 @@ mod tests {
         let mut vdp = shadow_vdp();
         shadow_background(&mut vdp, true);
 
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);
 
         let line = row(&vdp, 0);
@@ -960,6 +998,7 @@ mod tests {
     fn the_backdrop_is_shadowed_too() {
         let mut vdp = shadow_vdp();
 
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);
 
         assert_eq!(
@@ -1052,6 +1091,7 @@ mod tests {
             shadow_background(&mut vdp, false);
             sprite_over(&mut vdp, COLOUR, priority);
 
+            sized(&mut vdp); // #371: the buffer is sized on the frame boundary
             vdp.render_line(0);
 
             let line = row(&vdp, 0);
@@ -1182,6 +1222,7 @@ mod tests {
     #[test]
     fn interlace_mode_2_doubles_the_frame_height() {
         let mut vdp = interlaced_compose_vdp();
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);
         assert_eq!(vdp.frame().height, 448, "224 lines drawn twice");
         assert_eq!(vdp.active_height(), 224, "the beam still scans 224 lines");
@@ -1198,6 +1239,7 @@ mod tests {
         let mut pal = Vdp::new(true);
         pal.write_register(1, 0x48); // display on, V30
         pal.write_register(12, 0x06);
+        sized(&mut pal); // #371: the buffer is sized on the frame boundary
         pal.render_line(0);
         assert_eq!(pal.frame().height, 480, "240 lines drawn twice");
         assert!(
