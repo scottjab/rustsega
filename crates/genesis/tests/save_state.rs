@@ -141,8 +141,10 @@ fn header_written_and_checked() {
     );
     assert_eq!(
         u32::from_le_bytes(state[4..8].try_into().expect("4 bytes of version")),
-        1,
-        "format version 1"
+        2,
+        "format version 2, which is what `frame_state` carrying a woven mode-2 field is \
+         (#457); the number is pinned rather than read from `state::FORMAT_VERSION` because \
+         bumping it has to be a decision, not an accident"
     );
     let checksum = u64::from_le_bytes(state[8..16].try_into().expect("8 bytes of checksum"));
     assert_eq!(
@@ -183,11 +185,13 @@ fn newer_version_errors() {
     let rom = colour_cycler();
     let mut machine = Genesis::new(&rom, Config::default()).expect("loads");
     let mut state = machine.save_state();
-    state[4..8].copy_from_slice(&2u32.to_le_bytes());
+    state[4..8].copy_from_slice(&(genesis::state::FORMAT_VERSION + 1).to_le_bytes());
 
     assert_eq!(
         machine.load_state(&state),
-        Err(StateError::UnsupportedVersion(2))
+        Err(StateError::UnsupportedVersion(
+            genesis::state::FORMAT_VERSION + 1
+        ))
     );
     // And a version this build has never heard of in the other direction, with
     // no migration to get from it (out of scope of #127).
@@ -196,6 +200,41 @@ fn newer_version_errors() {
         machine.load_state(&state),
         Err(StateError::UnsupportedVersion(0))
     );
+}
+
+/// Version 1 is the format before the woven one: `frame_state` carried the frame
+/// buffer as its size alone, so a mode-2 state of that format was a state that
+/// could not say what half of its picture was (#457). The payload changed, the
+/// payload is postcard, and postcard cannot tell a v1 mode-2 payload from a
+/// plausible machine decoded out of the wrong bytes - which is why the version
+/// field is checked before any of the payload is read and a v1 state is refused
+/// rather than shimmed. Nothing about the machine moves when it is.
+#[test]
+fn version_one_is_refused_not_half_loaded() {
+    let rom = colour_cycler();
+    let mut machine = Genesis::new(&rom, Config::default()).expect("loads");
+    let mut state = machine.save_state();
+    assert_eq!(
+        u32::from_le_bytes(state[4..8].try_into().expect("4 bytes of version")),
+        genesis::state::FORMAT_VERSION,
+        "and this build writes the version it says it does"
+    );
+    state[4..8].copy_from_slice(&1u32.to_le_bytes());
+
+    assert_eq!(
+        machine.load_state(&state),
+        Err(StateError::UnsupportedVersion(1))
+    );
+    // Refused before a byte of it was applied: the machine still runs, and still
+    // takes a state of its own format.
+    assert!(!run_and_hash(&mut machine, 1).is_empty());
+    machine
+        .load_state(&state)
+        .expect_err("a v1 state is still refused after a refused load");
+    let own = machine.save_state();
+    machine
+        .load_state(&own)
+        .expect("the machine a v1 state was refused by still loads its own state");
 }
 
 #[test]

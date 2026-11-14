@@ -14,7 +14,7 @@ a header that says which format version it is and which game it belongs to.
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
 | 0 | 4 | magic | `b"RSGS"` |
-| 4 | 4 | format version | `u32`, little endian, currently `1` (`state::FORMAT_VERSION`) |
+| 4 | 4 | format version | `u32`, little endian, currently `2` (`state::FORMAT_VERSION`) |
 | 8 | 8 | ROM checksum | `u64`, little endian, [`state::rom_checksum`] of the loaded image |
 | 16 | 4 | payload length | `u32`, little endian — the number of bytes that follow offset 20 |
 | 20 | n | payload | the `postcard` encoding of the machine state |
@@ -29,8 +29,38 @@ The payload is not self-describing. It is the postcard encoding of the tuple
 (&M68k, &Z80, &genesis::Bus, &Scheduler)
 ```
 
-in that order, in the version-1 layout. A payload from a build with a different
+in that order, in the version-2 layout. A payload from a build with a different
 field order is a different payload, which is what the version field is for.
+
+### The interlace field, and why the order of the tuple is not load-bearing
+
+One field of the payload is present for one video mode and absent for the rest.
+In interlace mode 2 a frame writes one line in two of the picture it publishes
+and leaves the other field's lines alone, so half of what the chip publishes is
+the frame before it and no later frame draws it: `vdp::frame_state` carries those
+lines as pixels, and only there (#457).
+
+A field that is only *sometimes* there is decodable exactly when the reader knows
+whether it is there at that byte. Two ways to know existed:
+
+- read the interlace mode first. It comes from the VDP's register file, which is
+  ahead of the frame buffer inside `Vdp`, and the VDP is ahead of the scheduler
+  in the tuple above, so by the time a reader reaches `frame_state` it has
+  decoded the mode;
+- or say, in the payload, whether the field follows.
+
+The second was taken. The first is true only for as long as nobody reorders a
+struct, and a reordering that changed what a payload meant without changing a
+byte of it is exactly the failure the version field exists to catch - so the
+field is postcard's `Option`, and the state says whether it is there instead of
+depending on what the reader has read. The order above stays a version bump
+rather than a trap.
+
+The cost falls on mode 2 alone: `width * active_height` `u32`s, so 224 KiB at
+H32 and 300 KiB at H40 with PAL in V30, of the 600 KiB the frame buffer is.
+Progressive saves pay one byte, the presence tag, which
+`frame_state::a_progressive_frame_buffer_still_carries_no_pixels` holds them to.
+No cart of `crates/genesis/tests/commercial_list.toml` reaches mode 2.
 
 ## The ROM checksum
 
@@ -93,7 +123,7 @@ Not in a state, and why:
 |---|---|---|
 | The ROM | Named by checksum instead; see above | `Bus::rom`, `#[serde(skip)]` |
 | The VDP colour LUT | A fixed 3 × 512-entry table derived from the CRAM encoding; rebuilt on load | `vdp::Vdp::color_lut`, `#[serde(skip)]` |
-| The frame buffer's pixels | 320 × 480 `u32` of the picture the beam has already painted, which the next `run_frame` draws again from state that *is* saved. Its `width`/`height` are kept, because a line is written at `line * width` and the renderer only refreshes the geometry on line 0. | `vdp::frame_state` |
+| The frame buffer's pixels | 320 × 480 `u32` of the picture the beam has already painted, which the next `run_frame` draws again from state that *is* saved. Its `width`/`height` are kept, because a line is written at `line * width` and the renderer only refreshes the geometry on line 0. **Except in interlace mode 2**, where half the published picture is the other field's frame and no frame that follows will draw it: there the state carries that field's lines as pixels too (#457). | `vdp::frame_state` |
 | The audio mixer | The host's resampler, levels and filter, built from `Config`; not part of the machine, and a state written at 44.1 kHz must not rewrite the settings of a machine now running at 48 kHz. Its *settings* are never touched by a load. Its *position* and its filter memory are not settings, and `Mixer::seek` re-derives both from the loaded machine rather than leaving them where the previous run had got to. | `Genesis::load_state` calls `audio::Mixer::seek`; `Mixer::state`, `out_clock`, `Stream::seek` |
 | TMSS boot ROM, `Config`, front-end state | Not machine state; the front end's own business | — |
 
@@ -139,7 +169,7 @@ running where it was.
 | Variant | Cause |
 |---|---|
 | `BadMagic` | Fewer than twenty bytes, or the first four are not `RSGS` |
-| `UnsupportedVersion(n)` | The state is format `n` and this build knows `1` — newer or older, since there is no migration either way |
+| `UnsupportedVersion(n)` | The state is format `n` and this build knows `2` — newer or older, since there is no migration either way |
 | `WrongRom` | The checksum is not `rom_checksum` of the loaded image |
 | `Corrupt` | The length field disagrees with the bytes that follow it, or the postcard payload does not decode |
 
@@ -149,7 +179,7 @@ byte four means anything until the magic does.
 
 ## Versioning
 
-`FORMAT_VERSION` is 1. Bumping it is a decision with three parts, and the format
+`FORMAT_VERSION` is 2. Bumping it is a decision with three parts, and the format
 has no migration yet — that is out of scope of #127 and does not exist:
 
 1. A state written by a build with `FORMAT_VERSION = 1` will be *refused* by a
@@ -162,6 +192,13 @@ has no migration yet — that is out of scope of #127 and does not exist:
    field can.
 3. Anything that changes what a byte of the payload means has to bump
    `FORMAT_VERSION` in the same commit, and update this page.
+
+The two versions so far:
+
+| Version | Payload |
+|---|---|
+| 1 | The frame buffer as its `width` and `height` and none of its pixels, in every mode (`vdp::frame_state`). |
+| 2 | The same, plus the lines of the field an interlace mode 2 frame does not draw — 224 KiB or more of pixels, for that mode only (#457). A version-1 mode-2 payload would decode a plausible-looking machine out of the wrong bytes rather than failing, which is why 1 is refused and not shimmed. |
 
 ## Out of scope
 
