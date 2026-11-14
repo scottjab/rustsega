@@ -237,6 +237,10 @@
             pkgs.jq
             # For linting the shell scripts in scripts/ (`shellcheck scripts/*.sh`).
             pkgs.shellcheck
+            # For linting the workflow files in .github/workflows/ (`just actionlint`),
+            # the Actions equivalent of shellcheck: it checks expressions, script
+            # quoting, `uses:` inputs and action permissions (M8-07, #162).
+            pkgs.actionlint
             pkgs.curl
             pkgs.unzip
             # SVG rasteriser, to regenerate the PWA icons of M7-18 (#151) from
