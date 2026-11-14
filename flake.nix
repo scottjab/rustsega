@@ -19,6 +19,12 @@
         };
         # Toolchain is pinned in rust-toolchain.toml so cargo and nix agree.
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+
+        # The workspace version, which is what `rustsega --version` prints. Read
+        # from Cargo.toml so the package, the binary and the smoke check below
+        # cannot drift apart (#160).
+        workspaceVersion =
+          (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
       in
       {
         devShells.default = pkgs.mkShell {
@@ -76,6 +82,50 @@
             # overridable: a driver and a browser that disagree on the WebDriver
             # protocol produce failures that look like emulator bugs.
             export GECKODRIVER="${pkgs.geckodriver}/bin/geckodriver"
+          '';
+        };
+
+        # The packaging tests (M8-05, #160). There is no Rust test for this: the
+        # thing to prove is that `nix build` produces a working single binary,
+        # and that is a property of the derivation, so it is tested by building
+        # it. `nix flake check` runs both of these.
+        checks = {
+          # Building the default package is the assertion; it has no output.
+          package = self.packages.${system}.default;
+
+          # And the binary that came out of it has to run with nothing else on
+          # disk. `--version` and `--help` are answered before the server reads
+          # a directory, a socket or an environment variable, so they need no
+          # sandbox of their own and still catch a binary that is missing,
+          # unrunnable, or built from another workspace.
+          smoke = pkgs.runCommand "rustsega-smoke" { } ''
+            bin=${self.packages.${system}.default}/bin/rustsega
+
+            # The version comes from the workspace Cargo.toml, so this is what
+            # says the binary in the store is the one this flake just built.
+            version="$($bin --version)"
+            echo "--version: $version"
+            case "$version" in
+              "rustsega ${workspaceVersion}") ;;
+              *)
+                echo "expected '--version' to print 'rustsega ${workspaceVersion}'" >&2
+                exit 1
+                ;;
+            esac
+
+            help="$($bin --help)"
+            echo "$help"
+            for flag in --bind --port --rom-dir --log; do
+              case "$help" in
+                *"$flag"*) ;;
+                *)
+                  echo "expected '--help' to document $flag" >&2
+                  exit 1
+                  ;;
+              esac
+            done
+
+            touch $out
           '';
         };
 
