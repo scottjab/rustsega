@@ -328,32 +328,43 @@
           # build is that it carries no dynamic dependencies at all, and that is
           # a property of the binary rather than of the machine running it, so
           # `file` and `ldd` are the test: no container, no second host.
+          # `glibc.bin` is `ldd`: a minimal build environment has no other, and
+          # an absent `ldd` would read here as "no shared library needed".
           ${if supportsStatic then "static" else null} =
-            pkgs.runCommand "rustsega-static-check" { nativeBuildInputs = [ pkgs.file ]; } ''
+            pkgs.runCommand "rustsega-static-check"
+            { nativeBuildInputs = [ pkgs.file pkgs.glibc.bin ]; } ''
             bin=${self.packages.${system}.static}/bin/rustsega
 
-            # A glibc build of this same source says "dynamically linked (uses
-            # shared libs)", and a musl build that lost `crt-static` says
-            # "interleaved". Both are the failure this check exists for.
+            # The two failures this check exists for are the glibc build, which
+            # `file` calls "dynamically linked (uses shared libs)", and a musl
+            # build that lost `crt-static`, which it calls "interleaved". A
+            # correct one is "static-pie linked" here, and the phrasing of that
+            # varies between versions of `file`, so the word static has to be
+            # present and the words dynamically linked must not be.
             info="$(file -L "$bin")"
             echo "$info"
             case "$info" in
-              *"statically linked"*) ;;
-              *)
+              *"dynamically linked"* | *interleaved*)
                 echo "expected $bin to be statically linked" >&2
+                exit 1
+                ;;
+              *static*) ;;
+              *)
+                echo "expected '$info' to say how the binary is linked" >&2
                 exit 1
                 ;;
             esac
 
             # And `ldd` agrees. On a static binary it answers "not a dynamic
-            # executable" and exits 1, so the exit status says nothing here and
-            # the text is what is read.
+            # executable" and exits 1, so the exit status says nothing here; what
+            # matters is that no shared library is resolved for it, which is what
+            # an `=>` line would be.
             dynamic="$(ldd "$bin" 2>&1 || true)"
             echo "$dynamic"
             case "$dynamic" in
-              *"not a dynamic executable"* | *"statically linked"*) ;;
-              *)
-                echo "expected ldd to report $bin as not a dynamic executable" >&2
+              *"=>"*)
+                echo "expected $bin to need no shared library, ldd said:" >&2
+                echo "$dynamic" >&2
                 exit 1
                 ;;
             esac
