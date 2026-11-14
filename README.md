@@ -51,6 +51,19 @@ Commercial ROMs for local tests are read from `$RUSTSEGA_ROM_DIR`
 (default `~/games/roms/genesis`). Public test suites go in `./test-roms`
 via `scripts/fetch-test-data.sh`. Neither is ever committed.
 
+### The single binary
+
+```sh
+nix build                                    # -> ./result/bin/rustsega
+nix run . -- --rom-dir ~/games/roms/genesis  # build it, and serve the ROM library
+```
+
+One derivation, and no network: trunk builds the frontend, then the server is
+compiled with the result embedded in it. What `./result` holds is therefore the
+whole app, and it needs nothing else on disk to serve it. `nix flake check`
+builds that binary and runs a smoke test against it; inside `nix develop`,
+`just build` does the same two steps without Nix being in charge of them.
+
 ## Working with agents
 
 Coding agents should read [AGENTS.md](AGENTS.md). Short version:

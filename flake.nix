@@ -19,6 +19,89 @@
         };
         # Toolchain is pinned in rust-toolchain.toml so cargo and nix agree.
         rust = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+
+        # The workspace version, which is what `rustsega --version` prints. Read
+        # from Cargo.toml so the package, the binary and the smoke check below
+        # cannot drift apart (#160).
+        workspaceVersion =
+          (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
+        # What the single-binary derivation copies into the store (#160): the
+        # workspace manifests and every crate. A fileset lists what goes in
+        # rather than what stays out, which is what keeps `target/` (22 GB in a
+        # warm checkout) and `test-roms/` out of the store without a filter to
+        # keep honest, and it needs no `git` at eval time.
+        #
+        # `crates/web/dist` is the one part of `crates/` that is not source: it
+        # is what trunk produces, and this derivation produces it too.
+        sourceFileset = pkgs.lib.fileset.difference ./crates (pkgs.lib.fileset.maybeMissing ./crates/web/dist);
+
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            sourceFileset
+          ];
+        };
+
+        # cargo and rustc are the dev shell's own toolchain: the rust-overlay one
+        # that `rust-toolchain.toml` pins, which is the one that carries the
+        # `wasm32-unknown-unknown` target the frontend needs. `pkgs.rustPlatform`
+        # would be a second, unpinned rustc, without it.
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rust;
+          rustc = rust;
+        };
+
+        # The single binary (M8-05, #160): the frontend built by trunk and baked
+        # into the server by `embed-web`, in one derivation and with no network.
+        rustsega = rustPlatform.buildRustPackage {
+          pname = "rustsega";
+          version = workspaceVersion;
+          inherit src;
+
+          # One lockfile covers both halves of the build: `web` and `server` are
+          # members of the same workspace, so the crates only the wasm frontend
+          # uses are in here too. There are no git dependencies, which is what
+          # keeps `cargoLock.outputHashes` out of this file.
+          cargoLock.lockFile = ./Cargo.lock;
+
+          # The three tools of the trunk build, all from nixpkgs. They have to
+          # come from PATH: `crates/web/Trunk.toml` sets `offline = true` because
+          # NixOS cannot exec the binaries trunk would otherwise download, and it
+          # pins the two versions trunk checks these against.
+          nativeBuildInputs = [ pkgs.trunk pkgs.wasm-bindgen-cli pkgs.binaryen ];
+
+          # Step 1 of 2, the frontend, into `crates/web/dist` in the build tree.
+          # It is a `preBuild` because `embed-web` reads that directory at compile
+          # time, so the cargo build below needs it to already be there.
+          preBuild = ''
+            # trunk wants a home for its tool cache and a sandbox has no writable
+            # one; $TMPDIR is the directory stdenv made for exactly this.
+            export HOME=$TMPDIR
+            (cd crates/web && trunk build --release --offline)
+          '';
+
+          # Step 2 of 2: the default cargo build, narrowed to the binary that
+          # ships. What is left out of that choice is `headless` and `testkit`,
+          # which are test tooling: every other crate of the workspace is either
+          # a dependency of `server` or part of the wasm build above.
+          cargoBuildFlags = [ "-p" "server" ];
+          buildFeatures = [ "embed-web" ];
+
+          # Tests run in `nix develop -c just check` and in CI, where the test
+          # data, the ROM directories, nextest and Firefox all are. In here they
+          # would need all of those, and what this derivation has to prove is the
+          # packaging, not the emulator.
+          doCheck = false;
+
+          meta = {
+            description = "Sega Genesis / Mega Drive emulator, serving the WASM app from one binary";
+            homepage = "https://github.com/scottjab/rustsega";
+            mainProgram = "rustsega";
+          };
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -76,6 +159,63 @@
             # overridable: a driver and a browser that disagree on the WebDriver
             # protocol produce failures that look like emulator bugs.
             export GECKODRIVER="${pkgs.geckodriver}/bin/geckodriver"
+          '';
+        };
+
+        packages = {
+          # The same derivation under both names, so `nix build` and
+          # `nix build .#rustsega` produce one store path.
+          inherit rustsega;
+          default = rustsega;
+        };
+
+        # `nix run` starts the server. The `meta` is not decoration: `nix flake
+        # check` reads it for every app of a flake and warns when there is none.
+        apps.default = (flake-utils.lib.mkApp { drv = rustsega; }) // {
+          meta.description = "Serve the rustsega web app from the built binary";
+        };
+
+        # The packaging tests (M8-05, #160). There is no Rust test for this: the
+        # thing to prove is that `nix build` produces a working single binary,
+        # and that is a property of the derivation, so it is tested by building
+        # it. `nix flake check` runs both of these.
+        checks = {
+          # Building the default package is the assertion; it has no output.
+          package = self.packages.${system}.default;
+
+          # And the binary that came out of it has to run with nothing else on
+          # disk. `--version` and `--help` are answered before the server reads
+          # a directory, a socket or an environment variable, so they need no
+          # sandbox of their own and still catch a binary that is missing,
+          # unrunnable, or built from another workspace.
+          smoke = pkgs.runCommand "rustsega-smoke" { } ''
+            bin=${self.packages.${system}.default}/bin/rustsega
+
+            # The version comes from the workspace Cargo.toml, so this is what
+            # says the binary in the store is the one this flake just built.
+            version="$($bin --version)"
+            echo "--version: $version"
+            case "$version" in
+              "rustsega ${workspaceVersion}") ;;
+              *)
+                echo "expected '--version' to print 'rustsega ${workspaceVersion}'" >&2
+                exit 1
+                ;;
+            esac
+
+            help="$($bin --help)"
+            echo "$help"
+            for flag in --bind --port --rom-dir --log; do
+              case "$help" in
+                *"$flag"*) ;;
+                *)
+                  echo "expected '--help' to document $flag" >&2
+                  exit 1
+                  ;;
+              esac
+            done
+
+            touch $out
           '';
         };
 
