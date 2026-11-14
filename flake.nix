@@ -25,6 +25,83 @@
         # cannot drift apart (#160).
         workspaceVersion =
           (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
+
+        # What the single-binary derivation copies into the store (#160): the
+        # workspace manifests and every crate. A fileset lists what goes in
+        # rather than what stays out, which is what keeps `target/` (22 GB in a
+        # warm checkout) and `test-roms/` out of the store without a filter to
+        # keep honest, and it needs no `git` at eval time.
+        #
+        # `crates/web/dist` is the one part of `crates/` that is not source: it
+        # is what trunk produces, and this derivation produces it too.
+        sourceFileset = pkgs.lib.fileset.difference ./crates (pkgs.lib.fileset.maybeMissing ./crates/web/dist);
+
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            sourceFileset
+          ];
+        };
+
+        # The same compiler for cargo and for rustc, and the dev shell's: the
+        # rust-overlay toolchain that `rust-toolchain.toml` pins, which is the one
+        # that carries the `wasm32-unknown-unknown` target the frontend needs. A
+        # plain `pkgs.rustPlatform` would be a second, unpinned rustc without it.
+        rustPlatform = pkgs.makeRustPlatform {
+          cargo = rust;
+          rustc = rust;
+        };
+
+        # The single binary (M8-05, #160): the frontend built by trunk and baked
+        # into the server by `embed-web`, in one derivation and with no network.
+        rustsega = rustPlatform.buildRustPackage {
+          pname = "rustsega";
+          version = workspaceVersion;
+          inherit src;
+
+          # One lockfile covers both halves of the build: `web` and `server` are
+          # members of the same workspace, so the crates only the wasm frontend
+          # uses are in here too. There are no git dependencies, which is what
+          # keeps `cargoLock.outputHashes` out of this file.
+          cargoLock.lockFile = ./Cargo.lock;
+
+          # The three tools of the trunk build, all from nixpkgs. They have to
+          # come from PATH: `crates/web/Trunk.toml` sets `offline = true` because
+          # NixOS cannot exec the binaries trunk would otherwise download, and it
+          # pins the two versions trunk checks these against.
+          nativeBuildInputs = [ pkgs.trunk pkgs.wasm-bindgen-cli pkgs.binaryen ];
+
+          # Step 1 of 2, the frontend, into `crates/web/dist` in the build tree.
+          # It is a `preBuild` because `embed-web` reads that directory at compile
+          # time, so the cargo build below needs it to already be there.
+          preBuild = ''
+            # trunk wants a home for its tool cache and a sandbox has no writable
+            # one; $TMPDIR is the directory stdenv made for exactly this.
+            export HOME=$TMPDIR
+            (cd crates/web && trunk build --release --offline)
+          '';
+
+          # Step 2 of 2: the default cargo build, narrowed to the binary that
+          # ships. Every other crate of the workspace is either a dependency of
+          # `server` or part of the wasm build above, so nothing ships unbuilt
+          # and nothing that is not shipped gets compiled twice.
+          cargoBuildFlags = [ "-p" "server" ];
+          buildFeatures = [ "embed-web" ];
+
+          # Tests run in `nix develop -c just check` and in CI, where the test
+          # data, the ROM directories, nextest and Firefox are. In here they would
+          # need all three, and what is under test in this derivation is the
+          # packaging, not the emulator.
+          doCheck = false;
+
+          meta = {
+            description = "Sega Genesis / Mega Drive emulator, serving the WASM app from one binary";
+            homepage = "https://github.com/scottjab/rustsega";
+            mainProgram = "rustsega";
+          };
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -84,6 +161,15 @@
             export GECKODRIVER="${pkgs.geckodriver}/bin/geckodriver"
           '';
         };
+
+        packages = {
+          # The same derivation under both names, so `nix build` and
+          # `nix build .#rustsega` produce one store path.
+          inherit rustsega;
+          default = rustsega;
+        };
+
+        apps.default = flake-utils.lib.mkApp { drv = rustsega; };
 
         # The packaging tests (M8-05, #160). There is no Rust test for this: the
         # thing to prove is that `nix build` produces a working single binary,
