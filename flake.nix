@@ -102,6 +102,107 @@
             mainProgram = "rustsega";
           };
         };
+
+        # --- portable static binary (M8-05b, #159) ---------------------------
+
+        # The cargo target of the portable build. `x86_64-unknown-linux-musl`
+        # links the C library in by default (`crt-static`), which is the whole
+        # trick: one file, no `/nix/store`, no glibc to agree with.
+        muslTarget = "x86_64-unknown-linux-musl";
+
+        # Only x86_64-linux has the package and its check (#159); macOS, Windows
+        # and aarch64 are out of scope.
+        supportsStatic = pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isx86_64;
+
+        # The pinned toolchain of `rust-toolchain.toml` plus the musl target. A
+        # `rust.override` replaces the target list rather than adding to it, so
+        # `wasm32` is repeated here, and it is this package alone that pays for
+        # the extra target: the dev shell keeps the file as it is.
+        rustMusl = rust.override {
+          targets = [ "wasm32-unknown-unknown" muslTarget ];
+        };
+
+        rustMuslPlatform = pkgs.makeRustPlatform {
+          cargo = rustMusl;
+          rustc = rustMusl;
+        };
+
+        # rustc links with `cc`, and this package set's `cc` is the glibc one, so
+        # the link step of the static build is pointed at a musl gcc instead.
+        # `cargo tree -p server -e normal` carries no `-sys` crate, so libc is
+        # the only C in this build and a linker is all it takes - no C dependency
+        # is added, and nothing is compiled with it.
+        muslCc = pkgs.pkgsCross.musl64.stdenv.cc;
+
+        # The portable single binary (M8-05b, #159): `rustsega` above built for
+        # `muslTarget`, so that it runs on a Linux box with no nix on it.
+        #
+        # The cargo hooks of a rust platform build and install that platform's
+        # own target - here `--target x86_64-unknown-linux-gnu`, read back from
+        # `target/release` - so the two phases that touch the target are written
+        # out instead. Everything else is the machinery of #160: the same `src`,
+        # the same crates vendored from `Cargo.lock` by `cargoLock`, the same
+        # strip in `fixupPhase`.
+        #
+        # The frontend is built here rather than shared with `rustsega` because
+        # `crates/web/dist` is not an output of that derivation, so there is
+        # nothing in the store to share. What is shared is that both bake in the
+        # same tree: the wasm half of the build does not depend on the target.
+        rustsegaStatic = rustMuslPlatform.buildRustPackage {
+          pname = "rustsega-static";
+          version = workspaceVersion;
+          inherit src;
+
+          cargoLock.lockFile = ./Cargo.lock;
+
+          # The two tools of the trunk step, and the C linker of the musl link
+          # step. `muslCc` has to be an input, not just a path in a variable:
+          # nothing but an input puts it in the sandbox.
+          nativeBuildInputs = [
+            pkgs.trunk
+            pkgs.wasm-bindgen-cli
+            pkgs.binaryen
+            muslCc
+          ];
+
+          # The link step only, and only for the musl target, so build scripts
+          # and everything else keep this package set's own `cc`.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER =
+            "${muslCc}/bin/${muslCc.targetPrefix}cc";
+
+          # Step 1 of 2, as in `rustsega`, and step 2 for one target only: the
+          # hook would pass this platform's glibc target as well, doubling a
+          # release build that has to be small enough to wait for.
+          buildPhase = ''
+            runHook preBuild
+
+            # trunk wants a home for its tool cache and a sandbox has no writable
+            # one; $TMPDIR is the directory stdenv made for exactly this.
+            export HOME=$TMPDIR
+            (cd crates/web && trunk build --release --offline)
+
+            cargo build --release --offline -p server --features embed-web \
+              --target ${muslTarget}
+
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            install -Dm555 target/${muslTarget}/release/rustsega $out/bin/rustsega
+            runHook postInstall
+          '';
+
+          # As in `rustsega`: the tests need the test data, the ROM directories
+          # and nextest, and what has to be proven here is the packaging.
+          doCheck = false;
+
+          meta = {
+            description = "Sega Genesis / Mega Drive emulator, statically linked for a Linux box with no nix";
+            homepage = "https://github.com/scottjab/rustsega";
+            mainProgram = "rustsega";
+          };
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -167,6 +268,11 @@
           # `nix build .#rustsega` produce one store path.
           inherit rustsega;
           default = rustsega;
+
+          # The portable binary of M8-05b (#159), x86_64-linux only. A null
+          # attribute name drops the attribute, which is how this stays out of
+          # `nix flake check` on the systems that have no musl target.
+          ${if supportsStatic then "static" else null} = rustsegaStatic;
         };
 
         # `nix run` starts the server. The `meta` is not decoration: `nix flake
@@ -214,6 +320,56 @@
                   ;;
               esac
             done
+
+            touch $out
+          '';
+
+          # The portable binary test (M8-05b, #159). The point of the static
+          # build is that it carries no dynamic dependencies at all, and that is
+          # a property of the binary rather than of the machine running it, so
+          # `file` and `ldd` are the test: no container, no second host.
+          ${if supportsStatic then "static" else null} =
+            pkgs.runCommand "rustsega-static-check" { nativeBuildInputs = [ pkgs.file ]; } ''
+            bin=${self.packages.${system}.static}/bin/rustsega
+
+            # A glibc build of this same source says "dynamically linked (uses
+            # shared libs)", and a musl build that lost `crt-static` says
+            # "interleaved". Both are the failure this check exists for.
+            info="$(file -L "$bin")"
+            echo "$info"
+            case "$info" in
+              *"statically linked"*) ;;
+              *)
+                echo "expected $bin to be statically linked" >&2
+                exit 1
+                ;;
+            esac
+
+            # And `ldd` agrees. On a static binary it answers "not a dynamic
+            # executable" and exits 1, so the exit status says nothing here and
+            # the text is what is read.
+            dynamic="$(ldd "$bin" 2>&1 || true)"
+            echo "$dynamic"
+            case "$dynamic" in
+              *"not a dynamic executable"* | *"statically linked"*) ;;
+              *)
+                echo "expected ldd to report $bin as not a dynamic executable" >&2
+                exit 1
+                ;;
+            esac
+
+            # The version comes from the workspace Cargo.toml, so this is what
+            # says the static binary is this workspace's server and not just any
+            # binary that happens to be static.
+            version="$("$bin" --version)"
+            echo "--version: $version"
+            case "$version" in
+              "rustsega ${workspaceVersion}") ;;
+              *)
+                echo "expected '--version' to print 'rustsega ${workspaceVersion}'" >&2
+                exit 1
+                ;;
+            esac
 
             touch $out
           '';
