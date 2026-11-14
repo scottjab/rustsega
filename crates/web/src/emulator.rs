@@ -1915,6 +1915,7 @@ mod tests {
             width: 2,
             height: 1,
             pixels: vec![RED, BLUE],
+            odd_frame: None,
         };
         let mut out = Vec::new();
         frame_to_rgba_bytes(&frame, &mut out);
@@ -1947,6 +1948,7 @@ mod tests {
             width: 2,
             height: 1,
             pixels: vec![RED, BLUE],
+            odd_frame: None,
         };
         let mut out = Vec::new();
         frame_to_rgba_bytes(&frame, &mut out);
@@ -1956,6 +1958,7 @@ mod tests {
             width: 1,
             height: 1,
             pixels: vec![BLUE],
+            odd_frame: None,
         };
         frame_to_rgba_bytes(&small, &mut out);
         assert_eq!(out, vec![0, 0, 255, 255]);

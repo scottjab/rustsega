@@ -272,6 +272,11 @@ impl Vdp {
         if self.interlace_mode() != InterlaceMode::Off {
             self.odd_frame = !self.odd_frame;
         }
+        // The frame buffer holds the two fields two lines at a time, so the field
+        // it is on is part of what it is: `frame_state` needs it to know which of
+        // the published rows the frame about to be drawn leaves alone and has to
+        // come out of a save state whole (#457).
+        self.frame_buffer.odd_frame = self.weave_field();
     }
 
     /// One of the two points of the line that are not the line end.

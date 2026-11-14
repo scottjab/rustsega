@@ -34,6 +34,26 @@ pub struct FrameBuffer {
     pub height: usize,
     /// The pixels, row-major, `MAX_WIDTH * MAX_HEIGHT` of them.
     pub pixels: Vec<u32>,
+    /// The field of the picture in [`FrameBuffer::pixels`] that the frame being
+    /// drawn writes: `Some` in interlace mode 2, where a frame draws one line in
+    /// two of a picture twice as tall as the beam, and `None` in the two modes
+    /// that are not interlaced (M4-20 #98).
+    ///
+    /// This is the other half of [`Vdp::display_line`], which maps a beam line to
+    /// `line * 2 + field`: it says which of these rows the frame wrote and which
+    /// belong to the field before it, and the frame buffer is the only place that
+    /// can say so. The save state of `crate::frame_state` keeps the frame
+    /// buffer's size rather than its pixels, and this is what tells it to carry
+    /// the one field a restored chip cannot draw again - the field the frame
+    /// being drawn leaves alone (#457).
+    ///
+    /// Kept in step at the two places that can move it - `timing::frame_start`
+    /// toggles the flag it holds and [`Vdp::write_register`] writes the R12 that
+    /// decides whether there is one - so that it is true of `pixels` at any
+    /// moment a save state can be taken: at a frame boundary, inside a field, and
+    /// on the line a mode change lands on, where `display_line` starts or stops
+    /// weaving without the frame boundary having come round to say so.
+    pub odd_frame: Option<bool>,
 }
 
 impl FrameBuffer {
@@ -48,6 +68,7 @@ impl FrameBuffer {
             width: MAX_WIDTH,
             height: crate::LINES_V28,
             pixels: vec![0; MAX_WIDTH * MAX_HEIGHT],
+            odd_frame: None,
         }
     }
 

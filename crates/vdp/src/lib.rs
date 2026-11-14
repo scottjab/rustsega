@@ -447,7 +447,11 @@ impl Vdp {
     ///
     /// R0 is the one register whose write does something outside the register
     /// file: bit 1 (M3) latching the HV counter as it goes up and releasing it
-    /// as it comes down (M4-05, #83, and [`Vdp::hv_counter`]).
+    /// as it comes down (M4-05, #83, and [`Vdp::hv_counter`]). And R12 is the one
+    /// whose write moves something inside another field of the chip: its LSM bits
+    /// decide whether the picture is woven, and [`FrameBuffer::odd_frame`] keeps
+    /// step with them so that it is the mode of this line rather than the mode of
+    /// the last frame boundary (#457).
     pub fn write_register(&mut self, reg: u8, value: u8) {
         let index = usize::from(reg);
         let Some(previous) = self.regs.get(index).copied() else {
@@ -457,6 +461,9 @@ impl Vdp {
             self.m3_written(previous, value);
         }
         self.regs[index] = value;
+        if index == regs::R12 {
+            self.frame_buffer.odd_frame = self.weave_field();
+        }
     }
 
     /// Raw read of register `reg`, for the code that wants a register rather
@@ -887,6 +894,26 @@ impl Vdp {
         match self.interlace_mode() {
             InterlaceMode::Mode2 => line * 2 + u16::from(self.odd_frame),
             InterlaceMode::Off | InterlaceMode::Mode1 => line,
+        }
+    }
+
+    /// The field of the picture [`Vdp::display_line`] is weaving: `Some` in
+    /// interlace mode 2, holding [`Vdp::odd_frame`], and `None` in the two modes
+    /// that are not interlaced (genvdp.txt section 17 "$0C" LSM, section 6 bit 4
+    /// ODD; M4-20 #98).
+    ///
+    /// The other half of `display_line`, and the half a save state needs: a
+    /// mode-2 frame writes only the lines of its own field, so the lines of the
+    /// other field are the picture of the frame before it and the state has to
+    /// carry them (#457, [`frame_state`]). [`FrameBuffer::odd_frame`] carries it
+    /// to the save state, kept in step at the two places it can move:
+    /// `timing::frame_start` toggles the flag it holds, and
+    /// [`Vdp::write_register`] writes the R12 that decides whether there is one.
+    #[inline]
+    pub(crate) fn weave_field(&self) -> Option<bool> {
+        match self.interlace_mode() {
+            InterlaceMode::Mode2 => Some(self.odd_frame),
+            InterlaceMode::Off | InterlaceMode::Mode1 => None,
         }
     }
 }

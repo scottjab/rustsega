@@ -31,8 +31,16 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// The format version this build writes, and the only one it reads.
 ///
 /// Bumped by the change that breaks compatibility with old states. Migrating
-/// one version to another is out of scope of #127 and does not exist yet.
-pub const FORMAT_VERSION: u32 = 1;
+/// one version to another is out of scope of #127 and does not exist yet, so a
+/// state of any other version is refused with [`StateError::UnsupportedVersion`]
+/// rather than half-decoded.
+///
+/// Version 2 is `vdp::frame_state` carrying the one field of an interlace mode 2
+/// picture that no later frame draws (#457). Version 1 wrote the frame buffer as
+/// its size alone, and since a postcard payload is not self-describing a v1 mode-2
+/// payload would have decoded a plausible-looking machine out of the wrong bytes
+/// rather than failing - which is the case the version field exists for.
+pub const FORMAT_VERSION: u32 = 2;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 
@@ -107,6 +115,14 @@ pub fn rom_checksum(rom: &[u8]) -> u64 {
 
 /// The whole save state of `machine`: [`container`] over the postcard of the
 /// machine's four moving parts.
+///
+/// The order of those four parts *is* the payload format, and one of them is
+/// conditional inside: the VDP's frame state rides with [`Bus`], and the mode it
+/// is woven in comes from the VDP's register file, which is a little earlier in
+/// the same struct. Nothing here relies on that. The conditional field carries
+/// its own presence tag - see `vdp::frame_state` and #457 - so a reader needs
+/// nothing it has already decoded to know how many bytes `frame_state` is, and
+/// reordering this tuple stays a pure version bump rather than a trap.
 ///
 /// What a state carries is the 68000, the sound CPU, [`Bus`] - and with it the
 /// VDP, the I/O chip, the two working RAMs, the cartridge's save and bank
