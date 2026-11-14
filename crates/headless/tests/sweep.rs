@@ -117,6 +117,8 @@ fn sweep_on_temp_dir() {
             "region",
             "status",
             "distinct_colors",
+            "max_colours",
+            "input_gate",
             "frame_hash",
             "seconds",
             "notes",
@@ -129,7 +131,7 @@ fn sweep_on_temp_dir() {
     let junk = &rows[1];
     assert_eq!(junk[0], "junk.md");
     assert_eq!(junk[4], "LoadError", "16 bytes is not a ROM: {junk:?}");
-    assert!(!junk[8].is_empty(), "the row should say why: {junk:?}");
+    assert!(!junk[10].is_empty(), "the row should say why: {junk:?}");
 
     let booted = &rows[2];
     assert_eq!(booted[0], "loop.md");
@@ -140,8 +142,16 @@ fn sweep_on_temp_dir() {
         "an infinite loop runs, and draws nothing: {booted:?}"
     );
     assert_eq!(booted[5], "1", "the border is the only colour on screen");
+    assert_eq!(
+        booted[6], "1",
+        "no frame of the run drew either, so #373's peak says the same: {booted:?}"
+    );
+    assert_eq!(
+        booted[7], "",
+        "and holding START did not make it draw, so it is not input-gated: {booted:?}"
+    );
     assert!(
-        booted[6].starts_with("0x"),
+        booted[8].starts_with("0x"),
         "a frame that ran has a hash: {booted:?}"
     );
 
@@ -181,7 +191,7 @@ fn sweep_skips_a_sega_cd_image_without_running_it() {
         rows[1]
     );
     assert!(
-        rows[1][8].contains("Sega CD"),
+        rows[1][10].contains("Sega CD"),
         "and it says so: {:?}",
         rows[1]
     );

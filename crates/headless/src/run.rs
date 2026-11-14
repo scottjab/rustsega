@@ -92,13 +92,30 @@ pub struct RunArgs {
     /// Print `frame_hash=0x...` for the last frame on stdout.
     #[arg(long)]
     pub hash: bool,
-    /// Print `colours=N` for the last frame on stdout.
+    /// Print `colours=N` for the reported frame on stdout.
     ///
     /// N is the number of distinct pixels the frame holds, which is how
     /// `crates/genesis/tests/commercial.rs` decides a screen is blank; `sweep`
     /// asks for it in order to call a run that drew nothing `Blank` (M6-05, #124).
     #[arg(long)]
     pub colours: bool,
+    /// Print `max_colours=N` for the whole run on stdout: the widest frame it made.
+    ///
+    /// `--colours` answers "what does the frame it stopped on look like" and this
+    /// answers "did it ever draw", which is the question a compatibility report
+    /// actually wants: a title screen fades in, holds, and fades out again, so the
+    /// one sampled frame can be mid-fade while frame 700 held thirty colours
+    /// (#373). `sweep` asks for both.
+    #[arg(long)]
+    pub max_colours: bool,
+    /// Which frame `--hash`, `--colours` and `--dump-png` report: 1-based.
+    ///
+    /// The last frame of the run when the caller does not say. It exists so a
+    /// caller can run past the frame it reports: `sweep` runs each ROM for longer
+    /// than 600 frames to watch for a picture (#373) while its `distinct_colors`
+    /// and `frame_hash` columns stay the frame-600 ones of the committed report.
+    #[arg(long, value_name = "N")]
+    pub sample_frame: Option<u32>,
     /// Print `audio_hash=0x...` for the run's audio on stdout.
     ///
     /// FNV-1a 64 over the same PCM bytes `--dump-wav` writes as the WAV's
@@ -177,6 +194,18 @@ pub fn run(args: RunArgs) -> Result<()> {
     let want_audio = args.dump_wav.is_some() || args.audio_hash;
     let mut audio: Vec<i16> = Vec::new();
 
+    // The frame the report describes, and so the only frame worth counting pixels
+    // on unless `--max-colours` asked for every one of them.
+    let sample = args
+        .sample_frame
+        .unwrap_or(args.frames)
+        .clamp(1, args.frames);
+    let want_peak = args.max_colours;
+    let mut peak_colours = 0;
+    // The reported frame, kept as bytes rather than as a borrow of `machine`, so
+    // that a run of 1800 frames can report the picture of frame 600.
+    let mut reported: Option<(usize, usize, Vec<u32>)> = None;
+
     let started = Instant::now();
     // 1-based, so that a script written as `START@1` means the first frame. The
     // pad is set before the frame runs: a button is held *during* a frame.
@@ -198,6 +227,16 @@ pub fn run(args: RunArgs) -> Result<()> {
             // ran through rather than the one before it.
             machine.drain_audio(&mut audio);
         }
+        if want_peak || frame == sample {
+            let picture = machine.frame();
+            let pixels = &picture.pixels[..picture.width * picture.height];
+            if want_peak {
+                peak_colours = peak_colours.max(distinct_colours(pixels));
+            }
+            if frame == sample {
+                reported = Some((picture.width, picture.height, pixels.to_vec()));
+            }
+        }
     }
     let elapsed = started.elapsed();
     if let Some(path) = &args.record {
@@ -206,8 +245,12 @@ pub fn run(args: RunArgs) -> Result<()> {
             .with_context(|| format!("cannot write movie {}", quote(path)))?;
     }
 
-    let frame = machine.frame();
-    let pixels = &frame.pixels[..frame.width * frame.height];
+    let (width, height, captured) = reported.unwrap_or_else(|| {
+        let frame = machine.frame();
+        let pixels = &frame.pixels[..frame.width * frame.height];
+        (frame.width, frame.height, pixels.to_vec())
+    });
+    let pixels = captured.as_slice();
     if let Some(path) = &args.dump_png {
         if path.is_dir() {
             // Worth saying here rather than letting `testkit::dump_png` panic on
@@ -215,14 +258,17 @@ pub fn run(args: RunArgs) -> Result<()> {
             // tool should answer `--dump-png /tmp`.
             bail!("--dump-png: {} is a directory", quote(path));
         }
-        testkit::dump_png(path, pixels, frame.width, frame.height);
+        testkit::dump_png(path, pixels, width, height);
     }
     if args.hash {
-        let hash = testkit::frame_hash(pixels, frame.width, frame.height);
+        let hash = testkit::frame_hash(pixels, width, height);
         println!("frame_hash=0x{hash:016x}");
     }
     if args.colours {
         println!("colours={}", distinct_colours(pixels));
+    }
+    if args.max_colours {
+        println!("max_colours={peak_colours}");
     }
     if let Some(path) = &args.dump_wav {
         wav::write_wav(path, sample_rate, &audio)
@@ -309,7 +355,7 @@ fn describe(rom: &[u8], config: &Config) -> Result<String> {
     Ok(format!("title={title:?} region={}", region.name()))
 }
 
-/// Distinct pixels of a frame, as `--colours` prints them.
+/// Distinct pixels of a frame, as `--colours` and `--max-colours` print them.
 ///
 /// The same count `crates/genesis/tests/commercial.rs` takes to decide a screen
 /// is not blank, over the `0xAABBGGRR` pixels the machine holds.

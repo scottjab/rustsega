@@ -15,12 +15,28 @@
 //!
 //! [`Status`] is deliberately coarse - the sweep names problems for a human to
 //! triage (M6-13), it does not diagnose them. `Boots` means the machine ran the
-//! whole run and the last frame had more than [`BLANK_COLOUR_LIMIT`] distinct
+//! whole run and **some** frame of it held more than [`BLANK_COLOUR_LIMIT`] distinct
 //! colours; it says nothing about whether the picture is *right*, which is the
 //! same claim
 //! [`docs/compat-commercial.md`](../../../docs/compat-commercial.md) makes about
 //! the commercial smoke suite. What this command writes is `docs/compat.md` (the
 //! problems, grouped) and `docs/compat.csv` (every ROM, one row each).
+//!
+//! # Watching the whole run, not one frame
+//!
+//! A Genesis title screen is not a still: it fades in, holds, goes to attract mode
+//! and fades out again. Sampling one frame therefore calls a working cartridge
+//! `Blank` whenever that frame lands mid-fade, which is what #373 measured: 379 of
+//! the 536 ROMs the old sweep called Blank exceed the colour limit at some other
+//! frame count, and 27 more draw only once a button is held. So a run reports the
+//! widest frame it ever made (`max_colours`, via
+//! [`crate::run::RunArgs::max_colours`]) as well as the colour count of the
+//! checkpoint frame (`--frames`, which stays the frame the `distinct_colors` and
+//! `frame_hash` columns hold so that a resweep diffs against the committed
+//! table), and a ROM that drew nothing at all is run a second time with
+//! [`DEFAULT_INPUT_GATE`] held. Which gate produced the picture goes into the
+//! `input_gate` column: a cart that only draws when poked is not the same fault as
+//! one that never draws, and folding the first into `Boots` silently would hide it.
 //!
 //! Nothing here reads like a ROM: no cartridge byte is ever printed, and the only
 //! ROM content a row carries is the title, serial and region of its header.
@@ -56,6 +72,22 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// and a hung child is still killed within a frame or two of its limit.
 const POLL: Duration = Duration::from_millis(20);
 
+/// The pad script a second pass holds when a ROM drew nothing at all: START on two
+/// frames, which is the press `crates/genesis/tests/commercial_list.toml` holds for
+/// every game of its list and is enough to clear a `PRESS START` gate (#373).
+///
+/// It is one script for the whole collection rather than a per-ROM list because the
+/// sweep has nothing to choose on: `commercial_list.toml` is fifteen games somebody
+/// picked, not a table of 2775 carts and their gates.
+pub const DEFAULT_INPUT_GATE: &str = "START@300,START@301";
+
+/// How much longer than `--frames` each ROM runs when the caller does not say.
+///
+/// Three times the checkpoint. #373 measured the collection at about 100 s of wall
+/// clock for one pass, so the extra frames are affordable, and its own sampling ran
+/// frame counts up to 1800 and found carts that only draw at 700, 900 and 1200.
+const DEFAULT_WATCH_MULTIPLIER: u32 = 3;
+
 /// A frame with this many distinct colours or fewer is a blank screen.
 ///
 /// The same limit and the same reasoning as `BLANK_COLOUR_LIMIT` in
@@ -74,9 +106,9 @@ pub enum Status {
     Panic,
     /// The child was still running when `--timeout-secs` ran out and was killed.
     Timeout,
-    /// The run finished but the last frame is blank.
+    /// The run finished and no frame of it drew a picture, with or without input.
     Blank,
-    /// The run finished and the last frame is a picture.
+    /// The run finished and some frame of it drew a picture.
     Boots,
 }
 
@@ -126,8 +158,17 @@ pub struct RomResult {
     pub region: String,
     /// How it went.
     pub status: Status,
-    /// Distinct colours of the last frame; zero for a run that never got there.
+    /// Distinct colours of the checkpoint frame (`--frames`) of the unperturbed
+    /// run; zero for a run that never got there.
     pub distinct_colours: usize,
+    /// Distinct colours of the widest frame of the unperturbed run, i.e. whether
+    /// the cartridge ever drew at all (#373).
+    pub max_colours: usize,
+    /// The pad script that produced a picture on the second pass: empty when the
+    /// first pass drew one, when the second pass is switched off, and when it ran
+    /// and did not help. Naming the gate rather than folding the cart into `Boots`
+    /// keeps "never drew" separable from "only drew once START was held" (#373).
+    pub input_gate: String,
     /// `frame_hash` of the last frame, when there was one.
     pub frame_hash: Option<u64>,
     /// Wall-clock seconds this ROM took, child start-up included.
@@ -146,6 +187,8 @@ impl RomResult {
             region: String::new(),
             status,
             distinct_colours: 0,
+            max_colours: 0,
+            input_gate: String::new(),
             frame_hash: None,
             seconds,
             notes,
@@ -159,9 +202,24 @@ pub struct SweepArgs {
     /// Directory of ROM images to run.
     #[arg(value_name = "DIR")]
     pub dir: PathBuf,
-    /// Frames to run each ROM for.
+    /// Frames to run each ROM for: the checkpoint the `distinct_colors` and
+    /// `frame_hash` columns are taken at.
     #[arg(long, default_value_t = DEFAULT_FRAMES, value_name = "N")]
     pub frames: u32,
+    /// Frames each ROM actually runs, every one of them watched for a picture.
+    ///
+    /// Defaults to three times `--frames`: a cart whose title screen only appears at
+    /// frame 700 is a working cart, and the run has to reach 700 for the sweep to be
+    /// able to say so (#373).
+    #[arg(long, value_name = "N")]
+    pub run_frames: Option<u32>,
+    /// The pad script held on the second pass over a ROM that drew nothing.
+    ///
+    /// `none` turns the second pass off, which is how a run says "no input at all".
+    /// Anything else is a `--pad1` script, and the one that produced a picture is
+    /// named in the row's `input_gate` column (#373).
+    #[arg(long, value_name = "SCRIPT", default_value = DEFAULT_INPUT_GATE)]
+    pub input_gate: String,
     /// ROMs to run at once.
     #[arg(long, value_name = "N")]
     pub jobs: Option<usize>,
@@ -188,7 +246,7 @@ pub fn run(args: SweepArgs) -> Result<()> {
         write_csv(path, &rows).with_context(|| format!("cannot write CSV {:?}", path))?;
     }
     if let Some(path) = &args.markdown {
-        let text = markdown(&rows, args.frames, args.timeout_secs);
+        let text = markdown(&rows, args.frames, watch_frames(&args), args.timeout_secs);
         fs::write(path, text).with_context(|| format!("cannot write markdown {:?}", path))?;
     }
 
@@ -273,6 +331,9 @@ pub fn sweep_with(exe: &Path, args: &SweepArgs) -> Result<Vec<RomResult>> {
     }
     let jobs = args.jobs.unwrap_or_else(default_jobs).max(1);
     let timeout = Duration::from_secs(args.timeout_secs.max(1));
+    let watch = watch_frames(args);
+    let sample = args.frames;
+    let gate = input_gate(args);
     let total = candidates.len();
     let scratch = scratch_dir()?;
 
@@ -289,7 +350,7 @@ pub fn sweep_with(exe: &Path, args: &SweepArgs) -> Result<Vec<RomResult>> {
         let done = Arc::clone(&done);
         let sender = sender.clone();
         let scratch = scratch.clone();
-        let frames = args.frames;
+        let gate = gate.clone();
         workers.push(thread::spawn(move || {
             loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
@@ -297,7 +358,13 @@ pub fn sweep_with(exe: &Path, args: &SweepArgs) -> Result<Vec<RomResult>> {
                     break;
                 }
                 let path = &candidates[index];
-                let result = one(&exe, path, index, frames, timeout, &scratch);
+                let pass = Pass {
+                    frames: watch,
+                    sample,
+                    timeout,
+                    scratch: &scratch,
+                };
+                let result = one(&exe, path, index, &pass, gate.as_deref());
                 let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if finished.is_multiple_of(100) || finished == total {
                     eprintln!(
@@ -325,6 +392,19 @@ fn default_jobs() -> usize {
     thread::available_parallelism().map_or(4, |n| n.get())
 }
 
+/// How long each ROM actually runs: `--run-frames`, or [`DEFAULT_WATCH_MULTIPLIER`]
+/// times the `--frames` checkpoint, and never less than the checkpoint itself.
+fn watch_frames(args: &SweepArgs) -> u32 {
+    args.run_frames
+        .unwrap_or(args.frames.saturating_mul(DEFAULT_WATCH_MULTIPLIER))
+        .max(args.frames)
+}
+
+/// The pad script of the second pass, or `None` for `--input-gate none`.
+fn input_gate(args: &SweepArgs) -> Option<String> {
+    (args.input_gate != "none").then(|| args.input_gate.clone())
+}
+
 /// A directory for the children's stdout and stderr, removed with the sweep.
 ///
 /// Files rather than pipes because a pipe is a deadlock waiting for a chatty
@@ -337,18 +417,31 @@ fn scratch_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// What every child of the sweep is run with, so that `one` and [`run_child`] do
+/// not each take another four arguments to say the same thing.
+#[derive(Clone, Copy)]
+struct Pass<'a> {
+    /// How long the child runs: the watched run, longer than the checkpoint.
+    frames: u32,
+    /// The frame its `colours=` and `frame_hash=` report, i.e. the `--frames`
+    /// checkpoint the CSV columns are taken at (#373).
+    sample: u32,
+    /// The wall-clock limit of one child.
+    timeout: Duration,
+    /// Where the child's stdout and stderr go.
+    scratch: &'a Path,
+}
+
 /// One ROM: read its header, run it in a child, and say how it went.
 ///
 /// Never fails. Every way this can go wrong is a row of the report, because one
 /// unreadable cartridge out of 2775 is not a reason to stop the sweep.
-fn one(
-    exe: &Path,
-    path: &Path,
-    index: usize,
-    frames: u32,
-    timeout: Duration,
-    scratch: &Path,
-) -> RomResult {
+///
+/// The first pass runs the cartridge as it sits on the shelf. Only if that produced
+/// no picture at all does a second pass run it again with `gate` held, and only if
+/// *that* produced a picture does the row name the gate: the cart then boots, but
+/// the report says what it took (#373).
+fn one(exe: &Path, path: &Path, index: usize, pass: &Pass<'_>, gate: Option<&str>) -> RomResult {
     let started = Instant::now();
     let file = file_name(path);
     let seconds = || started.elapsed().as_secs_f64();
@@ -378,15 +471,38 @@ fn one(
         return row;
     }
 
-    let (timed_out, code, stdout, stderr) = run_child(exe, path, frames, timeout, scratch, index);
-    let (frame_hash, colours) = parse_report(&stdout);
+    let first = run_child(exe, path, None, index, pass);
+    let (frame_hash, colours, max_colours) = parse_report(&first.stdout);
     let attempt = Attempt {
-        timed_out,
-        code,
+        timed_out: first.timed_out,
+        code: first.code,
         colours,
-        stderr: &stderr,
+        max_colours,
+        stderr: &first.stderr,
     };
-    let (status, notes) = classify(&attempt);
+    let (mut status, mut notes) = classify(&attempt);
+    let mut input_gate = String::new();
+
+    if status == Status::Blank
+        && let Some(gate) = gate
+    {
+        let second = run_child(exe, path, Some(gate), index, pass);
+        let (_, _, gate_colours) = parse_report(&second.stdout);
+        let gate_attempt = Attempt {
+            timed_out: second.timed_out,
+            code: second.code,
+            colours,
+            max_colours: gate_colours,
+            stderr: &second.stderr,
+        };
+        if classify(&gate_attempt).0 == Status::Boots {
+            let drew = gate_colours.unwrap_or(0);
+            status = Status::Boots;
+            input_gate = gate.to_string();
+            notes = format!("{drew} colours with {gate}");
+        }
+    }
+
     RomResult {
         file,
         title,
@@ -394,10 +510,20 @@ fn one(
         region,
         status,
         distinct_colours: colours.unwrap_or(0),
+        max_colours: max_colours.unwrap_or(0),
+        input_gate,
         frame_hash,
         seconds: seconds(),
         notes,
     }
+}
+
+/// What one child run answered, as the caller wants it.
+struct Child {
+    timed_out: bool,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 /// The file name to report: inside the swept directory, never a path that leaks
@@ -413,26 +539,40 @@ fn file_name(path: &Path) -> String {
 /// Returns `(timed_out, exit code, stdout, stderr)`. The exit code is `None` when
 /// the child could not be started or was killed by a signal, which is what
 /// distinguishes "it panicked" from "we stopped it" in [`classify`].
-fn run_child(
-    exe: &Path,
-    rom: &Path,
-    frames: u32,
-    timeout: Duration,
-    scratch: &Path,
-    index: usize,
-) -> (bool, Option<i32>, String, String) {
-    let out_path = scratch.join(format!("{index}.out"));
-    let err_path = scratch.join(format!("{index}.err"));
+fn run_child(exe: &Path, rom: &Path, pad1: Option<&str>, index: usize, pass: &Pass<'_>) -> Child {
+    let Pass {
+        frames,
+        sample,
+        timeout,
+        scratch,
+    } = *pass;
+    // One scratch pair per (ROM, pass): `one` runs a ROM twice when the first pass
+    // drew nothing, and the two passes of one ROM must not share a file with each
+    // other - or delete it out from under the other, which is how a run that said
+    // something came back saying nothing.
+    let tag = if pad1.is_some() { "gate" } else { "run" };
+    let out_path = scratch.join(format!("{index}-{tag}.out"));
+    let err_path = scratch.join(format!("{index}-{tag}.err"));
     let child = File::create(&out_path)
         .and_then(|out| File::create(&err_path).map(|err| (out, err)))
         .and_then(|(out, err)| {
-            Command::new(exe)
+            let mut command = Command::new(exe);
+            command
                 .arg("run")
                 .arg(rom)
                 .arg("--frames")
                 .arg(frames.to_string())
+                // The report's `distinct_colors` and `frame_hash` columns are the
+                // checkpoint's, whatever the run went on to do (#373).
+                .arg("--sample-frame")
+                .arg(sample.to_string())
                 .arg("--hash")
                 .arg("--colours")
+                .arg("--max-colours");
+            if let Some(pad1) = pad1 {
+                command.arg("--pad1").arg(pad1);
+            }
+            command
                 .stdout(Stdio::from(out))
                 .stderr(Stdio::from(err))
                 .spawn()
@@ -440,12 +580,12 @@ fn run_child(
     let mut child = match child {
         Ok(child) => child,
         Err(err) => {
-            return (
-                false,
-                None,
-                String::new(),
-                format!("cannot start child: {err}"),
-            );
+            return Child {
+                timed_out: false,
+                code: None,
+                stdout: String::new(),
+                stderr: format!("cannot start child: {err}"),
+            };
         }
     };
 
@@ -480,7 +620,12 @@ fn run_child(
     }
     let _ = fs::remove_file(&out_path);
     let _ = fs::remove_file(&err_path);
-    (timed_out, exit, stdout, stderr)
+    Child {
+        timed_out,
+        code: exit,
+        stdout,
+        stderr,
+    }
 }
 
 /// What one child run reported, as [`classify`] wants it.
@@ -490,8 +635,12 @@ pub struct Attempt<'a> {
     pub timed_out: bool,
     /// The child's exit code; `None` when it never ran or was killed.
     pub code: Option<i32>,
-    /// `colours=` from its stdout, if it got that far.
+    /// `colours=` from its stdout, if it got that far: the checkpoint frame.
     pub colours: Option<usize>,
+    /// `max_colours=` from its stdout: the widest frame of the run, i.e. whether
+    /// the cart ever drew. `None` when the child was not asked for it, in which
+    /// case the checkpoint count is all there is.
+    pub max_colours: Option<usize>,
     /// Its stderr, which is where a panic and an `error:` line land.
     pub stderr: &'a str,
 }
@@ -505,10 +654,13 @@ pub struct Attempt<'a> {
 /// 2. a panic is a [`Status::Panic`], and it is found in the text rather than the
 ///    exit code because 101 is also what a `headless run` that could not load its
 ///    ROM answers with - the message is what tells them apart;
-/// 3. a clean exit with a blank frame is [`Status::Blank`], and one with a
-///    picture is [`Status::Boots`]. A clean exit that reported no colour count is
-///    blank by our own rule: we asked for the number, so not having it means we
-///    cannot claim it drew anything;
+/// 3. a clean exit whose run never drew a picture is [`Status::Blank`], and one that
+///    did is [`Status::Boots`]. The number that decides it is `max_colours` when the
+///    child reported one - the widest frame of the run, because a cart that drew at
+///    frame 700 and went dark again does draw (#373) - and the checkpoint count
+///    otherwise. A clean exit that reported no colour count at all is blank by our
+///    own rule: we asked for the number, so not having it means we cannot claim it
+///    drew anything;
 /// 4. everything else is [`Status::LoadError`], named by the child's `error:` line.
 pub fn classify(attempt: &Attempt<'_>) -> (Status, String) {
     if attempt.timed_out {
@@ -520,13 +672,13 @@ pub fn classify(attempt: &Attempt<'_>) -> (Status, String) {
     }
     match attempt.code {
         Some(0) => {
-            let colours = attempt.colours.unwrap_or(0);
-            let status = if colours <= BLANK_COLOUR_LIMIT {
+            let drew = attempt.max_colours.or(attempt.colours).unwrap_or(0);
+            let status = if drew <= BLANK_COLOUR_LIMIT {
                 Status::Blank
             } else {
                 Status::Boots
             };
-            (status, format!("{colours} colours"))
+            (status, format!("{drew} colours"))
         }
         _ => (
             Status::LoadError,
@@ -576,13 +728,14 @@ fn shorten(text: &str, max: usize) -> String {
     format!("{kept}...")
 }
 
-/// `frame_hash=0x...` and `colours=N` off a child's stdout.
+/// `frame_hash=0x...`, `colours=N` and `max_colours=N` off a child's stdout.
 ///
 /// The child prints one `key=value` per flag, so this is the only place that has
-/// to know what `headless run --hash --colours` looks like.
-fn parse_report(stdout: &str) -> (Option<u64>, Option<usize>) {
+/// to know what `headless run --hash --colours --max-colours` looks like.
+fn parse_report(stdout: &str) -> (Option<u64>, Option<usize>, Option<usize>) {
     let mut frame_hash = None;
     let mut colours = None;
+    let mut max_colours = None;
     for line in stdout.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
@@ -596,14 +749,21 @@ fn parse_report(stdout: &str) -> (Option<u64>, Option<usize>) {
                 frame_hash = u64::from_str_radix(hex, 16).ok();
             }
             "colours" => colours = value.trim().parse::<usize>().ok(),
+            "max_colours" => max_colours = value.trim().parse::<usize>().ok(),
             _ => {}
         }
     }
-    (frame_hash, colours)
+    (frame_hash, colours, max_colours)
 }
 
 /// The CSV header, exactly once, before every row.
-const CSV_HEADER: &str = "file,title,serial,region,status,distinct_colors,frame_hash,seconds,notes";
+/// The CSV header, exactly once, before every row.
+///
+/// `distinct_colors` and `frame_hash` are the checkpoint frame's, unchanged from
+/// #124, so a resweep diffs against the committed table; `max_colours` and
+/// `input_gate` are #373's additions and are what a row now reads as "did this
+/// cartridge ever draw, and did it need a button held".
+const CSV_HEADER: &str = "file,title,serial,region,status,distinct_colors,max_colours,input_gate,frame_hash,seconds,notes";
 
 /// Write the full per-ROM table.
 pub fn write_csv(path: &Path, rows: &[RomResult]) -> Result<()> {
@@ -621,6 +781,8 @@ pub fn write_csv(path: &Path, rows: &[RomResult]) -> Result<()> {
             row.region.clone(),
             row.status.name().to_string(),
             row.distinct_colours.to_string(),
+            row.max_colours.to_string(),
+            row.input_gate.clone(),
             hash,
             format!("{:.3}", row.seconds),
             row.notes.clone(),
@@ -668,15 +830,18 @@ fn csv_field(text: &str) -> String {
 ///
 /// The full per-ROM table is the CSV's job; this page has to stay readable at
 /// 2775 ROMs, so a game that booted appears only as a number.
-pub fn markdown(rows: &[RomResult], frames: u32, timeout_secs: u64) -> String {
+pub fn markdown(rows: &[RomResult], frames: u32, watch: u32, timeout_secs: u64) -> String {
     let mut out = String::new();
     out.push_str("# Compatibility sweep\n\n");
     out.push_str(&format!(
         "`headless sweep` over the local ROM collection: every cartridge run for {frames} frames \
-         in its own child process with a {timeout_secs}s wall-clock limit. `Boots` means the run \
-         finished and its last frame had more than {limit} distinct colours, which is a claim \
-         about the machine, not about the game: no row here says the picture is right, only that \
-         something was drawn. The full per-ROM table is \
+         of checkpoint and on to {watch} frames in its own child process with a \
+         {timeout_secs}s wall-clock limit. `Boots` means the run finished and some frame of it \
+         held more than {limit} distinct colours - any frame, not the one at {frames} - which is \
+         a claim about the machine, not about the game: no row here says the picture is right, \
+         only that something was drawn. A cart that drew nothing across the whole run is run \
+         again with a START press, and the gate that worked is named in the CSV's `input_gate` \
+         column. The full per-ROM table is \
          [`compat.csv`](compat.csv); this page lists the problems.\n\n",
         limit = BLANK_COLOUR_LIMIT,
     ));
@@ -689,6 +854,30 @@ pub fn markdown(rows: &[RomResult], frames: u32, timeout_secs: u64) -> String {
         }
     }
     out.push('\n');
+
+    // Carts that only drew once a button was held: `Boots`, but the report says so
+    // rather than folding them in (#373).
+    let gated: Vec<&RomResult> = rows
+        .iter()
+        .filter(|row| !row.input_gate.is_empty())
+        .collect();
+    if !gated.is_empty() {
+        out.push_str(&format!(
+            "### Boots with input ({} - drew nothing unperturbed, drew once {gate} was held)\n\n",
+            gated.len(),
+            gate = DEFAULT_INPUT_GATE,
+        ));
+        out.push_str("| ROM | Title | Notes |\n|---|---|---|\n");
+        for row in gated {
+            out.push_str(&format!(
+                "| `{}` | {} | {} |\n",
+                row.file,
+                markdown_cell(&row.title),
+                markdown_cell(&row.notes)
+            ));
+        }
+        out.push('\n');
+    }
 
     for status in STATUS_ORDER {
         if !status.is_problem() {
@@ -732,7 +921,20 @@ mod tests {
             timed_out: false,
             code,
             colours,
+            max_colours: colours,
             stderr,
+        }
+    }
+
+    /// An `Attempt` whose checkpoint frame and widest frame disagree, which is the
+    /// whole of #373: the sampled frame was dark and another one was not.
+    fn run_at(checkpoint: Option<usize>, peak: Option<usize>) -> Attempt<'static> {
+        Attempt {
+            timed_out: false,
+            code: Some(0),
+            colours: checkpoint,
+            max_colours: peak,
+            stderr: "",
         }
     }
 
@@ -742,6 +944,7 @@ mod tests {
             timed_out: true,
             code: None,
             colours: Some(40),
+            max_colours: Some(40),
             stderr: "error: killed\n",
         };
         let (status, notes) = classify(&attempt);
@@ -777,6 +980,27 @@ mod tests {
             notes.contains("No such file"),
             "the note should name the failure: {notes}"
         );
+    }
+
+    /// The #373 case: frame 600 was mid-fade and frame 700 was a picture, so the
+    /// run drew and the report has to say `Boots` off the run, not the checkpoint.
+    #[test]
+    fn classify_calls_a_rom_that_drew_away_from_the_checkpoint_boots() {
+        let (status, notes) = classify(&run_at(Some(2), Some(33)));
+        assert_eq!(status, Status::Boots, "a frame of the run was a picture");
+        assert_eq!(
+            notes, "33 colours",
+            "the note names the widest frame: {notes}"
+        );
+    }
+
+    #[test]
+    fn classify_calls_a_run_blank_only_when_no_frame_of_it_drew() {
+        assert_eq!(classify(&run_at(Some(1), Some(1))).0, Status::Blank);
+        assert_eq!(classify(&run_at(Some(1), Some(4))).0, Status::Blank);
+        assert_eq!(classify(&run_at(Some(1), Some(5))).0, Status::Boots);
+        // The checkpoint alone decides when the child was not asked for a peak.
+        assert_eq!(classify(&run_at(Some(40), None)).0, Status::Boots);
     }
 
     #[test]
@@ -822,10 +1046,13 @@ mod tests {
 
     #[test]
     fn parse_report_reads_the_two_lines_a_child_prints() {
-        let stdout = "frame_hash=0x0001020304050607\ncolours=42\n";
-        assert_eq!(parse_report(stdout), (Some(0x0001020304050607), Some(42)));
-        assert_eq!(parse_report(""), (None, None));
-        assert_eq!(parse_report("nonsense\n"), (None, None));
+        let stdout = "frame_hash=0x0001020304050607\ncolours=42\nmax_colours=57\n";
+        assert_eq!(
+            parse_report(stdout),
+            (Some(0x0001020304050607), Some(42), Some(57))
+        );
+        assert_eq!(parse_report(""), (None, None, None));
+        assert_eq!(parse_report("nonsense\n"), (None, None, None));
     }
 
     #[test]
@@ -853,6 +1080,8 @@ mod tests {
             region: "usa".to_string(),
             status,
             distinct_colours: 0,
+            max_colours: 0,
+            input_gate: String::new(),
             frame_hash: None,
             seconds: 1.0,
             notes: notes.to_string(),
@@ -867,7 +1096,7 @@ mod tests {
             row("noisy.md", Status::Panic, "index out of bounds"),
             row("dark.md", Status::Blank, "1 colours"),
         ];
-        let text = markdown(&rows, 600, 30);
+        let text = markdown(&rows, 600, 1800, 30);
 
         // A summary table of counts per status.
         assert!(
@@ -904,7 +1133,7 @@ mod tests {
     #[test]
     fn markdown_report_keeps_a_title_on_one_line() {
         let rows = vec![row("bad.md", Status::Panic, "line one\n| line two")];
-        let text = markdown(&rows, 600, 30);
+        let text = markdown(&rows, 600, 1800, 30);
         let lines: Vec<&str> = text
             .lines()
             .filter(|line| line.contains("bad.md"))
@@ -927,6 +1156,10 @@ mod tests {
         let text = fs::read_to_string(&path).expect("read csv");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], CSV_HEADER);
+        assert!(
+            CSV_HEADER.contains("max_colours") && CSV_HEADER.contains("input_gate"),
+            "the #373 fields are columns of their own: {CSV_HEADER}"
+        );
         assert_eq!(lines.len(), 2, "one row per ROM:\n{text}");
         assert!(lines[1].starts_with("a.md,"));
         fs::remove_dir_all(&dir).expect("clean temp dir");
