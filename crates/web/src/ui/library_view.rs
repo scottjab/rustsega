@@ -25,6 +25,7 @@ use crate::library::OVERSCAN;
 use crate::library::ROW_HEIGHT_PX;
 use crate::library::RegionFilter;
 use crate::library::RomEntry;
+use crate::library::entry_at;
 use crate::library::format_count;
 use crate::library::format_size;
 use crate::library::parse_tags;
@@ -179,9 +180,10 @@ pub fn LibraryView() -> impl IntoView {
                     view! {
                         <ul class="library__track" role="list" style:height=format!("{height}px")>
                             {rows
-                                .filter_map(|index| {
-                                    library.with_entries(|all| all.get(index).cloned())
-                                        .map(|entry| (entry, index))
+                                .filter_map(|row| {
+                                    library.with_entries(|all| {
+                                        entry_at(all, &shown, row).cloned().map(|entry| (entry, row))
+                                    })
                                 })
                                 .map(|(entry, index)| {
                                     let loading = fetching.as_deref() == Some(entry.id.as_str());
@@ -280,8 +282,8 @@ pub fn LibraryEntry() -> impl IntoView {
 
 /// The id of the first row of the current result, for `Enter` in the search box.
 fn first_shown(library: &Library) -> Option<String> {
-    let index = *library.shown().get_untracked().first()?;
-    library.with_entries(|all| all.get(index).map(|entry| entry.id.clone()))
+    let shown = library.shown().get_untracked();
+    library.with_entries(|all| entry_at(all, &shown, 0).map(|entry| entry.id.clone()))
 }
 
 /// Moves the focus to the first row of the list.

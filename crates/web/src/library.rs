@@ -268,6 +268,20 @@ pub fn visible_window(
     first as usize..last as usize
 }
 
+/// The entry a row of the virtualized window shows.
+///
+/// `visible_window` counts rows of the *filtered* list, so a row number reaches an
+/// entry by way of `shown` - and the two are the same number only before a search.
+/// Confusing them is a list that shows one game and launches another, which is what
+/// the browser found the first time this was written.
+pub fn entry_at<'a>(
+    all: &'a [RomEntry],
+    shown: &'a [usize],
+    row: usize,
+) -> Option<&'a RomEntry> {
+    all.get(*shown.get(row)?)
+}
+
 /// The height of one row of the library list, in CSS pixels.
 ///
 /// `style.css` sets `--library-row` to the same number, and the rows are absolutely
@@ -784,6 +798,19 @@ mod tests {
         assert_eq!(visible_window(100, 0.0, 0.0, 400.0, 3), 0..0);
         assert_eq!(visible_window(100, 0.0, f64::NAN, 400.0, 3), 0..0);
         assert_eq!(visible_window(100, f64::NAN, 40.0, 400.0, 3), 0..0);
+    }
+
+    /// A row of the window is a row of the *filtered* list: the entry it shows is
+    /// `shown[row]` steps into the listing, not the listing's own `row`.
+    #[test]
+    fn a_row_of_the_window_is_a_row_of_the_filtered_list() {
+        let all = collection();
+        let shown = filter_roms(&all, "sonic", RegionFilter::Japan);
+        assert_eq!(entry_at(&all, &shown, 0).map(|entry| entry.name.as_str()), Some("Sonic The Hedgehog 2 (World)"));
+        assert_eq!(entry_at(&all, &shown, 1).map(|entry| entry.name.as_str()), Some("Sonic 3D Blast (Japan)"));
+        assert_eq!(entry_at(&all, &shown, 2), None);
+        // And past the end of a window the list simply stops.
+        assert_eq!(entry_at(&all, &shown, 99), None);
     }
 
     #[test]
