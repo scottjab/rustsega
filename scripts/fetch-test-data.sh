@@ -20,9 +20,12 @@ set -euo pipefail
 
 # name | pinned URL | archive sha256 | subdir to keep | destination under test-roms/ | kind
 #
-# `kind` is `tar` (the default when the field is left off) or `zip`. A `tar`
-# row keeps only `subdir` from inside the archive; a `zip` row is unpacked
-# whole, so its `subdir` field is `-`.
+# `kind` is `tar` (the default when the field is left off), `zip` or `raw`.
+# A `tar` row keeps only `subdir` from inside the archive; a `zip` row is
+# unpacked whole, so its `subdir` field is `-`; a `raw` row is a single file
+# with nothing to unpack, and `subdir` becomes the name it lands as under
+# `dest` - which is how a source whose own file name has spaces and parens
+# still ends up on a path the tests can address without quoting.
 MANIFEST=(
   # SingleStepTests/680x0 @ e0d5ece9670205cc84a0101081837deb446f86a3 (main)
   "680x0|https://github.com/SingleStepTests/680x0/archive/e0d5ece9670205cc84a0101081837deb446f86a3.tar.gz|f90dab5ba7519c6d9e20143be12e433403b6db6586f6bae3e5d3bf0123f01b50|68000/v1|680x0"
@@ -40,6 +43,13 @@ MANIFEST=(
   # ZEXDOC and ZEXALL, Frank D. Cringle's CP/M Z80 exercisers, the suite ticket
   # M2-16 asks for. zexdoc.com is gone; mdfs.net has hosted these since 2003.
   "zexall-cpm|https://mdfs.net/Software/Z80/Exerciser/CPM.zip|e0f4e6af6c88764a615e0d9fa27b9bf9a2162bd77ac7492fd1f2d4fa9cdfb3bb|-|z80/zexall-cpm|zip"
+  # Paul Lee's Berzerk v1 (2010): the one genuine SMD dump available to us, so
+  # that the interleave direction of crates/genesis/src/cart/smd.rs is tested
+  # against a real copier image and not only against round trips (#252). Raw
+  # SMD, not an archive. Public domain is asserted by the title and by
+  # Zophar's Domain listing it under "ROMs (Public Domain)"; the basis, and its
+  # weaknesses, are written up in docs/test-roms.md.
+  "berzerk-smd|https://archive.org/download/255-sega-genesis-homebrew-games/HOMEBREWS/Berzerk%20%28PD%29%20v1%20Paul%20Lee%202010.smd|9458a702d4fdb065947045d62aac0f362727117c250a68ceac3c9104922d132e|berzerk-pd-v1.smd|genesis/berzerk-smd|raw"
 )
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,7 +74,7 @@ With no arguments every suite in the manifest is fetched; otherwise only the
 named suites are. Idempotent: a suite whose stamp file already matches the
 pinned SHA-256 is reported "up to date" and nothing is downloaded.
 
-Suites: 680x0, z80, md-test-pack, overdrive2, zexall-cpm
+Suites: 680x0, z80, md-test-pack, overdrive2, zexall-cpm, berzerk-smd
 See docs/test-roms.md for what each one is and what it is good for.
 
 Environment:
@@ -120,6 +130,14 @@ fetch_suite() {
       archive="$CACHE_DIR/$name.tar.gz"
       ;;
     zip) archive="$CACHE_DIR/$name.zip" ;;
+    # A raw row writes `subdir` itself, so it has to be a bare file name. The
+    # cached file is the ROM, and the suffix is only a cache label: the pinned
+    # SHA-256 is what authenticates it.
+    raw)
+      [[ "$subdir" != '-' && "$subdir" != */* && "$subdir" != *..* ]] ||
+        die "$name: a raw row needs a plain file name, not '$subdir'"
+      archive="$CACHE_DIR/$name.smd"
+      ;;
     *) die "$name: unknown archive kind '$kind'" ;;
   esac
 
@@ -161,6 +179,7 @@ fetch_suite() {
         --wildcards --strip-components=1 -- "*/$subdir/*"
       ;;
     zip) unzip -q -o "$archive" -d "$dest" ;;
+    raw) cp "$archive" "$dest/$subdir" ;;
   esac
 
   local count
