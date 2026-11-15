@@ -177,6 +177,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     let region = resolved_region(&rom, &config)?;
     let movie = read_movie(args.movie.as_deref(), &rom, region)?;
     let pads = parse_pad_script(args.pad1.as_deref())?;
+    warn_past_the_last_frame(&pads, args.frames);
     // The recorder records what the machine is handed, frame by frame; it starts
     // empty and `Movie::record` keeps only the frames that change.
     let mut recorder = args
@@ -253,12 +254,16 @@ pub fn run(args: RunArgs) -> Result<()> {
     let pixels = captured.as_slice();
     if let Some(path) = &args.dump_png {
         if path.is_dir() {
-            // Worth saying here rather than letting `testkit::dump_png` panic on
-            // the `File::create` inside it: a panic is not how a command line
-            // tool should answer `--dump-png /tmp`.
+            // Worth saying here rather than leaving it to the `File::create` inside
+            // `testkit::dump_png`: "is a directory" reads better than an OS error,
+            // and this is the one failure worth naming for the flag.
             bail!("--dump-png: {} is a directory", quote(path));
         }
-        testkit::dump_png(path, pixels, width, height);
+        // Everything else that can stop a PNG being written - a read-only
+        // filesystem, a parent that cannot hold one, the disk full - comes back
+        // from `dump_png` now instead of panicking inside it (#345).
+        testkit::dump_png(path, pixels, width, height)
+            .with_context(|| format!("--dump-png: cannot write {}", quote(path)))?;
     }
     if args.hash {
         let hash = testkit::frame_hash(pixels, width, height);
@@ -413,6 +418,29 @@ fn parse_pad_script(script: Option<&str>) -> Result<BTreeMap<u32, Buttons>> {
         }
     }
     Ok(pads)
+}
+
+/// Say so when `--pad1` presses a button on a frame the run never reaches (#345).
+///
+/// The loop that hands the pad to the machine runs `1..=frames`, so an entry past
+/// the end is looked up by nothing: `--pad1 START@1200 --frames 300` held nothing,
+/// ran clean, and never mentioned it. A warning on stderr rather than an error,
+/// because a script left over from a longer run is a person shortening a run, and
+/// the frames it does name are still worth running.
+fn warn_past_the_last_frame(pads: &BTreeMap<u32, Buttons>, frames: u32) {
+    let past: Vec<String> = pads
+        .keys()
+        .filter(|frame| **frame > frames)
+        .map(|frame| frame.to_string())
+        .collect();
+    if past.is_empty() {
+        return;
+    }
+    eprintln!(
+        "warning: --pad1 holds nothing on frame{} {}, past --frames {frames}",
+        if past.len() == 1 { "" } else { "s" },
+        past.join(", ")
+    );
 }
 
 /// The buttons `--pad1` can hold, by the name it spells them with: the eight of

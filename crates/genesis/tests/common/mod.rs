@@ -238,7 +238,8 @@ pub fn run_and_check(run: RomRun<'_>) {
         pixels,
         frame.width,
         frame.height,
-    );
+    )
+    .unwrap();
 
     let hash = testkit::frame_hash(pixels, frame.width, frame.height);
     testkit::assert_golden(&golden_path(run.golden_file), run.key, hash);

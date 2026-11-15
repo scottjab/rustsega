@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// FNV-1a 64 offset basis.
@@ -191,7 +192,14 @@ fn assert_golden_inner(path: &Path, key: &str, actual: u64, bless: bool) {
 ///
 /// `0xAABBGGRR` in memory is already R, G, B, A on disk, so the bytes go
 /// straight to the encoder.
-pub fn dump_png(path: &Path, pixels: &[u32], width: usize, height: usize) {
+///
+/// Fails as an [`io::Error`] rather than a panic (#345). Only the pixel count is
+/// the caller's mistake and so stays a `debug_assert`; everything else here is
+/// the filesystem refusing, and `rustsega run --dump-png` is a command line tool,
+/// for which a read-only filesystem or a parent that cannot hold a file is an
+/// answer to print and an exit status, not a crash. Callers that are tests use
+/// `.unwrap()`, which is what this function already did for them.
+pub fn dump_png(path: &Path, pixels: &[u32], width: usize, height: usize) -> io::Result<()> {
     debug_assert_eq!(
         pixels.len(),
         width * height,
@@ -200,8 +208,7 @@ pub fn dump_png(path: &Path, pixels: &[u32], width: usize, height: usize) {
         pixels.len()
     );
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .unwrap_or_else(|e| panic!("{}: cannot create parent dir: {e}", path.display()));
+        fs::create_dir_all(parent)?;
     }
 
     let mut rgba = Vec::with_capacity(pixels.len() * 4);
@@ -209,17 +216,19 @@ pub fn dump_png(path: &Path, pixels: &[u32], width: usize, height: usize) {
         rgba.extend_from_slice(&pixel.to_le_bytes());
     }
 
-    let file = fs::File::create(path)
-        .unwrap_or_else(|e| panic!("{}: cannot create png: {e}", path.display()));
+    let file = fs::File::create(path)?;
     let mut encoder = png::Encoder::new(file, width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
-    let mut writer = encoder
-        .write_header()
-        .unwrap_or_else(|e| panic!("{}: cannot write png header: {e}", path.display()));
-    writer
-        .write_image_data(&rgba)
-        .unwrap_or_else(|e| panic!("{}: cannot write png pixels: {e}", path.display()));
+    let mut writer = encoder.write_header().map_err(png_failed)?;
+    writer.write_image_data(&rgba).map_err(png_failed)?;
+    Ok(())
+}
+
+/// An encoder failure as an [`io::Error`], so that writing a PNG has one failure
+/// type. The encoder only fails because the file underneath it did.
+fn png_failed(error: png::EncodingError) -> io::Error {
+    io::Error::other(error)
 }
 
 #[cfg(test)]
@@ -394,7 +403,7 @@ mod tests {
         let path = dir.join("frame.png");
         // Opaque red, green, blue, white.
         let pixels = [0xFF00_00FFu32, 0xFF00_FF00, 0xFFFF_0000, 0xFFFF_FFFF];
-        dump_png(&path, &pixels, 2, 2);
+        dump_png(&path, &pixels, 2, 2).expect("dump a png");
 
         let file = fs::File::open(&path).expect("open dumped png");
         let decoder = png::Decoder::new(std::io::BufReader::new(file));
