@@ -160,6 +160,20 @@ format should read the row above first: those poles belong to this build's sampl
 rate, so a state carrying them would be a state that changes what a console sounds
 like depending on where the slot came from, which is exactly what #127 ruled out.
 
+That settling window is a concession about one measurement, and the two guarantees
+are worth keeping apart (#451). It exists because the tests that need it compare a
+restore against a run that never stopped: the reference carried its filter memory
+through the frame it is being compared at and the restored console dropped its.
+Between two restores there is no uninterrupted side. `Mixer::seek` puts both mixers
+on the same grid point from the same state, so two consoles that have run
+completely differently and are then loaded with one state are bit-exact from the
+first frame after the load, with no window and no allowance -
+`commercial_two_consoles_loaded_with_one_state_are_one_console` holds it on all
+nineteen carts. That, and not the windowed number, is what a save slot promises.
+The split is not hypothetical: removing the `FilterState` reset from `Mixer::seek`
+left the windowed fresh-console test passing all nineteen carts, and only the
+windowless comparison noticed.
+
 ## Errors
 
 `Genesis::load_state` answers with `StateError`, and every check is answered

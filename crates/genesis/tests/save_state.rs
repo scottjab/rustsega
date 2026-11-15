@@ -409,9 +409,18 @@ const AFTER: u32 = 120;
 ///
 /// The window is about this asymmetry only, and not about a limit in the restore.
 /// Two consoles loaded with the same state have no uninterrupted side to be
-/// measured against, so they should agree exactly from the first frame after the
-/// load - the stronger property of
-/// [#451](https://github.com/scottjab/rustsega/issues/451).
+/// measured against, so they agree from the very first frame after the load:
+/// [`commercial_two_consoles_loaded_with_one_state_are_one_console`] holds that
+/// with no allowance at all, on all nineteen carts
+/// ([#451](https://github.com/scottjab/rustsega/issues/451)).
+///
+/// It is worth saying that the two were checked apart rather than assumed to be
+/// the same claim, because a window makes them easy to confuse. With the
+/// `FilterState` reset in [`crate::audio::Mixer::seek`] removed - the one thing
+/// the exactness rests on - this file's windowed fresh-console test still passed
+/// all nineteen carts, quite blind to it; only the windowless comparison failed,
+/// on every cart, at frame +1. A settling window is a concession about how a
+/// measurement is taken, and nothing at all is conceded here.
 ///
 /// This is not a licence to ignore the mixer. Every frame after the window is
 /// compared sample for sample, the sample *count* of every frame is compared
@@ -436,6 +445,22 @@ struct Compare {
     /// [#362](https://github.com/scottjab/rustsega/issues/362): the defect was
     /// four frames of no samples at all, and it is caught on the frame it happens.
     host_audio: bool,
+    /// Both sides of the comparison went through [`Genesis::load_state`], so this
+    /// is a restore measured against a restore and not against a run that never
+    /// stopped
+    /// ([#451](https://github.com/scottjab/rustsega/issues/451)).
+    ///
+    /// That is what entitles it to drop the settling window. The window exists
+    /// because one side of the other three comparisons kept mixing all the way to
+    /// the frame it is being compared at and the other had its filter memory
+    /// dropped by the load; between two restores there is no uninterrupted side,
+    /// because both mixers were re-anchored by the same [`crate::audio::Mixer::seek`]
+    /// from the same state, and so both start from default poles at the same point
+    /// on the output grid. Any difference between them is not a filter settling.
+    ///
+    /// Only ever true with [`Compare::host_audio`], since it is a rule about the
+    /// mixed output.
+    both_sides_restored: bool,
 }
 
 /// One frame of a run, as the round trip judges it.
@@ -558,8 +583,10 @@ impl FrameStamp {
                     want.mixed_len, self.mixed_len
                 ));
             }
-            // And the samples, from the frame the mixer's filters have settled by.
-            if self.settled() && self.mixed != want.mixed {
+            // And the samples, from the frame the mixer's filters have settled by
+            // - unless both sides are restores, which allows no window at all:
+            // see [`Compare::both_sides_restored`].
+            if (judge.both_sides_restored || self.settled()) && self.mixed != want.mixed {
                 moved.push(format!("output {:x} {:x}", want.mixed, self.mixed));
             }
         }
@@ -590,6 +617,11 @@ fn divergences(before: &[FrameStamp], after: &[FrameStamp], judge: Compare) -> V
 /// `None` when the cartridge is not on disk: a skip, never a failure, because CI
 /// has no games (docs/TESTING.md, "External test data").
 fn round_trip(game: &Game, judge: Compare) -> Option<Vec<String>> {
+    // A restore against a restore is a different pair of consoles to build, not
+    // the same pair compared differently: both sides have to have been loaded.
+    if judge.both_sides_restored {
+        return two_restores(game, judge);
+    }
     let rom = testkit::commercial_rom(&format!("{}.md", game.prefix))?;
     let bytes = read_rom(&rom)?;
     let inputs: Vec<(u32, Buttons)> = game
@@ -653,6 +685,73 @@ fn round_trip(game: &Game, judge: Compare) -> Option<Vec<String>> {
     let after = run_stamped(&mut restored, SAVE_AT + 1, AFTER, &inputs);
 
     Some(divergences(&before, &after, judge))
+}
+
+/// How far past the state the console that wrote it runs before putting it back.
+///
+/// That run *is* the test. It is what gives the console a mixer that has mixed -
+/// filter poles full of a past the state does not carry - and a machine
+/// [`RUN_ON_PAST`] frames further along than the one the state describes. Put
+/// back, it has to become the console that never ran, and not approximately.
+const RUN_ON_PAST: u32 = 60;
+
+/// One game, both sides a restore: see
+/// [`commercial_two_consoles_loaded_with_one_state_are_one_console`] for the claim
+/// and [`Compare::both_sides_restored`] for why it is checked without the settling
+/// window the other three tests allow.
+///
+/// [`Compare::into_a_fresh_console`] is not consulted: this comparison has a fresh
+/// console by construction, on one side, and one that has run, on the other.
+fn two_restores(game: &Game, judge: Compare) -> Option<Vec<String>> {
+    let rom = testkit::commercial_rom(&format!("{}.md", game.prefix))?;
+    let bytes = read_rom(&rom)?;
+    let inputs: Vec<(u32, Buttons)> = game
+        .start_press
+        .iter()
+        .map(|&frame| (frame, Buttons::START))
+        .collect();
+
+    // The side with a history: the state taken at [`SAVE_AT`], then
+    // [`RUN_ON_PAST`] frames of game on top of it.
+    let mut machine = run_bytes(&bytes, SAVE_AT, &inputs);
+    let state = machine.save_state();
+    run_stamped(&mut machine, SAVE_AT + 1, RUN_ON_PAST, &inputs);
+    assert_ne!(
+        machine.save_state(),
+        state,
+        "{}: {RUN_ON_PAST} frames of running left the machine exactly as it was, so \
+         loading the state back into it would say nothing about a console with a \
+         history to lose",
+        game.key,
+    );
+
+    // Both sides now hold the one state: one console has run past it and the other
+    // has never run at all.
+    let mut had_run = machine;
+    had_run
+        .load_state(&state)
+        .unwrap_or_else(|e| panic!("{}: a state this console wrote was refused: {e}", game.key));
+    let mut never_ran = Genesis::new(&bytes, Config::default())
+        .unwrap_or_else(|e| panic!("{}: cannot build a second console: {e}", game.key));
+    never_ran
+        .load_state(&state)
+        .unwrap_or_else(|e| panic!("{}: a state was refused by a fresh console: {e}", game.key));
+
+    // The machine half of the claim, before the frames of output that are the
+    // audio half: two consoles that are not the same machine here are not going to
+    // be the same machine's sound later, and the frame list below would not say so
+    // in a way anyone could act on.
+    assert_eq!(
+        never_ran.save_state(),
+        had_run.save_state(),
+        "{}: two consoles loaded with one state do not describe themselves as the same \
+         machine, so a load left something of the console it went into behind",
+        game.key,
+    );
+
+    let from_history = run_stamped(&mut had_run, SAVE_AT + 1, AFTER, &inputs);
+    let from_nothing = run_stamped(&mut never_ran, SAVE_AT + 1, AFTER, &inputs);
+    Some(divergences(&from_history, &from_nothing, judge))
 }
 
 /// A cart held out of the round trip for a cause that is not the save state.
@@ -799,6 +898,7 @@ fn commercial_save_state_round_trip_is_deterministic() {
     round_trip_sweep(Compare {
         into_a_fresh_console: false,
         host_audio: false,
+        both_sides_restored: false,
     });
 }
 
@@ -834,6 +934,7 @@ fn commercial_save_state_transplants_to_a_fresh_console() {
     round_trip_sweep(Compare {
         into_a_fresh_console: true,
         host_audio: true,
+        both_sides_restored: false,
     });
 }
 
@@ -862,5 +963,47 @@ fn commercial_save_state_is_audible_after_a_load() {
     round_trip_sweep(Compare {
         into_a_fresh_console: false,
         host_audio: true,
+        both_sides_restored: false,
+    });
+}
+
+/// What a save slot actually promises, stated exactly: load this state, and you get
+/// this console, whatever the console was doing first
+/// ([#451](https://github.com/scottjab/rustsega/issues/451)).
+///
+/// The state is taken at frame [`SAVE_AT`]. One console that wrote it then runs on
+/// for [`RUN_ON_PAST`] frames and is loaded back with it; a second console built
+/// from the same ROM, which has never mixed a sample in its life, is loaded with
+/// that same state. From there the two run [`AFTER`] frames on the same pads, and
+/// every one of them is compared - picture, chip sound, mixed sample count and the
+/// mixed samples themselves - with **no settling allowance at all**.
+///
+/// That is the whole of the difference from the other three tests, and it is the
+/// stronger claim. `MIXER_SETTLE_FRAMES` exists because those three measure a
+/// restore against a run that never stopped: the reference kept its filter memory
+/// across the frame being compared at and the restored console dropped its, which
+/// costs a decaying difference and nothing else. Here both sides dropped theirs at
+/// the same moment, from [`crate::audio::Mixer::seek`], at the same point on the
+/// output grid, and neither has an uninterrupted past to be measured against. So
+/// this test is exact from frame `SAVE_AT + 1`, the first one after the load.
+///
+/// Which is what makes it worth having separately. The mixer is deliberately not
+/// in the state (`crate::state`) - it is the host's output path - so the only thing
+/// guaranteeing that a load puts a console's sound in the same place regardless of
+/// what that console had been doing is `seek`, and this is the test that says
+/// `seek` does it. A divergence here is not a filter taking its time and cannot be
+/// waved through: it is the re-anchor depending on the console's history, which is
+/// exactly the thing the dropping of `FilterState` in `seek` exists to prevent.
+///
+/// Needs cartridges, so CI skips it and `just test-commercial` runs it.
+#[test]
+#[ignore = "needs commercial ROMs; run with `just test-commercial`"]
+fn commercial_two_consoles_loaded_with_one_state_are_one_console() {
+    round_trip_sweep(Compare {
+        // `two_restores` has a fresh console by construction and does not read
+        // this; true is what one side of it is.
+        into_a_fresh_console: true,
+        host_audio: true,
+        both_sides_restored: true,
     });
 }
