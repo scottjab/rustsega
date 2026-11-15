@@ -32,6 +32,7 @@ mod interrupts;
 mod ops;
 mod sr;
 mod trace;
+mod trail;
 
 /// Always compiled, not `#[cfg(test)]`: integration tests under
 /// `crates/m68k/tests/` and other crates need `m68k::testbus::TestBus` too.
@@ -47,3 +48,4 @@ pub use exceptions::{
     trap_vector,
 };
 pub use sr::{CCR_MASK, SR_C, SR_INT_MASK, SR_MASK, SR_N, SR_RESET, SR_S, SR_T, SR_V, SR_X, SR_Z};
+pub use trail::{TRAIL_LEN, Trail};

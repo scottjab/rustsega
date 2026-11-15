@@ -923,6 +923,7 @@ dependencies = [
  "clap",
  "flate2",
  "genesis",
+ "m68k",
  "sn76489",
  "testkit",
  "ym2612",

@@ -149,6 +149,31 @@ pub struct RunArgs {
     /// frames back.
     #[arg(long, value_name = "PATH")]
     pub record: Option<PathBuf>,
+    /// Print the 68000's instruction trail when it next runs at `ADDR`, and stop.
+    ///
+    /// #436: the black carts that park on a `BRA self` or a `STOP` in their own
+    /// boot code are indistinguishable from a running one once they stop
+    /// branching, so the question - which address branched into the halt - can
+    /// only be answered by a recorder that was running beforehand. The trail is
+    /// the last [`m68k::TRAIL_LEN`] executed addresses, oldest first, each
+    /// disassembled from the cartridge image when it lands there.
+    ///
+    /// The run stops on the frame that reaches `ADDR`, because the trail froze
+    /// there and the frames after it can add nothing. If `ADDR` is never reached
+    /// the trail of the whole run - the last instructions it ran - is printed
+    /// anyway, under a line saying so.
+    #[arg(long, value_name = "ADDR", value_parser = parse_hex_address)]
+    pub trace_to: Option<u32>,
+}
+
+/// `--trace-to` takes a 68000 address in hex, with or without the `0x`.
+///
+/// Hex and nothing else: an address is read out of a disassembly, and accepting
+/// `200` as decimal would make the same spelling mean two things.
+fn parse_hex_address(value: &str) -> Result<u32, String> {
+    let text = value.trim();
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+    u32::from_str_radix(digits, 16).map_err(|_| format!("{value:?} is not a hex address"))
 }
 
 /// Run the machine `args` describes and report it.
@@ -188,6 +213,11 @@ pub fn run(args: RunArgs) -> Result<()> {
     let sample_rate = config.sample_rate;
     let mut machine = Genesis::new(&rom, config)
         .with_context(|| format!("cannot run ROM {}", quote(&args.rom)))?;
+    // Armed after the load, because [`Genesis::new`] resets and a trail armed
+    // before it would have recorded a machine that no longer exists.
+    if let Some(addr) = args.trace_to {
+        machine.arm_cpu_trail(Some(addr));
+    }
 
     // Audio is only collected when someone asked for it: `drain_audio` mixes and
     // resamples every call, and a `--hash`-only run has nowhere to put the
@@ -208,9 +238,13 @@ pub fn run(args: RunArgs) -> Result<()> {
     let mut reported: Option<(usize, usize, Vec<u32>)> = None;
 
     let started = Instant::now();
+    // Frames actually run, which is `args.frames` unless `--trace-to` stopped
+    // early on the frame that froze its trail.
+    let mut ran = 0_u32;
     // 1-based, so that a script written as `START@1` means the first frame. The
     // pad is set before the frame runs: a button is held *during* a frame.
     for frame in 1..=args.frames {
+        ran = frame;
         let held = pads.get(&frame).copied().unwrap_or_else(Buttons::empty);
         if let Some(movie) = &movie {
             // Movie frames are 0-based and this loop is 1-based: `--pad1 A@1` and
@@ -227,6 +261,11 @@ pub fn run(args: RunArgs) -> Result<()> {
             // After the frame, so the buffer holds the raster the machine just
             // ran through rather than the one before it.
             machine.drain_audio(&mut audio);
+        }
+        if machine.cpu().trail_caught() {
+            // The trail is frozen, so every frame from here records nothing the
+            // caller asked for and costs the whole of the run budget.
+            break;
         }
         if want_peak || frame == sample {
             let picture = machine.frame();
@@ -284,12 +323,47 @@ pub fn run(args: RunArgs) -> Result<()> {
         println!("audio_hash=0x{hash:016x}");
     }
 
-    eprintln!(
-        "{summary} frames={} time={:.3}s",
-        args.frames,
-        elapsed.as_secs_f64()
-    );
+    if let Some(addr) = args.trace_to {
+        let trail = machine.cpu().trail().expect("--trace-to arms a trail");
+        if trail.caught() {
+            println!(
+                "trace_to=0x{addr:06x} caught frame {ran} entries={}",
+                trail.entries().len()
+            );
+        } else {
+            println!(
+                "trace_to=0x{addr:06x} not reached in {ran} frames, showing the end of the run:"
+            );
+        }
+        for entry in trail.entries() {
+            println!("{}", trail_line(machine.bus().rom.as_slice(), entry));
+        }
+    }
+
+    eprintln!("{summary} frames={ran} time={:.3}s", elapsed.as_secs_f64());
     Ok(())
+}
+
+/// One line of a `--trace-to` trail: the address, and the instruction there when
+/// the address is inside the cartridge image.
+///
+/// The image is only mapped at 0, so a trail entry in work RAM or in I/O space
+/// prints as the bare address - which is itself information: the cart was not
+/// running cartridge code at that moment.
+fn trail_line(rom: &[u8], addr: u32) -> String {
+    let start = addr as usize;
+    if start + 2 > rom.len() {
+        return format!("0x{addr:06x}");
+    }
+    let end = rom.len().min(start + 8);
+    let words: Vec<u16> = rom[start..end]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
+        .collect();
+    let (text, _len) = m68k::disassemble(&words, addr);
+    format!("0x{addr:06x}  {text}")
 }
 
 /// Read a ROM image off disk, naming the path in every failure: "No such file

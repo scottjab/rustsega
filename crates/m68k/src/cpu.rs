@@ -7,6 +7,7 @@
 use crate::address_error::{AccessKind, PendingFault};
 use crate::bus::{ADDR_MASK, Bus};
 use crate::sr::{CCR_MASK, SR_C, SR_INT_MASK, SR_MASK, SR_N, SR_RESET, SR_S, SR_V, SR_X, SR_Z};
+use crate::trail::Trail;
 
 // Serialising the CPU state for save states (M6-07a, #126). Gated on the crate's
 // `serde` feature so `cargo build --no-default-features` keeps the core with no
@@ -96,7 +97,10 @@ pub(crate) const INTERNAL_RESULT_WRITE_CLOCKS: u32 = 2;
 ///
 /// The `serde` derive carries the whole struct — every field is chip state a
 /// save state has to restore, including the prefetch queue and the pending
-/// faults — and there is nothing here to skip: the CPU holds no tables.
+/// faults — and the CPU holds no tables. The one [`crate::cpu::M68k`] field that
+/// is not serialized is the diagnostic [`crate::trail::Trail`] of
+/// [`M68k::trail`]: a host-side instrument, left out of a save state like the
+/// `Bus`'s ROM image is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct M68k {
@@ -216,6 +220,16 @@ pub struct M68k {
     /// [`crate::EXC_ADDRESS_ERROR`] and [`crate::EXC_ILLEGAL`] are numerically
     /// the same vector (see [`crate::address_error`]).
     pub(crate) trace_suppressed: bool,
+    /// The diagnostic instruction trail, [`None`] until [`M68k::arm_trail`] is
+    /// called ([`crate::trail`], #436).
+    ///
+    /// An `Option` so the unarmed path through [`M68k::step`] is one test of a
+    /// register and nothing else, and `pub(crate)` so only [`M68k::arm_trail`]
+    /// and [`M68k::trail`] can see it. Not chip state, so `serde(skip)`, and not
+    /// cleared by [`M68k::reset`] either: arming a machine is not something a
+    /// reset inside it has to undo.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) trail: Option<Trail>,
     /// Running total of 68k clocks consumed since the last [`M68k::reset`].
     /// Bus accesses charge themselves (see [`M68k::read_w`]), and
     /// [`M68k::step`] will add instruction cycles as they land; the scheduler
@@ -250,6 +264,7 @@ impl M68k {
             pending_address_error: None,
             pending_exception: None,
             trace_suppressed: false,
+            trail: None,
             cycles: 0,
         }
     }
@@ -347,6 +362,15 @@ impl M68k {
         // exception entry and the clocks are the entry's (M1-28, #36).
         if self.check_interrupts(bus) {
             return step_clocks(start, self.cycles);
+        }
+
+        // The instruction trail of [`M68k::trail`], when one is armed: the
+        // address of the instruction about to run, which is `pc` here because
+        // the queue has not moved (see [`crate::trail`] for what the trail is
+        // for and why it is recorded below the interrupt check rather than
+        // above it). Unarmed, this is one branch.
+        if let Some(trail) = &mut self.trail {
+            trail.record(self.pc);
         }
 
         let opcode = self.prefetch[0];

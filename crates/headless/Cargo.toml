@@ -16,6 +16,10 @@ clap = { version = "4", features = ["derive"] }
 flate2 = "1"
 # The console to run (docs/ARCHITECTURE.md, "genesis").
 genesis = { path = "../genesis" }
+# `disassemble`, so `--trace-to` prints the instruction at each address of the
+# trail rather than a column of numbers the reader has to disassemble by hand
+# (#436). An in-repo crate, like the two chips below.
+m68k = { path = "../m68k" }
 # The two chips `headless vgm` plays, driven directly rather than through a
 # `Genesis`: a VGM is a recording of the chips, not of the console (M5-12, #117).
 sn76489 = { path = "../sn76489" }
