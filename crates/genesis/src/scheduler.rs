@@ -1367,4 +1367,82 @@ mod tests {
         );
         assert_ne!(z80_a(&z80), A_RESET, "and the rest of the machine ran");
     }
+
+    /// The HV counter port (genvdp.txt section 5, mirrored across the `$C00000`
+    /// block), and the work-RAM byte the program below copies it to. `Bus` mirrors
+    /// the 64 KiB at `0xE00000` over `0xFF0000` (plutiedev, "Memory map"), so the
+    /// test reads the byte back at `ram[0]`.
+    const HV_COUNTER: u32 = 0x00C0_0008;
+    const HV_COPY: u32 = 0x00FF_0000;
+    /// The V counter of the first line of VBlank: line 224, the `E0h` of
+    /// genvdp.txt section 4, which is also the first line of the raster the
+    /// console parks a started beam on (#310).
+    const VBLANK_V_COUNTER: u8 = 0xE0;
+
+    /// A cartridge image whose program samples the V counter forever: `move.b
+    /// (HV_COUNTER).L, (HV_COPY).L` then `bra.b` back over it. `MOVE.B (xxx).L,
+    /// (yyy).L` is `$13F9 src32 dst32` and the `BRA.B` sits ten bytes into the
+    /// loop, so it steps back twelve (M68000UM section 8 "MOVE", section 1 "BRA").
+    fn hv_watch_rom() -> Vec<u8> {
+        let mut rom = vec![0_u8; 0x200];
+        rom[0..4].copy_from_slice(&0x00FF_0000_u32.to_be_bytes());
+        rom[4..8].copy_from_slice(&CODE.to_be_bytes());
+        let program: [u16; 6] = [
+            0x13F9,
+            (HV_COUNTER >> 16) as u16,
+            (HV_COUNTER & 0xFFFF) as u16,
+            (HV_COPY >> 16) as u16,
+            (HV_COPY & 0xFFFF) as u16,
+            0x60F4,
+        ];
+        for (word, at) in program.iter().zip(0..) {
+            let at = CODE as usize + 2 * at;
+            rom[at..at + 2].copy_from_slice(&word.to_be_bytes());
+        }
+        rom
+    }
+
+    /// One frame of a 68000 watching the V counter: every line of the frame gives
+    /// it a read of the port, and the line VBlank starts on is not an exception.
+    ///
+    /// `Bus::read_vdp_word` answers `$C00008` from the beam, so a line that the
+    /// line loop gave the 68000 no slice for would be a V counter value that no
+    /// program could ever read. #439's `Bubble and Squeak (USA)` is a cart waiting
+    /// on one exact value - `CMPI.B #$E0,$C00008`, line 224, the first line of
+    /// VBlank (genvdp.txt sections 4 and 5) - so what it needs from the frame loop
+    /// is precisely "the beam spends a whole line on `E0h` and the 68000 is running
+    /// during it".
+    ///
+    /// This is the machine and not the chip: `Vdp::hv_counter` would answer `E0h`
+    /// for line 224 on its own, and what is checked here is the byte the program
+    /// stored - the only evidence there is of what the 68000 was actually
+    /// answered. The program is stepped by [`Scheduler::run_line`] 262 times,
+    /// which is one whole raster and exactly what [`Scheduler::run_frame`] is made
+    /// of; the frame boundary falls inside the raster, so a frame loop that lost
+    /// the VBlank line to the boundary would lose `E0h` from `seen`.
+    #[test]
+    fn every_v_counter_value_of_a_frame_is_readable_by_the_68k() {
+        let (mut cpu, mut z80, mut bus) = console(hv_watch_rom());
+        let mut s = Scheduler::new(Region::Usa);
+        let copy = usize::try_from(HV_COPY & 0xFFFF).expect("a 16 bit mirror offset");
+
+        let mut seen = [false; 256];
+        for _ in 0..LINES_PER_FRAME_NTSC {
+            s.run_line(&mut cpu, &mut z80, &mut bus);
+            // The byte the program stored is the last V counter it was answered,
+            // and the program reads the port every few tens of cycles, so one read
+            // per line is what this samples.
+            seen[usize::from(bus.ram[copy])] = true;
+        }
+
+        let missing: Vec<u16> = (0..=255_u16).filter(|v| !seen[usize::from(*v)]).collect();
+        assert!(
+            missing.is_empty(),
+            "over one NTSC frame the 68000 was never answered {missing:02X?} at $C00008"
+        );
+        assert!(
+            seen[usize::from(VBLANK_V_COUNTER)],
+            "the VBlank line's E0h is the value a cart waiting on it can least afford to lose"
+        );
+    }
 }
