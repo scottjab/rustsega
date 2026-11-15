@@ -13,14 +13,14 @@ it.
 | | |
 |---|---|
 | Measured | 2026-11-10, `main` at `2d55990` |
-| Check level | `harness::Check::StateAndCyclesSkipAddressErrors` |
+| Check level | `harness::Check::StateAndCyclesSkipExceptions` |
 | Instruction files | **124** — 122 clean, 2 failing |
 | Cases | **817 023 / 1 000 060** passed |
 | Cases skipped | **178 087**, spread over 62 files |
 | Cases failing | **4 950**, in 2 files |
 | Sweep time | 3.7 s of test time; 4.3 s wall including `nix develop` startup with the test binary already built |
 
-`Check::StateAndCyclesSkipAddressErrors` compares every data and address
+`Check::StateAndCyclesSkipExceptions` compares every data and address
 register, both stored stack pointers, SR, PC, both prefetch words, every RAM
 byte the case lists, **and** the clock count `step` returned against the case's
 `length`. It leaves out the cases the suite expects to end in its own exception
@@ -98,7 +98,7 @@ M1-32 (#42), which is the ticket that turned the sweep into a gate.
 
 Every `CHK` case that runs is 4 or 6 clocks *below* what the suite asks for, and
 no case's state is wrong; the state-only test (`chk.rs`,
-`Check::StateSkipAddressErrors`) has been green throughout, which is exactly why
+`Check::StateSkipExceptions`) has been green throughout, which is exactly why
 this went unseen until the sweep went to `StateAndCycles`. Measured over
 `CHK.json.gz` with this harness: 0 state mismatches, and the `length` deltas are
 `{4: 2409, 6: 1863}` on the 4 272 trapping cases (`final.pc == $00002000`) and
@@ -112,7 +112,7 @@ The suite's own law, read off the data:
 | does not trap (676 cases) | `10 + ea` (`length` ∈ {10, 14, 16, 18, 20, 22}) | `4 + ea` | +6 |
 
 [#241] carries the CHK clock law — it is written from the trapping half and
-records the unplaced 2 clocks — and CHK is left on `Check::StateSkipAddressErrors`
+records the unplaced 2 clocks — and CHK is left on `Check::StateSkipExceptions`
 until it lands. The non-trapping half is the same law's other shoe: the suite
 bills a CHK that completes 10 clocks for its own execution where this core bills
 4.
@@ -148,10 +148,10 @@ rather than hiding it.
 Things this run cannot see, with the issue that owns each:
 
 - **The 178 087 skipped cases (62 files).** These are the cases that end in the
-  suite's exception handler. `is_address_error_case` skips them because the core
+  suite's exception handler. `is_exception_case` skips them because the core
   could not take them when the harness was written; the exception path has since
   been built out (#37, #41), and enabling those cases is [#223].
-- **`is_address_error_case` skips the $00000C vector, which is *illegal
+- **`is_exception_case` skips the $00000C vector, which is *illegal
   instruction*, not address error** ([#185]). So "skipped" means "ends in the
   suite's handler", which is close to but not exactly the address-error set, and
   a case that takes a *different* vector is not skipped at all.

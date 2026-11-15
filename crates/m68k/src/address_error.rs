@@ -81,7 +81,7 @@
 //! - the hardware slot is a one-line change once a test ROM settles it, which is
 //!   the same open question [`crate::exceptions`] records for the divide, CHK
 //!   and TRAPV slots, and is related to issue #185 (the harness predicate
-//!   `is_address_error_case` reads `$00000C` and therefore cannot name which
+//!   `is_exception_case` reads `$00000C` and therefore cannot name which
 //!   exception it is detecting).
 //!
 //! # Clocks

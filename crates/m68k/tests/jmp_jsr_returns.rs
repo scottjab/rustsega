@@ -3,9 +3,9 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateAndCyclesSkipAddressErrors`], as in `BRANCHES`, `LEA`/`PEA` and
+//! [`harness::Check::StateAndCyclesSkipExceptions`], as in `BRANCHES`, `LEA`/`PEA` and
 //! `NEG`/`CLR`/`EXG`: the cases that end in the suite's own exception handler are
-//! left to M1-29 (#37) — see [`harness::is_address_error_case`] and #185. For
+//! left to M1-29 (#37) — see [`harness::is_exception_case`] and #185. For
 //! these six files that is a large share of the file, and it is the instruction,
 //! not the harness, that causes it: `JMP`/`JSR` jump to whatever the operand
 //! computes and `RTS`/`RTR`/`RTE` jump to whatever the stack holds, so most of
@@ -28,40 +28,40 @@ mod harness;
 /// nothing pushed.
 #[test]
 fn jmp_file_passes() {
-    harness::assert_file_passes("JMP", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("JMP", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `JSR`: `$4E80 | <ea>`, the same operand as `JMP` plus a long push of the
 /// address of the following instruction.
 #[test]
 fn jsr_file_passes() {
-    harness::assert_file_passes("JSR", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("JSR", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `RTS` `$4E75`: pop a long into `PC`.
 #[test]
 fn rts_file_passes() {
-    harness::assert_file_passes("RTS", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("RTS", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `RTR` `$4E77`: pop a word into the CCR, then a long into `PC`.
 #[test]
 fn rtr_file_passes() {
-    harness::assert_file_passes("RTR", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("RTR", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `RTE` `$4E73`: pop a word into the whole of `SR` — including `S`, which moves
 /// the active stack pointer — then a long into `PC`.
 #[test]
 fn rte_file_passes() {
-    harness::assert_file_passes("RTE", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("RTE", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `NOP` `$4E71`: advance the PC and nothing else. Every case in the file is
 /// compared, because none of them can fault.
 #[test]
 fn nop_file_passes() {
-    harness::assert_file_passes("NOP", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("NOP", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// The six file names above are what the suite ships for this ticket, so a rename

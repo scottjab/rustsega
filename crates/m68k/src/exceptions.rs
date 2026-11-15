@@ -178,7 +178,7 @@ pub(crate) const EXCEPTION_ENTRY_CLOCKS: u64 = 34;
 /// `(d16,An)` read + 34 entry (#238). It is the only case of its kind under a
 /// cycle check: every other trapping case either sits in a file that is not
 /// cycle-checked (`CHK`, `TRAP`, `TRAPV`) or is left out by
-/// `harness::is_address_error_case`. `CHK` is the second family that agrees with
+/// `harness::is_exception_case`. `CHK` is the second family that agrees with
 /// the split, at `4 + ea + 34` on all 3989 of its trapping cases (`Dn` 38,
 /// `(An)` 42, `-(An)` 44, `(xxx).l` 50), and #241 carries the 2-clock half of
 /// `CHK`'s population that no model here accounts for.
@@ -187,7 +187,7 @@ pub(crate) const EXCEPTION_ENTRY_CLOCKS: u64 = 34;
 /// opcode fault before any operand is read, and cost the entry's 34 with nothing
 /// of their own on top — 34 in every one of the 8065 `TRAP.json.gz` cases and
 /// the 4095 trapping cases of `TRAPV.json.gz`. No illegal-instruction case is
-/// dated by the suite at all (they all end at the vector `is_address_error_case`
+/// dated by the suite at all (they all end at the vector `is_exception_case`
 /// skips), which is what keeps this 4 away from [`M68k::op_illegal`].
 ///
 /// [`M68k::op_illegal`]: crate::M68k::op_illegal

@@ -399,11 +399,11 @@ const HANDLER: u32 = 5120;
 
 #[test]
 fn exception_cases_are_detected_and_skipped() {
-    // Address errors are M1-29 (#37). Until then `Check::StateSkipAddressErrors`
+    // Address errors are M1-29 (#37). Until then `Check::StateSkipExceptions`
     // leaves those cases alone, and the suite spells them out: the handler
     // long is in `initial.ram` at $00000C..=$00000F and `final.pc` is that long.
     assert!(
-        !harness::is_address_error_case(&base()),
+        !harness::is_exception_case(&base()),
         "a case with nothing at $C..=$F is not an exception case"
     );
 
@@ -411,13 +411,13 @@ fn exception_cases_are_detected_and_skipped() {
     exception.initial.ram.extend_from_slice(&HANDLER_BYTES);
     exception.final_state.pc = HANDLER;
     assert!(
-        harness::is_address_error_case(&exception),
+        harness::is_exception_case(&exception),
         "a case that ends at the $C vector is an exception case"
     );
 
     // Skipped, not failed: unskipped, the same case would add a second failure,
     // because the stub records the vector but does not take the exception.
-    let report = harness::run_cases(&[base(), exception], harness::Check::StateSkipAddressErrors);
+    let report = harness::run_cases(&[base(), exception], harness::Check::StateSkipExceptions);
     // The control no longer passes either — it panics on the unimplemented
     // opcode — so `passed` is 0 and the count that matters is `skipped: 1`.
     assert_eq!((report.total, report.passed, report.skipped), (2, 0, 1));
@@ -448,9 +448,9 @@ fn an_incomplete_vector_is_not_skipped() {
     partial.initial.ram.extend_from_slice(&HANDLER_BYTES[..3]);
     partial.initial.pc = HANDLER;
     partial.final_state.pc = HANDLER;
-    assert!(!harness::is_address_error_case(&partial));
+    assert!(!harness::is_exception_case(&partial));
 
-    let report = harness::run_cases(&[partial], harness::Check::StateSkipAddressErrors);
+    let report = harness::run_cases(&[partial], harness::Check::StateSkipExceptions);
     assert_eq!((report.total, report.passed, report.skipped), (1, 0, 0));
     // It ran, and it reported: the only difference is the unimplemented opcode.
     // A case the predicate had dropped would have contributed no line at all.
@@ -561,7 +561,7 @@ fn every_instruction_file_in_the_suite_is_enumerated() {
 /// State-only would leave the clock tables unmeasured, and the exception cases
 /// cannot be checked at any level until #223 lands, so this is the strictest
 /// level the suite can be held to today.
-const GATE_CHECK: harness::Check = harness::Check::StateAndCyclesSkipAddressErrors;
+const GATE_CHECK: harness::Check = harness::Check::StateAndCyclesSkipExceptions;
 
 /// Files the gate lets fail, each with the issue that carries it, as
 /// `(file, issue)` with a comment saying what fails and on which axis.
@@ -577,7 +577,7 @@ const KNOWN_FAILURES: &[(&str, &str)] = &[
     // same two cases `shifts.rs` drops from `asl_b_file_passes`.
     ("ASL.b", "#209"),
     // Clocks only — every CHK case's state matches, which is what the
-    // `Check::StateSkipAddressErrors` per-file test already proves. 4948 of the
+    // `Check::StateSkipExceptions` per-file test already proves. 4948 of the
     // 8065 cases run (the rest are the exception cases) and all 4948 are 4 or 6
     // clocks below the suite's `length`: a trapped CHK wants 38 + ea and a
     // passing one wants 10 + ea, against this core's 34 + ea and 4 + ea.

@@ -3,9 +3,9 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateAndCyclesSkipAddressErrors`] — state *and* `step`'s
+//! [`harness::Check::StateAndCyclesSkipExceptions`] — state *and* `step`'s
 //! clock total (M1-31a, #39); the cases that end in the suite's exception
-//! handler are left to M1-29 (#37) — see [`harness::is_address_error_case`] and
+//! handler are left to M1-29 (#37) — see [`harness::is_exception_case`] and
 //! #185.
 //!
 //! The suite ships no `CMPI.*` or `CMPM.*` file. Neither instruction is
@@ -26,13 +26,13 @@ mod harness;
 /// `$B108`-`$B10F`-style `CMPM.B` cases.
 #[test]
 fn cmp_b_file_passes() {
-    harness::assert_file_passes("CMP.b", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("CMP.b", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `CMP.W`: `$B040`-`$B07F`, `$0C40`-`$0C7F`, `$B148`-`$B14F`-style.
 #[test]
 fn cmp_w_file_passes() {
-    harness::assert_file_passes("CMP.w", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("CMP.w", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `CMP.L`: `$B080`-`$B0BF`, `$0C80`-`$0CBF`, `$B188`-`$B18F`-style.
@@ -42,20 +42,20 @@ fn cmp_w_file_passes() {
 /// nothing and whose immediate operand was already popped by the fetch.
 #[test]
 fn cmp_l_file_passes() {
-    harness::assert_file_passes("CMP.l", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("CMP.l", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `CMPA.W`: operation `011`, so high bytes `$B0`, `$B2`, … `$BE`. Word sources
 /// are sign-extended before the 32-bit compare.
 #[test]
 fn cmpa_w_file_passes() {
-    harness::assert_file_passes("CMPA.w", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("CMPA.w", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `CMPA.L`: operation `111`, the bit-8-set half of the group CMPM also lives in.
 #[test]
 fn cmpa_l_file_passes() {
-    harness::assert_file_passes("CMPA.l", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("CMPA.l", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// The five file names above are what the suite ships, so a rename fails here

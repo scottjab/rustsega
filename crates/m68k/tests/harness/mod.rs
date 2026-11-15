@@ -5,7 +5,7 @@
 //! This is the piece every later m68k instruction ticket reuses. Turning on a
 //! group means adding `crates/m68k/tests/<group>.rs` that calls
 //! [`assert_file_passes`] with the file names that group covers — e.g.
-//! `assert_file_passes("ADD.b", Check::StateSkipAddressErrors)` — and watching
+//! `assert_file_passes("ADD.b", Check::StateSkipExceptions)` — and watching
 //! it go green. Name is the file name without `.json` or `.json.gz`, exactly as
 //! it appears in `ls $RUSTSEGA_TEST_ROM_DIR/680x0/68000/v1/`.
 //!
@@ -97,14 +97,14 @@ pub enum Check {
     /// [`Check::State`] with the exception cases left out, because they need
     /// exception handling the core does not have yet (address errors are
     /// M1-29, #37). Instruction tickets use this until then.
-    StateSkipAddressErrors,
+    StateSkipExceptions,
     /// [`Check::StateAndCycles`] with the exception cases left out: the two
     /// independent axes of the variants above, combined. Added by M1-31a (#39),
     /// whose cycle work lands on files that #223 has not yet moved to full
     /// state checking — a cycle ticket must not have to take exception
     /// handling with it, and a timing ticket must not weaken a file by dropping
-    /// back to [`Check::StateSkipAddressErrors`].
-    StateAndCyclesSkipAddressErrors,
+    /// back to [`Check::StateSkipExceptions`].
+    StateAndCyclesSkipExceptions,
 }
 
 impl Check {
@@ -113,16 +113,16 @@ impl Check {
     fn checks_cycles(self) -> bool {
         matches!(
             self,
-            Self::StateAndCycles | Self::StateAndCyclesSkipAddressErrors
+            Self::StateAndCycles | Self::StateAndCyclesSkipExceptions
         )
     }
 
     /// Whether this mode leaves the exception cases out (see
-    /// [`is_address_error_case`]).
-    fn skips_address_errors(self) -> bool {
+    /// [`is_exception_case`]).
+    fn skips_exceptions(self) -> bool {
         matches!(
             self,
-            Self::StateSkipAddressErrors | Self::StateAndCyclesSkipAddressErrors
+            Self::StateSkipExceptions | Self::StateAndCyclesSkipExceptions
         )
     }
 }
@@ -561,7 +561,7 @@ fn compare_ram(bus: &mut TestBus, want: &[RamByte], out: &mut Vec<Mismatch>) {
 /// long at $000008 (M68000UM, "Exception Vector Memory Map"). So what this
 /// skips is "the case ends in the suite's exception handler", which is not
 /// exactly address errors. Issue #185 carries the decision that owes M1-29 (#37).
-pub fn is_address_error_case(case: &TestCase) -> bool {
+pub fn is_exception_case(case: &TestCase) -> bool {
     let mut bytes = [None; 4];
     for (i, slot) in bytes.iter_mut().enumerate() {
         let addr = EXCEPTION_VECTOR + i as u32;
@@ -580,10 +580,10 @@ pub fn is_address_error_case(case: &TestCase) -> bool {
 pub struct Report {
     /// Cases in the file, including any skipped.
     pub total: usize,
-    /// Cases whose state matched. With [`Check::StateSkipAddressErrors`] a clean
+    /// Cases whose state matched. With [`Check::StateSkipExceptions`] a clean
     /// file has `passed + skipped == total`.
     pub passed: usize,
-    /// Cases left out by [`Check::StateSkipAddressErrors`].
+    /// Cases left out by [`Check::StateSkipExceptions`].
     pub skipped: usize,
     /// The first [`MAX_REPORTED_FAILURES`] failures, one readable line each.
     /// Empty means every case that ran passed.
@@ -627,7 +627,7 @@ fn run_cases_on(machine: &mut Machine, cases: &[TestCase], check: Check) -> Repo
         failures: Vec::new(),
     };
     for case in cases {
-        if check.skips_address_errors() && is_address_error_case(case) {
+        if check.skips_exceptions() && is_exception_case(case) {
             report.skipped += 1;
             continue;
         }

@@ -1,7 +1,7 @@
 //! `CHK` in the pinned 680x0 suite (M1-27, #35).
 //!
 //! One test for `CHK.json.gz`, in the style of `status.rs`, checked with
-//! [`harness::Check::StateSkipAddressErrors`]. It is the one instruction file
+//! [`harness::Check::StateSkipExceptions`]. It is the one instruction file
 //! M1-31c (#41) left off cycle checking, and it is not because it was skipped:
 //! measured over the 4948 cases this test compares, `CHK`'s own work is
 //! 6 clocks when the comparison completes — `CHK.W D0,D0` is 10, `CHK.W (A0)` is
@@ -51,7 +51,7 @@ mod harness;
 /// Bound").
 #[test]
 fn chk_file_passes() {
-    harness::assert_file_passes("CHK", harness::Check::StateSkipAddressErrors);
+    harness::assert_file_passes("CHK", harness::Check::StateSkipExceptions);
 }
 
 /// The file name above is what the suite ships, so a rename fails here with a
