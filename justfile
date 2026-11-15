@@ -33,8 +33,16 @@ test:
     cargo nextest run {{vdp-debug}}
 
 # Includes slow #[ignore] suites (SingleStepTests, long ROM runs).
+#
+# `--success-output final` is what carries those suites' own reports into the
+# log: nextest hides the output of a passing test, and this is the one step that
+# runs the whole ignored set, so the per-file tables the CPU sweeps print were
+# being thrown away. `final`, not `immediate`, so they arrive in the summary
+# block rather than interleaved with the PASS list. The pinned nextest (0.9.146)
+# has no `--show-output`, the spelling #186 names; `--success-output` is that
+# setting under the name this version has.
 test-all:
-    cargo nextest run --workspace --no-tests=pass --run-ignored all
+    cargo nextest run --workspace --no-tests=pass --run-ignored all --success-output final
 
 # Milliseconds per `Genesis::run_frame` (M6-11, #131): a synthetic full-screen
 # scene, and Sonic 1 when that cartridge is on disk. `cargo bench` builds with
