@@ -21,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde::Serialize;
 use tower_http::compression::CompressionLayer;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
@@ -115,7 +116,20 @@ pub fn router(state: Arc<AppState>) -> Router {
         // tower-http's default predicate compresses anything that is not an
         // image, gRPC or an event stream, and skips bodies under 32 bytes: both
         // the wasm and the stylesheet are worth it.
-        .layer(CompressionLayer::new())
+        //
+        // A cartridge is the exception (#417), so `octet-stream` joins that list
+        // rather than the route being taken off compression: `DefaultPredicate`
+        // is kept whole, so everything it already refused still is, and a ROM is
+        // dense binary that shrinks by almost nothing. The waste was paid twice,
+        // because the download's cache rule is `private`: deflated again for
+        // every client, on every request.
+        //
+        // The rule is read from `library::OCTET_STREAM`, so it stops covering a
+        // ROM at exactly the moment a ROM stops being served as that. Nothing
+        // else here is `octet-stream`, so nothing else changes.
+        .layer(CompressionLayer::new().compress_when(
+            DefaultPredicate::new().and(NotForContentType::const_new(library::OCTET_STREAM)),
+        ))
         .layer(TraceLayer::new_for_http())
 }
 

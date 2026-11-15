@@ -40,7 +40,11 @@ const MAX_SIZE: u64 = 10 * 1024 * 1024;
 /// What a ROM download says it is. `application/octet-stream`, because a `.md`
 /// cartridge is binary and `text/markdown` would be a lie the browser would
 /// believe.
-const OCTET_STREAM: &str = "application/octet-stream";
+///
+/// Read from `crate::router` too, which uses it to keep a cartridge out of the
+/// compressor (#417), so the type a ROM is served as and the rule that says not
+/// to compress it are written once and cannot drift apart.
+pub(crate) const OCTET_STREAM: &str = "application/octet-stream";
 
 /// The cache rule for ROM bytes: `private` because the library belongs to whoever
 /// runs this server, and an hour because the bytes under an id do not change - a

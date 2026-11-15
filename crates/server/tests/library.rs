@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{Method, Request, Response, StatusCode};
+use axum::http::header::{ACCEPT_ENCODING, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_TYPE};
+use axum::http::{HeaderName, Method, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use server::AppState;
 use server::assets::PlaceholderAssets;
@@ -30,6 +30,10 @@ use tower::ServiceExt;
 
 /// The size a listed file may have at most, and one byte past it.
 const CAP: u64 = 10 * 1024 * 1024;
+
+/// The size tower-http will not compress under (`SizeAbove::DEFAULT_MIN_SIZE`),
+/// so a fixture meant to be caught by the compressor has to clear it.
+const MIN_COMPRESS_SIZE: usize = 32;
 
 /// The contents of the file next to every test rom dir: what a traversal is
 /// trying to get the server to read.
@@ -79,15 +83,37 @@ fn state_without_library() -> Arc<AppState> {
 }
 
 async fn request(state: Arc<AppState>, method: Method, uri: &str) -> Response<Body> {
-    let request = Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
+    request_with_headers(state, method, uri, &[]).await
+}
+
+/// A request carrying extra headers. The only thing this file needs them for is
+/// `Accept-Encoding`, which is how #417 asks the router for a compressed answer
+/// and finds out whether a ROM download refused to give one.
+async fn request_with_headers(
+    state: Arc<AppState>,
+    method: Method,
+    uri: &str,
+    headers: &[(HeaderName, &str)],
+) -> Response<Body> {
+    let mut builder = Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(name.clone(), *value);
+    }
     server::router(state)
-        .oneshot(request)
+        .oneshot(builder.body(Body::empty()).unwrap())
         .await
         .expect("the router answers without failing")
+}
+
+/// A cartridge big enough to be worth compressing: 1 KiB of a repeating pattern,
+/// which gzip would shrink happily.
+///
+/// The size is the point. `CompressionLayer`'s default predicate leaves anything
+/// of [`MIN_COMPRESS_SIZE`] bytes or fewer alone, so the 4- and 1-byte fixtures
+/// elsewhere in this file would let a test of #417 go green with the bug still
+/// in place.
+fn rom_bytes() -> Vec<u8> {
+    (0..1024).map(|i| (i % 251) as u8).collect()
 }
 
 async fn get(state: Arc<AppState>, uri: &str) -> Response<Body> {
@@ -366,6 +392,92 @@ async fn fetch_returns_the_bytes_as_octet_stream_for_a_private_cache() {
     )
     .await;
     assert_eq!(body(response).await, vec![7], "a nested file is served too");
+}
+
+/// #417: a ROM download arrives as the bytes on disk, whatever the client asked
+/// to be handed.
+#[tokio::test]
+async fn rom_downloads_are_not_compressed_even_when_the_client_asks_for_it() {
+    // One `CompressionLayer` covers the whole router, and its default predicate
+    // compresses anything that is not an image, gRPC or an event stream. A
+    // cartridge is `application/octet-stream`, so every download was deflated on
+    // every request: CPU spent on bytes a Genesis ROM barely shrinks, and
+    // repeated per client rather than once, because the cache rule is `private`.
+    let bytes = rom_bytes();
+    assert!(
+        bytes.len() > MIN_COMPRESS_SIZE,
+        "under the compressor's floor this test proves nothing"
+    );
+    let dir = rom_dir(&[("big.md", bytes.as_slice())]);
+    let library = Library::scan(dir.path()).unwrap();
+    let state = state_with(dir.path());
+    let uri = format!("/api/roms/{}", id_of(&library, "big.md"));
+
+    // Both the encodings this binary is built with (`compression-gzip` and
+    // `compression-br`), plus the combination a browser actually sends.
+    for encoding in ["gzip", "br", "gzip, br"] {
+        let response = request_with_headers(
+            Arc::clone(&state),
+            Method::GET,
+            &uri,
+            &[(ACCEPT_ENCODING, encoding)],
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK, "{encoding}");
+        assert_eq!(
+            response.headers().get(CONTENT_ENCODING),
+            None,
+            "{encoding}: a ROM download must not come back `{}`",
+            response
+                .headers()
+                .get(CONTENT_ENCODING)
+                .map(|v| v.to_str().unwrap_or("?"))
+                .unwrap_or_default()
+        );
+        assert_eq!(
+            body(response).await,
+            bytes,
+            "{encoding}: byte for byte the file, not a stream to decode"
+        );
+    }
+}
+
+/// The other half of #417: what is left of the API still compresses, so the fix
+/// turned the compressor off for ROMs and not for the router.
+#[tokio::test]
+async fn rom_listing_is_still_compressed_when_the_client_asks_for_it() {
+    // Enough entries that the listing clears the 32 byte floor on its own.
+    let names: Vec<String> = (0..40)
+        .map(|i| format!("a-rom-with-a-longish-name-{i:02}.md"))
+        .collect();
+    let files: Vec<(&str, &[u8])> = names
+        .iter()
+        .map(|name| (name.as_str(), &[0xABu8][..]))
+        .collect();
+    let dir = rom_dir(&files);
+    let state = state_with(dir.path());
+
+    // `/api/info` is deliberately not here: its whole body is 34 bytes, two
+    // past the compressor's floor, so whether it compresses would depend on how
+    // long the version string happens to be.
+    let response = request_with_headers(
+        Arc::clone(&state),
+        Method::GET,
+        "/api/roms",
+        &[(ACCEPT_ENCODING, "gzip")],
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_ENCODING)
+            .map(|value| value.to_str().unwrap()),
+        Some("gzip"),
+        "the listing is JSON, and JSON is what compression is for"
+    );
 }
 
 #[tokio::test]

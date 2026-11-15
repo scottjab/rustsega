@@ -381,6 +381,12 @@ frame buffer) and what that means after a load, is
   gets the same plain-text `not found` 404 the library gives an unknown id rather
   than the app shell at 200 (#418). A real endpoint with the wrong method is a
   405 from axum, settled before the fallback is reached.
+- One `CompressionLayer` covers the whole router, following tower-http's default
+  rule (not gRPC, not an image, not SSE, not under 32 bytes) plus one exception:
+  `application/octet-stream` is never compressed, because that is a cartridge, and
+  a Genesis ROM is dense binary that barely shrinks (#417). The download is cached
+  `private`, so compressing it was work repeated per client rather than once. What
+  is left still compresses, the wasm and the ROM listing included.
 - `nix build` produces the single binary (frontend built in the same
   derivation). `nix build .#static`, which `just build-static` runs, produces the
   same binary for `x86_64-unknown-linux-musl`, fully static (M8-05b, #159), so it
