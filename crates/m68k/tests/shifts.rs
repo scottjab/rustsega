@@ -1,9 +1,12 @@
 //! Conformance tests for M1-18 (#26): shifts and rotates, register form
 //! (`ASL`, `ASR`, `LSL`, `LSR`, `ROL`, `ROR`, `ROXL`, `ROXR`).
 //!
-//! One test per suite file, all `Check::StateAndCyclesSkipExceptions`: a register-form
+//! One test per suite file, all `Check::StateAndCycles`: a register-form
 //! shift has no operand to fault on, and the flag rules are the point of the
-//! exercise. The eight `.w` files are *not* here — they carry the memory-form
+//! exercise. #223 moved these sixteen files up from
+//! `Check::StateAndCyclesSkipExceptions`, which skipped nothing in any of them
+//! (see [`harness::is_exception_case`]). The eight `.w` files are *not* here —
+//! they carry the memory-form
 //! `ASx.w <ea>` cases, which are M1-19 (#27); see
 //! `crates/m68k/tests/shifts_word_memory_form.rs`, which checks that those files
 //! fail on memory-form cases and nothing else.
@@ -21,7 +24,7 @@ mod harness;
 use harness::Check;
 
 fn file_passes(name: &str) {
-    harness::assert_file_passes(name, Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes(name, Check::StateAndCycles);
 }
 
 /// Two cases of `ASL.b` whose recorded final state cannot come from their own
@@ -76,7 +79,7 @@ fn asl_b_file_passes() {
         "ASL.b: both broken case names must still be in the file, or this filter is stale"
     );
 
-    let report = harness::run_cases(&kept, Check::StateAndCyclesSkipExceptions);
+    let report = harness::run_cases(&kept, Check::StateAndCycles);
     assert!(
         report.failures.is_empty(),
         "ASL.b: {}/{} cases passed, {} skipped; first failing cases:\n{}",
