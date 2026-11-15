@@ -107,6 +107,14 @@ const TILE_ADDR: u32 = 0x2000;
 /// `src/sweep.rs`'s `BLANK_COLOUR_LIMIT` out of one 8x8 cell.
 const COLOURS: [u16; 5] = [0x0000, 0x000E, 0x00E0, 0x0E00, 0x0EEE];
 
+/// Port 1's data register: bit 6 is `TH`, the pad multiplexer's select, and with
+/// `TH` low bit 5 is `START`, active low (plutiedev "I/O ports" and
+/// "Controllers", "Reading the buttons").
+const PAD_1: u32 = 0xA1_0003;
+/// Bit 5 of port 1's data register with `TH` low: `START`, which reads 0 while it
+/// is held (plutiedev "Controllers", "Reading the buttons").
+const START_BIT: u16 = 1 << 5;
+
 /// `move.w #$value,(addr).L` = `33FC imm32 addr32` (M68000UM section 8 "MOVE"),
 /// the same encoding `boot.rs` uses.
 fn store_word(addr: u32, value: u16) -> Vec<u16> {
@@ -115,6 +123,27 @@ fn store_word(addr: u32, value: u16) -> Vec<u16> {
     vec![
         0x33FC,
         u16::from_be_bytes([value[0], value[1]]),
+        u16::from_be_bytes([addr[0], addr[1]]),
+        u16::from_be_bytes([addr[2], addr[3]]),
+    ]
+}
+
+/// `move.b #$value,(addr).L` = `13FC imm8 addr32` (M68000UM section 8 "MOVE").
+fn store_byte(addr: u32, value: u8) -> Vec<u16> {
+    let addr = addr.to_be_bytes();
+    vec![
+        0x13FC,
+        u16::from(value),
+        u16::from_be_bytes([addr[0], addr[1]]),
+        u16::from_be_bytes([addr[2], addr[3]]),
+    ]
+}
+
+/// `move.b (addr).L,D0` = `1039 addr32` (M68000UM section 8 "MOVE").
+fn read_byte_into_d0(addr: u32) -> Vec<u16> {
+    let addr = addr.to_be_bytes();
+    vec![
+        0x1039,
         u16::from_be_bytes([addr[0], addr[1]]),
         u16::from_be_bytes([addr[2], addr[3]]),
     ]
@@ -205,6 +234,33 @@ fn late_painter(waits: usize) -> Vec<u16> {
     for _ in 0..waits {
         program.extend(busy_wait_program());
     }
+    program.extend(paint_program());
+    program.push(WAIT);
+    program
+}
+
+/// The poll loop of [`start_painter`]: read port 1, keep `START`'s bit, and branch
+/// back while it is high. `ANDI.B #$20,D0` is `0200 imm16` and sets `Z` from the
+/// result (M68000UM section 8 "AND"), so `BNE` - `66F4`, back over the 12 bytes of
+/// read, mask and branch themselves, the same backstep `boot.rs`'s `sample_forever`
+/// uses - goes round while `START` is not held (section 8 "Bcc").
+fn poll_start_program() -> Vec<u16> {
+    let mut program = read_byte_into_d0(PAD_1);
+    program.extend([0x0200, START_BIT]);
+    program.push(0x66F4);
+    program
+}
+
+/// A cart that paints only while player 1 holds `START`: pull `TH` low so the pad
+/// multiplexer selects the `A`/`Start` row, sit in [`poll_start_program`] until
+/// `START` reads 0, then run [`paint_program`] and wait in place.
+///
+/// `TH` has to be pulled low because `START` is not on the pad's bus at all with
+/// `TH` high - a cart that never touches the port reads `0x7F`, `START` and all
+/// (plutiedev "Controllers", "Reading the buttons").
+fn start_painter() -> Vec<u16> {
+    let mut program = store_byte(PAD_1, 0);
+    program.extend(poll_start_program());
     program.extend(paint_program());
     program.push(WAIT);
     program
@@ -381,5 +437,67 @@ fn sweep_calls_a_cart_that_paints_after_the_checkpoint_booting() {
     assert_eq!(
         painted[7], "",
         "and it painted without being poked, so no input gate is named: {painted:?}"
+    );
+}
+
+/// The START input gate of #373 from the outside: a cart that draws nothing until
+/// player 1 holds `START` is `Blank` on the unperturbed pass, `Boots` on the gated
+/// pass, and the report says which gate it took.
+///
+/// `src/sweep.rs` unit-tests `classify` with two colour counts; this is the second
+/// pass of `one` actually happening - the child run twice, the second time with
+/// `--pad1` - and the two columns and the note that come out of it.
+///
+/// The gate is written out here instead of left at the default of
+/// `src/sweep.rs` because that script is two entries and so holds a comma, and a
+/// CSV field holding one is quoted - which this file's `read_csv`, which splits on
+/// the comma, is only exact while no field needs it.
+#[test]
+fn sweep_names_the_start_gate_that_made_a_cart_paint() {
+    let roms = TempDir::new("gate");
+    write_fake_rom(&roms.join("start.md"), &start_painter());
+    let out = TempDir::new("gate-out");
+    let csv = out.join("compat.csv");
+    let markdown = out.join("compat.md");
+
+    let run = headless()
+        .args(["sweep", roms.join(".").to_str().unwrap()])
+        .args(["--frames", "1", "--run-frames", "30"])
+        .args(["--input-gate", "START@5"])
+        .args(["--csv", csv.to_str().unwrap()])
+        .args(["--markdown", markdown.to_str().unwrap()])
+        .output()
+        .expect("run headless sweep over a START-gated ROM");
+    assert!(run.status.success(), "sweep failed: {}", report(&run));
+
+    let rows = read_csv(&csv);
+    let gated = &rows[1];
+    assert_eq!(
+        gated[5], "1",
+        "unperturbed, the cart polls and never draws, so the checkpoint frame is \
+         dark: {gated:?}"
+    );
+    assert_eq!(
+        gated[6], "1",
+        "and no other frame of the unperturbed run drew either, or the second pass \
+         would not have happened: {gated:?}"
+    );
+    assert_eq!(
+        gated[4], "Boots",
+        "but holding START made it draw, and that is a boot: {gated:?}"
+    );
+    assert_eq!(
+        gated[7], "START@5",
+        "and the row names the gate that did it: {gated:?}"
+    );
+    assert_eq!(
+        gated[10], "5 colours with START@5",
+        "the note says what the gate bought: {gated:?}"
+    );
+
+    let text = fs::read_to_string(&markdown).expect("read the markdown the sweep wrote");
+    assert!(
+        text.contains("Boots with input (1") && text.contains("`start.md`"),
+        "the report should list the cart under the gate it needed:\n{text}"
     );
 }
