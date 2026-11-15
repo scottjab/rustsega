@@ -174,6 +174,121 @@ fn run_fake_rom_prints_hash() {
     assert_ne!(line, "frame_hash=0x0000000000000000");
 }
 
+/// `--trace-to` is the #436 question in one flag: which instruction branched
+/// into this address. The fake ROM's whole program is one `BRA.B` at 0x1000, so
+/// the answer is one disassembled line, the trail freezes on the first
+/// instruction of frame 1, and the run stops there instead of running out the
+/// `--frames` budget.
+#[test]
+fn trace_to_prints_the_trail_and_stops() {
+    let dir = TempDir::new("trace-to");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "5",
+        "--trace-to",
+        "0x1000",
+    ]);
+    assert!(
+        out.status.success(),
+        "run failed: {:?}\nstderr: {}",
+        out.status.code(),
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("trace_to=0x001000 caught frame 1 entries=1"),
+        "the trail froze on the first instruction of the first frame, so it holds \
+         exactly one entry\nall stdout: {text}"
+    );
+    let line = text
+        .lines()
+        .find(|line| line.starts_with("0x001000"))
+        .unwrap_or_else(|| panic!("no trail line for 0x001000 in stdout: {text}"));
+    assert!(
+        line.contains("BRA"),
+        "the trail line is disassembled, not a bare address: {line}"
+    );
+    assert!(
+        stderr(&out).contains("frames=1 "),
+        "the run stopped on the frame that froze the trail, not on --frames 5\nstderr: {}",
+        stderr(&out)
+    );
+}
+
+/// An address the cart never runs at is not a silent miss: `--trace-to` says so
+/// and prints the end of the run anyway, because "where did it stop" is the same
+/// question with the same shape of answer, and the cart that halts at an address
+/// nobody predicted is the case that needs it.
+#[test]
+fn trace_to_reports_an_address_it_never_reached() {
+    let dir = TempDir::new("trace-to-miss");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "2",
+        "--trace-to",
+        "0x1234",
+    ]);
+    assert!(
+        out.status.success(),
+        "run failed: {:?}\nstderr: {}",
+        out.status.code(),
+        stderr(&out)
+    );
+    let text = stdout(&out);
+    assert!(
+        text.contains("trace_to=0x001234 not reached in 2 frames"),
+        "stdout: {text}"
+    );
+    let entries = text
+        .lines()
+        .filter(|line| line.starts_with("0x001000"))
+        .count();
+    assert!(
+        entries > 1,
+        "an uncaught trail keeps recording, so it is the last {entries} instructions \
+         of the run, not one\nall stdout: {text}"
+    );
+}
+
+/// `--trace-to` takes a hex address: `0x1000` and `1000` are the same address and
+/// `xyz` is a mistake the tool names instead of running the ROM anyway.
+#[test]
+fn trace_to_takes_hex_with_or_without_the_prefix() {
+    let dir = TempDir::new("trace-to-hex");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+    let rom = rom.to_str().expect("utf-8 path").to_string();
+
+    let bare = run(&["run", &rom, "--frames", "1", "--trace-to", "1000"]);
+    assert!(
+        bare.status.success(),
+        "a bare hex address is the same address\nstderr: {}",
+        stderr(&bare)
+    );
+    assert!(stdout(&bare).contains("trace_to=0x001000 caught"));
+
+    let junk = run(&["run", &rom, "--frames", "1", "--trace-to", "xyz"]);
+    assert!(
+        !junk.status.success(),
+        "--trace-to xyz is not an address and must not run the ROM"
+    );
+    assert!(
+        stderr(&junk).contains("not a hex address"),
+        "stderr: {}",
+        stderr(&junk)
+    );
+}
+
 /// `--dump-png` is how an agent looks at a frame, so the file has to exist and
 /// really be a PNG.
 #[test]

@@ -302,6 +302,24 @@ impl Genesis {
         &self.cpu
     }
 
+    /// Arm the 68000's instruction trail: a ring of the last
+    /// [`m68k::TRAIL_LEN`] program counters, frozen the first time the CPU is
+    /// about to run at `stop_at` (or never, when that is `None`).
+    ///
+    /// The diagnostic half of #436: a cart parked in a halt stub and a cart
+    /// running look identical from [`Genesis::cpu`] once it has stopped
+    /// branching, so the caller has to be recording before it happens. Read the
+    /// answer back from [`Genesis::cpu`]`().trail()` and
+    /// [`m68k::M68k::trail_caught`]; `headless run --trace-to` is the tool that
+    /// does it.
+    ///
+    /// This does not move the CPU, which is what [`Genesis::cpu`] being
+    /// read-only is about. A trail is not chip state, so it is not in a save
+    /// state and a [`Genesis::reset`] does not clear it.
+    pub fn arm_cpu_trail(&mut self, stop_at: Option<u32>) {
+        self.cpu.arm_trail(stop_at);
+    }
+
     /// The memory map, for the tests that have to look at work RAM to see what a
     /// program did, and for a front end that wants [`Bus::take_dirty`] to know
     /// when the cart's save is worth writing out.
