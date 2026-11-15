@@ -133,15 +133,58 @@ case "e502 [ASL.b Q, D2] 1583": d2: expected 0x2E5E4304, got 0xCDFB7FF8; sr: exp
 case "e502 [ASL.b Q, D2] 1761": d2: expected 0x6461D390, got 0x417C7EF4
 ```
 
-`shifts.rs` [`ASL_B_BROKEN_CASES`] drops the same two cases and documents at
-length why no emulator behaviour can produce them: each recorded final state is
-a correct `ASL.B #2` *of some other register*, so the two snapshots are
-individually plausible and do not belong to their own initial states. It is a
-bug in the pinned suite data, filed as [#209], and the gate keeps counting it
-rather than hiding it.
+The suite data is wrong and no emulator behaviour can produce it. Both are
+`$E502` = `ASL.B #2,D2`, and both run exactly one instruction — `pc` goes `$C00`
+→ `$C02`, and only `d2`, `sr`, `pc` and the prefetch queue differ — so the
+destination is `D2`'s low byte and the three bytes above it have to come out as
+they went in:
+
+| case | `initial.d2` | `final.d2` recorded | `ASL.B #2,D2` gives |
+|---|---|---|---|
+| `e502 [ASL.b Q, D2] 1583` | `$CDFB7FBE` | `$2E5E4304` | `$CDFB7FF8` |
+| `e502 [ASL.b Q, D2] 1761` | `$417C7E7D` | `$6461D390` | `$417C7EF4` |
+
+Each recorded final *is* a correct `ASL.B #2` — data and all five condition
+codes — of some other register: `$2E5E4341` gives `$2E5E4304` with
+`N=0 Z=0 V=1 C=X=1`, which is the recorded `sr $2713`, and `$6461D364` gives
+`$6461D390` with `N=1 Z=0 V=1 C=X=1`, which is the recorded `sr $271B`. The two
+snapshots are individually plausible and mispaired, so the `initial` is simply
+not a preimage of its own `final`. The file shows it can do these two correctly:
+`e502 [ASL.b Q, D2] 1341` and `… 1722` execute `ASL.B #2,D2` on the same two
+`initial.d2` values and record the results above. And of the 4 070 cases of this
+file whose destination is a data register, exactly these 2 ask for bits above the
+instruction's own width, so it is two cross-wired pairs rather than a systematic
+difference in some mode.
+
+`shifts.rs` [`ASL_B_BROKEN_CASES`] drops the same two cases and documents the
+above at length. Where the hole sits is the decided shape of [#209]:
+
+- **Not at fetch.** `scripts/fetch-test-data.sh` pins this suite by the archive's
+  SHA-256, so rewriting a file on unpack would put bytes on disk that the pin
+  does not attest — and would delete the one signal that tells us upstream fixed
+  the data.
+- **Not in the gate.** `all_instructions` still runs all 8 065 cases, so the two
+  stay counted as failures and `ASL.b` still reads 8063/8065 above; only the
+  per-file `shifts.rs` test drops them, and it asserts both names are still in
+  the file, so a pin bump that repairs them fails that test instead of quietly
+  restoring coverage.
+
+We are not the first to notice it. The suite's own repository carries
+[SingleStepTests/680x0#4], opened by `howprice` on 2024-08-11, which names these
+same two cases and predicts `$CDFB7FF8` with `sr $270A` and `$417C7EF4` — exactly
+what this core computes — and it is still open with no reply. That issue is the
+one to watch. We post nothing there: the decision on [#209] is to work around the
+data rather than lobby for a fix, which is why the drop list is the whole of the
+remedy.
+
+Expect the workaround to be long-lived. That repository has one commit, `e0d5ece`
+"Import initial tests." of 2024-05-14, nothing has been pushed since, and
+`e0d5ece` is what [the pin](#the-data) points at — so there is no upstream change
+to bump to, and `ASL.b` should be read as 8063/8065 for as long as the pin stands.
 
 [`ASL_B_BROKEN_CASES`]: ../crates/m68k/tests/shifts.rs
 [#209]: https://github.com/scottjab/rustsega/issues/209
+[SingleStepTests/680x0#4]: https://github.com/SingleStepTests/680x0/issues/4
 
 ## What the gate leaves out
 
