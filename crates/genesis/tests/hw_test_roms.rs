@@ -158,8 +158,8 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 ///  A04000-A05FFF : 0000 0000 (0000 0000)
 ///  A06000-A07EFF : FFFF FFFF (FFFF FFFF)
 ///  A10000-A1001F : A0A0 A0A0 (A0A0 A0A0)
-///  A11100        : FEFE FEFF (4F00 4F00)
-///  A11100        : FEFE FEFF (4E00 4E00)
+///  A11100        : FEFE FEFE (4F00 4F00)
+///  A11100        : FEFE FEFE (4E00 4E00)
 ///  A11200        : FFFF FFFF (4E00 4E00)
 ///  C00000-C00003 : 1122 1122 (1122 1122)
 ///  C00004-C00007 : 3688 3688 (4E88 4E88)
@@ -177,6 +177,26 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 /// the ROM's way of saying it passed. Every read-back matches what a real
 /// console returns for those regions: $4E71, the byte pair of `NOP`, is the
 /// 68000 bus floating after an instruction fetch.
+///
+/// # The $A11100 rows, and what this golden does and does not prove (#437)
+///
+/// The block above was transcribed from **our** dump, not from a hardware
+/// capture: the ROM is a dumper rather than a checker - its screen is a fixed
+/// template in the image (visible with `strings`) whose `0000 0000` fields are
+/// overwritten with what it read, and there is no PASS/FAIL/MISMATCH text in it
+/// at all. Nothing here is an assertion by the ROM about the value, and the
+/// numbers are not to be treated as hardware truth either.
+///
+/// That matters for the two $A11100 rows, which changed with #437. They print
+/// the bus request register twice: the first group follows the *byte* read and
+/// the second the *word* read. Patching `Bus::busreq_word` to answer 0xBEEF for
+/// a granted bus moves exactly the second group's digits - 8x8 cells 22, 24 and
+/// 25 of both rows, nothing else - which is what identifies them. Before #437 the
+/// two disagreed about bit 0: the byte read's `FEFE` says the Z80 has stopped and
+/// the word read's `FEFF` says it has not. `busreq_word` now mirrors the flag into
+/// bit 0, so both read `FEFE` and the golden was re-recorded
+/// (`0xb8274a8ff209b032` -> `0x6bd9b2fb7eede3d2`). Re-check this block against a
+/// hardware capture of `memtest_68k` if one ever exists.
 #[test]
 fn md_test_pack_memtest_68k_prints_its_memory_report() {
     check(
