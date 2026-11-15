@@ -100,7 +100,8 @@ fn smoke(game: &Game, rom: &Path) {
         pixels,
         frame.width,
         frame.height,
-    );
+    )
+    .unwrap();
 
     let colours: HashSet<u32> = pixels.iter().copied().collect();
     assert!(

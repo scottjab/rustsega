@@ -236,7 +236,8 @@ fn play(section: &Section, rom: &[u8], movie: &Movie) -> (Vec<u64>, u64) {
             &pixels,
             shot.width,
             shot.height,
-        );
+        )
+        .unwrap();
         assert_shows_a_level(section, played, &pixels);
         hashes.push(testkit::frame_hash(&pixels, shot.width, shot.height));
     }

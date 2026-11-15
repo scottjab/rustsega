@@ -409,7 +409,8 @@ fn sonic_boots_to_non_blank_screen() {
         &frame.pixels[..frame.width * frame.height],
         frame.width,
         frame.height,
-    );
+    )
+    .unwrap();
 }
 
 /// Boots one Realtec cart for `frames` and returns how many distinct colours its
@@ -454,7 +455,8 @@ fn colour_count(path: &std::path::Path, frames: u32, name: &str) -> usize {
         pixels,
         frame.width,
         frame.height,
-    );
+    )
+    .unwrap();
     colours.len()
 }
 
@@ -718,7 +720,8 @@ fn post_reset_colours(path: &std::path::Path, warm: u32, after: u32, name: &str)
         &picture.pixels[..picture.width * picture.height],
         picture.width,
         picture.height,
-    );
+    )
+    .unwrap();
     (first, last)
 }
 

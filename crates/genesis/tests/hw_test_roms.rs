@@ -356,5 +356,6 @@ fn overdrive2_runs_without_crashing_and_is_deterministic() {
         &pixels(&second),
         second.frame().width,
         second.frame().height,
-    );
+    )
+    .unwrap();
 }

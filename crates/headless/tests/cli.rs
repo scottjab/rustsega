@@ -238,6 +238,111 @@ fn dump_png_to_a_directory_errors_nicely() {
     );
 }
 
+/// The directory case had its own guard; this is every other way writing a PNG
+/// fails, which `testkit::dump_png` used to answer by panicking (#345).
+///
+/// A file where the parent directory should be is the portable way to ask for a
+/// failing create: it needs no read-only mount and no privileges.
+#[test]
+fn dump_png_onto_a_path_that_cannot_hold_a_file_errors_nicely() {
+    let dir = TempDir::new("png-parent");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+    // `blocked` is a file, so `blocked/out.png` has a parent that cannot be made.
+    let blocker = dir.join("blocked");
+    fs::write(&blocker, b"not a directory").expect("write a file to stand in for a dir");
+    let png = blocker.join("out.png");
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "1",
+        "--dump-png",
+        png.to_str().expect("utf-8 path"),
+    ]);
+
+    assert!(
+        !out.status.success(),
+        "a PNG that cannot be written must not report success\nstdout: {}",
+        stdout(&out)
+    );
+    let text = stderr(&out);
+    assert!(
+        !text.contains("panicked"),
+        "a clean error, not a panic from the PNG writer: {text}"
+    );
+    assert!(
+        text.contains("--dump-png"),
+        "the error must name the flag it is complaining about: {text}"
+    );
+    assert!(
+        text.contains(&blocker.display().to_string()),
+        "the error must name the path it could not write: {text}"
+    );
+}
+
+/// `--pad1 START@1200 --frames 300` presses a button on a frame the run never
+/// reaches, which used to pass in silence (#345). Doing nothing is still what it
+/// does, but it has to say so.
+#[test]
+fn pad1_pressing_past_the_last_frame_warns() {
+    let dir = TempDir::new("pad1-past");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "1",
+        "--pad1",
+        "START@1200,B@1201",
+    ]);
+
+    assert!(
+        out.status.success(),
+        "an unreachable press is a warning, not a failed run\nstderr: {}",
+        stderr(&out)
+    );
+    let text = stderr(&out);
+    assert!(
+        text.contains("warning"),
+        "a silent no-op is the thing #345 is about: {text}"
+    );
+    for frame in ["1200", "1201"] {
+        assert!(
+            text.contains(frame),
+            "the warning must name the frame it is skipping: {text}"
+        );
+    }
+}
+
+/// The same warning is not owed to a script the run does reach, so that it stays
+/// a signal rather than noise on every run that uses `--pad1`.
+#[test]
+fn pad1_pressing_within_the_run_stays_quiet() {
+    let dir = TempDir::new("pad1-in");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "2",
+        "--pad1",
+        "START@2",
+    ]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let text = stderr(&out);
+    assert!(
+        !text.contains("warning"),
+        "a script the run reaches must not be warned about: {text}"
+    );
+}
+
 /// A WAV file header as the `wav` module writes it, parsed back for a test to
 /// check. Only the fields `--dump-wav` promises are kept; a malformed or short
 /// file is a panic with the bytes that caused it.
