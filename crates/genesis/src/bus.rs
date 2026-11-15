@@ -1496,12 +1496,15 @@ impl Bus {
         }
     }
 
-    /// Z80 bus control word read: the same flag, in bit 8 of the word.
+    /// Z80 bus control word read: the flag in bit 8 of the word, and mirrored into
+    /// bit 0.
     ///
-    /// Not [`io_word`]: the flag is driven on D8 and the low byte of the word is
-    /// nothing's, rather than being a second copy of a byte register. Genesis Plus GX's
+    /// Bit 8 is the bit the byte register drives on a 16 bit access: Genesis Plus GX's
     /// `ctrl_io_read_word` clears or sets `0x0100` in an otherwise floating word and
-    /// MAME's `megadriv_68k_check_z80_bus` does `nextvalue | 0x0100`.
+    /// MAME's `megadriv_68k_check_z80_bus` does `nextvalue | 0x0100`. Bit 0 is not
+    /// driven hardware; it follows the same flag so that a cart polling
+    /// `btst #0, (Z80BusReq)` with a word read is served too, and
+    /// [`busreq_word`] is where that trade-off is argued.
     fn read_z80_ctrl_word(&mut self, addr: u32) -> u16 {
         match Z80Ctrl::decode(addr) {
             Some(Z80Ctrl::Busreq) => busreq_word(!self.z80_bus_granted()),
@@ -1778,17 +1781,40 @@ fn z80_word(byte: u8) -> u16 {
 /// that never comes, and Genesis Plus GX says the same ("Unused bits return prefetched
 /// bus data (Time Killers)"). A fixed 1 is the cheap version of never-zero, and open
 /// bus is 1 anyway.
+///
+/// The word read keeps the same rule for its own flag bit; see [`busreq_word`] for why
+/// the low byte of that one is not held at a fixed 1 too.
 fn busreq_byte(running: bool) -> u8 {
     if running { OPEN_BUS } else { OPEN_BUS & !1 }
 }
 
-/// What a word read of the bus request register reports: `running` in bit 8, with the
-/// same placeholder bits around it. See [`Bus::read_z80_ctrl_word`].
+/// What a word read of the bus request register reports: `running` in bit 8 - the bit
+/// the byte register drives on a 16 bit access - and mirrored into bit 0, with the
+/// other fourteen bits [`OPEN_BUS`]. See [`Bus::read_z80_ctrl_word`].
+///
+/// Bit 0 of a word read is unclaimed territory. `0xA11100` is a byte register driven on
+/// D8 (plutiedev "Using the Z80"), so on a word read bits 0-7 are exactly the "unused
+/// bits return prefetched bus data" case plutiedev describes, and nothing here models a
+/// prefetch latch. What it answers is therefore a choice, and a fixed 1 - what this
+/// returned until #437 - is our own modelling artifact rather than a hardware level.
+/// It is also what turns the documented poll into a deadlock for a cart that issues it
+/// as a word read: Time Killers runs `move.w $A11100,d0` / `btst #0,d0` / `bne` for
+/// 1800 frames, waiting for a bit that never falls, and never reaches its VDP
+/// initialisation.
+///
+/// Mirroring the flag into bit 0 is the cheap approximation, not a claim that hardware
+/// drives D0 with it. It is chosen because it (a) makes the byte read and the word read
+/// agree about the one bit the register knows, at either width of the
+/// `btst #0, (Z80BusReq)` poll, (b) leaves the never-all-zero rule the byte read keeps
+/// for its unused bits intact - a granted word read is `0xFEFE`, not `0` - and (c) is
+/// the level the 68k itself last put on that lane, since requesting the bus is a write
+/// of `0x0100` with bit 0 clear. A modelled prefetched-bus latch is what would replace
+/// it, and would still read back 0 for the cart that has just asked for the bus.
 fn busreq_word(running: bool) -> u16 {
     if running {
         OPEN_BUS_WORD
     } else {
-        OPEN_BUS_WORD & !0x0100
+        OPEN_BUS_WORD & !(0x0100 | 0x0001)
     }
 }
 
@@ -2438,6 +2464,51 @@ mod tests {
         // Writing 0 releases it and the Z80 is running again; nothing latches.
         bus.write_word(Z80_BUSREQ, 0x0000);
         assert_eq!(bus.read_word(Z80_BUSREQ) & 0x0100, 0x0100);
+    }
+
+    /// Bit 0 of a **word** read follows the same flag as bit 0 of the byte read, so
+    /// the `btst #0, (Z80BusReq)` poll of plutiedev "Using the Z80" works whatever
+    /// width the cart happens to read with (#437).
+    ///
+    /// Time Killers reads it as a word - `move.w $A11100,d0` / `btst #0,d0` /
+    /// `bne.s $40e`, all 1800 frames of it - and waits for bit 0 to fall. While that
+    /// bit is a fixed 1 the cart never sees the release it asked for and never gets
+    /// as far as its VDP initialisation.
+    #[test]
+    fn busreq_word_bit0_follows_the_byte_read() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        assert_eq!(
+            bus.read_word(Z80_BUSREQ) & 1,
+            u16::from(bus.read_byte(Z80_BUSREQ) & 1),
+            "released: both widths report the Z80 running"
+        );
+
+        bus.write_word(Z80_BUSREQ, 0x0100);
+        assert_eq!(
+            bus.read_word(Z80_BUSREQ) & 1,
+            0,
+            "granted: bit 0 of the word is not a constant (#437)"
+        );
+        assert_eq!(
+            bus.read_word(Z80_BUSREQ) & 1,
+            u16::from(bus.read_byte(Z80_BUSREQ) & 1),
+            "granted: both widths report the Z80 stopped"
+        );
+    }
+
+    /// A granted bus reads `0xFEFE` as a word: the two flag bits - bit 8, the bit the
+    /// register drives on a word access, and bit 0, which mirrors it so that the poll
+    /// works at either width, see [`busreq_word`] - and every other bit still
+    /// [`OPEN_BUS`].
+    ///
+    /// The fourteen 1s are what keeps the rule the byte read already had, that "the
+    /// unused bits are never all-zero" ([`busreq_grant_after_request`]), true of a
+    /// word read too.
+    #[test]
+    fn busreq_word_granted_is_the_flag_bits_only() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        bus.write_word(Z80_BUSREQ, 0x0100);
+        assert_eq!(bus.read_word(Z80_BUSREQ), 0xFEFE);
     }
 
     /// The byte write does the same thing, from bit 0 of the byte rather than bit 8
