@@ -1,7 +1,12 @@
 /target
 /dist
 /crates/web/dist
-/test-roms/
+# A directory, a file, or a symlink to one. The trailing slash meant only a real
+# directory, so in a linked worktree - where the way to point the data-driven
+# tests at the collection is `ln -s /path/to/main/test-roms test-roms` - the
+# symlink showed up as untracked and one `git add -A` away from being committed
+# with an absolute path in it (#251).
+/test-roms
 *.srm
 *.state
 .direnv/
