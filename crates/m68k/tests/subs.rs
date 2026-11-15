@@ -3,9 +3,9 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateAndCyclesSkipAddressErrors`], the same one the add class uses:
+//! [`harness::Check::StateAndCyclesSkipExceptions`], the same one the add class uses:
 //! the cases that end in the suite's exception handler are left to M1-29 (#37) —
-//! see [`harness::is_address_error_case`] and #185.
+//! see [`harness::is_exception_case`] and #185.
 //!
 //! The suite ships no `SUBI.*` or `SUBQ.*` file. Those instructions are not
 //! untested by this binary: their cases live in `SUB.b`, `SUB.w` and `SUB.l`,
@@ -29,50 +29,50 @@ mod harness;
 /// encodings taken out.
 #[test]
 fn sub_b_file_passes() {
-    harness::assert_file_passes("SUB.b", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("SUB.b", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `SUB.W`: `$9040`-`$907F` / `$9140`-`$917F`.
 #[test]
 fn sub_w_file_passes() {
-    harness::assert_file_passes("SUB.w", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("SUB.w", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `SUB.L`: `$9080`-`$90BF` / `$9180`-`$91BF`.
 #[test]
 fn sub_l_file_passes() {
-    harness::assert_file_passes("SUB.l", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("SUB.l", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `SUBA.W`: operation `011`, word only.
 #[test]
 fn suba_w_file_passes() {
-    harness::assert_file_passes("SUBA.w", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("SUBA.w", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `SUBA.L`: operation `111`.
 #[test]
 fn suba_l_file_passes() {
-    harness::assert_file_passes("SUBA.l", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("SUBA.l", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `SUBX.B`: `$9100`-`$9107` style, `ss = 00`, which overlaps `SUB`'s
 /// `$9100`-`$913F` byte group and must win there.
 #[test]
 fn subx_b_file_passes() {
-    harness::assert_file_passes("SUBX.b", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("SUBX.b", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `SUBX.W`: `ss = 01` inside the `SUB.W` `$9140`-`$917F` range.
 #[test]
 fn subx_w_file_passes() {
-    harness::assert_file_passes("SUBX.w", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("SUBX.w", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `SUBX.L`: `ss = 10` inside the `SUB.L` `$9180`-`$91BF` range.
 #[test]
 fn subx_l_file_passes() {
-    harness::assert_file_passes("SUBX.l", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("SUBX.l", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// The eight file names above are what the suite ships, so a rename fails here

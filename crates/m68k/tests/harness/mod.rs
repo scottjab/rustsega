@@ -5,7 +5,7 @@
 //! This is the piece every later m68k instruction ticket reuses. Turning on a
 //! group means adding `crates/m68k/tests/<group>.rs` that calls
 //! [`assert_file_passes`] with the file names that group covers — e.g.
-//! `assert_file_passes("ADD.b", Check::StateSkipAddressErrors)` — and watching
+//! `assert_file_passes("ADD.b", Check::StateSkipExceptions)` — and watching
 //! it go green. Name is the file name without `.json` or `.json.gz`, exactly as
 //! it appears in `ls $RUSTSEGA_TEST_ROM_DIR/680x0/68000/v1/`.
 //!
@@ -75,7 +75,9 @@ const MAX_REPORTED_FAILURES: usize = 10;
 const MAX_REPORTED_MISMATCHES: usize = 5;
 
 /// The suite's exception vector slot: the handler long at $00000C..=$00000F,
-/// which a case that takes an exception fetches and jumps to.
+/// which a case that takes an exception fetches and jumps to. Hardware vectors
+/// the address error at $000008 (M68000UM "Exception Vector Memory Map"); this
+/// suite does not, and [`is_exception_case`] is where that is argued.
 const EXCEPTION_VECTOR: u32 = 0x0000_000C;
 
 /// One `[address, value]` pair from a case's `ram` array. Address is a full
@@ -94,17 +96,20 @@ pub enum Check {
     /// [`Check::State`] plus the clock count `step` returned against the case's
     /// `length`.
     StateAndCycles,
-    /// [`Check::State`] with the exception cases left out, because they need
-    /// exception handling the core does not have yet (address errors are
-    /// M1-29, #37). Instruction tickets use this until then.
-    StateSkipAddressErrors,
+    /// [`Check::State`] with the cases that end in the suite's exception handler
+    /// left out, because they needed exception handling the core did not have
+    /// when the harness was written. Which cases those are is what
+    /// [`is_exception_case`] documents — notably, they are not "the address
+    /// errors". Instruction tickets use this until their exception cases are
+    /// reproducible, and #223 tracks moving files up to [`Check::State`].
+    StateSkipExceptions,
     /// [`Check::StateAndCycles`] with the exception cases left out: the two
     /// independent axes of the variants above, combined. Added by M1-31a (#39),
     /// whose cycle work lands on files that #223 has not yet moved to full
     /// state checking — a cycle ticket must not have to take exception
     /// handling with it, and a timing ticket must not weaken a file by dropping
-    /// back to [`Check::StateSkipAddressErrors`].
-    StateAndCyclesSkipAddressErrors,
+    /// back to [`Check::StateSkipExceptions`].
+    StateAndCyclesSkipExceptions,
 }
 
 impl Check {
@@ -113,16 +118,16 @@ impl Check {
     fn checks_cycles(self) -> bool {
         matches!(
             self,
-            Self::StateAndCycles | Self::StateAndCyclesSkipAddressErrors
+            Self::StateAndCycles | Self::StateAndCyclesSkipExceptions
         )
     }
 
     /// Whether this mode leaves the exception cases out (see
-    /// [`is_address_error_case`]).
-    fn skips_address_errors(self) -> bool {
+    /// [`is_exception_case`]).
+    fn skips_exceptions(self) -> bool {
         matches!(
             self,
-            Self::StateSkipAddressErrors | Self::StateAndCyclesSkipAddressErrors
+            Self::StateSkipExceptions | Self::StateAndCyclesSkipExceptions
         )
     }
 }
@@ -547,21 +552,43 @@ fn compare_ram(bus: &mut TestBus, want: &[RamByte], out: &mut Vec<Mismatch>) {
     }
 }
 
-/// True when `case` takes an exception rather than running its instruction, and
-/// so needs exception handling the core does not have yet (M1-29, #37).
+/// True when `case` ends in the suite's exception handler rather than finishing
+/// its instruction, and so needs exception handling this core may not model yet.
 ///
-/// The suite spells it out: the handler long is present in `initial.ram` at
-/// $00000C..=$00000F and `final.pc` is that long. Measured over the whole pinned
-/// suite with this harness (`all_instructions`): 178 087 of 1 000 060 cases, over
-/// 62 of the 124 files, and every one of those 62 files reaches `final.pc`
-/// $00001400, the single handler the suite installs in its vectors.
+/// The suite spells the condition out: the handler long is present in
+/// `initial.ram` at $00000C..=$00000F and `final.pc` is that long. Measured over
+/// the whole pinned suite with this harness (`all_instructions`): 178 087 of
+/// 1 000 060 cases, over 62 of the 124 files, and every one of those 62 files
+/// reaches `final.pc` $00001400, the single handler the suite installs in its
+/// vectors.
 ///
-/// One thing to know when reading the name: the vector caught here is the one at
-/// $00000C, which on the 68000 is *illegal instruction*; address error is the
-/// long at $000008 (M68000UM, "Exception Vector Memory Map"). So what this
-/// skips is "the case ends in the suite's exception handler", which is not
-/// exactly address errors. Issue #185 carries the decision that owes M1-29 (#37).
-pub fn is_address_error_case(case: &TestCase) -> bool {
+/// # Why $00000C is the right slot here
+///
+/// A reader who knows the map will expect address error at $000008 (M68000UM
+/// "Exception Vector Memory Map": vector 2), and the suite really does not put
+/// it there. `crates/m68k/src/address_error.rs` measured the recorded suite
+/// instead: every group 0 frame case fetches its handler long from $00000C, and
+/// the recording core sends the address error and the illegal instruction to the
+/// same slot, so `EXC_ADDRESS_ERROR == EXC_ILLEGAL == 3` there. This crate's
+/// convention is that the measured slot wins, so this predicate and that module
+/// read the same long. If a test ROM ever settles the question and
+/// `address_error::EXC_ADDRESS_ERROR` moves to $000008, this moves with it; do
+/// not "fix" it here first.
+///
+/// # What the skipped set is, and is not
+///
+/// It is **not a set of hardware address errors**. It is every case that ends at
+/// the handler recorded in the $0C slot, and because the recording core routes
+/// both exceptions to $0C, the set includes genuine illegal-instruction cases as
+/// well as address errors and nothing here can tell them apart. Equally, a case
+/// that ends at a *different* vector is not skipped: `CHK`'s 4 272 traps end at
+/// $00002000 with no $0C long in `initial.ram`, so they run and are gated like
+/// any other case. Read a file's pass count as `total - skipped` cases covered,
+/// with no claim about which exception the missing ones took.
+///
+/// Issue #185 renamed this from `is_address_error_case`, which promised the
+/// narrower set the code never had.
+pub fn is_exception_case(case: &TestCase) -> bool {
     let mut bytes = [None; 4];
     for (i, slot) in bytes.iter_mut().enumerate() {
         let addr = EXCEPTION_VECTOR + i as u32;
@@ -580,10 +607,10 @@ pub fn is_address_error_case(case: &TestCase) -> bool {
 pub struct Report {
     /// Cases in the file, including any skipped.
     pub total: usize,
-    /// Cases whose state matched. With [`Check::StateSkipAddressErrors`] a clean
+    /// Cases whose state matched. With [`Check::StateSkipExceptions`] a clean
     /// file has `passed + skipped == total`.
     pub passed: usize,
-    /// Cases left out by [`Check::StateSkipAddressErrors`].
+    /// Cases left out by [`Check::StateSkipExceptions`].
     pub skipped: usize,
     /// The first [`MAX_REPORTED_FAILURES`] failures, one readable line each.
     /// Empty means every case that ran passed.
@@ -627,7 +654,7 @@ fn run_cases_on(machine: &mut Machine, cases: &[TestCase], check: Check) -> Repo
         failures: Vec::new(),
     };
     for case in cases {
-        if check.skips_address_errors() && is_address_error_case(case) {
+        if check.skips_exceptions() && is_exception_case(case) {
             report.skipped += 1;
             continue;
         }

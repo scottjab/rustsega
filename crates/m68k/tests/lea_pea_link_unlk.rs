@@ -2,9 +2,9 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateAndCyclesSkipAddressErrors`], the same one `NEG`/`CLR`/`EXG`
+//! [`harness::Check::StateAndCyclesSkipExceptions`], the same one `NEG`/`CLR`/`EXG`
 //! use: the cases that end in the suite's exception handler are left to M1-29
-//! (#37) — see [`harness::is_address_error_case`] and #185.
+//! (#37) — see [`harness::is_exception_case`] and #185.
 //!
 //! `LEA` and `PEA` are each 8065 cases over the seven control addressing modes
 //! — `(An)`, `d16(An)`, `d8(An,Xn)`, `abs.W`, `abs.L`, `d16(PC)`, `d8(PC,Xn)` —
@@ -31,27 +31,27 @@ mod harness;
 /// `LEA <ea>,An`: `$41C0`..`$4FFF` with bits 8..6 all set, no flag affected.
 #[test]
 fn lea_file_passes() {
-    harness::assert_file_passes("LEA", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("LEA", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `PEA <ea>`: PEA's half of the `$48??` window (`$4840`+EA at any mode but
 /// `000`, which is `SWAP`), pushing the computed address rather than its contents.
 #[test]
 fn pea_file_passes() {
-    harness::assert_file_passes("PEA", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("PEA", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `LINK An,#d16`: `$4E50`+`r`, the frame-pointer prologue.
 #[test]
 fn link_file_passes() {
-    harness::assert_file_passes("LINK", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("LINK", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// `UNLINK An` — the suite's `UNLINK.json.gz`, which is `$4E58`+`r`: the frame
 /// teardown that reverses `LINK`.
 #[test]
 fn unlk_file_passes() {
-    harness::assert_file_passes("UNLINK", harness::Check::StateAndCyclesSkipAddressErrors);
+    harness::assert_file_passes("UNLINK", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// The four file names above are what the suite ships for this ticket, so a
