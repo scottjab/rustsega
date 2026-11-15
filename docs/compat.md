@@ -135,6 +135,157 @@ not recomputed here:
   builds of titles that draw fine in their retail form, and should fall with
   whatever fixes their parent (#375, #357).
 
+### Truncated dumps: images shorter than their own header
+
+Set aside rather than filed, like the entries above: these are dump problems, not
+emulator problems. `0x1A4` is the last address the cart answers (plutiedev "ROM range
+start/end"), so a complete image is one byte longer than the field. `declared_rom_size`
+in `crates/genesis/src/cart/header.rs` reads it, `RomHeader::truncated` compares it with
+the length of the image, and **86 of the local 2775 images are short**. The flag is
+informational - like the header checksum beside it, it refuses nothing and changes
+nothing about what the emulator does.
+
+The cart that found this is `QuackShot Starring Donald Duck (World) (En,Ja) (Rev A)`:
+`0x80000` on disk, `0x13FFFF` in its header, and a boot self-test that sums
+`$100000..$13FFFF` - the top quarter of the cart it does not have - before halting in
+`NOP; NOP; BRA.S $200` with the VDP never initialised, so `headless run` says
+`colours=1` at every frame count. `(Rev A) (Alt)` is the same cart at `0x140000`, and
+draws 33 colours with no emulator change at all. Re-dumping `Rev A` is the only fix for
+it, and only 13 of the 86 rows are worth the trouble: the other 73 are betas, protos,
+demos, Sega Channel downloads and program carts, whose headers were written for a cart
+bigger than the build in hand.
+
+**Reading a field as a length, and when to say nothing.** `0x1A4` is taken as a length
+only when `0x1A0` is 0 (plutiedev says it always is), `0x1A4 + 1` does not overflow, the
+result is a whole number of 32 KiB units - every size the collection declares is, all
+21 of them, the fourteen non-powers-of-two among them (3 MB is the commonest, at 153
+carts) - and it is at most 8 MB. **199 of the 2775 fail that and get
+no verdict at all**, and 98 of those 199 happen to name an address past their own end.
+They are deliberately not counted as truncated: `Phantasy Star Fukkokuban (Japan).md`
+declares `0x2120C211` with a `0x1A0` of `0x7DCD9C7E`, and `Fantastic Dizzy (USA, Europe)
+(Beta).md` declares `0xFFFF2020`, two `0xFF`s and the two spaces of a field nobody
+filled in. A field that is nonsense is a
+fact about the header, not evidence that the dump is short, and saying "truncated" about
+it would be a claim nobody could check. `Phantasy Star Fukkokuban` is grouped with these
+carts in [#435](https://github.com/scottjab/rustsega/issues/435) only because its header is unreadable; its own symptom - a `pc` of
+`$D3BFC9FF` at every frame boundary - is a run-away 68000 and is elsewhere.
+
+**What the emulator answers above the image, and why it is not the image again.** A
+`Region::Rom` read past the end of the image is `0xFF` open bus
+(`Bus::read_rom_byte` in `crates/genesis/src/bus.rs`, where the decision and its
+measurements are recorded). Mirroring instead - wrapping such an address back into the
+image, which is what an unbanked cart with its upper address lines unconnected really
+does - was tried, and it fixes no picture: with `offset % len` in that one lookup
+`QuackShot (Rev A)` is still `colours=1 max_colours=1`, and the two complete QuackShot
+images are unchanged, because a 512 KiB mirror holds the first quarter of the image, not
+the quarter the cart is asking for. Mirroring a truncated dump invents data and serves it
+as the cart's own. It is not inert either, so it would not be a free change: see the
+[#355](https://github.com/scottjab/rustsega/issues/355) note below, where a mirrored
+Triple Play stops crashing and still draws nothing. No complete cart is known to need a
+mirror, and if one is shown to need it that is a new issue with a measurement on it.
+
+**#355's `00FF` carts: two of these, and not an instruction gap.** `Triple Play 96
+(USA)` and `Triple Play - Gold Edition (USA)` are each 1 MiB short, and both reach
+`not implemented: m68k opcode 00FF` if run long enough (1800 frames on this tree, not
+the 600 the sweep's `Panic` row was measured at). Two scratch copies of `Triple Play 96`
+say what that means. Padded with `0xFF` to its declared `0x400000` it panics exactly the
+same way - which is the control, since `0xFF` padding and reading past the end are the
+same answer by construction. Mirrored instead, with the missing megabyte filled by the
+first megabyte of the image, it runs all 1800 frames clean and **still draws 1 colour**.
+So those `00FF` hits are the cart fetching filler from the ROM it does not have and
+executing it, not a missing instruction; and the black screen is not the short image
+either, since fixing the length does not fix the picture. Nothing in the m68k decoder
+was changed for this, and `00FF` is still unimplemented for the cart that really wants
+it.
+
+| ROM | Length | Declared | Missing | Notes |
+|---|---|---|---|---|
+| `Aladdin (USA) (Final Cut).md` | `0x2460b4` | `0x400000` | `0x1b9f4c` | a hack carrying the retail `Aladdin` header, not a dump |
+| `Bare Knuckle II (Japan) (En) (Beta).md` | `0x130000` | `0x200000` | `0xd0000` |  |
+| `Barney's Hide & Seek Game (USA) (1993-09-18) (Sega Channel).md` | `0xe9c2a` | `0x100000` | `0x163d6` |  |
+| `Body Count (Brazil) (En) (Beta) (1994-02-08).md` | `0xff900` | `0x100000` | `0x700` |  |
+| `Chaoji Mahjong Club (Taiwan) (Unl).md` | `0x100000` | `0x800000` | `0x700000` |  |
+| `Crystal's Pony Tale (USA) (Beta) (1994-07-12) (Alt).md` | `0xff554` | `0x100000` | `0xaac` |  |
+| `Desert Demolition (USA, Europe) (Beta) (1994-12-06).md` | `0xed0ad` | `0x100000` | `0x12f53` |  |
+| `Desert Demolition (USA, Europe) (Beta) (1994-12-08).md` | `0xfdfb8` | `0x100000` | `0x2048` |  |
+| `Desert Demolition (USA, Europe) (Beta) (1994-12-12) (Alt).md` | `0xec988` | `0x100000` | `0x13678` |  |
+| `Desert Demolition (USA, Europe) (Beta) (1994-12-13).md` | `0xfde9c` | `0x100000` | `0x2164` |  |
+| `Desert Demolition (USA, Europe) (Beta) (1994-12-14).md` | `0xfde9c` | `0x100000` | `0x2164` |  |
+| `Desert Demolition (USA, Europe) (Beta) (1994-12-15).md` | `0xfde9c` | `0x100000` | `0x2164` |  |
+| `Desert Demolition (USA, Europe) (Beta) (1994-12-19).md` | `0xfde9c` | `0x100000` | `0x2164` |  |
+| `Dominus (USA) (Proto) (Alt).md` | `0xc0000` | `0x100000` | `0x40000` |  |
+| `Du Shen Zhi - Menghuan Poker (Taiwan) (Unl).md` | `0x100000` | `0x800000` | `0x700000` |  |
+| `Eternal Champions (Japan, Korea) (En) (Beta) (1993-11-17).md` | `0x2ff4b0` | `0x300000` | `0xb50` |  |
+| `Fantasy Pinball (Brazil) (Mega Drive 4).md` | `0x81faa` | `0x400000` | `0x37e056` |  |
+| `Fengkuang Taohuayuan (China) (Unl).md` | `0x100000` | `0x800000` | `0x700000` |  |
+| `Fengkuang Taohuayuan (Taiwan) (Unl).md` | `0x100000` | `0x800000` | `0x700000` |  |
+| `GEMS (USA) (v2.8) (Proto) (1994-06-04) (Program).md` | `0x40000` | `0x80000` | `0x40000` |  |
+| `Gargoyles (USA) (Beta) (1995-10-02).md` | `0x2fa048` | `0x300000` | `0x5fb8` |  |
+| `Home Alone 2 - Lost in New York (USA) (1993-09-29) (Sega Channel).md` | `0x7f9e6` | `0x80000` | `0x61a` |  |
+| `Instruments of Chaos Starring Young Indiana Jones (USA) (Beta) (1993-09-23).md` | `0xfe3c4` | `0x100000` | `0x1c3c` |  |
+| `Instruments of Chaos Starring Young Indiana Jones (USA) (Beta) (1993-12-28) (Alt).md` | `0xff73c` | `0x100000` | `0x8c4` |  |
+| `Jurassic Park (USA) (1993-05-26) (Sega Channel).md` | `0x1e3240` | `0x200000` | `0x1cdc0` |  |
+| `Jurassic Park - Rampage Edition (USA, Europe) (Beta) (1994-06-20).md` | `0x1f6e60` | `0x200000` | `0x91a0` |  |
+| `Lufia & The Fortress of Doom (USA) (Proto).md` | `0x100000` | `0x200000` | `0x100000` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-01-12).md` | `0xeb2e4` | `0x100000` | `0x14d1c` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-02-17).md` | `0xdf6bc` | `0x100000` | `0x20944` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-03-07).md` | `0xe9aa8` | `0x100000` | `0x16558` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-03-14).md` | `0xf1c30` | `0x100000` | `0xe3d0` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-03-27).md` | `0xf52e8` | `0x100000` | `0xad18` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-03-31).md` | `0xf93c0` | `0x100000` | `0x6c40` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-04-11).md` | `0xfdfbc` | `0x100000` | `0x2044` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-04-21).md` | `0xfcfdc` | `0x100000` | `0x3024` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-04-25).md` | `0xfd5e0` | `0x100000` | `0x2a20` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-04-28).md` | `0xfe89c` | `0x100000` | `0x1764` |  |
+| `Magic School Bus, The - Space Exploration Game (USA) (Beta) (1995-05-05).md` | `0xfea00` | `0x100000` | `0x1600` |  |
+| `Mahjong Qingren (Taiwan) (Unl).md` | `0x100000` | `0x800000` | `0x700000` |  |
+| `Monopoly (USA) (Beta).md` | `0x80000` | `0x100000` | `0x80000` |  |
+| `NBA Action '95 Starring David Robinson (USA, Europe) (Beta) (1995-01-18).md` | `0x1ff49e` | `0x200000` | `0xb62` |  |
+| `NBA Action '95 Starring David Robinson (USA, Europe) (Beta) (1995-01-27) (Alt).md` | `0x1fe190` | `0x200000` | `0x1e70` |  |
+| `NBA Action '95 Starring David Robinson (USA, Europe) (Beta) (1995-01-27).md` | `0x1fe190` | `0x200000` | `0x1e70` |  |
+| `NBA Action '95 Starring David Robinson (USA, Europe) (Beta) (1995-01-28) (Alt).md` | `0x1fe19e` | `0x200000` | `0x1e62` |  |
+| `NBA Action '95 Starring David Robinson (USA, Europe) (Beta) (1995-02-02).md` | `0x1fe1f0` | `0x200000` | `0x1e10` |  |
+| `NHL All-Star Hockey 95 (USA) (Beta) (1994-11-09).md` | `0x1ffff9` | `0x200000` | `0x7` |  |
+| `NHL All-Star Hockey 95 (USA) (Beta) (1994-11-22).md` | `0x1ffffa` | `0x200000` | `0x6` |  |
+| `NHL All-Star Hockey 95 (USA) (Beta) (1994-11-23).md` | `0x1ffffa` | `0x200000` | `0x6` |  |
+| `NHL All-Star Hockey 95 (USA) (Beta) (1994-11-27).md` | `0x1ffffa` | `0x200000` | `0x6` |  |
+| `NHL All-Star Hockey 95 (USA) (Beta) (1994-11-28).md` | `0x1ffffa` | `0x200000` | `0x6` |  |
+| `NHL All-Star Hockey 95 (USA) (Beta) (1994-11-29).md` | `0x1ffffa` | `0x200000` | `0x6` |  |
+| `NHL All-Star Hockey 95 (USA) (Beta) (1994-12-01) (Alt).md` | `0x1ffffa` | `0x200000` | `0x6` |  |
+| `NHL All-Star Hockey 95 (USA) (Beta) (1994-12-01).md` | `0x1ffffa` | `0x200000` | `0x6` |  |
+| `NHL All-Star Hockey 95 (USA) (Beta) (1994-12-02).md` | `0x1ffffa` | `0x200000` | `0x6` |  |
+| `NHL Hockey (USA) (Rev 1) (Beta) (1991-09-18).md` | `0x7fea6` | `0x80000` | `0x15a` |  |
+| `Ooze, The (USA) (Beta) (1995-06-22).md` | `0xebea8` | `0x100000` | `0x14158` |  |
+| `Ooze, The (USA) (Beta) (1995-06-26).md` | `0xec570` | `0x100000` | `0x13a90` |  |
+| `Ooze, The (USA) (Beta) (1995-06-29).md` | `0xee456` | `0x100000` | `0x11baa` |  |
+| `Out of the Vortex (USA) (Proto) (1995-09-13).md` | `0x1fcd14` | `0x200000` | `0x32ec` |  |
+| `Prince of Persia (Europe) (Beta 1).md` | `0x40000` | `0x80000` | `0x40000` |  |
+| `QuackShot Starring Donald Duck (World) (En,Ja) (Rev A).md` | `0x80000` | `0x140000` | `0xc0000` | the cart that opened [#435](https://github.com/scottjab/rustsega/issues/435); its complete `(Rev A) (Alt)` dump is on disk and draws 33 colours |
+| `Ren & Stimpy Show Presents, The - Stimpy's Invention (Europe) (1993-12-09) (Sega Channel).md` | `0xff27a` | `0x100000` | `0xd86` |  |
+| `Richard Scarry's Busytown (USA) (Beta) (1994-08-17).md` | `0x1ffaa4` | `0x200000` | `0x55c` |  |
+| `Sega Channel (USA) (Demo) (1994-02-16).md` | `0x80000` | `0x100000` | `0x80000` |  |
+| `Sega Channel (USA) (General Instrument) (Program).md` | `0x80000` | `0x100000` | `0x80000` |  |
+| `Segapede (USA) (Proto).md` | `0x7168c` | `0x100000` | `0x8e974` |  |
+| `Ship (USA) (Demo) (GEMS 2.5).md` | `0x20000` | `0x80000` | `0x60000` |  |
+| `Slam - Shaq vs. the Legends (USA) (Proto).md` | `0x1f485a` | `0x200000` | `0xb7a6` |  |
+| `Soldiers of Fortune (USA).md` | `0x180000` | `0x200000` | `0x80000` | retail; exactly half the ROM its header names |
+| `Sonic 3D Blast (USA, Europe, Korea) (En) (Beta) (1996-08-30).md` | `0x3fff06` | `0x400000` | `0xfa` |  |
+| `Sonic Crackers (USA) (Proto) (1994-07-xx).md` | `0x100000` | `0x200000` | `0x100000` |  |
+| `Story of Thor, The (Europe) (Beta) (1994-04-xx).md` | `0x1b0000` | `0x200000` | `0x50000` |  |
+| `Triple Play - Gold Edition (USA).md` | `0x300000` | `0x400000` | `0x100000` | retail; one of the three `m68k opcode 00FF` carts of [#355](https://github.com/scottjab/rustsega/issues/355) |
+| `Triple Play 96 (USA).md` | `0x300000` | `0x400000` | `0x100000` | retail; one of the three `m68k opcode 00FF` carts of [#355](https://github.com/scottjab/rustsega/issues/355) |
+| `Vectorman 2 (USA) (Beta) (1996-08-26).md` | `0x2a8e46` | `0x300000` | `0x571ba` |  |
+| `Viewpoint (USA) (Beta) (1994-08-xx).md` | `0x180000` | `0x200000` | `0x80000` |  |
+| `WWF WrestleMania - The Arcade Game (USA, Europe) (Beta).md` | `0x40000` | `0x80000` | `0x40000` |  |
+| `World of Illusion starring Mickey Mouse & Donald Duck (USA, Korea) (En) (Beta 2).md` | `0x100000` | `0x140000` | `0x40000` |  |
+| `Wrestle War (Japan, Europe) (En) (Beta) (1990-09-xx).md` | `0x80000` | `0xa0000` | `0x20000` |  |
+| `X-Men 2 - Clone Wars (USA, Europe) (Beta) (1994-12-02).md` | `0x1fbe22` | `0x200000` | `0x41de` |  |
+| `X-Men 2 - Clone Wars (USA, Europe) (Beta) (1994-12-08).md` | `0x1feedc` | `0x200000` | `0x1124` |  |
+| `X-Men 2 - Clone Wars (USA, Europe) (Beta) (1994-12-10).md` | `0x1ffaf0` | `0x200000` | `0x510` |  |
+| `X-Men 2 - Clone Wars (USA, Europe) (Beta) (1994-12-15).md` | `0x1ffe54` | `0x200000` | `0x1ac` |  |
+| `Zero Tolerance Underground (World) (Proto) (Switch).md` | `0x1dd6d0` | `0x200000` | `0x22930` |  |
+| `Zhanqi - Chinese Battle Chess (Taiwan) (Unl).md` | `0x100000` | `0x800000` | `0x700000` |  |
+| `Zombi Terror (World) (Unl).md` | `0x9297a` | `0x400000` | `0x36d686` |  |
 ### Method, so the numbers can be repeated
 
 `headless sweep ~/games/roms/genesis --jobs 24` takes 422 s (7 min) wall clock on 28 cores: a 600-frame checkpoint (`--frames`), a 1800-frame watched run (`--run-frames`, three times the checkpoint) and a second pass holding `START@300,START@301` for any cart that drew nothing (`--input-gate none` switches that pass off). `distinct_colors` and `frame_hash` are still the checkpoint frame's, so the CSV diffs against the old table; `max_colours` and `input_gate` are #373's columns. The wider per-ROM sampling behind #373 and #375 was `headless run <rom> --colours` at the frame counts 60, 120, 180, 240, 300, 420, 540, 600, 700, 900, 1200, 1500, 2100, 2400, 2700 and 3600, with and without `--pad1`, and `identify -format %k` plus `convert ... txt:-` on `--dump-png` output to read back what the single colour actually was (`#000000`).

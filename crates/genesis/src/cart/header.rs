@@ -30,6 +30,20 @@ const HEADER_END: usize = 0x200;
 /// header rather than the header itself.
 const CHECKSUM_DATA_START: usize = 0x200;
 
+/// One ROM chip unit, and the granularity [`RomHeader::declared_rom_size`]
+/// accepts: every ROM size the local collection declares is a whole number of
+/// these, including the fourteen that are not powers of two - 3 MB (`0x300000`,
+/// what 153 of them declare) and the 1.25 MB of `QuackShot Starring Donald Duck
+/// (World) (En,Ja) (Rev A)` (`0x140000`, forty units).
+const ROM_UNIT: usize = 0x8000;
+
+/// The largest ROM a Genesis cartridge is built with, and so the largest value
+/// 0x1A4 will be read as a length. The field is a 32-bit address, so a header can
+/// write a "size" larger than any cart that existed - and does: this is what
+/// keeps [`RomHeader::declared_rom_size`] from claiming a 530 MB cart for
+/// `Phantasy Star Fukkokuban (Japan)`.
+const ROM_MAX: usize = 0x0080_0000;
+
 /// Regions the software declares itself compatible with, from the field at
 /// 0x1F0.
 ///
@@ -121,6 +135,82 @@ impl RomHeader {
     /// rather than a verified value.
     pub fn checksum_ok(&self, rom: &[u8]) -> bool {
         self.checksum == compute_checksum(rom)
+    }
+
+    /// The length a complete image of this cart would be: the range end at 0x1A4
+    /// plus one, since plutiedev "ROM range start/end" documents 0x1A4 as the
+    /// *last address covered* and a cart of `n` bytes therefore writes `n - 1`.
+    ///
+    /// `None` is the third answer, beside "the image is long enough" and "the
+    /// image is short", and it is deliberately not folded into either: a header
+    /// can write rubbish in this field - `Phantasy Star Fukkokuban (Japan)`
+    /// writes `0x2120C211`, and the space-filled and `0xFF` headers of
+    /// unlicensed and beta images write worse - and a nonsense field is a fact
+    /// about the header, not evidence that the dump is short. It is the
+    /// difference between "this image declares 4.5 MB and holds 512 KiB" and
+    /// "this header says nothing usable about length", and only the first is a
+    /// claim anyone can check.
+    ///
+    /// The field is read as a length only when all of these hold:
+    ///
+    /// * `rom_start` (0x1A0) is 0, which is all plutiedev says it ever is; any
+    ///   other value and the pair is not "the image is this long".
+    /// * `rom_end + 1` does not overflow: an all-`0xFF` header writes
+    ///   `0xFFFFFFFF`, which is a blank field rather than 4 GB minus one.
+    /// * the result is a whole number of `ROM_UNIT`s. This is what rejects the
+    ///   shifted and half-filled values that dominate the nonsense set -
+    ///   `0xFFFF2020` is two `0xFF`s and the two spaces of a padded header, and
+    ///   `0x2120C211` above - while keeping every real size, power of two or
+    ///   not, that the collection declares.
+    /// * the result is at most `ROM_MAX`.
+    ///
+    /// Informational, exactly like [`RomHeader::checksum_ok`]: nothing here
+    /// refuses a load, and nothing here is used to change what the cartridge
+    /// slot answers - see [`RomHeader::truncated`] for what the flag is for.
+    pub fn declared_rom_size(&self) -> Option<usize> {
+        if self.rom_start != 0 {
+            return None;
+        }
+        // `u64` so that `0xFFFFFFFF` is a value that fails a comparison rather
+        // than a sum that wraps on a 32-bit target.
+        let size = u64::from(self.rom_end) + 1;
+        if size > ROM_MAX as u64 || size % ROM_UNIT as u64 != 0 {
+            return None;
+        }
+        Some(size as usize)
+    }
+
+    /// Does this header declare more ROM than `rom` holds: is the image shorter
+    /// than the cart says it is?
+    ///
+    /// The reason this is a question worth asking is ["#435"](https://github.com/scottjab/rustsega/issues/435):
+    /// 86 of the local
+    /// 2775 images answer yes, and they are not an emulator bug. The one that
+    /// started the ticket, `QuackShot Starring Donald Duck (World) (En,Ja) (Rev
+    /// A)`, is `0x80000` long and declares `0x13FFFF`; its `(Alt)` dump is
+    /// `0x140000`, declares the same, verifies its own checksum and draws 33
+    /// colours where `(Rev A)` draws one. A cart that reads its own ROM up
+    /// there - as that one's boot self-test does - is answered with `0xFF`
+    /// filler by [`crate::Bus`], which is the whole of its black screen. See the
+    /// decision recorded on `Bus::read_rom_byte` for why the answer stays
+    /// filler and is not the image repeated.
+    ///
+    /// Three limits on what a `true` here means:
+    ///
+    /// * It says the image and its own header disagree, not that the dump is
+    ///   bad. The common case is a truncated dump, but a beta whose header was
+    ///   written for the full cart answers true too: 73 of the local 86 are
+    ///   betas, protos, demos, Sega Channel downloads or program carts, and the
+    ///   other 13 are what the list is really for.
+    /// * It is never a load error, and never acted on by the emulator: the set
+    ///   it names is a list for humans, under "Truncated dumps" in
+    ///   [`docs/compat.md`](../../../../docs/compat.md).
+    /// * `false` means "this header does not say the image is short", which
+    ///   covers a complete cart and a header that declares nothing usable. Use
+    ///   [`RomHeader::declared_rom_size`] to tell those apart.
+    pub fn truncated(&self, rom: &[u8]) -> bool {
+        self.declared_rom_size()
+            .is_some_and(|size| size > rom.len())
     }
 }
 
@@ -540,6 +630,125 @@ mod tests {
         put_u16(&mut rom, 0x18E, computed.wrapping_add(1));
         let header = parse_header(&rom).expect("a bad checksum still parses");
         assert!(!header.checksum_ok(&rom));
+    }
+
+    /// 0x1A4 is the *last address covered*, not a length (plutiedev "ROM range
+    /// start/end"), so a complete image is one byte longer than the field.
+    #[test]
+    fn declared_size_is_the_end_address_plus_one() {
+        let cases = [
+            (0x07_FFFF, Some(0x0008_0000)), // the 512 KiB every Sonic cart declares
+            (0x0F_FFFF, Some(0x0010_0000)), // 1 MB
+            (0x13_FFFF, Some(0x0014_0000)), // 1.25 MB, the QuackShot cart of #435
+            (0x7F_FFFF, Some(0x0080_0000)), // 8 MB, the largest cart there is
+        ];
+        for (rom_end, want) in cases {
+            let mut rom = fake_rom(0x200);
+            put_u32(&mut rom, 0x1A4, rom_end);
+            let header = parse_header(&rom).expect("a 0x200 byte ROM parses");
+            assert_eq!(header.declared_rom_size(), want, "field {rom_end:#010x}");
+        }
+    }
+
+    /// A field that is not a length gets no verdict: neither "complete" nor
+    /// "truncated". These are the shapes the local collection actually contains,
+    /// each measured out of the file named beside it.
+    #[test]
+    fn a_field_that_is_not_a_length_is_not_called_truncated() {
+        let cases = [
+            // What `Phantasy Star Fukkokuban (Japan).md` writes: not a size, not
+            // close to one, and its 0x1A0 is `0x7DCD9C7E` as well.
+            (0x7D_CD9C7E, 0x2120_C211),
+            // `0xFF` padding, the header of `all_ff_header_parses` above: this is
+            // the case where `rom_end + 1` would overflow.
+            (0xFFFF_FFFF, 0xFFFF_FFFF),
+            // Two space characters, which is what 0x1A4 holds on `Micro Machines
+            // (USA).md` and five others.
+            (0x31_FC0000, 0xFFFF_2020),
+            // A 24-bit end address, so 16 MB: over the largest cart there is.
+            (0x00_0000, 0x00FF_FFFF),
+            // Not a whole number of 32 KiB units.
+            (0x00_0000, 0x0007_FFFE),
+            // A declared range that does not start at 0 is not "the image is this
+            // long": plutiedev says 0x1A0 is always 0, and this is `Sonic &
+            // Knuckles (World) (Lock-on).bin`.
+            (0xF6_006720, 0x003F_FFFF),
+        ];
+        for (rom_start, rom_end) in cases {
+            let mut rom = fake_rom(0x200);
+            put_u32(&mut rom, 0x1A0, rom_start);
+            put_u32(&mut rom, 0x1A4, rom_end);
+            let header = parse_header(&rom).expect("a nonsense size still parses");
+            assert_eq!(
+                header.declared_rom_size(),
+                None,
+                "start {rom_start:#010x} end {rom_end:#010x}",
+            );
+            // And above all it is not a "truncated" - a nonsense field says
+            // nothing about the length of the image.
+            assert!(!header.truncated(&rom));
+        }
+    }
+
+    /// The flag itself: a header promising more than the bytes on hand.
+    #[test]
+    fn truncated_is_the_header_against_the_image_length() {
+        // 1 MB declared, 0x200 bytes present: the QuackShot `(Rev A)` shape at
+        // the smallest sizes that keep the field a real one.
+        let rom = fake_rom(0x200);
+        let header = parse_header(&rom).expect("its header parses");
+        assert_eq!(header.declared_rom_size(), Some(0x0010_0000));
+        assert!(header.truncated(&rom));
+
+        // The same header on a complete image - 1 MB of it - is not truncated,
+        // and one byte short is. Comparison is `>` against the length, not `>=`:
+        // `0x1A4` is an address, so an image of exactly the declared length has
+        // every address the cart names.
+        let complete = fake_rom(0x100000);
+        let header = parse_header(&complete).expect("its header parses");
+        assert!(!header.truncated(&complete));
+        let short = fake_rom(0xFFFFE);
+        let header = parse_header(&short).expect("its header parses");
+        assert!(header.truncated(&short));
+    }
+
+    /// The four carts #435 names, and the two of them that must read differently
+    /// from each other: `QuackShot (Rev A)` is a truncated dump, and its `(Alt)`
+    /// - the same cart, complete - is not.
+    #[test]
+    #[ignore = "needs a commercial ROM, which only exists locally"]
+    fn flags_the_short_dumps_of_the_local_collection() {
+        let cases = [
+            // Truncated: 0x80000 present, 0x140000 declared.
+            (
+                "QuackShot Starring Donald Duck (World) (En,Ja) (Rev A).md",
+                true,
+            ),
+            // The same cart complete, and the oracle for the ticket.
+            (
+                "QuackShot Starring Donald Duck (World) (En,Ja) (Rev A) (Alt).md",
+                false,
+            ),
+            // Truncated: 0x300000 present, 0x400000 declared. These two are also
+            // two of the three carts #355 blames on an unimplemented opcode.
+            ("Triple Play - Gold Edition (USA).md", true),
+            ("Triple Play 96 (USA).md", true),
+            // Not a truncated dump: its 0x1A4 is not a length at all, so the
+            // flag stays false and `declared_rom_size` says nothing.
+            ("Phantasy Star Fukkokuban (Japan).md", false),
+        ];
+        for (file, want) in cases {
+            let path = require_data!(testkit::commercial_rom(file));
+            let rom = std::fs::read(path).unwrap_or_else(|err| panic!("{file}: {err}"));
+            let header = parse_header(&rom).expect("every one of these parses");
+            assert_eq!(
+                header.truncated(&rom),
+                want,
+                "{file}: declared {:?}, image {:#x}",
+                header.declared_rom_size(),
+                rom.len(),
+            );
+        }
     }
 
     /// The same decode end to end on a real ROM. Local only: CI has no
