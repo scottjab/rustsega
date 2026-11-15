@@ -1047,13 +1047,42 @@ impl Bus {
     ///    the bank and remembers which bank was underneath to put back. The
     ///    mapper answers `None` for a cart that has no mapper, and the address is
     ///    then its own offset - the plain image.
-    /// 3. **the image**, in address order. A read above its end is [`OPEN_BUS`]:
-    ///    real hardware leaves the bus floating there, some dumps are sold as
-    ///    mirrored copies of the ROM, and either way an image shorter than the
-    ///    slot is the common case and 0xFF is what nothing driving the lines reads
-    ///    as. This is also what a bank number pointing past the end of the cart
-    ///    reads as, which is why [`crate::cart::mapper::Mapper::map`] never sees
-    ///    the image at all.
+    /// 3. **the image**, in address order. A read above its end is [`OPEN_BUS`].
+    ///    That is a decided question - [#435](https://github.com/scottjab/rustsega/issues/435)
+    ///    is where it was decided - so the reasoning is written down here rather
+    ///    than left to be re-derived the next time a cart draws black.
+    ///
+    ///    An unbanked cart really has no "past the end": the ROM chip is wired to
+    ///    the address lines it needs and ignores the rest, so on real hardware the
+    ///    image repeats. Answering 0xFF there is therefore wrong for a *complete*
+    ///    cart that reads its own echo. What has not been demonstrated is one such
+    ///    cart: no image in the local 2775 is known to need the mirror.
+    ///
+    ///    What has been measured is the other case, and it is the reason mirroring
+    ///    is not the answer here. The file is not the ROM. `QuackShot Starring
+    ///    Donald Duck (World) (En,Ja) (Rev A)` is `0x80000` bytes of a `0x140000`
+    ///    cart, and its boot self-test sums `$100000..$13FFFF` looking for the
+    ///    missing top quarter. Mirroring has to wrap on the image length - the
+    ///    header's declared size is unusable as a mask, and
+    ///    [`crate::cart::RomHeader::declared_rom_size`] says why - so that range
+    ///    lands on `$000000..$03FFFF`: the first 256 KiB, which is not the data the
+    ///    cart is asking for. Measured with `offset % len` in this one lookup,
+    ///    `(Rev A)` stays at `colours=1 max_colours=1` and the two complete
+    ///    QuackShot images are unchanged at `colours=4 max_colours=12`. Mirroring a
+    ///    truncated dump invents bytes and presents them as the cart's own; it
+    ///    cannot put back what is not in the file, and it would change the answer
+    ///    across the whole library to rescue one cart that it does not rescue.
+    ///
+    ///    So: filler, on one measured case and no demonstrated need for the
+    ///    alternative. If a *complete* cart is ever shown to read its own image
+    ///    above the end of it, that is a new issue with a name and a measurement on
+    ///    it, not a licence to wrap here. The short dumps themselves are listed for
+    ///    re-dumping under "Truncated dumps" in `docs/compat.md` and flagged by
+    ///    [`crate::cart::RomHeader::truncated`].
+    ///
+    ///    A bank number pointing past the end of the cart reads the same way,
+    ///    which is why [`crate::cart::mapper::Mapper::map`] never sees the image at
+    ///    all.
     fn read_rom_byte(&mut self, addr: u32) -> u8 {
         if let Some(value) = self.sram.as_ref().and_then(|save| save.read(addr)) {
             return value;
@@ -2122,6 +2151,47 @@ mod tests {
         // A word straddling the end keeps the byte that is in the image.
         assert_eq!(bus.read_word(0x000002), 0x56FF);
         assert_eq!(bus.read_word(0x000004), OPEN_BUS_WORD);
+    }
+
+    /// The answer above the end of the image is filler, not the image repeated:
+    /// the decision recorded on [`Bus::read_rom_byte`], pinned at the addresses
+    /// `QuackShot Starring Donald Duck (World) (En,Ja) (Rev A)` really asks for.
+    #[test]
+    fn reads_above_the_image_are_filler_and_not_a_mirror_of_it() {
+        // 0x80000 of the 1.25 MB cart, which is that dump exactly. `rom_image`
+        // fills by index modulo 251, so no byte of it is 0xFF and no byte repeats
+        // at two offsets a mirror would use: a wrap cannot pass this test by
+        // accident, and neither can an off-by-one at the top of the image.
+        let image = rom_image(0x08_0000);
+        let mut bus = Bus::new(image.clone(), TEST_VERSION);
+
+        // The last byte of the cart, and the word that ends on it: both real.
+        assert_eq!(bus.read_byte(0x07_FFFF), image[0x07_FFFF]);
+        assert_eq!(
+            bus.read_word(0x07_FFFE),
+            u16::from_be_bytes([image[0x07_FFFE], image[0x07_FFFF]]),
+            "a word straddling the end keeps the half that is there",
+        );
+
+        // One past it, at the top of the slot, and at the three addresses that
+        // modulo mirroring on this length would hand back `image[0]` for: `$80000`
+        // and `$100000` are the wrap points, and `$13FFFF` is the end of the sum
+        // the cart runs.
+        for addr in [
+            0x08_0000_u32,
+            0x08_0002,
+            0x10_0000,
+            0x13_FFFF,
+            0x3F_FFFE,
+            ROM_END,
+        ] {
+            assert_eq!(bus.read_byte(addr), OPEN_BUS, "byte at {addr:#08x}");
+            assert_eq!(
+                bus.read_word(addr & !1),
+                OPEN_BUS_WORD,
+                "word at {addr:#08x}"
+            );
+        }
     }
 
     /// The SVP's IRAM window is the game image, read at the same offsets.
@@ -3700,6 +3770,35 @@ mod tests {
         // Page 9 is the last one the cart has, and it does answer.
         bus.write_byte(0xA130FF, 9);
         assert_eq!(bus.read_byte(0x38_0000), 9);
+    }
+
+    /// A mapped page that runs off the end of the cart is the same case as a
+    /// plain read above the image, and the mapper is not where the length lives:
+    /// [`crate::cart::mapper::Mapper::map`] returns an offset and the image decides
+    /// whether it exists, so a word straddling the end of a *mapped* page keeps
+    /// the half that is in the cart - which is what the two separate lookups in
+    /// [`Bus::read_rom_word`] are for.
+    #[test]
+    fn word_read_straddling_a_mapped_page_past_the_image_end() {
+        // The 5 MB cart, cut to nine whole pages and one byte of the tenth, so
+        // that page 9 - the last one slot 7 can be pointed at - ends one byte
+        // inside the cart rather than on a page boundary.
+        let mut image = banked_rom();
+        image.truncate(0x48_0001);
+        let mut bus = Bus::new(image, TEST_VERSION);
+        bus.write_byte(0xA130FF, 9);
+
+        assert_eq!(bus.read_byte(0x38_0000), 9, "page 9 answers slot 7");
+        assert_eq!(
+            bus.read_byte(0x38_0001),
+            OPEN_BUS,
+            "and one byte in it stops"
+        );
+        assert_eq!(
+            bus.read_word(0x38_0000),
+            0x09FF,
+            "the word keeps the mapped half and fills the other",
+        );
     }
 
     /// The registers go back to slot `n` on page `n` with the rest of the
