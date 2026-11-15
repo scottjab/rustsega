@@ -40,9 +40,11 @@ prints `up to date` for every entry and touches no network.
 | `md-test-pack` | `test-roms/genesis/md-test-pack/` | 22,807 B | `1b37dd77e81f5bfd8e3dc09adc69609f07a30135ea611782a850e8c7336a33ba` | none stated |
 | `overdrive2` | `test-roms/genesis/overdrive2/` | 4,010,970 B | `877d3244102531052d2ffc39e0e7390c7b1ca65a7323b49cf28d49ffb3ef6110` | scene freeware, no licence text |
 | `zexall-cpm` | `test-roms/z80/zexall-cpm/` | 122,572 B | `e0f4e6af6c88764a615e0d9fa27b9bf9a2162bd77ac7492fd1f2d4fa9cdfb3bb` | GPL-2.0 (`Copying`) |
+| `berzerk-smd` | `test-roms/genesis/berzerk-smd/` | 262,656 B | `9458a702d4fdb065947045d62aac0f362727117c250a68ceac3c9104922d132e` | PD, asserted - see its section; the hash is the file's own, it is pinned raw |
 
 Every archive above was downloaded and hashed on 2026-11-06; that is also the
 date the URLs were last checked. When you bump a pin, update that date.
+(`berzerk-smd` is later: hashed and URL-checked on 2026-11-15.)
 
 ### `md-test-pack` (Eke's Gens hardware test pack)
 
@@ -139,6 +141,49 @@ the tile data in the ROM image rather than eyeballed.
   Note the Genesis Z80 has no CP/M disk, so this runs as a loaded `.com` image
   with our own stub, which is what M2-16 is scoped for.
 
+### `berzerk-smd` (Paul Lee, *Berzerk* v1, 2010)
+
+- **Source:**
+  `https://archive.org/download/255-sega-genesis-homebrew-games/HOMEBREWS/Berzerk%20%28PD%29%20v1%20Paul%20Lee%202010.smd`,
+  from the Internet Archive item `255-sega-genesis-homebrew-games`. It is pinned
+  as a `raw` row: the file itself is cached, hash-checked and copied to
+  `test-roms/genesis/berzerk-smd/berzerk-pd-v1.smd`. The local name drops the
+  spaces and parentheses of the upstream one so that
+  `testkit::test_rom("genesis/berzerk-smd/berzerk-pd-v1.smd")` stays a plain path.
+- **Size / SHA-256:** 262,656 B,
+  `9458a702d4fdb065947045d62aac0f362727117c250a68ceac3c9104922d132e`.
+  262,656 = 512 + 16 x 16,384, i.e. a copier header plus sixteen whole
+  interleaved blocks, so the ROM inside it is 262,144 B.
+- **What it tests:** nothing that runs - it is a **format fixture**, not a test
+  ROM. It is the only genuine `.smd` this project can pin, and `smd` is the
+  format whose interleave direction the written sources disagree about (see
+  `EvenHalf` in `crates/genesis/src/cart/smd.rs`). Before it, that question was
+  settled by argument plus round trips against this crate's own encoder; with it,
+  a test reads a real copier image and asserts the direction it finds. This one
+  is `Upper` - even bytes in the upper half of each block, the BizHawk / zrax /
+  EutherDrive reading - and reading it `Lower` instead opens `ESAGG NE` at 0x100
+  where the header says `SEGA GEN`.
+- **Reporting:** none, and none needed; the test is `crates/genesis/src/cart/smd.rs`,
+  not a screen.
+- **Licence:** public domain is **asserted**, there is no licence text in the
+  item. Three independent indications: the file name in the source item says
+  `(PD)`; a dedicated item, `archive.org/details/Berzerk_V1.00_by_Paul_Lee_PD`,
+  repeats the claim; and Zophar's Domain carries it inside its curated "ROMs
+  (Public Domain)" section (<https://www.zophar.net/pdroms/genesis/berzerk.html>).
+  Two weaknesses to keep in view rather than paper over: the CC-PD mark on the
+  collection item was applied by whoever repackaged it, who does not hold those
+  rights, so the claim rests on the title and the Zophar curation and not on that
+  mark; and this is a port of a commercial arcade property, so "PD" can only be
+  the author's claim on his own code. `overdrive2` above is pinned on looser
+  evidence than this, so it is within house practice, but it is not a clearance.
+  Fetched only into the gitignored `test-roms/`, never committed.
+- **Not a reference for anything else:** the `.bin` of the same title at
+  `archive.org/details/Berzerk_V1.00_by_Paul_Lee_PD` is a different dump or
+  revision - neither interleave convention reproduces it from this SMD, and
+  neither matches it even in the first 4 KiB - so no test compares the
+  deinterleaved bytes against it, and none should claim that they do.
+- **Ticket:** #252.
+
 ## Manual: place these by hand
 
 Not auto-fetched, with the reason next to each. Put them under
@@ -184,7 +229,9 @@ SHA-256 you got to this file.
    how it reports, which ticket wants it.
 4. If the URL is stable and the licence allows redistribution, add a manifest
    row to `scripts/fetch-test-data.sh` (`name|url|sha256|in-archive path|dest|zip`
-   for a zip) and run the script twice: the second run must print `up to date`.
+   for a zip, or `name|url|sha256|file name|dest|raw` for a single file that is
+   not an archive) and run the script twice: the second run must print `up to
+   date`.
    If it needs a login, a click-through, or it is commercial/proprietary, leave
    it in the manual table.
 5. Say in the row whether it is **self-checking** (prints a verdict, good for a

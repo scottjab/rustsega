@@ -161,7 +161,8 @@ fetch only some, e.g. `scripts/fetch-test-data.sh z80`) downloads these into
 the URL and by the SHA-256 of the downloaded archive, so CI and local runs
 always see identical bytes. The archive is kept in `test-roms/.cache/` and the
 verified hash in `test-roms/.stamp-<name>`; a matching stamp means no network
-access at all.
+access at all. One entry, `berzerk-smd`, is a raw file rather than an archive, so
+its hash is the file's own and `subdir` names the file it is written as.
 
 | Suite | Repo | Pinned commit | Tarball SHA-256 | Lands in | Files |
 |---|---|---|---|---|---|
@@ -170,6 +171,7 @@ access at all.
 | `md-test-pack` | Eke's Gens hardware test pack, via [Wayback](https://web.archive.org/web/20150610093059if_/http://genplus-gx.googlecode.com/files/md_test.zip) | 2015 capture | `1b37dd77e81f5bfd8e3dc09adc69609f07a30135ea611782a850e8c7336a33ba` | `test-roms/genesis/md-test-pack/` | 15 |
 | `overdrive2` | TiTAN, Overdrive 2, [archive.org mirror](https://archive.org/details/pouet_69648) | 2017 release | `877d3244102531052d2ffc39e0e7390c7b1ca65a7323b49cf28d49ffb3ef6110` | `test-roms/genesis/overdrive2/` | 2 |
 | `zexall-cpm` | [mdfs.net](https://mdfs.net/Software/Z80/Exerciser/), Frank D. Cringle | 2003 build | `e0f4e6af6c88764a615e0d9fa27b9bf9a2162bd77ac7492fd1f2d4fa9cdfb3bb` | `test-roms/z80/zexall-cpm/` | 6 |
+| `berzerk-smd` | Paul Lee, *Berzerk* v1 (PD), [archive.org](https://archive.org/details/255-sega-genesis-homebrew-games) | 2010 release | `9458a702d4fdb065947045d62aac0f362727117c250a68ceac3c9104922d132e` | `test-roms/genesis/berzerk-smd/` | 1 |
 
 What each ROM is good for, and the ROMs that have to be downloaded by hand
 (240p Test Suite, Nemesis's VDP FIFO tests, the YM2612 tests, Sega's own

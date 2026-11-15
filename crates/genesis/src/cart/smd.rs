@@ -45,6 +45,16 @@ const PADDED_SYSTEM_TYPE: &[u8] = b" SEGA";
 /// image of exactly the right length, with every word byte-swapped, so the ROM
 /// simply fails to boot. So the layout is read from the file rather than
 /// assumed - see [`convention_of`].
+///
+/// One genuine SMD dump has been checked, and it reads `Upper`: Paul Lee's
+/// `Berzerk (PD) v1` (2010), pinned as `berzerk-smd` in
+/// `scripts/fetch-test-data.sh` and recorded in `docs/test-roms.md`. Read as
+/// `Upper` its first block opens `SEGA GEN` at 0x100; read as `Lower` it opens
+/// `ESAGG NE`, exactly the byte-swapped system type [`convention_of`] counts on
+/// the wrong choice producing. That is one dump from one copier, so it settles
+/// that `Upper` is a real dumpers' convention rather than a BizHawk quirk - it
+/// is not evidence about which tools wrote any other file, which is why both
+/// entries stay in [`CONVENTIONS`] and detection stays content-driven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EvenHalf {
     /// Even bytes in the lower half: the layout `smdtech.txt` documents.
@@ -155,6 +165,16 @@ fn has_sega_at_100(rom: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use testkit::require_data;
+
+    /// The one genuine SMD dump this project can ship: `Berzerk (PD) v1` (Paul
+    /// Lee, 2010), pinned by URL and SHA-256 in `scripts/fetch-test-data.sh`
+    /// under this name and recorded in `docs/test-roms.md`. The destination is
+    /// ours to choose, so it carries none of the spaces and parens the source
+    /// file name has and `testkit::test_rom` addresses it like any other path.
+    const REAL_SMD: &str = "genesis/berzerk-smd/berzerk-pd-v1.smd";
+    /// Its size: the copier header plus 16 whole blocks, i.e. a 256 KiB ROM.
+    const REAL_SMD_LEN: usize = SMD_HEADER + 16 * SMD_BLOCK;
 
     /// A plain ROM of `size` bytes with a valid header: a header in address
     /// order at 0x100, and a byte pattern that changes every byte so a
@@ -336,5 +356,57 @@ mod tests {
         assert!(!is_smd(
             &fake_plain_at_smd_length()[..SMD_HEADER + SMD_HALF]
         ));
+    }
+
+    /// The real-data half of this module, and the reason #252 exists: everything
+    /// above proves the two conventions against each other, which cannot say
+    /// which one a copier actually produced. This image was.
+    ///
+    /// The `ESAG` assertion is what makes it evidence rather than a tautology:
+    /// the rejected convention was rejected because it byte-swaps the system
+    /// type, not for something incidental about this particular file.
+    #[test]
+    fn real_smd_image_carries_the_even_bytes_in_the_upper_half() {
+        let path = require_data!(testkit::test_rom(REAL_SMD));
+        let data = std::fs::read(path).expect("read the pinned SMD image");
+
+        assert_eq!(data.len(), REAL_SMD_LEN);
+        assert_eq!(data.len() % SMD_BLOCK, SMD_HEADER, "the length rule");
+        assert!(is_smd(&data));
+        assert_eq!(convention_of(&data), Some(EvenHalf::Upper));
+
+        let block = &data[SMD_HEADER..SMD_HEADER + SMD_BLOCK];
+        let reversed = block_in_address_order(block, EvenHalf::Lower);
+        assert_eq!(
+            &reversed[SYSTEM_TYPE_AT..SYSTEM_TYPE_AT + 4],
+            b"ESAG",
+            "and this is why Lower is the reading that gets rejected"
+        );
+        assert!(!has_sega_at_100(&reversed));
+    }
+
+    /// The ROM inside the real dump: exactly 16 blocks, no copier header, and a
+    /// system type at the address the 68000 reads first.
+    #[test]
+    fn real_smd_image_deinterleaves_to_its_rom() {
+        let path = require_data!(testkit::test_rom(REAL_SMD));
+        let data = std::fs::read(path).expect("read the pinned SMD image");
+
+        let rom = deinterleave(&data);
+        assert_eq!(rom.len(), 16 * SMD_BLOCK, "header dropped");
+        assert_eq!(
+            &rom[SYSTEM_TYPE_AT..SYSTEM_TYPE_AT + SYSTEM_TYPE.len()],
+            SYSTEM_TYPE
+        );
+    }
+
+    /// What a loader calls is [`normalize_rom`], so on the real file that has to
+    /// reach [`deinterleave`]'s answer rather than pass the SMD through.
+    #[test]
+    fn normalize_rom_deinterleaves_the_real_smd_image() {
+        let path = require_data!(testkit::test_rom(REAL_SMD));
+        let data = std::fs::read(path).expect("read the pinned SMD image");
+
+        assert_eq!(normalize_rom(&data), deinterleave(&data));
     }
 }
