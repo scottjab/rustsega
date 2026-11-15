@@ -148,13 +148,18 @@ rather than hiding it.
 Things this run cannot see, with the issue that owns each:
 
 - **The 178 087 skipped cases (62 files).** These are the cases that end in the
-  suite's exception handler. `is_exception_case` skips them because the core
-  could not take them when the harness was written; the exception path has since
-  been built out (#37, #41), and enabling those cases is [#223].
-- **`is_exception_case` skips the $00000C vector, which is *illegal
-  instruction*, not address error** ([#185]). So "skipped" means "ends in the
-  suite's handler", which is close to but not exactly the address-error set, and
-  a case that takes a *different* vector is not skipped at all.
+  suite's exception handler at $00000C. `is_exception_case` skips them because
+  the core could not take them when the harness was written; the exception path
+  has since been built out (#37, #41), and enabling those cases is [#223].
+- **"Skipped" is not "address error"** ([#185], closed by the rename). The suite
+  records its address error at $00000C, not at hardware's $000008, because the
+  core it was recorded against routes the address error and the illegal
+  instruction to the same slot — `EXC_ADDRESS_ERROR == EXC_ILLEGAL == 3`, see
+  `crates/m68k/src/address_error.rs`. So the $0C slot the predicate reads is the
+  right one, but it cannot name which exception fired: the skipped set includes
+  genuine illegal-instruction cases and is not a set of hardware address errors.
+  A case ending at a *different* vector is not skipped either — `CHK`'s 4 272
+  traps end at $00002000 and are run, and failed on, by the gate.
 - **The privilege-violation vector in user mode** ([#194]): the one measured
   vector the suite cannot pin, so nothing here asserts it.
 - **Bus transactions.** The suite's `transactions` array is deliberately not
