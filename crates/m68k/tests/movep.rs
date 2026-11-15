@@ -1,11 +1,11 @@
 //! `MOVEP` in the pinned 680x0 suite: `MOVEP.w` and `MOVEP.l` (M1-25, #33).
 //!
 //! One test per suite file, in the style of `movem.rs`, checked with
-//! [`harness::Check::StateAndCyclesSkipExceptions`]. `MOVEP` only ever does byte
-//! accesses, so an odd operand address is legal here and the skip is nearly
-//! empty — it stays because the ticket asks for the same check as the other
-//! instruction files, and an address error can still be what a case reports
-//! (M1-29, #37).
+//! [`harness::Check::StateAndCycles`]: #223 moved these two files up from
+//! [`harness::Check::StateAndCyclesSkipExceptions`], and `MOVEP` only ever does
+//! byte accesses, so an odd operand address is legal here and nothing was being
+//! skipped — all 8065 cases of each file run (see
+//! [`harness::is_exception_case`]).
 //!
 //! # What the files cover
 //!
@@ -24,14 +24,14 @@ mod harness;
 /// `0000 ddd 1 oo 001 aaa` (M68000UM MOVEP).
 #[test]
 fn movep_w_file_passes() {
-    harness::assert_file_passes("MOVEP.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MOVEP.w", harness::Check::StateAndCycles);
 }
 
 /// `MOVEP.l`: the same with `oo` = `01` (memory to `Dn`) and `11` (`Dn` to
 /// memory), e.g. `$0148` and `$01C8`.
 #[test]
 fn movep_l_file_passes() {
-    harness::assert_file_passes("MOVEP.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MOVEP.l", harness::Check::StateAndCycles);
 }
 
 /// The two file names above are what the suite ships, so a rename fails here
