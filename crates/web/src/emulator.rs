@@ -50,6 +50,7 @@ use crate::render::canvas2d::Canvas2dRenderer;
 use crate::render::choose_renderer_latched;
 use crate::render::webgl::WebGlRenderer;
 use crate::render::webgl::gl_lost;
+use crate::render::webgl::take_context_restore;
 use crate::render::webgl::webgl2_supported;
 use crate::rom::LoadedRom;
 use crate::settings::Settings;
@@ -1114,6 +1115,11 @@ struct Emulator {
     /// later - on a setting change, or after a lost context - is built the way the
     /// player has it rather than the way the default is.
     picture: (FilterSetting, bool),
+    /// Which drawing path the player asked for, kept for the same reason as
+    /// [`Emulator::picture]: a context that comes back is offered to the player's
+    /// setting and not to a decision of the shell's, so a player who chose `Canvas`
+    /// is never moved by it (#397).
+    renderer_setting: RendererSetting,
     /// The RGBA bytes of the frame being drawn, reused every frame so the draw
     /// path allocates nothing (see [`frame_to_rgba_bytes`]).
     rgba: Vec<u8>,
@@ -1169,10 +1175,14 @@ impl Emulator {
         // The drawing path first, because everything after this point has a
         // browser resource attached to it that a failed start would have to give
         // back - and because a console with nothing to draw with is not a console.
-        let (renderer, filter, smoothing) = settings
+        let (renderer_setting, filter, smoothing) = settings
             .with_untracked(|settings| (settings.renderer, settings.filter, settings.smoothing));
         let (kind, renderer) = make_renderer(
-            choose_renderer_latched(webgl2_on_offer(renderer), gl_lost(), renderer),
+            choose_renderer_latched(
+                webgl2_on_offer(renderer_setting),
+                gl_lost(),
+                renderer_setting,
+            ),
             canvas,
             canvas_gl,
             filter,
@@ -1245,6 +1255,7 @@ impl Emulator {
             kind,
             renderer,
             picture: (filter, smoothing),
+            renderer_setting,
             rgba: Vec::new(),
             pacer: FramePacer::new(target_hz),
             fps_meter: FpsMeter::new(),
@@ -1715,6 +1726,19 @@ impl Emulator {
         // frame that would otherwise have been drawn on the lost one (#146).
         if self.renderer.context_lost() {
             self.use_renderer(RendererKind::Canvas);
+        } else if take_context_restore() && self.kind == RendererKind::Canvas {
+            // And the driver gave it back (#397). The same question the drawer asks,
+            // so the player's own setting is what decides - `Canvas` stays on the 2D
+            // path and `Auto` gets its shader back - and the frame being painted
+            // here is drawn by the rebuilt renderer rather than lost.
+            let wanted = choose_renderer_latched(
+                webgl2_on_offer(self.renderer_setting),
+                gl_lost(),
+                self.renderer_setting,
+            );
+            if wanted == RendererKind::Webgl {
+                self.use_renderer(wanted);
+            }
         }
         self.renderer.draw(&self.rgba, width, height);
     }
@@ -1745,6 +1769,7 @@ impl Emulator {
     /// frame of their own - would otherwise be looking at nothing.
     fn set_picture(&mut self, renderer: RendererSetting, filter: FilterSetting, smoothing: bool) {
         self.picture = (filter, smoothing);
+        self.renderer_setting = renderer;
         let wanted = choose_renderer_latched(webgl2_on_offer(renderer), gl_lost(), renderer);
         if wanted != self.kind {
             self.use_renderer(wanted);

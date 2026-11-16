@@ -47,6 +47,17 @@ const TEXTURE_HEIGHT: u32 = 480;
 
 /// The canvas event that says the driver has taken the context away.
 const CONTEXT_LOST: &str = "webglcontextlost";
+/// The canvas event that says the driver has given one back (#397). It is only
+/// ever fired for a loss the page cancelled - see [`latch_gl_lost`].
+const CONTEXT_RESTORED: &str = "webglcontextrestored";
+
+/// How many times one page load will ask for its context back.
+///
+/// A restore is not free: it costs two shader compiles, a texture allocation and a
+/// buffer upload, and a driver that is short of context memory will lose the new
+/// one just as happily. Two comebacks ride out a driver hiccup or a GPU switch
+/// without letting a broken one rebuild the renderer for ever (#397).
+const MAX_RESTORES: u32 = 2;
 
 /// The longest edge a drawing buffer is allowed to be.
 ///
@@ -61,33 +72,84 @@ thread_local! {
     static WEBGL2: Cell<Option<bool>> = const { Cell::new(None) };
     /// Whether a WebGL context has been lost during this page load: [`gl_lost`].
     static GL_LOST: Cell<bool> = const { Cell::new(false) };
+    /// How many contexts this page load has lost, which is what [`MAX_RESTORES`]
+    /// counts up to the loss that is left permanent.
+    static GL_LOSSES: Cell<u32> = const { Cell::new(0) };
+    /// Raised by a `webglcontextrestored` and taken by the draw loop:
+    /// [`take_context_restore`].
+    static GL_RESTORED: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Whether WebGL has gone away for good during this page load.
+/// Whether this page load has spent its restoration budget, reported once on the
+/// loss that spends the last of it.
+fn past_restore_budget(losses: u32) -> bool {
+    if losses == MAX_RESTORES + 1 {
+        report(&format!(
+            "WebGL has lost {losses} contexts in this page load: using the canvas path for the rest of it"
+        ));
+    }
+    losses > MAX_RESTORES
+}
+
+/// Whether a WebGL context is down in this page load.
 ///
-/// `true` from the first `webglcontextlost` onwards, and the shell reads it where
-/// it would otherwise ask [`webgl2_supported`] - so a settings change, or a second
-/// console, cannot put the player back on a driver that has already taken a context
-/// away (#146).
+/// `true` from a `webglcontextlost` onwards, and the shell reads it where it would
+/// otherwise ask [`webgl2_supported`] - so a settings change, or a second console,
+/// cannot put the player back on a driver that has just taken a context away
+/// (#146).
 ///
-/// Deliberately *not* cleared by `webglcontextrestored`. A restored context means a
-/// renderer built against the old one is holding dead handles, and the shell would
-/// have to rebuild one mid-frame to use it; the loss is rare, the cost of staying
-/// on the 2D path until the page is reloaded is a session without shaders, and a
-/// driver that loses a context once is not obviously the one to hand a second
-/// attempt to. Recovery is tracked as its own issue rather than half-done here.
+/// Cleared by one thing only: a `webglcontextrestored` that is still inside the
+/// loss budget ([`MAX_RESTORES`]). Being asked again is not one - that is what kept
+/// #146's rule intact, and the latch stays a statement about this page load that
+/// only the browser, holding out a restored context, can retract. Before #397 it
+/// was never cleared at all, because a rebuild had nowhere safe to happen;
+/// [`take_context_restore`] is where it happens now.
 pub fn gl_lost() -> bool {
     GL_LOST.with(|latched| latched.get())
 }
 
-/// Latches a lost context, and says so once: the loss is one event, and the draw
-/// path runs it sixty times a second.
-fn latch_gl_lost() {
-    GL_LOST.with(|latched| {
-        if !latched.replace(true) {
-            report("WebGL context lost: using the canvas path for the rest of this page");
-        }
+/// Whether a lost context has been given back and not acted on yet.
+///
+/// Taking it is what clears it, so the console that switches also discharges the
+/// offer and the draw loop pays one cell read per frame (#397).
+///
+/// The loop - not the event listener - is what acts on it, for the reason the
+/// [`CONTEXT_LOST`] listener already gives: switching renderers means dropping the
+/// renderer whose event this is, and this is the closure JS is inside.
+pub fn take_context_restore() -> bool {
+    GL_RESTORED.with(|offered| offered.replace(false))
+}
+
+/// Latches a lost context, and answers whether to ask for it back.
+///
+/// Cancelling `webglcontextlost` is the only thing that makes a browser offer a
+/// `webglcontextrestored` at all: measured in the harness browser, a loss the page
+/// cancelled comes back (`isContextLost()` false, and it draws again) and one it did
+/// not come back never (#397). So the answer is the recovery decision: `false` means
+/// leaving the event alone, which is the deliberate "this context is gone" that #146
+/// described as the whole behaviour.
+fn latch_gl_lost() -> bool {
+    let losses = GL_LOSSES.with(|count| {
+        count.set(count.get() + 1);
+        count.get()
     });
+    if !GL_LOST.replace(true) {
+        // Not "for the rest of this page": a context inside its budget comes back,
+        // and the line a player reads should not claim otherwise.
+        report("WebGL context lost: using the canvas path until it comes back");
+    }
+    !past_restore_budget(losses)
+}
+
+/// Takes the offer a restored context makes: the latch goes off and the draw loop is
+/// told to look. Only reachable for a loss that was cancelled, so there is always a
+/// latch to clear - and if there is not one, nothing was lost and there is nothing
+/// to hand back.
+fn latch_gl_restored() {
+    if GL_LOST.replace(false) {
+        GL_RESTORED.with(|offered| offered.set(true));
+        note("WebGL context restored: the shader path is coming back");
+    }
 }
 
 /// Whether this browser will give up a WebGL2 context at all.
@@ -210,6 +272,12 @@ fn report(text: &str) {
     web_sys::console::error_1(&JsValue::from_str(text));
 }
 
+/// One line that is not a failure: [`latch_gl_restored`] has nothing to complain
+/// about, and a recovery written as an error is a bug report waiting to happen.
+fn note(text: &str) {
+    web_sys::console::log_1(&JsValue::from_str(text));
+}
+
 /// The four corners of a fullscreen triangle strip, as `(x, y)` clip
 /// coordinates.
 const CORNERS: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
@@ -254,6 +322,8 @@ pub struct WebGlRenderer {
     /// The listener JS is holding. Taken off in [`Self::drop`], because the
     /// canvas outlives the renderer that attached it.
     on_lost: Closure<dyn FnMut(web_sys::Event)>,
+    /// The `webglcontextrestored` half of the same pair (#397).
+    on_restored: Closure<dyn FnMut(web_sys::Event)>,
     /// Whether a GL error has already been reported. Drivers are chatty after the
     /// first one, and this is inside the frame loop.
     reported: Cell<bool>,
@@ -339,12 +409,16 @@ impl WebGlRenderer {
         // The listener only raises a flag. Switching renderers here would mean
         // dropping this renderer - and this closure - while JS is inside its own
         // callback, and the loop is about to read the flag anyway.
-        let on_lost = Closure::wrap(Box::new(move |_: web_sys::Event| {
+        let on_lost = Closure::wrap(Box::new(move |event: web_sys::Event| {
             listener.set(true);
             // And for every renderer this page builds from now on, so the loss
             // outlives this one: switching to the 2D path drops `self`, and with
             // it the flag a later setting change would have had to read.
-            latch_gl_lost();
+            // Cancelling is what buys the way back: the browser only fires
+            // `webglcontextrestored` for a loss the page cancelled (#397).
+            if latch_gl_lost() {
+                event.prevent_default();
+            }
         }) as Box<dyn FnMut(web_sys::Event)>);
         if canvas
             .add_event_listener_with_callback(CONTEXT_LOST, on_lost.as_ref().unchecked_ref())
@@ -353,6 +427,21 @@ impl WebGlRenderer {
             // Not fatal: a listener the browser would not take only means a lost
             // context is found out by the draws failing rather than by the event.
             report("the WebGL context loss listener could not be attached");
+        }
+        // The other half (#397): raise the flag the draw loop reads. Nothing is
+        // rebuilt here, for the same reason the loss above is not acted on here -
+        // this closure is what JS is inside, and a renderer switch drops it.
+        let on_restored = Closure::wrap(Box::new(|_: web_sys::Event| {
+            latch_gl_restored();
+        }) as Box<dyn FnMut(web_sys::Event)>);
+        if canvas
+            .add_event_listener_with_callback(
+                CONTEXT_RESTORED,
+                on_restored.as_ref().unchecked_ref(),
+            )
+            .is_err()
+        {
+            report("the WebGL context restore listener could not be attached");
         }
 
         let mut renderer = Self {
@@ -367,6 +456,7 @@ impl WebGlRenderer {
             surface: (canvas.width(), canvas.height()),
             lost,
             on_lost,
+            on_restored,
             reported: Cell::new(false),
         };
         renderer.set_smoothing(smoothing);
@@ -498,6 +588,10 @@ impl Drop for WebGlRenderer {
         let _ = self.canvas.remove_event_listener_with_callback(
             CONTEXT_LOST,
             self.on_lost.as_ref().unchecked_ref(),
+        );
+        let _ = self.canvas.remove_event_listener_with_callback(
+            CONTEXT_RESTORED,
+            self.on_restored.as_ref().unchecked_ref(),
         );
     }
 }
