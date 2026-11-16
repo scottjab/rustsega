@@ -69,6 +69,15 @@ whole app, and it needs nothing else on disk to serve it. `nix flake check`
 builds that binary and runs a smoke test against it; inside `nix develop`,
 `just build` does the same two steps without Nix being in charge of them.
 
+A library served on an address that is not loopback is a library anyone on that
+network can list and download: there is no authentication in this binary, the
+`/api/roms` ids are not secrets, and `POST /api/roms/rescan` rebuilds the list
+for any client that asks. The server prints a warning at startup when it is about
+to serve one, naming the address and the number of files, because `--bind` is
+`127.0.0.1` by default and opening it up is a decision rather than an accident.
+Bind a library only to a network you trust, or to a reverse proxy that
+authenticates.
+
 ### Running it as a NixOS service
 
 The flake carries a NixOS module, `nixosModules.default` (also under

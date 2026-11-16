@@ -16,13 +16,13 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 /// How long a test waits for anything: the binary is built before nextest runs,
 /// so anything past a few seconds is a hang rather than a slow start.
@@ -42,10 +42,15 @@ fn missing_directory() -> std::path::PathBuf {
     a_directory().join("no-such-rom-dir")
 }
 
-/// A `rustsega` process, and the address it said it was listening on.
+/// A `rustsega` process, the address it said it was listening on, and the log
+/// lines it has written since.
 struct Server {
     child: Child,
     addr: SocketAddr,
+    /// Lines still unread from stdout. `wait_for_listen` stops at the startup
+    /// line, and what a server says *after* that line is the subject of tests
+    /// about what it decided to expose (#415).
+    logged: mpsc::Receiver<String>,
 }
 
 impl Server {
@@ -79,18 +84,62 @@ impl Server {
         let stdout = child.stdout.take().expect("stdout was piped");
         // `std::process::Child` has no `kill_on_drop`, and until this function
         // returns there is no `Server` whose `Drop` could do it instead.
-        let addr = wait_for_listen(stdout).unwrap_or_else(|reason| {
+        let (addr, logged) = wait_for_listen(stdout).unwrap_or_else(|reason| {
             let _ = child.kill();
             let _ = child.wait();
             panic!("{reason}");
         });
-        let server = Server { child, addr };
+        let server = Server {
+            child,
+            addr,
+            logged,
+        };
         assert_ne!(
             server.addr.port(),
             DEFAULT_PORT,
             "listening on the default port means RUSTSEGA_PORT was not read"
         );
         server
+    }
+
+    /// Wait for the log to say every one of `needles`, and fail with the log so far.
+    ///
+    /// Substrings rather than whole lines: this asks what the process chose to
+    /// disclose, and a startup line may be reworded without changing that.
+    fn expect_logged(&mut self, needles: &[&str]) {
+        let deadline = Instant::now() + LIMIT;
+        let mut seen: Vec<String> = Vec::new();
+        for needle in needles.iter().copied() {
+            loop {
+                if seen.iter().any(|line| line.as_str().contains(needle)) {
+                    break;
+                }
+                match self.logged.recv_timeout(remaining(deadline)) {
+                    Ok(line) => seen.push(line),
+                    Err(_) => panic!(
+                        "rustsega never logged {needle:?} within {}s; since the startup line it logged {seen:?}",
+                        LIMIT.as_secs()
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Assert that `needle` is not said, given the server a chance to say it.
+    ///
+    /// Bounded and therefore not proof of absence in general - but a warning that
+    /// arrives after the window would arrive after the first request too, which is
+    /// the only promise a startup line can make.
+    fn expect_not_logged(&mut self, needle: &str) {
+        let mut seen: Vec<String> = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while let Ok(line) = self.logged.recv_timeout(remaining(deadline)) {
+            assert!(
+                !line.contains(needle),
+                "loopback server said {needle:?} in {line:?}"
+            );
+            seen.push(line);
+        }
     }
 }
 
@@ -106,7 +155,7 @@ impl Drop for Server {
 /// On the pipe rather than by polling a socket, so there is no window in which the
 /// process is up but the test has stopped looking, and none in which a connect
 /// succeeds against something else that owns the port.
-fn wait_for_listen(stdout: ChildStdout) -> Result<SocketAddr, String> {
+fn wait_for_listen(stdout: ChildStdout) -> Result<(SocketAddr, mpsc::Receiver<String>), String> {
     let (sender, lines) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
@@ -127,7 +176,8 @@ fn wait_for_listen(stdout: ChildStdout) -> Result<SocketAddr, String> {
         if let Some((_, addr)) = line.split_once("listening on http://") {
             return addr
                 .trim()
-                .parse()
+                .parse::<SocketAddr>()
+                .map(|addr| (addr, lines))
                 .map_err(|error| format!("bad address in the startup line {line:?}: {error}"));
         }
     }
@@ -324,4 +374,78 @@ fn the_binary_answers_help_and_version() {
         String::from_utf8_lossy(&version.stdout).contains(env!("CARGO_PKG_VERSION")),
         "--version should say which version this is"
     );
+}
+
+/// A ROM directory holding `count` cartridges, for a server that has something to
+/// disclose. `*.md` is one of the four extensions the scan offers (#157).
+fn rom_dir(count: usize) -> TempDir {
+    let dir = tempdir().expect("a temp directory");
+    for index in 0..count {
+        fs::write(dir.path().join(format!("game-{index}.md")), [0u8; 16]).expect("a cartridge");
+    }
+    dir
+}
+
+/// The same port, reached the way a client on this machine reaches it: a server
+/// bound to `0.0.0.0` cannot be connected to at `0.0.0.0` on every platform.
+fn loopback_of(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port())
+}
+
+/// #415: a non-loopback bind with a library has to say, in one line, the address,
+/// how many files it is about to expose, and that there is no authentication in
+/// front of them. It is a warning and not a gate - see the decision on the issue -
+/// which the last assertion here pins: a gate would have to change this test.
+#[test]
+fn a_non_loopback_bind_with_a_library_says_what_it_is_exposing() {
+    let roms = rom_dir(2);
+    let mut server = Server::start(
+        &[
+            ("RUSTSEGA_BIND", "0.0.0.0"),
+            (
+                "RUSTSEGA_ROM_DIR",
+                roms.path().to_str().expect("a UTF-8 temp path"),
+            ),
+        ],
+        &[],
+    );
+
+    server.expect_logged(&["0.0.0.0", "2 files", "no authentication"]);
+
+    let listing = get(loopback_of(server.addr), "/api/roms");
+    let (code, body) = split(&listing);
+    assert_eq!(code, 200, "the warning is not a gate: {code}");
+    assert!(body.contains("game-0"), "the library still serves: {body}");
+}
+
+/// The other half of #415: the address the binary chooses by default, and which is
+/// why this is a warning rather than a breakage, says nothing about exposure.
+#[test]
+fn a_loopback_bind_with_a_library_says_nothing_about_exposure() {
+    let roms = rom_dir(2);
+    let mut server = Server::start(
+        &[(
+            "RUSTSEGA_ROM_DIR",
+            roms.path().to_str().expect("a UTF-8 temp path"),
+        )],
+        &[],
+    );
+
+    server.expect_not_logged("no authentication");
+
+    let listing = get(server.addr, "/api/roms");
+    let (code, body) = split(&listing);
+    assert_eq!(code, 200, "loopback is unchanged: {code}");
+    assert!(body.contains("game-0"), "and still serves: {body}");
+}
+
+/// And a wide bind with nothing to hide warns about nothing, so the line keeps
+/// meaning that a library is involved.
+#[test]
+fn a_non_loopback_bind_without_a_library_warns_about_nothing() {
+    let mut server = Server::start(&[("RUSTSEGA_BIND", "0.0.0.0")], &[]);
+    server.expect_not_logged("no authentication");
+    let info = get(loopback_of(server.addr), "/api/info");
+    let (code, _) = split(&info);
+    assert_eq!(code, 200);
 }
