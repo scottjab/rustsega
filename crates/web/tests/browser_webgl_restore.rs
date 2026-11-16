@@ -55,6 +55,38 @@ fn frame(colour: [u8; 4]) -> Vec<u8> {
     pixels
 }
 
+/// The pname `WEBGL_debug_renderer_info` answers with. Named because `get_parameter`
+/// wants the number, and because asking it without enabling the extension above is an
+/// error rather than an answer.
+const UNMASKED_RENDERER_WEBGL: u32 = 0x9246;
+
+/// Which GL this browser really drew with, in the log CI shows.
+///
+/// The point of #498 is that a green run used to prove nothing about the WebGL path
+/// because both tests skipped, and console output from a *passing* test is not
+/// printed - which is why CI passes `--nocapture` to `just test-web` and why this
+/// line exists. `llvmpipe` in it means the runner has real GL and the assertions
+/// below ran; the `SKIPPED` line means it does not.
+///
+/// `WEBGL_debug_renderer_info` rather than `RENDERER` because the masked string
+/// Firefox answers with is "WebGL Renderer" wherever it runs, and "wherever it
+/// runs" is exactly the thing being established.
+fn log_renderer(gl: &web_sys::WebGl2RenderingContext) {
+    let unmasked = gl
+        .get_extension("WEBGL_debug_renderer_info")
+        .ok()
+        .flatten()
+        .and_then(|_| {
+            gl.get_parameter(UNMASKED_RENDERER_WEBGL)
+                .ok()
+                .and_then(|value| value.as_string())
+        });
+    let renderer = unmasked.unwrap_or_else(|| "unknown".to_string());
+    web_sys::console::log_1(&JsValue::from_str(&format!(
+        "WebGL renderer in use: {renderer}"
+    )));
+}
+
 /// Lets the browser run its own frames: the context events are dispatched
 /// asynchronously, and this is the clock they were measured against.
 async fn frames(count: u32) {
@@ -165,6 +197,7 @@ async fn a_restored_context_draws_again() {
         return;
     };
     let gl = context(&canvas);
+    log_renderer(&gl);
     let Some(extension) = gl.get_extension("WEBGL_lose_context").ok().flatten() else {
         skip("this browser offers WEBGL_lose_context");
         return;

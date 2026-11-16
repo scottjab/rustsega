@@ -111,8 +111,16 @@ jobs:
         # part of `just check`, so a WebDriver problem reads as "the browser tests
         # broke" and a core-crate commit does not depend on a browser. Nothing to
         # install: this job already realises the dev shell, which pins Firefox and
-        # geckodriver and exports `GECKODRIVER`.
-        run: nix develop -c just test-web
+        # geckodriver and exports `GECKODRIVER` - and, since #498, the software GL
+        # vendor that lets the WebGL tests run here instead of skipping.
+        #
+        # `--nocapture` is not a debugging leftover. Console output from a *passing*
+        # browser test is not printed, and the two WebGL tests report a skip on the
+        # console: without it, a run that skipped every GL test and a run that
+        # asserted pixels through a lost and restored context look identical in this
+        # log, which is the hole #498 is about. With it the line to read is
+        # `WebGL renderer in use: ...`, and a `SKIPPED` line next to it is a finding.
+        run: nix develop -c just test-web -- --nocapture
 
       - name: m68k conformance gate
         # The whole 68000 SingleStepTests suite at state-and-clocks checking, as

@@ -279,6 +279,27 @@
             # overridable: a driver and a browser that disagree on the WebDriver
             # protocol produce failures that look like emulator bugs.
             export GECKODRIVER="${pkgs.geckodriver}/bin/geckodriver"
+            # Software GL for the WebGL browser tests (#498). The Firefox this shell
+            # pins carries GLVND - the loader - and nothing else, and a GL vendor is
+            # not something a browser can supply for itself: on a machine with no GPU
+            # driver `canvas.getContext('webgl2')` answers `null`, and every test of
+            # the WebGL path skips. That is CI, which is how #397 found it out.
+            #
+            # Mesa is the vendor and `swrast_dri.so` (llvmpipe) is the driver, so this
+            # is GLVND/EGL/WebGL rather than an emulation of the API, and
+            # `LIBGL_ALWAYS_SOFTWARE` with a surfaceless EGL platform is what lets it
+            # come up with no X server and no DRM node. A machine with a GPU then gets
+            # the same answer as CI rather than a greener one: #498 exists because
+            # "it passes on my machine" was true here and meaningless there.
+            #
+            # Prepended, not replacing: the Firefox wrapper puts its own GLVND in front
+            # of whatever it inherits, and GLVND reaches this Mesa through
+            # `__EGL_VENDOR_LIBRARY_FILENAMES` rather than by search order.
+            export LD_LIBRARY_PATH="${pkgs.libglvnd}/lib:${pkgs.mesa}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
+            export LIBGL_ALWAYS_SOFTWARE=1
+            export GALLIUM_DRIVER=llvmpipe
+            export EGL_PLATFORM=surfaceless
           '';
         };
 
