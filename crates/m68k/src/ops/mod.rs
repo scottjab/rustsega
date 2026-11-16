@@ -22,9 +22,10 @@
 //!
 //! # The exception path
 //!
-//! `Op::Illegal` covers the reserved opcodes, and `Op::LineA` / `Op::LineF`
-//! cover the `1010` and `1111` groups — see [`crate::decode`]. All three run
-//! [`M68k::op_illegal`], which enters the illegal-instruction exception. That is
+//! `Op::Illegal` covers the reserved opcodes, `Op::Undefined` the encodings no
+//! instruction occupies, and `Op::LineA` / `Op::LineF` cover the `1010` and
+//! `1111` groups — see [`crate::decode`]. All four run [`M68k::op_illegal`],
+//! which enters the illegal-instruction exception. That is
 //! the 68000's behaviour: the MC68000 has no line emulator, so Formats I and J
 //! in M68000UM are reserved encodings there and a reserved opcode raises the
 //! illegal-instruction exception (M68000PM section 8, "ILLEGAL INSTRUCTION").
@@ -84,7 +85,11 @@ impl M68k {
     /// return the 68k clocks it cost.
     pub(crate) fn run_op(&mut self, bus: &mut impl Bus, op: Op, opcode: u16) -> u32 {
         match op {
-            Op::Illegal | Op::LineA | Op::LineF => self.op_illegal(bus),
+            // `Op::Undefined` joins the three because an encoding the ISA does
+            // not define has the same hardware answer as the documented
+            // `ILLEGAL` opcode; it is `Op::Unimplemented` below that must stay a
+            // panic, and the two must never be merged (#355).
+            Op::Illegal | Op::Undefined | Op::LineA | Op::LineF => self.op_illegal(bus),
             Op::Trap => self.op_trap(bus, opcode),
             // The move class (`0001`/`0010`/`0011` and `0111`). Each handler
             // re-reads the size, destination and source fields from the opcode,

@@ -628,6 +628,44 @@ mod tests {
     }
 
     #[test]
+    fn undefined_encodings_take_the_illegal_frame() {
+        // The encodings #355 found carts executing: `$4741` is the `0100` group's
+        // unassigned `101` operation slot, `$00FF`/`$00FA` are `ORI` at size `11`
+        // and `$0AC6` is `EORI` at size 11. None of them is an instruction, so
+        // the 68000 treats them exactly as it treats `ILLEGAL` — same vector, the
+        // address of the encoding itself in the frame, the same four fetches and
+        // the same 34 clocks — instead of leaving the core with nothing to do.
+        for opcode in [0x4741u16, 0x00FF, 0x00FA, 0x0AC6, 0x0E00, 0x0808] {
+            let (mut cpu, mut bus) = cpu_at(opcode, SUP);
+            let before = cpu.cycles;
+            cpu.step(&mut bus);
+            assert_eq!(
+                cpu.pending_exception,
+                Some(EXC_ILLEGAL),
+                "${opcode:04X} must take the illegal-instruction vector"
+            );
+            assert_frame(&cpu, &bus, STACK - 6, SUP, PROGRAM);
+            assert_eq!(
+                cpu.pc, HANDLER,
+                "${opcode:04X} must jump to the $00000C long"
+            );
+            assert_eq!(
+                cpu.cycles - before,
+                EXCEPTION_ENTRY_CLOCKS,
+                "${opcode:04X} costs the same 34 clocks ILLEGAL costs"
+            );
+            let mut illegal_bus_reads = vec![0x0000_000C, 0x0000_000E, HANDLER, HANDLER + 2];
+            illegal_bus_reads.sort();
+            let mut reads = bus.reads();
+            reads.sort();
+            assert_eq!(
+                reads, illegal_bus_reads,
+                "${opcode:04X} must read the same four words as ILLEGAL"
+            );
+        }
+    }
+
+    #[test]
     fn no_line_a_or_line_f_vector_number_is_taken() {
         // The anti-test for the ticket's `line_a_vector_10` / `line_f_vector_11`:
         // those slots belong to the 68010's line emulators, so on the 68000

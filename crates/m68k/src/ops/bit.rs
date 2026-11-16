@@ -301,10 +301,11 @@ mod tests {
         }
         // The static form's mode `001` is not MOVEP — MOVEP has bit 8 set — and
         // it is unassigned on the 68000, so it is the one encoding of this column
-        // that stays unclaimed.
+        // that nothing claims: undefined, so an illegal instruction rather than a
+        // handler that has not been written (#355).
         assert_eq!(
             decode(static_(BTST, AN, 0)),
-            Op::Unimplemented,
+            Op::Undefined,
             "static, An direct"
         );
         // And the neighbours that *are* bit operations do decode, so the rule

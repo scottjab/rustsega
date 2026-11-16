@@ -1205,6 +1205,84 @@ mod tests {
         }
     }
 
+    /// An encoding no instruction occupies is not a rustsega hole, so `step`
+    /// must not panic on it: the 68000 raises the illegal-instruction exception
+    /// and execution carries on in the handler (#355, which found `$4741`,
+    /// `$00FF`, `$00FA` and `$0AC6` on thirteen carts).
+    ///
+    /// This sits next to [`step_panics_loudly_on_an_unimplemented_opcode`] on
+    /// purpose. The two together are the rule: `$4E74` — a slot this ticket did
+    /// not derive, and the anchor of that test — still panics, while these take
+    /// the same route `ILLEGAL`, line A and line F take above, with the same
+    /// frame, the same vector fetch and the same 34 clocks.
+    #[test]
+    fn step_takes_the_illegal_exception_for_an_undefined_encoding() {
+        use crate::decode::Op as Decoded;
+        use crate::exceptions::EXC_ILLEGAL;
+
+        for (opcode, why) in [
+            (0x4741, "the 0100 group's unassigned 101 operation slot"),
+            (0x00FF, "ORI at size 11"),
+            (0x00FA, "ORI at size 11, mode 111/010"),
+            (0x0AC6, "EORI at size 11"),
+            (0x0E00, "the 0000 group's unassigned nibble"),
+            (0x0808, "the static bit-number form at An direct"),
+        ] {
+            assert_eq!(
+                crate::decode::decode(opcode),
+                Decoded::Undefined,
+                "{why} (${opcode:04X}) must decode as undefined, not unimplemented"
+            );
+
+            let (mut cpu, mut bus) = cpu_at_opcode(opcode);
+            let before = cpu.clone();
+            let clocks = cpu.step(&mut bus);
+
+            assert_eq!(
+                u64::from(clocks),
+                crate::exceptions::EXCEPTION_ENTRY_CLOCKS,
+                "{why}: the whole step is the entry sequence, which charges its own 34 clocks"
+            );
+            assert_eq!(
+                cpu.pending_exception,
+                Some(EXC_ILLEGAL),
+                "{why} (${opcode:04X}) must take the illegal-instruction vector"
+            );
+            // The frame: SR as it was, then the address of the encoding that has
+            // no instruction, so a handler can look at what it jumped over.
+            assert_eq!(bus.read_word(STACK_TOP - 6), 0x2700, "{why}: SR at SP");
+            assert_eq!(
+                bus.read_long(STACK_TOP - 4),
+                PROGRAM_BASE,
+                "{why}: PC at SP + 2, pointing at the undefined encoding"
+            );
+            assert_eq!(
+                cpu.pc, ILLEGAL_HANDLER,
+                "{why}: PC from the long at $00000C"
+            );
+            assert_eq!(cpu.d, before.d, "{why} must not touch Dn");
+            assert_eq!(cpu.a[..7], before.a[..7], "{why} must not touch An");
+        }
+    }
+
+    /// The other half of #355, spelled out where the panic rule lives: the
+    /// undefined encodings above may not be reached by making
+    /// `Op::Unimplemented` quiet, because `$4E74` — no handler, and a slot this
+    /// ticket leaves alone — still has to blow up.
+    #[test]
+    fn an_undefined_encoding_does_not_silence_the_unimplemented_one() {
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4E74);
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cpu.step(&mut bus)))
+            .expect_err("$4E74 has no handler, and #355 does not change that");
+        let text = error
+            .downcast_ref::<String>()
+            .expect("the panic payload is a formatted message");
+        assert!(
+            text.contains("m68k opcode 4E74"),
+            "the panic must name the opcode it could not run, got {text:?}"
+        );
+    }
+
     /// The record describes the step that just ran, not the last exception the
     /// CPU ever took.
     #[test]
