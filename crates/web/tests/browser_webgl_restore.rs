@@ -38,6 +38,14 @@ const FRAME_HEIGHT: u32 = 4;
 const RED: [u8; 4] = [220, 20, 20, 255];
 const GREEN: [u8; 4] = [20, 210, 20, 255];
 
+/// Says out loud what this run could not test, so a green that measured nothing
+/// cannot be mistaken for one that did.
+fn skip(what: &str) {
+    web_sys::console::log_1(&JsValue::from_str(&format!(
+        "SKIPPED browser_webgl_restore: {what}"
+    )));
+}
+
 /// `FRAME_WIDTH` x `FRAME_HEIGHT` of one colour, RGBA8.
 fn frame(colour: [u8; 4]) -> Vec<u8> {
     let mut pixels = Vec::with_capacity((FRAME_WIDTH * FRAME_HEIGHT * 4) as usize);
@@ -145,14 +153,21 @@ async fn a_restored_context_draws_again() {
         .append_child(&canvas)
         .expect("add the canvas to the page");
 
-    let mut renderer = WebGlRenderer::new(&canvas, FilterSetting::Sharp, false)
-        .expect("this browser gives a WebGL2 renderer");
+    // Two things this test needs and a CI runner may not have: a WebGL2 context, and
+    // `WEBGL_lose_context` to take it away with. GitHub's headless Firefox answers
+    // `None` to the first (#397 found this out by going red), so this reports a skip
+    // rather than panicking - a browser with no GPU context is an environment
+    // without the thing under test, not a bug in it. `webgl2_supported()` is what
+    // the shell asks in production, and it answers the same way: no WebGL, canvas
+    // path, no failure.
+    let Some(mut renderer) = WebGlRenderer::new(&canvas, FilterSetting::Sharp, false) else {
+        skip("this browser will not give a WebGL2 context");
+        return;
+    };
     let gl = context(&canvas);
     let Some(extension) = gl.get_extension("WEBGL_lose_context").ok().flatten() else {
-        panic!(
-            "this browser offers no WEBGL_lose_context, so nothing below could lose a \
-             context and the test would assert nothing"
-        );
+        skip("this browser offers WEBGL_lose_context");
+        return;
     };
 
     // The path works before anything is lost: every assertion after this one is

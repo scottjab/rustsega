@@ -60,12 +60,12 @@ fn call(target: &JsValue, method: &str) {
 }
 
 /// One canvas, with a WebGL2 context and the extension that can take it away.
-fn page_with_a_renderer() -> (
+fn page_with_a_renderer() -> Option<(
     web_sys::HtmlCanvasElement,
     web_sys::WebGl2RenderingContext,
     JsValue,
     Box<dyn Renderer>,
-) {
+)> {
     let document = web_sys::window()
         .expect("a browser window")
         .document()
@@ -82,27 +82,37 @@ fn page_with_a_renderer() -> (
         .expect("a body")
         .append_child(&canvas)
         .expect("add the canvas to the page");
-    let renderer: Box<dyn Renderer> = Box::new(
-        WebGlRenderer::new(&canvas, FilterSetting::Sharp, false).expect("a WebGL2 renderer"),
-    );
-    let gl: web_sys::WebGl2RenderingContext = canvas
-        .get_context("webgl2")
-        .expect("asking a canvas for its context does not throw")
-        .expect("this canvas has a WebGL2 context")
-        .dyn_into()
-        .expect("a canvas asked for webgl2 gives back a WebGL2 context");
-    let extension = gl
-        .get_extension("WEBGL_lose_context")
-        .ok()
-        .flatten()
-        .expect("this browser offers WEBGL_lose_context, so the budget cannot be driven");
-    (canvas, gl, extension.into(), renderer)
+    // A WebGL2 context and `WEBGL_lose_context` are both things a CI runner may not
+    // have - GitHub's headless Firefox answers `None` to the first, which is how
+    // #397 found the difference out - so this answers `None` too and the caller
+    // reports the skip rather than the failure.
+    let renderer: Box<dyn Renderer> = match WebGlRenderer::new(&canvas, FilterSetting::Sharp, false)
+    {
+        Some(renderer) => Box::new(renderer),
+        None => return None,
+    };
+    let Some(value) = canvas.get_context("webgl2").ok().flatten() else {
+        return None;
+    };
+    let Ok(gl) = value.dyn_into::<web_sys::WebGl2RenderingContext>() else {
+        return None;
+    };
+    let Some(extension) = gl.get_extension("WEBGL_lose_context").ok().flatten() else {
+        return None;
+    };
+    Some((canvas, gl, extension.into(), renderer))
 }
 
 /// The budget: two comebacks, then the loss is left permanent (#397).
 #[wasm_bindgen_test]
 async fn a_driver_that_keeps_losing_its_context_is_left_alone() {
-    let (_canvas, gl, extension, renderer) = page_with_a_renderer();
+    let Some((_canvas, gl, extension, renderer)) = page_with_a_renderer() else {
+        web_sys::console::log_1(&JsValue::from_str(
+            "SKIPPED browser_webgl_budget: this browser cannot lose a context, so its \
+             budget cannot be driven",
+        ));
+        return;
+    };
 
     let mut given_back = 0;
     for loss in 1..=RESTORATIONS_ALLOWED + 1 {
