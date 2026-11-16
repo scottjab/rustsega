@@ -268,6 +268,39 @@ mod tests {
         assert_eq!(cpu.pc, PROGRAM + 6, "opcode and both extension words");
     }
 
+    /// `LEA #$E000,A1` (`$43F8`): mode `111` register `000` is absolute word, and
+    /// the word is sign-extended into the address register, so the result is
+    /// `$FFFFE000` and not `$0000E000` (M68000UM "LEA", addressing-mode table
+    /// "Absolute short: the 16-bit displacement is sign-extended to 32 bits").
+    ///
+    /// The instruction is load-bearing on real carts rather than a curiosity:
+    /// Sonic & Knuckles sets up its level-art staging pointer exactly this way at
+    /// `$005DB8`, and a zero-extended result sends the buffer to `$00E000` -
+    /// cartridge space, where writes are ignored - while the 68k->VDP DMA reads
+    /// the `$FFE000` it always did and ships whatever was already there (#404).
+    #[test]
+    fn lea_abs_w_sign_extends_into_an_address_register() {
+        let (mut cpu, mut bus) = run(0x43F8, &[0xE000, 0x4E71]);
+        cpu.a[1] = 0xA5A5_A5A5;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[1], 0xFFFF_E000, "$E000 into A1, sign extended");
+        assert_eq!(cpu.pc, PROGRAM + 4, "opcode and one extension word");
+    }
+
+    /// The same absolute word through A7, whose stored value the core keeps
+    /// separate - the sign extension has to survive that path too
+    /// ([`lea_to_a7_moves_the_stored_stack_pointer`]).
+    #[test]
+    fn lea_abs_w_sign_extends_into_the_stack_pointer() {
+        let (mut cpu, mut bus) = run(0x4FF8, &[0xE000, 0x4E71]);
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[7], 0xFFFF_E000, "$E000 into A7, sign extended");
+    }
+
     /// `LEA (A0),A1` (`$43D0`) with every flag preset and a zero address: no
     /// condition code moves, so `Z` stays set even though the result is zero
     /// for once and `X` survives (M68000UM "LEA — Condition Codes: not

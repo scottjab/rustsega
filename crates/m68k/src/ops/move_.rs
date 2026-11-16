@@ -375,6 +375,22 @@ mod tests {
         assert_eq!(cpu.ccr(), SR_Z | SR_V | SR_C);
     }
 
+    /// `MOVEA.W #$E000,A1` (`$327C`): the immediate form of
+    /// [`movea_w_sign_extends_and_keeps_flags`], which reaches the address
+    /// register through the extension word rather than a data register, so the
+    /// absolute-short sign extension is pinned for this path too (M68000UM
+    /// "MOVEA", addressing-mode table "Immediate: the word is sign-extended to
+    /// 32 bits").
+    #[test]
+    fn movea_w_immediate_sign_extends() {
+        let (mut cpu, mut bus) = run(0x327C, &[0xE000, 0x4E71]);
+        cpu.a[1] = 0xA5A5_A5A5;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.a[1], 0xFFFF_E000, "sign extended, not zero extended");
+    }
+
     /// `MOVE.L (A0)+,(A0)+` (`$20D8`): the source is read and `A0` incremented
     /// *before* the destination is resolved, so the value lands at `A0 + 4` and
     /// `A0` ends 8 above where it started. Getting the order wrong writes to
