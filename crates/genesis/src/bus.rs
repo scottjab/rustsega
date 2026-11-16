@@ -35,7 +35,9 @@
 //! floats, so the value read is whatever the previous transfer left on the
 //! lines, and some decoded-but-unpopulated corners stall the bus instead -
 //! plutiedev "Memory map" documents 0xC00020-0xC0003F, inside the VDP area, as
-//! "hangs up". Modelling open bus is M3-16 (#77).
+//! "hangs up". Modelling open bus is
+//! [#508](https://github.com/scottjab/rustsega/issues/508), split out of the #77
+//! note when #308 took the timing half of it.
 //!
 //! ## The cartridge slot, in order
 //!
@@ -64,7 +66,8 @@ use m68k::ADDR_MASK;
 use vdp::Vdp;
 
 /// What an undriven data bus reads as: the placeholder for every area that
-/// nothing drives yet. See the module docs, and M3-16 (#77) for the real thing.
+/// nothing drives yet. See the module docs, and
+/// [#508](https://github.com/scottjab/rustsega/issues/508) for the real thing.
 ///
 /// Crate-visible because the Z80's own unused areas float to the same value
 /// ([`crate::z80_bus`]) and the two sides should not disagree about a placeholder.
@@ -80,8 +83,11 @@ const OPEN_BUS_WORD: u16 = 0xFFFF;
 // `vdp::Vdp::data_port_stall_mclk`) are master clocks, so a figure a source
 // quotes in a chip's own clocks is converted on the way in and never back out.
 //
-// Two of the three constants come from the ticket rather than from a page; each
-// says so, and TODO(M3-16 #77) on it names the follow-up of checking it.
+// #308 checked these three against hardware documentation. Two are now quoted
+// rather than inferred - the pair below, both from Kabuto's "SEGA Mega Drive /
+// Genesis hardware notes" (v1.5, "The bus system"), which is the source the
+// ticket's "commonly cited" was reaching for. The third is still unquoted, and
+// says so where it stands.
 
 /// Master clocks in one 68000 clock: the 68000 runs at master / 7
 /// (docs/ARCHITECTURE.md, "Clocks and timing"), so one 68000 wait state is this
@@ -99,35 +105,60 @@ const MCLK_PER_Z80: u32 = 15;
 /// "Using the Z80": "you must use byte accesses when touching Z80 RAM, word
 /// accesses won't work").
 ///
-/// INFERRED as one 68000 clock, which is what "one wait state" means on a CPU
-/// whose bus cycle is counted in its own clocks; the number of wait states is the
-/// ticket's and is not something this ticket could reach a page for.
-///
-/// TODO(M3-16 #77): verify against a hardware source. [#308](https://github.com/scottjab/rustsega/issues/308) is open on it.
+/// **#308 could not verify the count, and this stays one 68000 clock.** The
+/// byte-only half of the claim is quoted above; the number of wait states is not
+/// in anything available. Kabuto's hardware notes measure the opposite direction
+/// (the Z80 asking for the 68k's bus), plutiedev "Memory map" gives the map and
+/// no timing, and genvdp.txt never mentions the sound CPU at all. One 68000 clock
+/// is the smallest claim that keeps the area slower than work RAM, which is what
+/// the byte-only rule implies: an access to an 8-bit device behind a 16-bit bus
+/// cannot be free. Treat the 7 as unquoted, and reopen
+/// [#308](https://github.com/scottjab/rustsega/issues/308) with a page that
+/// states a figure.
 pub(crate) const Z80_AREA_WAIT_MCLK: u32 = MCLK_PER_68K;
 
 /// Master clocks a Z80 access to the 68k bus costs the Z80: about 3.3 T-states,
 /// which at [`MCLK_PER_Z80`] is 49.5 and is paid as 50.
 ///
-/// The 3.3 is the ticket's "about 3.3 extra Z80 cycles on average" - an average
-/// over a burst of accesses rather than a per-access minimum, hence rounding to
-/// whole master clocks instead of carrying the fraction over thousands of
-/// accesses (see [`Bus::pending_z80_stall`]).
+/// Quoted by #308 from Kabuto, "SEGA Mega Drive / Genesis hardware notes" v1.5,
+/// "The bus system": "When the Z80 accesses ROM the bus arbiter needs to pause
+/// the 68k, let the Z80 finish its request, then unpause the 68k again. [...] This
+/// typically means that the Z80's 68k bus accesses will be delayed by 2 to 5
+/// cycles. IIRC reads and writes behave exactly the same way. The average Z80
+/// delay is around 3.3 Z80 cycles". The same page's foreword says what to do with
+/// it in an emulator: "just using a default value of 3.3 should already do the
+/// trick here".
 ///
-/// TODO(M3-16 #77): verify against a hardware source. [#308](https://github.com/scottjab/rustsega/issues/308) is open on it.
+/// It is an average of a 2-to-5-cycle spread, so it is charged as one whole
+/// number per access rather than as a distribution, and the fraction is rounded
+/// up rather than carried (see [`Bus::pending_z80_stall`]). Footnote #1 of the
+/// same page gives the per-access model behind the average - `readdelay = a + 3 +
+/// b + 2`, then `Z80 delay = (readdelay*7 + 4 - subcycle)/15` - and running it
+/// over the ranges the page states (a = 1..4, no refresh prolongation, subcycle
+/// 0..6) returns 2 to 4 T-states and a mean of 3.11, which is the 3.3. A model
+/// that sampled the spread per access instead of the mean would need to know the
+/// 68k's own position in its cycle, the "subcycle"; #308 left that alone, and
+/// #489 is unresolved in exactly this charging path.
 pub(crate) const Z80_WINDOW_WAIT_MCLK: u32 = (33 * MCLK_PER_Z80 + 5) / 10;
 
 /// Master clocks a Z80 access to the 68k bus costs the 68000: about 11 of its
 /// clocks, the 68000 stopping for the width conversion while the sound CPU has
 /// the line.
 ///
-/// The 11 is the ticket's number, "commonly cited" with the 3.3 of
-/// [`Z80_WINDOW_WAIT_MCLK`] and by the same average-per-access rule. The pair is
-/// not internally consistent - 11 68000 clocks is 77 master clocks and 3.3
-/// T-states is 50 - which is what both being averages gets up to; both are
-/// charged because both are what the ticket names.
+/// The 11 is the same page and the same sentence as the 3.3: "whereas the average
+/// 68k delay is around 11 68k cycles".
 ///
-/// TODO(M3-16 #77): verify against a hardware source. [#308](https://github.com/scottjab/rustsega/issues/308) is open on it.
+/// **#308 closed the contradiction the ticket saw between this and
+/// [`Z80_WINDOW_WAIT_MCLK`].** 3.3 T-states is 49.5 master clocks and 11 68000
+/// clocks is 77, and they were read as two answers to one question. They are not:
+/// they are the delay each of the two chips suffers on the same arbitration event,
+/// which is why they differ and why both are charged here. Footnote #1 of the
+/// source gives the relation directly - `68k delay = ((Z80 delay) * 15 +
+/// subcycle + 46) / 7 - a` - and over the ranges the page states for its typical
+/// case that returns 10 to 12 with a mean of 10.75, which is the 11. The 68k loses
+/// more than the sound CPU because it also loses the cycle it was already running:
+/// "if the 68k is just about to access the bus itself it finishes its own access
+/// cycle first before releasing the bus".
 pub(crate) const Z80_WINDOW_STEAL_MCLK: u32 = 11 * MCLK_PER_68K;
 
 // Region boundaries, from plutiedev "Memory map".
@@ -354,7 +385,8 @@ enum VdpPort {
 /// lane - A5 has to be low for the chip to answer at all, and nothing above A5
 /// reaches the decode, which is what "mirrors every $40" is.
 ///
-/// Modelling the hang itself - no DTACK, so the 68k stops - is M3-16 (#77); until
+/// Modelling the hang itself - no DTACK, so the 68k stops - is
+/// [#508](https://github.com/scottjab/rustsega/issues/508); until
 /// then an address with this bit set answers what the rest of the undecoded area
 /// answers.
 const VDP_HANG_BIT: u32 = 1 << 5;
@@ -933,12 +965,26 @@ impl Bus {
     /// be holding the line for a transfer it is not running.
     ///
     /// The Z80 pays [`Z80_WINDOW_WAIT_MCLK`] for the width conversion and the
-    /// 68000 pays [`Z80_WINDOW_STEAL_MCLK`] for the bus it just lost; and a 68k ->
-    /// VDP DMA is the 68000's bus read at its most jealous - "The 68000 is frozen
-    /// during 68k -> VDP transfers" (genvdp.txt section 6) covers the whole of the
-    /// bus, including the part the Z80 is asking through, so a window access made
-    /// while one runs waits out the rest of it
-    /// ([`vdp::Vdp::dma_68k_stall_mclk`]) rather than arriving in the middle.
+    /// 68000 pays [`Z80_WINDOW_STEAL_MCLK`] for the bus it just lost.
+    ///
+    /// A window access made while a 68k -> VDP transfer is running waits out the
+    /// rest of it ([`vdp::Vdp::dma_68k_stall_mclk`]) as well. #308 checked that
+    /// against the page that describes the arbiter rather than inferring it from
+    /// the 68000's own freeze: Kabuto, "SEGA Mega Drive / Genesis hardware notes"
+    /// v1.5, "The bus system": "If the Z80 tries to access the bus while the VDP is
+    /// doing a DMA from RAM/ROM [...] it has to wait for that to complete first."
+    /// (Footnote #2 of the same page: "This is one of the reasons Sega advised
+    /// developers to pause the Z80 before doing DMA.")
+    ///
+    /// **The same sentence has a half that is not implemented.** It goes on: "or
+    /// the 68k is halted because it tried to read from the VDP while its FIFO is
+    /// empty or write to the VDP while its FIFO is full it has to wait for that to
+    /// complete first" - so a data-port stall holds the Z80 off the 68k bus too,
+    /// and `data_port_stall_mclk` is not added to the Z80's wait here. It is not
+    /// added because that figure is beam-relative, and charging a beam-relative
+    /// figure into a chip clock is the defect #489 is open on: adding it before
+    /// that lands would move the same bug into a second path. Filed separately
+    /// against #489's fix, not folded in here.
     ///
     /// Called from [`crate::z80_bus::Z80View`] for the window alone: the Z80's own
     /// RAM, the YM2612 and the PSG are on its side of the arbitration and cost it
@@ -1243,7 +1289,7 @@ impl Bus {
             Some(VdpPort::HvCounter) => self.vdp.hv_counter(),
             Some(VdpPort::Psg) | Some(VdpPort::Debug) => OPEN_BUS_WORD,
             // The corner of the area that decodes to nothing: see
-            // [`VDP_HANG_BIT`] for what it does on real hardware, and M3-16 (#77)
+            // [`VDP_HANG_BIT`] for what it does on real hardware, and #508
             // for when that gets modelled.
             None => OPEN_BUS_WORD,
         }
@@ -1260,8 +1306,8 @@ impl Bus {
     ///
     /// A data port write is queued rather than performed - it is a write FIFO
     /// entry on its way to a memory (`vdp::fifo`, M4-21a #99) - and this does not
-    /// wait for it. [`Vdp::data_port_stall_mclk`] is the wait, and M3-16 (#77) is
-    /// the ticket that adds it to the 68k's cycles: see [`Bus::vdp_data_write`].
+    /// wait for it. [`Vdp::data_port_stall_mclk`] is the wait, and it is charged to
+    /// the 68k by [`Bus::vdp_data_write`].
     fn write_vdp_byte(&mut self, addr: u32, value: u8) {
         match vdp_port(addr) {
             Some(VdpPort::Data) => self.vdp_data_write(u16::from_be_bytes([value, value])),
@@ -4511,7 +4557,7 @@ mod tests {
     /// other word one that lets a longword be two word accesses, and "VDP mirrors
     /// every $40 up to $DFFFFF" - and the one address that page says is not a
     /// port at all must not reach it: `$C00020-$C0003F` hangs up, which this bus
-    /// answers as nothing-there until M3-16 (#77) models the hang. The mask that
+    /// answers as nothing-there until #508 models the hang. The mask that
     /// decides it, and why the one #69 suggested is not it, is on [`vdp_port`].
     #[test]
     fn mirror_address_hits_vdp() {
@@ -4698,6 +4744,40 @@ mod tests {
         let (first, second) = dma_cmd(0x0000);
         bus.write_word(0xC00004, first);
         bus.write_word(0xC00004, second);
+    }
+
+    /// The three constants, pinned to the sentences that set them.
+    ///
+    /// Every other timing test in this area - [`a00000_access_adds_wait_state`],
+    /// [`z80_window_access_costs_both_cpus`], and the scheduler pair
+    /// `z80_bank_access_slows_z80` / `z80_bank_access_steals_68k_cycles` - works
+    /// out its expectation *from* the constants. That is right for a model test and
+    /// it has one consequence worth naming: none of them fails when a number
+    /// changes, which is how three unquoted figures sat here through four tests
+    /// that all looked like they were checking them. So this is the one place the
+    /// values are stated as numbers, next to where #308 got them: Kabuto, "SEGA
+    /// Mega Drive / Genesis hardware notes" v1.5, "The bus system" ("The average
+    /// Z80 delay is around 3.3 Z80 cycles, whereas the average 68k delay is around
+    /// 11 68k cycles"), and `docs/ARCHITECTURE.md` for the two divisors.
+    ///
+    /// Moving one is allowed. Moving one now means editing a line that says where
+    /// the number came from, and the sound-side one says it is unquoted.
+    #[test]
+    fn the_bus_timing_constants_are_the_quoted_ones() {
+        assert_eq!(MCLK_PER_68K, 7, "the 68000 runs at master / 7");
+        assert_eq!(MCLK_PER_Z80, 15, "the Z80 runs at master / 15");
+        assert_eq!(
+            Z80_WINDOW_WAIT_MCLK, 50,
+            "3.3 Z80 cycles is 49.5 master clocks, paid up to 50"
+        );
+        assert_eq!(
+            Z80_WINDOW_STEAL_MCLK, 77,
+            "11 68000 clocks, the same chip's loss on the same arbitration being larger"
+        );
+        assert_eq!(
+            Z80_AREA_WAIT_MCLK, 7,
+            "one 68000 clock: the count is unquoted, see the constant's doc comment"
+        );
     }
 
     /// One 68000 access to the sound side at `0xA00000` costs one wait state beyond
