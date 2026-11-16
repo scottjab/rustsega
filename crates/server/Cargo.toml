@@ -32,6 +32,13 @@ serde_json = { workspace = true }
 # The `id` of a ROM (M8-03, #157). `crates/web` already hashes a ROM with this
 # one, so a browser and this server agree on what a ROM is called.
 sha1_smol = "1"
+# The CSP hash of trunk's inline bootstrap (#411). These are the first direct
+# dependencies of this crate after clap, and #411 asks for them by name; neither
+# is new to the build graph - `sha2 0.10.9` and `base64 0.22.1` were already in
+# `Cargo.lock` transitively, so nothing extra compiles. `sha1_smol` stays: a CSP
+# hash is not a ROM id, and the two are compared with nothing.
+sha2 = "0.10"
+base64 = "0.22"
 # Only pulled in by `embed-web`: `rust-embed` reads `../web/dist` at compile
 # time, and `just check` runs before trunk has produced it.
 rust-embed = { version = "8", features = ["mime-guess"], optional = true }

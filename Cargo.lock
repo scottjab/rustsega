@@ -2042,12 +2042,14 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "clap",
  "http-body-util",
  "rust-embed",
  "serde",
  "serde_json",
  "sha1_smol",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tower",

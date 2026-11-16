@@ -94,10 +94,10 @@ async fn api_info_reports_a_library_when_one_was_asked_for() {
     // Whether there is a library is M8-02's business; the directory is scanned
     // here rather than named, because from #157 a library is a scan.
     let rom_dir = tempfile::tempdir().expect("a temp dir to pretend to be a collection");
-    let with_library = Arc::new(AppState {
-        assets: Arc::new(PlaceholderAssets),
-        library: LibrarySlot::scan(rom_dir.path()).expect("the empty temp dir scans"),
-    });
+    let with_library = Arc::new(
+        AppState::new(Arc::new(PlaceholderAssets))
+            .with_library(LibrarySlot::scan(rom_dir.path()).expect("the empty temp dir scans")),
+    );
 
     let response = get(with_library, "/api/info").await;
 
