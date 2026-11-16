@@ -474,16 +474,40 @@ impl Vdp {
         self.regs.get(usize::from(reg)).copied().unwrap_or(0)
     }
 
-    /// R0 bit 5 (LCB): blank the leftmost 8 pixels of the display, filling them
-    /// with the backdrop colour (genvdp.txt section 17 "$00"; plutiedev
-    /// "$80xx").
+    /// R0 HSMA (bits 5-4) = `%01`: blank the leftmost 8 pixels of the display,
+    /// filling them with the backdrop colour (genvdp.txt section 17 "$00";
+    /// plutiedev "$80xx").
+    ///
+    /// HSMA is a 2-bit field, not two independent bits, and the four encodings
+    /// are `%00` nothing, `%01` the leftmost 8 pixels, `%11` the whole line
+    /// ([`Vdp::mask_whole_line`]) and `%10` - HSMA0 clear, so the mask is off -
+    /// nothing. `%10` is the encoding the documents leave unnamed; reading bit 5
+    /// on its own called both `%10` and `%11` "left column blank", which lost a
+    /// masked line without saying so (#490).
     ///
     /// Read per line by [`Vdp::render_line`]'s compositor rather than once a
-    /// frame, so the bit may be written at any point of a raster and what it says
-    /// is true of the next line drawn (M4-19, #97).
+    /// frame, so the field may be written at any point of a raster and what it
+    /// says is true of the next line drawn (M4-19, #97).
     #[inline]
     pub fn left_column_blank(&self) -> bool {
-        self.line_reg(regs::R0) & (1 << 5) != 0
+        self.hsma() == 0b01
+    }
+
+    /// R0 HSMA (bits 5-4) = `%11`: the horizontal scroll mask covers the whole
+    /// line, so the line shows the backdrop colour from edge to edge (genvdp.txt
+    /// section 17 "$00"; plutiedev "$80xx").
+    ///
+    /// The other half of the field [`Vdp::left_column_blank`] reads; a cart that
+    /// asks for this gets every pixel of the line masked, not 8 of them.
+    #[inline]
+    pub fn mask_whole_line(&self) -> bool {
+        self.hsma() == 0b11
+    }
+
+    /// R0 bits 5-4 (HSMA), the horizontal scroll mask field, as written.
+    #[inline]
+    fn hsma(&self) -> u8 {
+        (self.line_reg(regs::R0) >> 4) & 0b11
     }
 
     /// R0 bit 6 (IE): enable the HINT horizontal-blank interrupt
@@ -1176,6 +1200,38 @@ mod tests {
 
         // IE set with the mask's high bit only: still HINTs.
         vdp.write_register(0, 0x64);
+        assert!(vdp.hint_enabled());
+    }
+
+    #[test]
+    fn r0_hsma_selects_the_mask_and_only_two_of_its_four_encodings_mask_anything() {
+        // R0 bits 5-4 are HSMA: %00 masks nothing, %01 masks the leftmost 8
+        // pixels, %11 masks the whole line (genvdp.txt section 17 "$00";
+        // plutiedev "$80xx"). %10 is the one encoding the docs do not give a
+        // meaning to; see Vdp::left_column_blank for what this emulator does
+        // with it (#490).
+        let mut vdp = Vdp::new(false);
+
+        vdp.write_register(0, 0x04);
+        assert!(!vdp.left_column_blank(), "HSMA %00");
+        assert!(!vdp.mask_whole_line(), "HSMA %00");
+
+        vdp.write_register(0, 0x14);
+        assert!(vdp.left_column_blank(), "HSMA %01 is the left column");
+        assert!(!vdp.mask_whole_line(), "HSMA %01 is not the whole line");
+
+        vdp.write_register(0, 0x34);
+        assert!(vdp.mask_whole_line(), "HSMA %11 is the whole line");
+        assert!(!vdp.left_column_blank(), "and not the left column");
+
+        vdp.write_register(0, 0x24);
+        assert!(!vdp.left_column_blank(), "HSMA %10 leaves HSMA0 clear");
+        assert!(!vdp.mask_whole_line(), "so %10 masks nothing");
+
+        // IE and the mask are independent: a cart that masks the left column and
+        // wants HINTs sets both, and neither accessor may disturb the other.
+        vdp.write_register(0, 0x54);
+        assert!(vdp.left_column_blank());
         assert!(vdp.hint_enabled());
     }
 

@@ -365,9 +365,9 @@ mod tests {
         assert_eq!(row(&vdp, 11), plane_rows(11, 8), "line 11 is scrolled");
     }
 
-    /// A register of the compositor is latched with the rest of the line: R0 bit
-    /// 5 (LCB) written halfway across line 10 blanks the left column of line 11
-    /// and leaves line 10 alone. This is what [`Vdp::left_column_blank`] already
+    /// A register of the compositor is latched with the rest of the line: R0 HSMA
+    /// %01 written halfway across line 10 blanks the left column of line 11 and
+    /// leaves line 10 alone. This is what [`Vdp::left_column_blank`] already
     /// promises ("what it says is true of the next line drawn").
     #[test]
     fn a_blank_column_switch_in_mid_line_shows_on_the_next_line() {
@@ -376,7 +376,7 @@ mod tests {
 
         vdp.advance(10 * MCLKS_PER_LINE);
         vdp.advance(HBLANK_CLEAR_MCLK_H32 + 100);
-        vdp.write_register(0, 1 << 5);
+        vdp.write_register(0, 1 << 4);
 
         vdp.advance(MCLKS_PER_LINE - vdp.line_mclk);
         assert_eq!(

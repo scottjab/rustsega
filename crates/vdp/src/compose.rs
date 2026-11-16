@@ -59,7 +59,7 @@ const HIGHLIGHT_OPERATOR: u8 = 0x3E;
 /// is all the way - "shadow + shadow = shadow" (SpritesMind thread 2692).
 const SHADOW_OPERATOR: u8 = 0x3F;
 
-/// The width of the column R0 bit 5 (LCB) blanks: one cell, the leftmost one,
+/// The width of the column R0 HSMA %01 (LCB) blanks: one cell, the leftmost one,
 /// "filled with the backdrop color" whatever the layers hold in it (genvdp.txt
 /// section 17 "$00"; plutiedev "$80xx").
 const LEFT_COLUMN: usize = 8;
@@ -203,8 +203,9 @@ struct LineMode {
     /// Pixels the line itself draws, [`Vdp::active_width`], which a mode change
     /// mid-frame makes less than the frame is wide.
     width: usize,
-    /// Columns of the left edge that go to the backdrop: 8 for R0 bit 5
-    /// ([`Vdp::left_column_blank`]) and 0 for a display that has it clear.
+    /// Columns of the left edge that go to the backdrop: 8 for R0 HSMA %01
+    /// ([`Vdp::left_column_blank`]), the whole line for HSMA %11
+    /// ([`Vdp::mask_whole_line`]), 0 for a display that masks nothing.
     blank: usize,
     /// The CRAM entry the backdrop shows from, [`Vdp::backdrop_index`].
     backdrop: u8,
@@ -227,8 +228,9 @@ struct LineMode {
 /// * columns `mode.width..` of the row are not overscan data but nothing at all,
 ///   the display of the line having ended, so they are read as empty layers and
 ///   compose to the backdrop;
-/// * columns `..mode.blank` of it are R0 bit 5, [`Vdp::left_column_blank`],
-///   which shows the backdrop colour and nothing else.
+/// * columns `..mode.blank` of it are the R0 horizontal scroll mask,
+///   [`Vdp::left_column_blank`] and [`Vdp::mask_whole_line`], which shows the
+///   backdrop colour and nothing else.
 ///
 /// The blank takes the colour only, not the intensity: genvdp.txt section 16
 /// settles the two for a pixel separately, so the left column of a shadowed line
@@ -423,7 +425,9 @@ impl Vdp {
         let cram = self.cram_pixels();
         let mode = LineMode {
             width,
-            blank: if self.left_column_blank() {
+            blank: if self.mask_whole_line() {
+                width
+            } else if self.left_column_blank() {
                 LEFT_COLUMN
             } else {
                 0
@@ -915,7 +919,7 @@ mod tests {
         assert_eq!(vdp.frame().height, 224, "PAL in V28 is 224 like NTSC");
     }
 
-    /// R0 bit 5 (LCB): "the leftmost 8 pixels ... are filled with the backdrop
+    /// R0 HSMA = %01: "the leftmost 8 pixels ... are filled with the backdrop
     /// color" (genvdp.txt section 17 "$00"; plutiedev "$80xx"). Plane A and a
     /// sprite both cover the column here, and both go.
     #[test]
@@ -935,17 +939,46 @@ mod tests {
             "before the blank is switched on, the sprite is what the column shows"
         );
 
-        vdp.write_register(0, 1 << 5);
+        vdp.write_register(0, 1 << 4);
         vdp.render_line(0);
         let line = row(&vdp, 0);
         let backdrop = pixel_of(BACKDROP);
         assert!(
             line[..8].iter().all(|&p| p == backdrop),
-            "the 8 pixels of R0 bit 5 are the backdrop, sprite included"
+            "the 8 pixels of HSMA %01 are the backdrop, sprite included"
         );
         assert!(
             line[8..].iter().all(|&p| p == plane_a),
             "and pixel 8 on is the plane it always was"
+        );
+    }
+
+    /// R0 HSMA = %11 masks the whole line, not the left 8 pixels of it (genvdp.txt
+    /// section 17 "$00"; plutiedev "$80xx", #490). Reading bit 5 alone made %11
+    /// look like %01, so 312 pixels of a drawn line went missing without anyone
+    /// being told.
+    #[test]
+    fn hsma_11_masks_the_whole_line_and_not_just_the_left_column() {
+        let mut vdp = compose_vdp();
+        plane_a_everywhere(&mut vdp);
+        solid(&mut vdp, 4, COLOUR);
+        put_sprite(&mut vdp, 0, 0, 0, entry(SPRITE, 4, true));
+
+        sized(&mut vdp);
+        vdp.render_line(0);
+        let plane_a = pixel_of((PLANE_A << 4) | COLOUR);
+        assert_eq!(
+            row(&vdp, 0)[row(&vdp, 0).len() - 4],
+            plane_a,
+            "unmasked, the line is the plane"
+        );
+
+        vdp.write_register(0, 3 << 4);
+        vdp.render_line(0);
+        let backdrop = pixel_of(BACKDROP);
+        assert!(
+            row(&vdp, 0).iter().all(|&p| p == backdrop),
+            "every pixel of an HSMA %11 line is the backdrop"
         );
     }
 
