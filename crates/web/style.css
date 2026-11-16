@@ -15,7 +15,12 @@
   --bg-screen: #05060a;
   --surface: #141821;
   --surface-2: #1c2230;
-  --border: #2a3142;
+  /* Every component boundary in the shell, and the only cue for where one ends:
+   * `--surface-2` on `--bg` is 1.22:1, so a control cannot rely on its fill. It is
+   * the value 1.4.11 asks for (#407) - moved the minimum distance along the
+   * original hue to reach 3:1 against every surface it can sit on, and checked by
+   * tests/contrast.rs rather than by eye. */
+  --border: #686d79;
   --text: #e8ecf4;
   --text-muted: #8b93a7;
   --accent: #5b8cff;
@@ -101,10 +106,15 @@
     --bg-screen: #e9ebf2;
     --surface: #ffffff;
     --surface-2: #eef0f6;
-    --border: #d8dce6;
+    --border: #84868c;
     --text: #141821;
     --text-muted: #5b6275;
     --accent: #2f56cf;
+    /* The light theme redefines the other three and forgot this one, so a success
+     * toast kept the dark theme's mint on near-white: 1.55:1, and 1.4.11 asks 3:1 of
+     * the stripe that says which kind a toast is (#407). Only ever a `border-color`,
+     * so it is not a text colour and `contrast.rs` does not read it as one. */
+    --ok: #2a9868;
     --danger: #c0202a;
     --warn: #7a5300;
     --on-accent: #f7f9ff;
@@ -117,10 +127,13 @@
   --bg-screen: #e9ebf2;
   --surface: #ffffff;
   --surface-2: #eef0f6;
-  --border: #d8dce6;
+  --border: #84868c;
   --text: #141821;
   --text-muted: #5b6275;
   --accent: #2f56cf;
+  /* 1.4.11 on the toast's kind stripe, as above - `--ok` has to be in both light
+   * blocks or the two light themes disagree about it. */
+  --ok: #2a9868;
   --danger: #c0202a;
   --warn: #7a5300;
   --on-accent: #f7f9ff;

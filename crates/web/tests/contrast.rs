@@ -14,15 +14,18 @@
 //! a text colour in the dark theme has to be a text colour in the light one too,
 //! which is what M7-19 found and fixed.
 //!
-//! Borders, glows and the touch overlay's pressed tint are not text and are not
-//! checked here; 1.4.11 (non-text contrast) is a different bar on different rules,
-//! and it is tracked separately.
+//! Borders, glows and the touch overlay's pressed tint are not text. 1.4.11 asks a
+//! different bar of them - 3:1 rather than 4.5:1 - and the two that carry meaning are
+//! checked for it below: `--border` on every surface, and the toast kind stripes
+//! (#407). `browser_boundary_contrast.rs` is the live-DOM half of the same promise,
+//! because a token can be compliant and still not be what an element is painted with.
+//! Glows and the pressed tint remain unchecked by anything.
 
 mod support;
 
 use std::collections::BTreeMap;
 
-use support::{declarations, strip_comments};
+use support::{declarations, ratio, strip_comments};
 
 /// The four tokens the shell paints behind text.
 const SURFACES: [&str; 4] = ["bg", "bg-screen", "surface", "surface-2"];
@@ -78,36 +81,6 @@ fn insert(tokens: &mut Theme, property: &str, value: &str) {
     if value.starts_with('#') && value.len() == 7 {
         tokens.insert(name.to_string(), value.to_string());
     }
-}
-
-/// One sRGB channel, 0..=1, as the linear light it stands for.
-fn linear(channel: u8) -> f64 {
-    let channel = f64::from(channel) / 255.0;
-    if channel <= 0.04045 {
-        channel / 12.92
-    } else {
-        ((channel + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-/// The relative luminance of a `#rrggbb` colour, as WCAG 2.1 defines it.
-fn luminance(colour: &str) -> f64 {
-    let hex = colour.trim_start_matches('#');
-    let channel = |at: usize| {
-        linear(
-            u8::from_str_radix(&hex[at..at + 2], 16)
-                .unwrap_or_else(|e| panic!("{colour:?} is not a hex colour: {e}")),
-        )
-    };
-    0.2126 * channel(0) + 0.7152 * channel(2) + 0.0722 * channel(4)
-}
-
-/// The WCAG 2.1 contrast ratio of two colours: 1.0 when they are the same, 21.0
-/// for black on white.
-fn ratio(foreground: &str, background: &str) -> f64 {
-    let (one, two) = (luminance(foreground), luminance(background));
-    let (lighter, darker) = if one >= two { (one, two) } else { (two, one) };
-    (lighter + 0.05) / (darker + 0.05)
 }
 
 /// Every token the stylesheet paints as `color:`, without the `--`.
@@ -237,4 +210,77 @@ fn comments_are_gone_and_lines_are_not() {
 
 fn declarations_count(css: &str) -> usize {
     support::declarations_in(css).len()
+}
+
+// ------------------------------------------------- 1.4.11: boundaries ----
+
+/// The bar WCAG 2.1 asks of a non-text boundary: 3:1, not text's 4.5:1.
+const AA_NON_TEXT: f64 = 3.0;
+
+/// The colours a toast's 3px kind stripe is painted with, as `.toast--*` chooses
+/// them. The stripe is the only thing that says which kind of message it is, so
+/// 1.4.11 asks it to be visible against the toast it is painted on.
+const TOAST_KINDS: [&str; 4] = ["accent", "ok", "warn", "danger"];
+
+/// The `--border` of every component in the shell against every surface a boundary
+/// can sit on (#407).
+///
+/// `--border` is the whole boundary: it is used 21 times and `.btn`'s own fill is
+/// 1.20:1 against the page, so there is no other cue for where a control ends. The
+/// bar is the pair with the least contrast, because a boundary that disappears
+/// against one neighbour is a boundary that disappeared.
+#[test]
+fn borders_meet_1_4_11_on_every_surface_in_both_themes() {
+    for (label, theme) in [("dark", dark()), ("light", light())] {
+        let border = theme
+            .get("border")
+            .unwrap_or_else(|| panic!("{label} theme has no --border"));
+        let mut misses = Vec::new();
+        for surface in SURFACES {
+            let background = theme
+                .get(surface)
+                .unwrap_or_else(|| panic!("{label} theme has no --{surface}"));
+            let ratio = ratio(border, background);
+            if ratio < AA_NON_TEXT {
+                misses.push(format!("--border on --{surface} is {ratio:.2}:1"));
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{label} theme borders below the {AA_NON_TEXT}:1 of 1.4.11: {}",
+            misses.join("; ")
+        );
+    }
+}
+
+/// Each toast kind stripe against the toast it is painted on (`--surface-2`, per
+/// `.toast { background: var(--surface-2) }`), in both themes (#407).
+///
+/// This is the test that catches a token the light theme forgot. `.toast--ok` was
+/// the dark theme's mint on near-white at 1.55:1, and `contrast.rs` could not see it
+/// either way: it checks tokens the file paints as `color:`, and `--ok` is only ever
+/// a `border-color`.
+#[test]
+fn toast_kind_stripes_meet_1_4_11_in_both_themes() {
+    for (label, theme) in [("dark", dark()), ("light", light())] {
+        let surface = theme
+            .get("surface-2")
+            .unwrap_or_else(|| panic!("{label} theme has no --surface-2"));
+        let mut misses = Vec::new();
+        for kind in TOAST_KINDS {
+            let Some(colour) = theme.get(kind) else {
+                misses.push(format!("--{kind} has no {label} value"));
+                continue;
+            };
+            let ratio = ratio(colour, surface);
+            if ratio < AA_NON_TEXT {
+                misses.push(format!("--{kind} on --surface-2 is {ratio:.2}:1"));
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "{label} theme toast stripes below the {AA_NON_TEXT}:1 of 1.4.11: {}",
+            misses.join("; ")
+        );
+    }
 }
