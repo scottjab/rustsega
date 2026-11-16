@@ -120,7 +120,12 @@ jobs:
         # asserted pixels through a lost and restored context look identical in this
         # log, which is the hole #498 is about. With it the line to read is
         # `WebGL renderer in use: ...`, and a `SKIPPED` line next to it is a finding.
-        run: nix develop -c just test-web -- --nocapture
+        #
+        # `xvfb-run` is the dev shell's, not the runner image's, so the display is
+        # pinned like everything else: Firefox will not create a GL context with
+        # nothing to draw into, and the runner has no display (#498, attempt 1 -
+        # with Mesa alone the tests still reported `SKIPPED`).
+        run: nix develop -c xvfb-run -a just test-web -- --nocapture
 
       - name: m68k conformance gate
         # The whole 68000 SingleStepTests suite at state-and-clocks checking, as

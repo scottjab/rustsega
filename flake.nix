@@ -261,6 +261,11 @@
             # geckodriver 0.37.1 in the revision this flake.lock points at.
             pkgs.firefox
             pkgs.geckodriver
+            # A virtual X server for the browser tests (#498). The GLVND vendor above
+            # gives Firefox a driver; this gives it somewhere to put a window, which is
+            # what Firefox 159 asks for before it will create a GL context at all.
+            # `just test-web` runs under it on CI - see the comment on that step.
+            pkgs.xvfb-run
           ];
 
           # Where the emulator tests look for commercial ROMs. Override if needed.
@@ -294,12 +299,13 @@
             #
             # Prepended, not replacing: the Firefox wrapper puts its own GLVND in front
             # of whatever it inherits, and GLVND reaches this Mesa through
-            # `__EGL_VENDOR_LIBRARY_FILENAMES` rather than by search order.
+            # `__EGL_VENDOR_LIBRARY_FILENAMES` rather than by search order. No
+            # `EGL_PLATFORM` is set: the display is Xvfb's, and picking a platform here
+            # would only fight it.
             export LD_LIBRARY_PATH="${pkgs.libglvnd}/lib:${pkgs.mesa}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
             export __EGL_VENDOR_LIBRARY_FILENAMES="${pkgs.mesa}/share/glvnd/egl_vendor.d/50_mesa.json"
             export LIBGL_ALWAYS_SOFTWARE=1
             export GALLIUM_DRIVER=llvmpipe
-            export EGL_PLATFORM=surfaceless
           '';
         };
 

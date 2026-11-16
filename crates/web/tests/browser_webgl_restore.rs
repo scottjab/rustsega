@@ -134,7 +134,9 @@ fn context(canvas: &web_sys::HtmlCanvasElement) -> web_sys::WebGl2RenderingConte
 /// One pixel out of the middle of the drawing buffer.
 fn centre_pixel(gl: &web_sys::WebGl2RenderingContext) -> [u8; 4] {
     let mut pixel = [0u8; 4];
-    gl.read_pixels_with_opt_u8_array(
+    // The pixel below is the assertion; a failed read leaves `pixel` zeroed, which
+    // that check then reports as a mismatch rather than as an unread buffer.
+    let _ = gl.read_pixels_with_opt_u8_array(
         gl.drawing_buffer_width() / 2,
         gl.drawing_buffer_height() / 2,
         1,
