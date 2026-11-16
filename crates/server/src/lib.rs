@@ -7,6 +7,7 @@
 
 pub mod assets;
 pub mod cli;
+pub mod csp;
 pub mod library;
 
 use std::sync::Arc;
@@ -38,23 +39,6 @@ const LONG_CACHE: &str = "public, max-age=31536000, immutable";
 /// fixed name. Both have to be revalidated before every use.
 const NO_CACHE: &str = "no-cache";
 
-/// The document policy of every response: same-origin for everything, with wasm
-/// allowed to compile (`wasm-unsafe-eval`) and inline styles allowed because
-/// Leptos writes `style=` attributes.
-///
-/// `script-src` ends in `'unsafe-inline'`, one step looser than M8-01 (#155)
-/// asked for, and only for the single inline `<script type="module">` trunk
-/// injects into `dist/index.html` to call the wasm loader. Without it the policy
-/// is enforced exactly as written and the app never starts: in the dev shell's
-/// Firefox 159, every subresource of the page loaded (`wasm-bindgen`'s `.js` and
-/// the `.wasm` both 200, brotli-compressed) while the bootstrap did not run, so
-/// `window.wasmBindings` stayed `undefined` and no canvas was ever mounted.
-///
-/// A per-file `'sha256-...'` of that script would be narrower and is the right
-/// fix; it is not taken here because hashing it means `sha2` and `base64` as
-/// direct dependencies, which #155 does not list.
-pub const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'";
-
 /// The CSP header name, which the `http` crate does not define for us.
 const CONTENT_SECURITY_POLICY_HEADER: &str = "content-security-policy";
 
@@ -74,15 +58,27 @@ pub struct AppState {
     /// Empty is no library, which is what `/api/info` reports as `"library":
     /// false` and what every `/api/roms` handler answers with a 404.
     pub library: LibrarySlot,
+    /// The `Content-Security-Policy` of every response, derived from `assets`
+    /// when this was built - see [`csp`].
+    pub csp: HeaderValue,
 }
 
 impl AppState {
-    /// State serving `assets` with no ROM library.
+    /// State serving `assets` with no ROM library: the document policy is read
+    /// out of `assets`' own `index.html`, once, here.
     pub fn new(assets: Arc<dyn AssetSource>) -> Self {
+        let policy = csp::for_assets(assets.as_ref());
         Self {
+            csp: HeaderValue::from_str(&policy).expect("a CSP of only ASCII"),
             assets,
             library: LibrarySlot::empty(),
         }
+    }
+
+    /// The same state with `library` as its ROM library.
+    #[must_use]
+    pub fn with_library(self, library: LibrarySlot) -> Self {
+        Self { library, ..self }
     }
 }
 
@@ -93,6 +89,9 @@ impl AppState {
 /// Layers are added innermost-first, so the security headers are on the response
 /// before the compressor looks at it, and tracing sees the finished response.
 pub fn router(state: Arc<AppState>) -> Router {
+    // Taken before `state` moves into the router: the policy is a property of the
+    // assets, and the layer wants the value rather than the state.
+    let csp = state.csp.clone();
     Router::new()
         .route("/healthz", get(healthz))
         .route("/api/info", get(info))
@@ -111,7 +110,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         .layer(SetResponseHeaderLayer::overriding(
             HeaderName::from_static(CONTENT_SECURITY_POLICY_HEADER),
-            HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+            csp,
         ))
         // tower-http's default predicate compresses anything that is not an
         // image, gRPC or an event stream, and skips bodies under 32 bytes: both

@@ -71,10 +71,10 @@ fn sparse(dir: &Path, name: &str, size: u64) {
 
 /// State whose library is a scan of `dir`.
 fn state_with(dir: &Path) -> Arc<AppState> {
-    Arc::new(AppState {
-        assets: Arc::new(PlaceholderAssets),
-        library: LibrarySlot::scan(dir).expect("the fixture directory scans"),
-    })
+    Arc::new(
+        AppState::new(Arc::new(PlaceholderAssets))
+            .with_library(LibrarySlot::scan(dir).expect("the fixture directory scans")),
+    )
 }
 
 /// State with no library at all: what `rustsega` is without `--rom-dir`.

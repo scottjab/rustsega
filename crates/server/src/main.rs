@@ -33,10 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(feature = "embed-web"))]
     tracing::warn!("built without `embed-web`: serving the placeholder page, use `just build`");
 
-    let state = Arc::new(AppState {
-        assets: assets::builtin(),
-        library,
-    });
+    let state = Arc::new(AppState::new(assets::builtin()).with_library(library));
     // `LibrarySlot` is one `Arc`ed scan, so this is a handle on the library the
     // router is serving rather than a copy of it. It is taken because the
     // exposure line below can only be written once the socket says which address

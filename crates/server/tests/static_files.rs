@@ -16,7 +16,7 @@ use axum::http::header::{
 use axum::http::{HeaderName, Request, Response, StatusCode};
 use http_body_util::BodyExt;
 use server::AppState;
-use server::assets::{Asset, AssetSource};
+use server::assets::{Asset, AssetSource, PlaceholderAssets};
 use tower::ServiceExt;
 
 /// The page trunk builds, in miniature.
@@ -68,11 +68,19 @@ fn frontend() -> Arc<dyn AssetSource> {
 }
 
 async fn request(uri: &str, headers: &[(HeaderName, &str)]) -> Response<Body> {
+    request_from(state(), uri, headers).await
+}
+
+async fn request_from(
+    state: Arc<AppState>,
+    uri: &str,
+    headers: &[(HeaderName, &str)],
+) -> Response<Body> {
     let mut builder = Request::get(uri);
     for (name, value) in headers {
         builder = builder.header(name.clone(), *value);
     }
-    server::router(state())
+    server::router(state)
         .oneshot(builder.body(Body::empty()).unwrap())
         .await
         .expect("the router serves every request without failing")
@@ -210,9 +218,13 @@ async fn dot_dot_in_a_path_never_escapes_the_asset_tree() {
 
 #[tokio::test]
 async fn every_response_carries_the_security_headers() {
-    // Pinned verbatim, including the `'unsafe-inline'` on `script-src` that the
-    // inline bootstrap script of trunk needs: see CONTENT_SECURITY_POLICY.
-    let csp = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; \
+    // Pinned verbatim, because a change to a security header should be a reviewed
+    // change. Note what is absent (#411): `script-src` no longer carries
+    // `'unsafe-inline'`, and it carries no `'sha256-...'` either, because this page
+    // has nothing inline in it - `INDEX` is a title and nothing more. The page that
+    // does have trunk's bootstrap is pinned by hash in
+    // `a_page_with_a_bootstrap_pins_it_by_hash`.
+    let csp = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
                style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; \
                connect-src 'self'";
 
@@ -234,4 +246,73 @@ async fn every_response_carries_the_security_headers() {
             "{uri}"
         );
     }
+}
+
+/// trunk's inline bootstrap, byte-for-byte the fixture of `tests/csp.rs` and of
+/// `crates/web/tests/browser_csp.rs`. One fixture across all three is what lets a
+/// native hash test and a real browser boot test cover each other: neither alone is
+/// enough, because the failure this replaces was every subresource returning 200
+/// while the script did not run (#155).
+const BOOTSTRAP: &str = "document.body.appendChild(document.createElement('i')).id='ran';\
+try{new WebAssembly.Module(new Uint8Array([0,97,115,109,1,0,0,0]));\
+document.body.appendChild(document.createElement('i')).id='wasm'}\
+catch(e){document.body.appendChild(document.createElement('i')).id='wasm-'+e.name}";
+
+/// `base64(sha256(BOOTSTRAP))`, from python3 - see `tests/csp.rs` for why the
+/// expected hash is never computed by the code under test.
+const BOOTSTRAP_SHA: &str = "sha256-WjYXdo+j/6Ky7KwdT89atX0ifQft8ykslCoAcFJkg+Q=";
+
+/// The `script-src` of a policy header.
+fn script_src(policy: &str) -> String {
+    policy
+        .split("; ")
+        .find(|directive| directive.starts_with("script-src "))
+        .unwrap_or_else(|| panic!("no script-src in {policy}"))
+        .to_owned()
+}
+
+/// A page like the one trunk writes: the inline module that calls the wasm loader.
+fn bootstrap_page() -> Vec<u8> {
+    format!(
+        "<!doctype html><title>rustsega</title>\
+         <script type=\"module\">{BOOTSTRAP}</script>\
+         <link rel=\"stylesheet\" href=\"/style-def456.css\">"
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn a_page_with_a_bootstrap_pins_it_by_hash() {
+    let index = asset(Cow::Owned(bootstrap_page()), "text/html");
+    let state = Arc::new(AppState::new(Arc::new(MemoryAssets(HashMap::from([(
+        "index.html",
+        index,
+    )])))));
+
+    let policy = header(
+        &request_from(state, "/", &[]).await,
+        HeaderName::from_static("content-security-policy"),
+    );
+    assert_eq!(
+        script_src(&policy),
+        format!("script-src 'self' 'wasm-unsafe-eval' '{BOOTSTRAP_SHA}'"),
+        "the bootstrap is named by hash, wasm may still compile, and inline is          otherwise refused"
+    );
+}
+
+#[tokio::test]
+async fn a_placeholder_binary_asks_for_strictly_less_than_the_app_does() {
+    // Chosen deliberately for the no-trunk build (#411 asks which way this goes):
+    // the placeholder page has no inline script, so it gets the same policy with
+    // nothing added - narrower than the embedded build, never `'unsafe-inline'`.
+    let policy = header(
+        &request_from(
+            Arc::new(AppState::new(Arc::new(PlaceholderAssets))),
+            "/",
+            &[],
+        )
+        .await,
+        HeaderName::from_static("content-security-policy"),
+    );
+    assert_eq!(script_src(&policy), "script-src 'self' 'wasm-unsafe-eval'");
 }
