@@ -16,7 +16,7 @@ publish.workspace = true
 # `save_state` does not compile (M6-07, #127).
 m68k = { path = "../m68k", features = ["serde"] }
 # `bus.rs` answers the 68k's VDP ports from the chip itself (M3-09, #69).
-vdp = { path = "../vdp", features = ["serde"] }
+vdp = { path = "../vdp", features = ["serde", "debug-views"] }
 # `z80_bus.rs` implements `z80::Z80Bus` for the sound CPU's view of the system.
 z80 = { path = "../z80", features = ["serde"] }
 # The two sound chips the bus clocks and writes (M5-13, #118).
