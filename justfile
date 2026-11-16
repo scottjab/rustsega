@@ -69,8 +69,8 @@ fetch:
 # core-crate commit. Compiling the web package for wasm finds the native tests of
 # `crates/web/tests` too, and they register no test there; they run on the host,
 # through `check`.
-test-web:
-    CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --target wasm32-unknown-unknown -p web
+test-web *args:
+    CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner cargo test --target wasm32-unknown-unknown -p web {{args}}
 
 # The cartridge the in-browser frame budget is measured with (M7-21, #154):
 # Overdrive 2, the one pinned public ROM that is a load rather than a judge, so
