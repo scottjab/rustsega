@@ -107,8 +107,8 @@ enum Region {
     Bank,
     /// 0x6100-0x7EFF: nothing, reading [`OPEN_BUS`].
     ///
-    /// TODO(M3-16 #77): open bus. This area floats like every other undriven read,
-    /// and Genesis Plus GX is content with 0xFF for it.
+    /// TODO(#508): open bus. This area floats like every other undriven read, and
+    /// Genesis Plus GX is content with 0xFF for it.
     Unused,
     /// 0x7F00-0x7FFF: the VDP ports, which the Z80 sees as the 68k does - see
     /// [`vdp_port_addr`]. The PSG is in here at 0x7F11.
