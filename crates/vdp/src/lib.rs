@@ -486,14 +486,21 @@ impl Vdp {
         self.line_reg(regs::R0) & (1 << 5) != 0
     }
 
-    /// R0 bit 4 (IE1): enable the HINT horizontal-blank interrupt
-    /// (genvdp.txt section 4 "Interrupts"; plutiedev "$80xx").
+    /// R0 bit 6 (IE): enable the HINT horizontal-blank interrupt
+    /// (genvdp.txt section 4 "Interrupts" and section 17 "$00"; plutiedev
+    /// "$80xx").
+    ///
+    /// Bits 5-4 of R0 are *not* an interrupt enable: they are the horizontal
+    /// scroll mask field ([`Vdp::left_column_blank`], [`Vdp::mask_whole_line`]),
+    /// so reading the enable out of bit 4 hands a HINT to every cart that
+    /// merely masks the left column - `R0 = $14`, HSMA `%01` with IE clear, is a
+    /// common retail setting and asked for no HINT at all (#490).
     ///
     /// Read by [`Vdp::pending_irq`], which is the side that decides whether a
     /// pending HINT reaches the 68k.
     #[inline]
     pub fn hint_enabled(&self) -> bool {
-        self.line_reg(regs::R0) & (1 << 4) != 0
+        self.line_reg(regs::R0) & (1 << 6) != 0
     }
 
     /// R0 bit 1 (M3): latch and freeze the HV counter instead of letting it
@@ -1129,18 +1136,47 @@ mod tests {
 
     #[test]
     fn r0_mode_bits() {
+        // R0 = %0100_0110: IE (bit 6) set, HSMA = %00 so nothing is masked,
+        // palette select and HV-counter latch set. The IE bit is bit 6 and not
+        // bit 4 - genvdp.txt section 17 "$00", plutiedev "$80xx" (#490).
         let mut vdp = Vdp::new(false);
-        vdp.write_register(0, 0b0011_0110);
-        assert!(vdp.left_column_blank(), "bit 5");
-        assert!(vdp.hint_enabled(), "bit 4");
+        vdp.write_register(0, 0b0100_0110);
+        assert!(!vdp.left_column_blank(), "HSMA %00 masks nothing");
+        assert!(vdp.hint_enabled(), "bit 6 (IE)");
         assert!(vdp.palette_select(), "bit 2");
         assert!(vdp.hv_counter_latch(), "bit 1");
 
-        vdp.write_register(0, 0b1100_1001);
+        vdp.write_register(0, 0b0000_1001);
         assert!(!vdp.left_column_blank());
         assert!(!vdp.hint_enabled());
         assert!(!vdp.palette_select());
         assert!(!vdp.hv_counter_latch());
+    }
+
+    #[test]
+    fn r0_hint_enable_is_bit_6_and_the_hsma_bits_are_not_an_enable() {
+        // The #490 bug: the HINT enable was decoded out of R0 bit 4, which is
+        // the low bit of the horizontal scroll mask field. genvdp.txt section 17
+        // "$00" and section 4 "Interrupts"; plutiedev "$80xx".
+        let mut vdp = Vdp::new(false);
+
+        // The retail-common $14: HSMA %01 (mask the left 8 pixels), IE clear.
+        // Such a cart gets no HINT at all, forever.
+        vdp.write_register(0, 0x14);
+        assert!(!vdp.hint_enabled(), "HSMA bit 4 is not the HINT enable");
+
+        // IE alone, HSMA %00: HINTs, and nothing masked.
+        vdp.write_register(0, 0x44);
+        assert!(vdp.hint_enabled(), "R0 bit 6 (IE) is the HINT enable");
+
+        // IE together with a mask: both are true at once, which is what the old
+        // single-bit decode could not say.
+        vdp.write_register(0, 0x54);
+        assert!(vdp.hint_enabled());
+
+        // IE set with the mask's high bit only: still HINTs.
+        vdp.write_register(0, 0x64);
+        assert!(vdp.hint_enabled());
     }
 
     #[test]

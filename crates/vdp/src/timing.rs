@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn hint_counter_with_r10_three_fires_on_lines_three_and_seven() {
         let mut vdp = running(false);
-        vdp.write_register(0, 0x10);
+        vdp.write_register(0, 0x40); // R0 bit 6 (IE): HINTs on, HSMA %00 (#490)
         vdp.write_register(10, 3);
 
         assert_eq!(
@@ -610,7 +610,7 @@ mod tests {
     #[test]
     fn vint_outranks_hint_and_each_has_its_own_acknowledge() {
         let mut vdp = running(false);
-        vdp.write_register(0, 0x10);
+        vdp.write_register(0, 0x40); // R0 bit 6 (IE): HINTs on, HSMA %00 (#490)
         vdp.write_register(10, 0);
 
         for _ in 0..225 {
