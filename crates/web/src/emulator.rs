@@ -816,6 +816,164 @@ impl Controls {
         };
         spawn_local(read_slot(store, slot, toasts));
     }
+
+    /// Hand the running cart's SRAM out as a `.srm` file (M7-#398).
+    ///
+    /// Taken from the cart rather than from IndexedDB, because the cart is the
+    /// newest copy: #147 coalesces writes for two seconds, so a save made a
+    /// moment ago is in RAM and maybe not yet on disk. The name is the ROM's
+    /// SHA-1 for the reason in [`crate::srm::file_name`] - it is the identity the
+    /// save is keyed by, and a player can match a download against what the
+    /// browser holds.
+    pub fn export_sram(self, toasts: Toasts) {
+        let Some(emulator) = running() else {
+            toasts.push(ToastKind::Warn, "Load a cartridge to export its save");
+            return;
+        };
+        let copied = emulator
+            .with(|emulator| {
+                emulator.genesis.sram().map(|sram| {
+                    (
+                        sram.to_vec(),
+                        emulator.save.as_ref().map(|save| save.rom_id.clone()),
+                    )
+                })
+            })
+            .flatten();
+        let Some((bytes, rom_id)) = copied else {
+            toasts.push(
+                ToastKind::Warn,
+                "This cartridge has no battery-backed save to export",
+            );
+            return;
+        };
+        let Some(rom_id) = rom_id else {
+            // A cart with RAM and no `Save` means IndexedDB would not open, which
+            // is also why there is no key to name the file by.
+            toasts.push(
+                ToastKind::Warn,
+                storage::StoreError::Unavailable.to_string(),
+            );
+            return;
+        };
+        let name = crate::srm::file_name(&rom_id);
+        crate::srm::save_to_disk(&name, &bytes);
+        toasts.push(
+            ToastKind::Ok,
+            format!("Exported {} bytes as {name}", bytes.len()),
+        );
+    }
+
+    /// Take `bytes` as the running cart's SRAM, immediately: into the cart and
+    /// into IndexedDB, in that order of reliability (M7-#398).
+    ///
+    /// The size rule is applied here, before either is touched, because
+    /// [`genesis::Genesis::load_sram`] answers nothing - it refuses a blob of the
+    /// wrong length silently - and a player who picks the wrong file has to be
+    /// told rather than left to notice. A refusal therefore changes nothing at
+    /// all, and a write that fails leaves the cart as it was: the storage write
+    /// comes first so the two can be briefly inconsistent (stored, not yet
+    /// applied) but never the other way round, which would be a save the browser
+    /// was told it has and does not.
+    pub fn import_sram(self, bytes: Vec<u8>, toasts: Toasts) {
+        let Some(emulator) = running() else {
+            toasts.push(
+                ToastKind::Danger,
+                crate::srm::ImportError::NoCartridge.to_string(),
+            );
+            return;
+        };
+        let wanted = emulator
+            .with(|emulator| {
+                emulator.genesis.sram().map(|sram| {
+                    (
+                        emulator.save.as_ref().map(|save| save.rom_id.clone()),
+                        sram.len(),
+                    )
+                })
+            })
+            .flatten();
+        let Some((rom_id, want)) = wanted else {
+            toasts.push(
+                ToastKind::Danger,
+                crate::srm::ImportError::NoSram.to_string(),
+            );
+            return;
+        };
+        let Some(rom_id) = rom_id else {
+            toasts.push(
+                ToastKind::Danger,
+                storage::StoreError::Unavailable.to_string(),
+            );
+            return;
+        };
+        if let Err(error) = crate::srm::check_import(bytes.len(), want) {
+            toasts.push(ToastKind::Danger, error.to_string());
+            return;
+        }
+        toasts.push(
+            ToastKind::Info,
+            "Importing - pause the game first if it is mid-save",
+        );
+        spawn_local(apply_imported_sram(emulator, rom_id, bytes, self, toasts));
+    }
+}
+
+/// Store `bytes` as this cart's SRAM and then put them into the cart, off the
+/// frame loop (M7-#398).
+///
+/// The cart is only borrowed after the write has come back, which is how
+/// [`read_slot`] avoids holding the console across an `.await` (#387) - and here
+/// it is also what keeps a failed write from having changed anything.
+async fn apply_imported_sram(
+    emulator: TakeCell<Emulator>,
+    rom_id: String,
+    bytes: Vec<u8>,
+    console: Controls,
+    toasts: Toasts,
+) {
+    let want = bytes.len();
+    let Some(db) = emulator
+        .with(|emulator| emulator.save.as_ref().map(|save| save.db.clone()))
+        .flatten()
+    else {
+        return;
+    };
+    match db.put_sram(&rom_id, &bytes).await {
+        Ok(()) => {
+            let applied = emulator.with(|emulator| {
+                emulator.genesis.load_sram(&bytes);
+                let same = emulator
+                    .genesis
+                    .sram()
+                    .is_some_and(|sram| sram == bytes.as_slice());
+                if same {
+                    // Re-seed the watcher with the bytes the cart now holds. Left
+                    // at its old baseline it would see this import as a change and
+                    // write the same bytes back a second later - harmless, but only
+                    // because nothing else wrote in between, and "harmless because
+                    // of what else happens not to have happened" is not a reason.
+                    if let Some(save) = emulator.save.as_mut() {
+                        save.watcher = SramWatcher::new(&bytes, now_ms());
+                    }
+                }
+                same
+            });
+            if applied.unwrap_or(false) {
+                // The chip means "IndexedDB has this", which is exactly what just
+                // happened (#147).
+                console.mark_saved();
+                toasts.push(ToastKind::Ok, format!("Imported {want} bytes of save"));
+            } else {
+                toasts.push(
+                    ToastKind::Danger,
+                    "The save was stored but the cartridge refused it - reload the game",
+                );
+            }
+        }
+        // RAM was never touched, so the cart and IndexedDB still agree.
+        Err(error) => toasts.push(ToastKind::Danger, error.to_string()),
+    }
 }
 
 /// The IndexedDB half of one cart's slots, handed to whoever is showing the

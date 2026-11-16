@@ -40,6 +40,7 @@ pub mod scale;
 pub mod screen;
 pub mod settings;
 pub mod slots;
+pub mod srm;
 pub mod storage;
 pub mod theme;
 pub mod touch_events;
