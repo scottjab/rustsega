@@ -28,6 +28,68 @@
 //! only source for where in the line the gaps fall - even though counting its
 //! `~`s gives 18 slots for H40 and 16 for H32 out of lines of exactly 210 and 171
 //! slots, which is the evidence that the pattern is being read right. TODO(#301).
+//!
+//! # The display-off line: measured, and deliberately not waited for (#302)
+//!
+//! A line with the display off is not "always ready". It carries
+//! [`OFF_TRANSFERS_H40`] transfers in H40 - 198, because the line runs
+//! [`REFRESH_OFF_H40`] DRAM refreshes and each costs a 68k read two slots - which
+//! is a grid about 17.3 master clocks wide, not an open door. #302 offered two
+//! ways to handle that and the decision is to keep the shortcut in
+//! [`Vdp::fifo_clock`] and [`Vdp::dma_slot_table`]. The reason is a rate
+//! comparison, not convenience:
+//!
+//! * **supply.** `MCLKS_PER_LINE` master clocks carry [`OFF_TRANSFERS_H40`]
+//!   transfers, so the drain can take one every 17.3 clocks.
+//! * **demand.** The cheapest instruction that reaches the port is a `MOVE` into a
+//!   memory operand at 8 clocks. That figure is not asserted here: it is what
+//!   `m68k::ea::EaUse` documents from M68000UM Appendix C "Instruction Timing"
+//!   and what the Golden suite checks for `MOVE.B D0,-(A0)`, and `m68k` charges
+//!   `BUS_CYCLE_CLOCKS` per access so the emulator cannot issue a port write in
+//!   fewer than two of them (fetch and write) either. At master / 7
+//!   (docs/ARCHITECTURE.md, "Clocks and timing") that is 56 master clocks a word,
+//!   and a VRAM word needs two transfers (`crate::fifo::Entry`, genvdp.txt
+//!   section 8).
+//!
+//! 3420 / 56 words a line, two transfers each, is 122 against 198 available: the
+//! display-off line drains a port write faster than a 68000 can make one, with
+//! over a third of the line spare. That is what `fifo_clock`'s shortcut rests on,
+//! and `a_display_off_line_drains_faster_than_the_68k_can_write` pins the
+//! inequality so the shortcut fails loudly if the grid is ever refined or the bus
+//! model gets quicker.
+//!
+//! What the claim does *not* cover, said rather than hidden: it is a rate bound on
+//! word-at-a-time writes. A single instruction that puts several words on the port
+//! (a `MOVEM` of a register list) has a better transfers-per-clock figure and
+//! narrows the margin, and nothing here measured it because neither the crate's
+//! bus accounting (which is per access, not per instruction) nor any document on
+//! disk supports the arithmetic. It is also a *rate* argument: it says the queue
+//! never becomes the limiter, not that a display-off write is free.
+//!
+//! Two more reasons the shortcut stayed, both measured rather than assumed:
+//!
+//! * the H32 display-off transfer count is in nothing, and #302 did not invent
+//!   one. It is not needed: H32 lines have [`SLOTS_H32`] = 171 slots to spend, so
+//!   the demand above fits whatever the refresh count turns out to be (up to 24
+//!   of them), which is why the missing figure cannot change this decision.
+//! * modelling it is expensive in a way the ticket did not price. Running the
+//!   shortcut removed and the suite run over it costs 15 tests in two crates -
+//!   11 in `vdp` (#99's `a_write_with_the_display_off_drains_at_once` and ten of
+//!   the M4-02 `ports` data-port tests) and 4 in `genesis`
+//!   (`bus::tests::{mirror_address_hits_vdp, reset_devices_resets_the_vdp,
+//!   word_write_data_port_reaches_vdp}`, `z80_bus::tests::z80_7f00_window_reaches_vdp`),
+//!   all of which write the port with the display off and no `advance`, because
+//!   they are not about timing. Each would need the beam walked, and goldens would
+//!   move with it.
+//!
+//! The DMA line is the one to look at next, and it is not this decision: with the
+//! display off [`Vdp::dma_slot_table`] hands a transfer [`BLANK_SLOTS_H40`] = 205
+//! slots, which is the Sega bandwidth table's own display-off figure, while
+//! SpritesMind measures 198 transfers on such a line. A DMA that takes its whole
+//! allowance is therefore modelling something 3.5% wider than hardware carries -
+//! a demand shape this port argument does not speak to. #305 is open on the DMA
+//! table (against the Sega manual) and is where that belongs; #101 shipped the DMA
+//! timing itself and did not have the display-off measurement to compare to.
 
 use crate::Vdp;
 use crate::hv::{MCLKS_PER_LINE, pixel_to_mclk};
@@ -54,15 +116,15 @@ pub(crate) const BLANK_SLOTS_H32: usize = SLOTS_H32 - REFRESH_BLANK_H32;
 /// blank line, and each of them costs a 68k read *two* slots rather than the one
 /// a write pays. "There are 6 refresh slots when the display is off ... a refresh
 /// costs one write slot but two 68k read slots" (SpritesMind thread 1291 page 3).
-#[allow(dead_code)] // first caller is the display-off wait of #302
 pub(crate) const REFRESH_OFF_H40: usize = 6;
 /// Transfers an H40 line with the display off carries: 198, which is
 /// [`SLOTS_H40`] less two slots for each of the 6 refresh slots.
 ///
-/// This is not what the write FIFO waits on: with the display off nothing is
-/// being fetched and [`Vdp::fifo_clock`] gives a write the memories as it is
-/// made. The note under [`Vdp::free_slot_indices`] says what that costs.
-#[allow(dead_code)] // first caller is the display-off wait of #302
+/// This is **not** what the write FIFO waits on, and #302 decided to leave it
+/// that way rather than model it - see `a_display_off_line_drains_faster_than_the_68k_can_write`
+/// for the rate comparison the shortcut rests on, and the display-off note in this
+/// module's header for what the alternative costs.
+#[allow(dead_code)] // read by tests only: the display-off decision of #302
 pub(crate) const OFF_TRANSFERS_H40: usize = SLOTS_H40 - (2 * REFRESH_OFF_H40);
 
 /// Every slot of an H40 line but the [`REFRESH_BLANK_H40`] the DRAM refresh
@@ -176,8 +238,10 @@ impl Vdp {
     /// fetched, so the memories are free for the port the moment a write is made,
     /// which is what [`Vdp::fifo_clock`] does with them and what #99 pins in
     /// `a_write_with_the_display_off_drains_at_once`. Hardware charges for it
-    /// anyway - [`OFF_TRANSFERS_H40`] transfers a line in H40, 17.3 clocks apiece
-    /// - and #302 is whether to start modelling that wait.
+    /// anyway - [`OFF_TRANSFERS_H40`] transfers a line in H40, 17.3 clocks apiece -
+    /// and #302 decided to keep the shortcut; the display-off note at the top of
+    /// this module is the decision and
+    /// `a_display_off_line_drains_faster_than_the_68k_can_write` is the guard.
     fn free_slot_indices(&self) -> &'static [u16] {
         if self.in_hblank || self.in_vblank {
             return if self.h40() { &BLANK_H40 } else { &BLANK_H32 };
@@ -446,6 +510,50 @@ mod tests {
     #[test]
     fn a_display_off_h40_line_carries_198_transfers() {
         assert_eq!(OFF_TRANSFERS_H40, 198);
+    }
+
+    /// The inequality [`Vdp::fifo_clock`]'s display-off shortcut rests on (#302):
+    /// a line with the display off drains port writes faster than a 68000 can
+    /// make them, so the grid of [`OFF_TRANSFERS_H40`] transfers never becomes the
+    /// thing a write waits for.
+    ///
+    /// Both sides are the crate's own numbers. Demand is 8 clocks a write - the
+    /// `MOVE`-into-memory figure `m68k::ea::EaUse` documents from M68000UM
+    /// Appendix C "Instruction Timing" and the Golden suite checks, and the floor
+    /// this emulator cannot beat either, since `m68k` charges `BUS_CYCLE_CLOCKS`
+    /// per access and a write costs a fetch as well as the write. At master / 7
+    /// that is 56 master clocks; a VRAM word then costs the drain two transfers
+    /// (`crate::fifo::Entry`, genvdp.txt section 8), the widest case there is.
+    ///
+    /// It is a guard, not decoration: it fails if the display-off grid is refined
+    /// downward or the bus model gets quicker, and either of those is exactly the
+    /// moment the shortcut stops being equivalent to waiting.
+    #[test]
+    fn a_display_off_line_drains_faster_than_the_68k_can_write() {
+        /// Master clocks in one 68000 clock: "68000: master / 7"
+        /// (docs/ARCHITECTURE.md, "Clocks and timing").
+        const MCLK_PER_68K: usize = 7;
+        /// Clocks of the cheapest instruction that reaches the port; see above.
+        const MOVE_TO_MEMORY: usize = 8;
+        /// Transfers one VRAM word costs the drain.
+        const VRAM_WORD: usize = 2;
+
+        let writes_a_line = MCLKS_PER_LINE as usize / (MOVE_TO_MEMORY * MCLK_PER_68K);
+        let demand = VRAM_WORD * writes_a_line;
+        assert!(
+            demand <= OFF_TRANSFERS_H40,
+            "a 68000 writing VRAM words as fast as it can wants {demand} transfers a \
+             line; a display-off H40 line carries {OFF_TRANSFERS_H40}"
+        );
+
+        // H32's display-off count is in nothing (the module header says so), so
+        // what gets checked is that the decision cannot depend on it: the demand
+        // fits however many refresh slots the mode turns out to spend, up to 24 of
+        // them - far past the 6 an H40 line is measured at.
+        assert!(
+            demand <= SLOTS_H32 - 2 * 24,
+            "{demand} against an H32 line of {SLOTS_H32} slots, even charging 24 refreshes"
+        );
     }
 
     /// The widest gap between two free slots across the fetch groups of an active
