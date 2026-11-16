@@ -213,10 +213,13 @@ impl Vdp {
     /// ([`Vdp::slots_ahead`] of 0 clocks is no slots) - except with the display
     /// off, where nothing is being fetched and the memories are free for the
     /// port the moment it asks. That last part is #99's and is what keeps every
-    /// data port test of #80 and #81 true without an `advance` in it; real
+    /// data port test of #80 and #81 true without an `advance` in it. Real
     /// hardware still only lets the 68k have the memories
     /// [`slots::OFF_TRANSFERS_H40`](crate::slots::OFF_TRANSFERS_H40) times an H40
-    /// line, 17.3 clocks apiece, and #302 is whether to start waiting for that.
+    /// line, 17.3 clocks apiece, and #302 decided not to wait for that grid: a
+    /// display-off line drains writes faster than a 68000 can make them, which is
+    /// argued in the display-off note of [`crate::slots`] and pinned by
+    /// `slots::a_display_off_line_drains_faster_than_the_68k_can_write`.
     ///
     /// The schedule is read at the state the beam is in now, so a call that runs
     /// across the end of the line counts its slots against the line it started
@@ -252,8 +255,9 @@ impl Vdp {
     /// words and then reads the port is reading the memory those words are on
     /// their way to, and it is the bus's own access rather than a clock, so the
     /// slots are spent in one go rather than counted out. It is also what the
-    /// display-off case in [`Vdp::fifo_clock`] does, for the reason its comment
-    /// gives.
+    /// display-off case in [`Vdp::fifo_clock`] does; #302 kept that shortcut, and
+    /// the rate it rests on is in [`crate::slots`]' display-off note rather than
+    /// repeated here.
     pub(crate) fn fifo_drain(&mut self) {
         while let Some(entry) = self.fifo.pop() {
             self.write_code_word(entry.code, entry.addr, entry.value);
