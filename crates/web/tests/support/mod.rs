@@ -184,3 +184,80 @@ pub fn colour_literals(text: &str) -> Vec<String> {
     }
     found
 }
+
+// ------------------------------------------------------ WCAG 2.1 contrast --
+
+/// One sRGB channel, 0..=1, as the linear light it stands for.
+pub fn linear(channel: u8) -> f64 {
+    let channel = f64::from(channel) / 255.0;
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// The relative luminance of an 8-bit sRGB colour, as WCAG 2.1 defines it.
+pub fn luminance_rgb(rgb: [u8; 3]) -> f64 {
+    0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2])
+}
+
+/// The relative luminance of a `#rrggbb` colour.
+pub fn luminance(colour: &str) -> f64 {
+    luminance_rgb(parse_hex(colour).unwrap_or_else(|| panic!("{colour:?} is not a hex colour")))
+}
+
+/// The WCAG 2.1 contrast ratio of two `#rrggbb` colours: 1.0 when they are the
+/// same, 21.0 for black on white.
+pub fn ratio(foreground: &str, background: &str) -> f64 {
+    let one = luminance_rgb(
+        parse_hex(foreground).unwrap_or_else(|| panic!("{foreground:?} is not a hex colour")),
+    );
+    let two = luminance_rgb(
+        parse_hex(background).unwrap_or_else(|| panic!("{background:?} is not a hex colour")),
+    );
+    ratio_of(one, two)
+}
+
+/// [`ratio`] for a colour already read out of a live element, which never arrives
+/// as a hex string - `getComputedStyle` says `rgb(104, 109, 121)`.
+pub fn ratio_rgb(foreground: [u8; 3], background: [u8; 3]) -> f64 {
+    ratio_of(luminance_rgb(foreground), luminance_rgb(background))
+}
+
+fn ratio_of(one: f64, two: f64) -> f64 {
+    let (lighter, darker) = if one >= two { (one, two) } else { (two, one) };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+/// `#rrggbb` as three channels.
+fn parse_hex(colour: &str) -> Option<[u8; 3]> {
+    let hex = colour.trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(&hex[at..at + 2], 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?])
+}
+
+/// `rgb(r, g, b)` or `rgba(r, g, b, a)` as three channels - the shape
+/// `getComputedStyle` reports any colour in, and the reason the alpha is dropped
+/// rather than trusted: a computed colour of a painted element is opaque, and an
+/// `rgba` here carries `1` in that fourth field.
+pub fn parse_rgb(text: &str) -> Option<[u8; 3]> {
+    let text = text.trim();
+    let inner = text
+        .strip_prefix("rgb(")
+        .or_else(|| text.strip_prefix("rgba("))?
+        .strip_suffix(')')?;
+    let mut parts = inner.split(',');
+    let mut channel = || {
+        parts
+            .next()?
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| value.round() as u8)
+    };
+    Some([channel()?, channel()?, channel()?])
+}
