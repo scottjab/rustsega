@@ -278,7 +278,7 @@ fn format_op(r: &mut Reader<'_>, opcode: u16) -> String {
 
     match decode::decode(opcode) {
         // Nothing to name: print the word and step over it.
-        Op::Illegal | Op::Unimplemented | Op::LineA | Op::LineF => data(opcode),
+        Op::Illegal | Op::Undefined | Op::Unimplemented | Op::LineA | Op::LineF => data(opcode),
 
         Op::Nop => String::from("NOP"),
         Op::Reset => String::from("RESET"),
@@ -747,7 +747,11 @@ mod tests {
     fn is_real_op(opcode: u16) -> bool {
         !matches!(
             decode::decode(opcode),
-            decode::Op::Illegal | decode::Op::Unimplemented | decode::Op::LineA | decode::Op::LineF
+            decode::Op::Illegal
+                | decode::Op::Undefined
+                | decode::Op::Unimplemented
+                | decode::Op::LineA
+                | decode::Op::LineF
         )
     }
 

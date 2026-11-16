@@ -82,6 +82,32 @@ pub enum Op {
     /// Not a valid instruction on the 68000: takes the illegal-instruction
     /// exception (vector [`crate::exceptions::EXC_ILLEGAL`]).
     Illegal,
+    /// An encoding the ISA does not define at all — an operation slot no
+    /// instruction occupies, or a size field value the 68000 does not have. The
+    /// hardware answer is the illegal-instruction exception, so like
+    /// [`Op::Illegal`] this runs [`crate::ops::M68k::op_illegal`].
+    ///
+    /// The three variants split three complaints, and #355 is why they stay
+    /// split:
+    ///
+    /// * [`Op::Illegal`] is a format the manual defines whose *operand* is not
+    ///   allowed (`ADD.B` into `An`, Format A's `111/010`), or the documented
+    ///   `ILLEGAL` opcode;
+    /// * `Op::Undefined` is an encoding outside the ISA. Whether rustsega has
+    ///   written anything for it is beside the point: the CPU takes the
+    ///   exception, and an emulator that panicked here would be failing in a way
+    ///   the silicon does not;
+    /// * [`Op::Unimplemented`] is an encoding this decoder cannot place: an
+    ///   instruction the manual defines and this crate has not written, or an
+    ///   encoding in a group whose unassigned slots have not been worked out.
+    ///   That is the pessimistic answer, and [`crate::ops`] panics on it so a
+    ///   suite can never report a pass for an instruction that never ran.
+    ///
+    /// Every `Undefined` opcode is one `classify` can point at in the manual's
+    /// group structure, so an opcode whose group has not had its unassigned
+    /// slots identified yet falls to [`Op::Unimplemented`] — the pessimistic
+    /// side of the split, which #477 audits.
+    Undefined,
     /// An opcode in the `1010` group (M68000UM Format I, "Line 1010 emulator
     /// instruction"). The 68000 has no line emulator, so it takes
     /// [`crate::exceptions::EXC_ILLEGAL`] like any other reserved opcode; the variant
@@ -457,9 +483,11 @@ pub enum Op {
 
 /// The one opcode the manual spells out as illegal: `ILLEGAL`, `$4AFC`
 /// (M68000PM/AD section 8, "ILLEGAL — Illegal Instruction"; it exists so
-/// software and simulators can force the exception). A reserved or undefined
-/// encoding that is not this one still decodes to [`Op::Unimplemented`] until
-/// the ticket that owns its group says otherwise.
+/// software and simulators can force the exception). It is a defined encoding —
+/// the manual prints it — so it is [`Op::Illegal`], not [`Op::Undefined`], which
+/// is for the encodings no instruction occupies at all.
+///
+/// [`Op::Undefined`]: Op::Undefined
 const ILLEGAL_OPCODE: u16 = 0x4AFC;
 
 /// Address register direct, the destination mode that turns a move-group opcode
@@ -578,6 +606,14 @@ fn classify(opcode: u16) -> Op {
         // `0000 1100 ss eeeeee`: `CMPI` is the third instruction of that shape,
         // after SUBI at `$0400` and ADDI at `$0600`.
         0x0C00..=0x0CFF => classify_cmpi(opcode),
+        // `0000 1110 ss eeeeee`: nothing. With bit 8 clear the `0000` group's
+        // operation nibbles are ORI (`0`), ANDI (`2`), SUBI (`4`), ADDI (`6`),
+        // the static bit operations (`8`, `0000 1000 tt`), EORI (`A`) and CMPI
+        // (`C`); with bit 8 set they are the dynamic bit operations, `0000 ddd 1
+        // tt`, all eight odd nibbles. `$0E00..=$0EFF` is the nibble none of them
+        // occupies, so all 256 encodings are undefined (M68000UM ORI/BTST/
+        // ANDI/SUBI/ADDI/EORI/CMPI formats; #355).
+        0x0E00..=0x0EFF => Op::Undefined,
         // `0101 ddd 0 ss eeeeee` is ADDQ and `0101 ddd 1 ss eeeeee` is SUBQ —
         // unless `ss` = `11`, which is not a size: `ss` = `11` is Format V,
         // `Scc`/`DBcc`, and it takes both halves of bit 8 because there the bit
@@ -669,6 +705,15 @@ fn classify(opcode: u16) -> Op {
         // unassigned encoding, and `CHK.json.gz` agrees: `$4D00` and friends are
         // exception cases, not `Unimplemented`.
         0x4000..=0x4FFF if opcode & 0x1C0 == 0x100 => Op::Illegal,
+        // Bits 8..6 = `101` in the same group: no instruction at all. The
+        // `0100` group's operation field holds NEGX/NEG (`000`), CLR and MOVE
+        // from SR/CCR (`001`), NOT and MOVE to CCR (`010`), MOVE to SR (`011`),
+        // the `0100 1000`/`0100 1010`/`0100 1100` block (SWAP, EXT, PEA, MOVEM,
+        // TST, TAS), CHK.L (`100`, illegal above), CHK (`110`) and LEA (`111`).
+        // `101` is not one of them: all 512 of these encodings are unassigned on
+        // the 68000, which is what `$4741` — nine carts' worth of panic in #355
+        // — is. It is therefore an illegal instruction, not a rustsega hole.
+        0x4000..=0x4FFF if opcode & 0x1C0 == 0b101 << 6 => Op::Undefined,
         // `0000 0000 ss eeeeee`, `0000 0010 ss eeeeee` and `0000 1010 ss eeeeee`:
         // ORI, ANDI and EORI, the three `#imm,<ea>` logic operations. Bit 8 is
         // clear throughout all three ranges, which is what keeps them apart from
@@ -866,11 +911,11 @@ fn classify_add(opcode: u16) -> Op {
 /// immediate itself lives in the instruction's extension words, so
 /// [`crate::ops::arith::op_addi`] resolves it as mode `111` register `100`.
 fn classify_addi(opcode: u16) -> Op {
-    // `ss` = `11` is not one of the three widths `ADDI` defines. It is not
-    // `SUBI` (which has its own opcode pattern) and no ticket has claimed it,
-    // so it stays unimplemented rather than guessed at.
+    // `ss` = `11` is not one of the three widths `ADDI` defines, and no other
+    // instruction takes the `0000 0110 11` slot, so the encoding is undefined
+    // rather than unparsed (#355).
     if Size::from_bits((opcode >> 6) & 0b11).is_none() {
-        return Op::Unimplemented;
+        return Op::Undefined;
     }
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
@@ -950,10 +995,11 @@ fn classify_sub(opcode: u16) -> Op {
 /// immediate itself lives in the instruction's extension words, so
 /// [`crate::ops::arith::op_subi`] resolves it as mode `111` register `100`.
 fn classify_subi(opcode: u16) -> Op {
-    // `ss` = `11` is not one of the three widths `SUBI` defines, and no ticket
-    // has claimed it, so it stays unimplemented rather than guessed at.
+    // `ss` = `11` is not one of the three widths `SUBI` defines, and no other
+    // instruction takes the `0000 0100 11` slot, so the encoding is undefined
+    // rather than unparsed (#355).
     if Size::from_bits((opcode >> 6) & 0b11).is_none() {
-        return Op::Unimplemented;
+        return Op::Undefined;
     }
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
@@ -1561,8 +1607,8 @@ const fn is_bit_op(opcode: u16) -> bool {
 ///   D0,(A0)` would use; M68000PM/AD section 8 spells bits 7..6 `d1 d0` there,
 ///   not `tt`. MOVEP itself has bit 8 set and went to [`Op::Movep`] with #33,
 ///   so what is left in this corner is the mode `001` encodings with bit 8
-///   clear — `0000 1000 tt 001 aaa`, unassigned on the 68000 — and they stay
-///   [`Op::Unimplemented`].
+///   clear — `0000 1000 tt 001 aaa`, unassigned on the 68000 — and they are
+///   [`Op::Undefined`] (#355).
 /// * **`BTST` reads, the other three write.** `is_data` is the operand rule of
 ///   `TST`, and `is_data_alterable` the one of `NOT`/`CLR`/`NEG`: a modify needs
 ///   an alterable destination, so `BCHG D1,d16(PC)` and `BCLR #3,#$1234` are
@@ -1576,8 +1622,9 @@ fn classify_bit_op(opcode: u16) -> Op {
     let reg = (opcode & 0b111) as u8;
     if mode == AN_DIRECT_MODE {
         // Only reachable with bit 8 clear now that MOVEP owns the mode; the
-        // static-form `An` column is unassigned, not illegal.
-        return Op::Unimplemented;
+        // static-form `An` column is unassigned, so it is undefined rather than
+        // an illegal operand (#355).
+        return Op::Undefined;
     }
     let writes = (opcode >> BIT_OP_MNEMONIC_SHIFT) & 0b11 != 0;
     let ok = if writes {
@@ -1612,6 +1659,12 @@ fn classify_bit_op(opcode: u16) -> Op {
 /// of those numbers are a 68020 thing, and the 68000 originals are `$44C0` and
 /// `$46C0`.
 fn classify_logic_imm(opcode: u16, op: Op) -> Op {
+    // The width is read before the mode, so `$00FC` (`ss` = `11` on the
+    // immediate EA) is undefined like every other `ss` = `11` of these six
+    // nibbles rather than a fourth CCR/SR form (#355).
+    if Size::from_bits((opcode >> 6) & 0b11).is_none() {
+        return Op::Undefined;
+    }
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
     if mode == 0b111 && reg == 0b100 {
@@ -1620,9 +1673,6 @@ fn classify_logic_imm(opcode: u16, op: Op) -> Op {
             0b01 => Op::LogicImmSr,
             _ => Op::Unimplemented,
         };
-    }
-    if Size::from_bits((opcode >> 6) & 0b11).is_none() {
-        return Op::Unimplemented;
     }
     if !is_data_alterable(mode, reg) {
         return Op::Illegal;
@@ -1641,10 +1691,11 @@ fn classify_logic_imm(opcode: u16, op: Op) -> Op {
 /// with PC-relative correctly absent (M68000PM/AD 2.2.12: the 68000 adds it to
 /// CMPI later).
 fn classify_cmpi(opcode: u16) -> Op {
-    // `ss` = `11` is not one of the three widths `CMPI` defines, and no ticket
-    // has claimed it, so it stays unimplemented rather than guessed at.
+    // `ss` = `11` is not one of the three widths `CMPI` defines, and no other
+    // instruction takes the `0000 1100 11` slot, so the encoding is undefined
+    // rather than unparsed (#355).
     if Size::from_bits((opcode >> 6) & 0b11).is_none() {
-        return Op::Unimplemented;
+        return Op::Undefined;
     }
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
@@ -1937,6 +1988,113 @@ mod tests {
         assert_eq!(decode(0x4AD0), Op::Tas, "TAS (A0), between the two");
     }
 
+    /// The four opcode groups #355 found carts executing are not instructions.
+    /// `$00FF` and `$00FA` are `ORI` at size `11`, `$0AC6` is `EORI` at size `11`,
+    /// `$4741` is the `0100` group's unassigned `101` operation slot — the
+    /// manual defines no instruction at any of them, so the 68000's answer is
+    /// the illegal-instruction exception ([`Op::Undefined`], routed by
+    /// [`crate::ops`]) and not the `Op::Unimplemented` panic that stands in for a
+    /// rustsega hole. The panic stays for its own case: see
+    /// `cpu::tests::step_panics_loudly_on_an_unimplemented_opcode`, which these
+    /// opcodes must not silence and #355 must not merge with this arm.
+    #[test]
+    fn undefined_encodings_decode_to_undefined() {
+        for (opcode, why) in [
+            (0x00FF, "ORI at size 11, absolute long"),
+            (0x00FA, "ORI at size 11, mode 111/010"),
+            (0x00C0, "ORI at size 11, D0: the first of the sixty-four"),
+            (0x04C0, "SUBI at size 11"),
+            (0x06C0, "ADDI at size 11"),
+            (0x0AC6, "EORI at size 11, (A6)"),
+            (0x0CC0, "CMPI at size 11"),
+            (0x0808, "the static bit operations at MOVEP's mode"),
+            (0x0E00, "the 0000 group's unassigned nibble"),
+            (0x4741, "the 0100 group's unassigned 101 operation slot"),
+        ] {
+            assert_eq!(decode(opcode), Op::Undefined, "{why} (${opcode:04X})");
+        }
+    }
+
+    /// #355's split has to be exact on both sides, so this walks the three
+    /// families whole rather than spot-checking: every size-`11` encoding of the
+    /// six `0000`-group immediate nibbles, all 256 of the unassigned `$0E00`
+    /// nibble, and all 512 of the `0100` group's `101` operation slot are
+    /// [`Op::Undefined`]; nothing else in those groups is.
+    #[test]
+    fn undefined_is_the_whole_of_a_slot_and_nothing_else() {
+        // `ss` = `11`: `0000 ooo0 11 eeeeee` for ORI, ANDI, SUBI, ADDI, EORI and
+        // CMPI. The static bit operations (`0000 1000 tt eeeeee`) share the two
+        // bits but there they are `tt`, the mnemonic, so BCHG `#n` at `$08C0` is
+        // a real instruction and must not be swept up (M68000UM BTST/BSET/
+        // BCHG/BCLR "Format").
+        for opcode in 0x0000u16..0x1000 {
+            let nibble = (opcode >> 8) & 0xF;
+            let slot = [0x0u16, 0x2, 0x4, 0x6, 0xA, 0xC].contains(&nibble);
+            let static_an_direct = nibble == 8 && (opcode >> 3) & 0b111 == 0b001;
+            let want = (slot && opcode & 0xC0 == 0xC0)
+                || static_an_direct
+                || (0x0E00..=0x0EFF).contains(&opcode);
+            assert_eq!(
+                decode(opcode) == Op::Undefined,
+                want,
+                "${opcode:04X}: size 11 of the six immediate nibbles, or the `$0E00` nibble, and nothing else"
+            );
+        }
+        assert_eq!(
+            decode(0x08C0),
+            Op::BitStatic,
+            "BCHG #n,D0: `tt`, not a size"
+        );
+
+        // The `0100` group's `101` operation slot: NEGX/NEG (`000`), CLR and MOVE
+        // from SR/CCR (`001`), NOT and MOVE to CCR (`010`), MOVE to SR (`011`),
+        // CHK.L (`100`, `Illegal`), CHK (`110`) and LEA (`111`) own the other
+        // six, so all of `101` is undefined.
+        for opcode in 0x4000u16..=0x4FFF {
+            assert_eq!(
+                decode(opcode) == Op::Undefined,
+                opcode & 0x1C0 == 0b101 << 6,
+                "${opcode:04X}: only bits 8..6 = 101 is undefined in the 0100 group"
+            );
+        }
+    }
+
+    /// The other side of #355: an opcode that has no handler and is not one of
+    /// the unassigned slots above still reports [`Op::Unimplemented`], so the
+    /// panic that stops the core shrugging at a defined instruction nobody has
+    /// written is unreachable only for the encodings this ticket proved.
+    /// `$4E74` is `decode::tests`' anchor for it and `$00BC` (`ORI.L #imm`, the
+    /// one left in `classify_logic_imm`) shows a group can hold both halves of
+    /// the split.
+    #[test]
+    fn unimplemented_is_still_reachable_next_door() {
+        assert_eq!(decode(0x4E74), Op::Unimplemented, "$4E74 has no handler");
+        assert_eq!(decode(0x00BC), Op::Unimplemented, "ORI.L #imm");
+        // And the defined neighbours of the anchors above are untouched: the
+        // size-11 rule sits next to real instructions on both sides.
+        for (opcode, want, why) in [
+            (0x003C, Op::LogicImmCcr, "ORI to CCR, size 00"),
+            (0x007C, Op::LogicImmSr, "ORI to SR, size 01"),
+            (0x0040, Op::Ori, "ORI.W D0"),
+            (0x0080, Op::Ori, "ORI.L D0"),
+            (0x0100, Op::BitDynamic, "BTST D0,D0, the nibble above"),
+            (0x0800, Op::BitStatic, "BTST #n,D0, the nibble below"),
+            (0x0400, Op::Subi, "SUBI.B D0"),
+            (0x0440, Op::Subi, "SUBI.W D0"),
+            (
+                0x0A40,
+                Op::Eori,
+                "EORI.W #imm,D0, the size below 11 of the same nibble",
+            ),
+            (0x4640, Op::Not, "NOT.W D0, bits 8..6 = 010"),
+            (0x4840, Op::Swap, "SWAP D0, next to the 101 slot in number"),
+            (0x4500, Op::Illegal, "CHK.L, the 100 slot next to 101"),
+            (0x4580, Op::Chk, "CHK.W, bits 8..6 = 110"),
+        ] {
+            assert_eq!(decode(opcode), want, "{why} (${opcode:04X})");
+        }
+    }
+
     /// Until an instruction's ticket lands, its opcodes are unimplemented —
     /// loudly, not silently. `$4E70` is `RESET` (M1-27).
     ///
@@ -1969,14 +2127,22 @@ mod tests {
         // `$0000` was ORI until #21 implemented it (see
         // `ori_andi_eori_decode_and_leave_ccr_sr_alone`), `$0100` was BTST until
         // #28 implemented the bit operations, and `$0108` was MOVEP until #33
-        // implemented that. The anchor inside the group is now `0000 1000 tt 001
+        // implemented that. The anchor inside the group was `0000 1000 tt 001
         // aaa`, the static bit-number form at `An` direct: MOVEP needs bit 8 set
-        // and no 68000 instruction has this encoding, so it is the one member of
-        // the group nothing has claimed.
+        // and no 68000 instruction has this encoding. #355 says what that has
+        // always meant — nothing is defined there, so it is `Undefined`, not a
+        // handler waiting to be written — so the group's `Unimplemented` anchor is
+        // now `$00BC`, `ORI.L #imm`, the one encoding of the `0000` group whose
+        // slot exists and whose code has not been written.
         assert_eq!(
             decode(0x0808),
+            Op::Undefined,
+            "$0808: the bit-op group's static form at An direct, which nothing defines"
+        );
+        assert_eq!(
+            decode(0x00BC),
             Op::Unimplemented,
-            "$0808: the bit-op group's static form at An direct"
+            "$00BC: ORI.L #imm, the 0000 group's remaining unimplemented corner"
         );
         // The move groups — bits 15..12 = `0001`, `0010`, `0011` (`MOVE`,
         // `MOVEA`) and `0111` (`MOVEQ`) — left this list with #17, see
@@ -2252,9 +2418,9 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
-        // `ss` = `11` is not a size `ADDI` defines and no ticket has claimed
-        // it, so it stays loud rather than guessed at.
-        assert_eq!(decode(0x06C0), Op::Unimplemented, "ADDI with ss = 11");
+        // `ss` = `11` is not a size `ADDI` defines and nothing else occupies the
+        // `0000 0110 11` slot, so the encoding is undefined (#355).
+        assert_eq!(decode(0x06C0), Op::Undefined, "ADDI with ss = 11");
         // Its neighbours in the `0000` group. The `$04` pattern was one of them
         // until #19 claimed it (SUBI, see
         // `subi_decodes_and_validates_its_destination`), `$00` and `$02` until #21
@@ -2272,7 +2438,7 @@ mod tests {
             ),
             (0x08C8, "the same, the top of that column"),
         ] {
-            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+            assert_eq!(decode(opcode), Op::Undefined, "{name} (${opcode:04X})");
         }
     }
 
@@ -2479,7 +2645,7 @@ mod tests {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
         // `ss` = `11` is not a size `SUBI` defines and no ticket has claimed it.
-        assert_eq!(decode(0x04C0), Op::Unimplemented, "SUBI with ss = 11");
+        assert_eq!(decode(0x04C0), Op::Undefined, "SUBI with ss = 11");
     }
 
     /// `SUBQ` is `0101 ddd 1 ss eeeeee` with `ss` != `11`, its quick data in
@@ -2639,7 +2805,7 @@ mod tests {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
         // `ss` = `11` is not a size CMPI defines and no ticket has claimed it.
-        assert_eq!(decode(0x0CC0), Op::Unimplemented, "CMPI with ss = 11");
+        assert_eq!(decode(0x0CC0), Op::Undefined, "CMPI with ss = 11");
     }
 
     /// `TST` is `0100 1010 ss eeeeee` with `ss` != `11`, so it occupies
@@ -2876,15 +3042,23 @@ mod tests {
         // size, and `ss` = `10`/`11` at the CCR EA are the two 68020 spellings the
         // 68000 leaves unassigned (M68000UM ORI, and the note on
         // [`classify_logic_imm`]).
+        // `ss` = `11` is not a size at all, so these are undefined encodings
+        // rather than unparsed operands (#355)...
         for (opcode, name) in [
             (0x00C0u16, "ORI with ss = 11: not a size"),
             (0x02C0, "ANDI with ss = 11"),
             (0x0AC0, "EORI with ss = 11"),
             (0x02FC, "ANDI with ss = 11 at the CCR EA"),
-            (0x00BC, "ORI.L #imm at the CCR EA: a 68020 encoding only"),
         ] {
-            assert_eq!(decode(opcode), Op::Unimplemented, "{name} (${opcode:04X})");
+            assert_eq!(decode(opcode), Op::Undefined, "{name} (${opcode:04X})");
         }
+        // ... and `ss` = `10` at the CCR EA is a 68020 encoding whose slot the
+        // 68000 does have, so it stays on the unimplemented side of the split.
+        assert_eq!(
+            decode(0x00BC),
+            Op::Unimplemented,
+            "ORI.L #imm at the CCR EA: a 68020 encoding only ($00BC)"
+        );
         for (opcode, name) in [
             (
                 0x0048u16,
@@ -2989,7 +3163,7 @@ mod tests {
             );
             assert_eq!(
                 decode(0x0800 | (tt << 6) | ea),
-                Op::Unimplemented,
+                Op::Undefined,
                 "static, tt = {tt:b}, (A0) ({:04X})",
                 0x0800 | (tt << 6) | ea
             );
@@ -3021,7 +3195,7 @@ mod tests {
                 let opcode = 0x0800 | (0b11 << 6) | (0b001 << 3) | an;
                 assert_eq!(
                     decode(opcode),
-                    Op::Unimplemented,
+                    Op::Undefined,
                     "0000 1000 11 001 {an:03b} (${opcode:04X})"
                 );
                 // And beside it, the same `ddd` and `aaa` at a mode MOVEP cannot
@@ -3041,7 +3215,7 @@ mod tests {
             let opcode = 0x0800 | (tt << 6) | (0b001 << 3);
             assert_eq!(
                 decode(opcode),
-                Op::Unimplemented,
+                Op::Undefined,
                 "0000 1000 {tt:02b} 001 000 (${opcode:04X})"
             );
         }
