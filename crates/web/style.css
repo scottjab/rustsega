@@ -1703,12 +1703,27 @@ canvas {
     transition: opacity var(--duration) var(--ease);
   }
 
-  /* `visibility` is in the transition list so it waits for the slide to finish
-     on the way out, and flips immediately on the way in. */
+  /* `visibility` is transitioned so the drawer stays painted while it slides back
+     off-screen - and `step-end` is what makes that work, holding the value it is
+     leaving (`visible`) for the whole transition and jumping to `hidden` at the
+     end. Read literally, that timing is the wrong way round for opening: it would
+     hold `hidden` for `--duration` after `.drawer--open` is set, and an open
+     drawer whose computed `visibility` is still `hidden` cannot hold the focus at
+     all. So the transition is declared on the closed state and taken back off on
+     the open one below, which is the direction a transition is read from. */
   .drawer {
     transition:
       transform var(--duration) var(--ease),
       visibility var(--duration) step-end;
+  }
+
+  /* A transition is taken from the state being transitioned *to*, so opening
+     uses this list - transform alone, with `visibility` flipping on the first
+     frame - and closing falls back to `.drawer`'s, which keeps the wait. Named
+     as a full `transition` rather than `transition-property` because the
+     shorthand is what clears the `visibility` entry (#394). */
+  .drawer--open {
+    transition: transform var(--duration) var(--ease);
   }
 
   .toast {
