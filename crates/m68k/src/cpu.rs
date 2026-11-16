@@ -345,7 +345,20 @@ impl M68k {
             // request above the mask both clears `stopped` and is entered like
             // any other interrupt (M1-28, #36). With no request there is
             // nothing to do but burn these clocks.
+            static PROBED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = PROBED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 6 || n % 200000 == 0 {
+                eprintln!(
+                    "PROBE stopped-branch ipl={} mask={} sr={:04X} pc={:08X} n={}",
+                    self.ipl,
+                    self.int_mask(),
+                    self.sr,
+                    self.pc,
+                    n
+                );
+            }
             if self.check_interrupts(bus) {
+                eprintln!("PROBE woke");
                 self.stopped = false;
                 return step_clocks(start, self.cycles);
             }
