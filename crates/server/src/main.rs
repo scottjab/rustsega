@@ -37,6 +37,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         assets: assets::builtin(),
         library,
     });
+    // `LibrarySlot` is one `Arc`ed scan, so this is a handle on the library the
+    // router is serving rather than a copy of it. It is taken because the
+    // exposure line below can only be written once the socket says which address
+    // it actually took, and by then `state` has been moved into the router.
+    let served = state.library.clone();
     let app = server::router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // The address the socket ended up with, not the one that was asked for: with
@@ -45,6 +50,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // line to find the server it started.
     let listening = listener.local_addr()?;
     tracing::info!("rustsega listening on http://{listening}");
+
+    // A ROM library behind a reachable address is a public ROM library (#415).
+    // There is no authentication anywhere in M8 - TLS and access control are
+    // explicitly the reverse proxy's job - and an id is `sha1(relative path)`,
+    // which is not a secret, so `POST /api/roms/rescan` recomputes the whole
+    // listing for anyone who can reach the port.
+    //
+    // So it says so, in one line, naming the address and how many files are on the
+    // way out. It does not refuse: `rustsega --bind 0.0.0.0 --port 9000` is an
+    // acceptance criterion of #156, and the decision on #415 is that whether to
+    // expose the collection belongs to whoever runs this, who is being told rather
+    // than overruled. `crates/server/tests/running_binary.rs` holds the other half
+    // of that promise: a gate here is a decision someone has to make by editing
+    // those tests.
+    if !listening.ip().is_loopback()
+        && let Some(library) = served.get()
+    {
+        tracing::warn!(
+            "ROM library is served to {listening} with no authentication: {} files are listable \
+             and downloadable by anyone who can reach this address, and `POST \
+             /api/roms/rescan` recomputes the list for them. Serve it only on a network you \
+             trust, or behind a proxy that authenticates.",
+            library.entries().len()
+        );
+    }
+
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

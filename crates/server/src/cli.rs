@@ -47,6 +47,11 @@ pub struct Args {
     /// name lookup happens at startup: a server that will not start because
     /// `localhost` resolved to `::1` while the client came in over IPv4 is a
     /// confusing failure, and `getaddrinfo` is not what should decide it.
+    ///
+    /// There is no authentication, so any address that is not loopback makes the
+    /// ROM library readable by everyone on that network: the server says so in a
+    /// warning at startup, naming the address and the number of files. Bind a
+    /// library only to a network you trust, or to a proxy that authenticates.
     #[arg(long, default_value = DEFAULT_BIND, env = "RUSTSEGA_BIND", value_name = "ADDR")]
     pub bind: IpAddr,
 

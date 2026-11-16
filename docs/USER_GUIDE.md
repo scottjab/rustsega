@@ -42,9 +42,13 @@ uploaded to the server.
 
 By default the server answers loopback only, because it has no accounts and no
 password: whoever reaches the port can play every ROM in the directory and read
-nothing else of your machine. `--bind 0.0.0.0` opens it to your network. TLS is
-not in this binary either, so put a reverse proxy in front for anything that is
-not your own laptop.
+nothing else of your machine. `--bind 0.0.0.0` opens it to your network, and with
+`--rom-dir` that means the whole collection: the ids in `/api/roms` are not
+secrets, and `POST /api/roms/rescan` will rebuild the list for any client that
+asks. Treat a library on a reachable address as public to that network. The
+server prints a warning at startup when it is about to serve one, naming the
+address and how many files are exposed. TLS is not in this binary either, so put
+a reverse proxy in front for anything that is not your own laptop.
 
 ## Command line
 
@@ -53,7 +57,7 @@ command line. A flag beats the variable, which beats the default.
 
 | Flag | Environment | Default | Meaning |
 |---|---|---|---|
-| `--bind <addr>` | `RUSTSEGA_BIND` | `127.0.0.1` | Address to answer on. `0.0.0.0` for the whole network. |
+| `--bind <addr>` | `RUSTSEGA_BIND` | `127.0.0.1` | Address to answer on. `0.0.0.0` for the whole network, which makes an enabled ROM library readable by anyone on it. |
 | `--port <port>` | `RUSTSEGA_PORT` | `8080` | Port. `0` asks the OS for a free one and prints what it got. |
 | `--rom-dir <dir>` | `RUSTSEGA_ROM_DIR` | unset | Directory of ROMs to list. Unset runs with no library. |
 | `--log <level>` | `RUSTSEGA_LOG` | `info` | One of `trace`, `debug`, `info`, `warn`, `error`, `off`. |
