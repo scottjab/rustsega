@@ -131,8 +131,10 @@ pub fn choose_renderer(webgl2_available: bool, setting: RendererSetting) -> Rend
 }
 
 /// [`choose_renderer`] with a context lost earlier in this page load taken into
-/// account: `gl_lost` is the latch, set once by a `webglcontextlost` event and
-/// never cleared by a setting change.
+/// account: `gl_lost` is the latch, set by a `webglcontextlost` event and never
+/// cleared by a setting change. A `webglcontextrestored` inside the loss budget is
+/// the one thing that does clear it, and it is the browser rather than the shell
+/// that raises it (#397).
 ///
 /// A lost context is not the player's doing, so this is not allowed to reach
 /// [`RendererSetting`] - a driver hiccup that rewrote the saved preference would
