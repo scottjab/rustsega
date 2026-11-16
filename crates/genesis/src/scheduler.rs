@@ -933,8 +933,9 @@ mod tests {
     /// 261 reload - which is the 224 / 16 = 14 a frame holds.
     #[test]
     fn hint_fires_every_n_lines() {
-        // R0 = $10 turns IE1 on and R10 = 15 is the line counter the ticket names.
-        let (mut cpu, mut z80, mut bus) = interrupt_machine(&[(0, 0x10), (10, 15)]);
+        // R0 = $40 turns IE (bit 6) on with the scroll mask off, and R10 = 15 is
+        // the line counter the ticket names (#490: bit 4 is HSMA0, not an enable).
+        let (mut cpu, mut z80, mut bus) = interrupt_machine(&[(0, 0x40), (10, 15)]);
         let mut s = Scheduler::new(Region::Usa);
 
         let mut counted = Vec::new();
