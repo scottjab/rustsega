@@ -1651,9 +1651,15 @@ impl Emulator {
     /// boundary, and because the loop is already running sixty times a second.
     /// Written only when it changes: a signal write per frame would re-render the
     /// top bar for nothing.
+    ///
+    /// The state is read untracked, for the reason [`Self::report_fps`] gives: this
+    /// runs on the animation frame, which is not a reactive context, so a tracked
+    /// read there logged "outside a reactive tracking context" once a frame and
+    /// buried the devtools (#389). The read is only there to spare a redundant
+    /// write, so it wants the current value and never a subscription.
     fn sync_sound(&self) {
         let running = self.audio.as_ref().is_some_and(|audio| audio.is_running());
-        if self.console.sound_on.get() != running {
+        if self.console.sound_on.get_untracked() != running {
             self.console.sound_on.set(running);
         }
     }
