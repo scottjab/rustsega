@@ -192,7 +192,10 @@ pub(crate) fn load_file(
 
 /// The bytes behind a `File` handle, from `File::array_buffer` (a `Promise`),
 /// into a `Vec`.
-async fn read_file(file: &File) -> Result<Vec<u8>, ()> {
+///
+/// `pub(crate)` because importing a `.srm` (#398) reads a file exactly this way,
+/// and two ways of awaiting the same promise is two ways to get it wrong.
+pub(crate) async fn read_file(file: &File) -> Result<Vec<u8>, ()> {
     let buffer = file.array_buffer();
     let bytes = wasm_bindgen_futures::JsFuture::from(buffer)
         .await

@@ -258,6 +258,12 @@ under the site's own origin:
 - **Battery saves** (the SRAM a real cart would keep alive with a battery) are
   written back automatically while you play, and again when you hide or close the
   tab.
+- **Cartridge saves** can also be taken out and put back. The settings drawer's
+  `Cartridge save` section exports the running cart's battery RAM as a `.srm` file
+  named after the game's SHA-1 (the same identity the save is stored under), and
+  imports one back. An import is checked against the cart's size before anything is
+  touched, so a save from a different game is refused and changes nothing; an
+  accepted one is stored and applied to the running cart immediately.
 - **Save states** are the emulator's own snapshot of everything: four slots per
   game, with a thumbnail and a time, reached by F1, F4, F2 and F3, or by the
   `Save states` button.

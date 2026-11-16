@@ -34,6 +34,7 @@ use crate::scale::ScaleMode;
 use crate::screen::use_screen;
 use crate::settings::FastForwardSpeed;
 use crate::settings::Settings;
+use crate::srm::SrmFileInput;
 use crate::theme::Theme;
 use crate::touch_events::TouchOverlay;
 use crate::touch_events::coarse_pointer;
@@ -522,6 +523,7 @@ pub fn App() -> impl IntoView {
                 {move || library_open.0.get().then(|| view! { <LibraryView/> })}
                 {move || crashed.get().then(|| view! { <CrashCard/> })}
                 <RomFileInput/>
+                <SrmFileInput/>
             </main>
 
             <Drawer
@@ -754,6 +756,27 @@ pub fn App() -> impl IntoView {
                     </p>
                     <Button on_click=Callback::new(move |_| menu.open_states())>
                         "Open save states"
+                    </Button>
+                </section>
+
+                // A cart's battery-backed RAM, out of the browser and back in
+                // (M7-#398). The drawer rather than the top bar because the bar
+                // shows one action on a phone and `browser_topbar.rs` pins that
+                // count; the drawer's own section, note and `Button` styles are
+                // already contrast-checked by token, so nothing new is painted.
+                <section class="settings-section">
+                    <h3 class="settings-section__title">Cartridge save</h3>
+                    <p class="settings-section__note">
+                        "Battery-backed RAM, as a .srm file: export it to keep a copy "
+                        "before it is overwritten or to move machines, import one to put "
+                        "it back. A save for a different cartridge is refused and changes "
+                        "nothing."
+                    </p>
+                    <Button on_click=Callback::new(move |_| console.export_sram(toasts))>
+                        "Export .srm"
+                    </Button>
+                    <Button on_click=Callback::new(move |_| crate::srm::open_srm_picker())>
+                        "Import .srm"
                     </Button>
                 </section>
 
