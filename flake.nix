@@ -275,6 +275,13 @@
             # Nothing in `just check` runs it: the oracle compares a cartridge read from
             # $RUSTSEGA_ROM_DIR, which CI does not have.
             pkgs.blastem
+            # The interpreter for scripts/ref/: `terminal-standin.py` is what makes
+            # blastem's debugger a pipe and `compare.py` is the comparator, whose
+            # --selftest is part of `just check`. python3 was already reachable here
+            # through another package, and a tool that works because of a transitive
+            # dependency is a tool that breaks the day someone tidies that dependency
+            # away, so the dependency on the interpreter is stated, not inherited.
+            pkgs.python3
           ];
 
           # Where the emulator tests look for commercial ROMs. Override if needed.
