@@ -40,7 +40,15 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// its size alone, and since a postcard payload is not self-describing a v1 mode-2
 /// payload would have decoded a plausible-looking machine out of the wrong bytes
 /// rather than failing - which is the case the version field exists for.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// Version 3 is the two freeze gates of `Scheduler::m68k_frozen_until` and
+/// `Scheduler::z80_frozen_until` (#517): two `u64`s added to `Scheduler`, so the
+/// payload of a machine mid-freeze is eight-odd bytes longer and a v2 reader would
+/// have run out of message in the middle of the last field. It is not a bump taken
+/// for the shape alone - a state that does not carry a gate resumes a frame with the
+/// rest of a 68k -> VDP transfer silently dropped, which is the same class of wrong
+/// as the mode-2 field that made 2 what it is.
+pub const FORMAT_VERSION: u32 = 3;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 

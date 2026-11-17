@@ -141,8 +141,9 @@ fn header_written_and_checked() {
     );
     assert_eq!(
         u32::from_le_bytes(state[4..8].try_into().expect("4 bytes of version")),
-        2,
-        "format version 2, which is what `frame_state` carrying a woven mode-2 field is \
+        3,
+        "format version 3, which is what the scheduler carrying the two freeze gates of a \
+         68k -> VDP transfer is (#517) on top of the woven mode-2 field that made it 2 \
          (#457); the number is pinned rather than read from `state::FORMAT_VERSION` because \
          bumping it has to be a decision, not an accident"
     );

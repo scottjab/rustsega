@@ -14,7 +14,7 @@ a header that says which format version it is and which game it belongs to.
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
 | 0 | 4 | magic | `b"RSGS"` |
-| 4 | 4 | format version | `u32`, little endian, currently `2` (`state::FORMAT_VERSION`) |
+| 4 | 4 | format version | `u32`, little endian, currently `3` (`state::FORMAT_VERSION`) |
 | 8 | 8 | ROM checksum | `u64`, little endian, [`state::rom_checksum`] of the loaded image |
 | 16 | 4 | payload length | `u32`, little endian — the number of bytes that follow offset 20 |
 | 20 | n | payload | the `postcard` encoding of the machine state |
@@ -29,7 +29,7 @@ The payload is not self-describing. It is the postcard encoding of the tuple
 (&M68k, &Z80, &genesis::Bus, &Scheduler)
 ```
 
-in that order, in the version-2 layout. A payload from a build with a different
+in that order, in the version-3 layout. A payload from a build with a different
 field order is a different payload, which is what the version field is for.
 
 ### The interlace field, and why the order of the tuple is not load-bearing
@@ -114,8 +114,9 @@ In a state, because it is the machine:
   bank registers of a mapped cart;
 - the bus's TMSS state, its Z80 reset and bus-request lines, its pending stall
   counters;
-- the scheduler's four clocks, so a restored frame continues where it stopped
-  rather than starting again.
+- the scheduler's four clocks and its two freeze gates (#517), so a restored frame
+  continues where it stopped rather than starting again — and does not let go of a
+  chip that a 68k -> VDP transfer is still holding.
 
 Not in a state, and why:
 
@@ -183,7 +184,7 @@ running where it was.
 | Variant | Cause |
 |---|---|
 | `BadMagic` | Fewer than twenty bytes, or the first four are not `RSGS` |
-| `UnsupportedVersion(n)` | The state is format `n` and this build knows `2` — newer or older, since there is no migration either way |
+| `UnsupportedVersion(n)` | The state is format `n` and this build knows `3` — newer or older, since there is no migration either way |
 | `WrongRom` | The checksum is not `rom_checksum` of the loaded image |
 | `Corrupt` | The length field disagrees with the bytes that follow it, or the postcard payload does not decode |
 
@@ -193,7 +194,7 @@ byte four means anything until the magic does.
 
 ## Versioning
 
-`FORMAT_VERSION` is 2. Bumping it is a decision with three parts, and the format
+`FORMAT_VERSION` is 3. Bumping it is a decision with three parts, and the format
 has no migration yet — that is out of scope of #127 and does not exist:
 
 1. A state written by a build with `FORMAT_VERSION = 1` will be *refused* by a
@@ -213,6 +214,7 @@ The two versions so far:
 |---|---|
 | 1 | The frame buffer as its `width` and `height` and none of its pixels, in every mode (`vdp::frame_state`). |
 | 2 | The same, plus the lines of the field an interlace mode 2 frame does not draw — 224 KiB or more of pixels, for that mode only (#457). A version-1 mode-2 payload would decode a plausible-looking machine out of the wrong bytes rather than failing, which is why 1 is refused and not shimmed. |
+| 3 | The scheduler's two freeze gates, `Scheduler::m68k_frozen_until` and `Scheduler::z80_frozen_until` (#517): how far in front of the beam a 68k -> VDP transfer is still holding each chip. Rule 2 above is what forces the bump — two fields added to a `serde` type in the tuple change the encoding — and the freeze is what makes it more than bookkeeping: a state that does not carry a gate resumes the frame with the rest of a transfer dropped, the two chips let go lines before their bus time is paid for, and a cart that froze for 855 raster lines carries on drawing as if it had waited. |
 
 ## Out of scope
 

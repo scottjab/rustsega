@@ -58,20 +58,29 @@
 //!   by [`Scheduler::charge_mclk`].
 //! * the freeze a 68k -> VDP transfer puts on the two chips is counted from the beam
 //!   by `vdp::slots`, so it names an instant rather than a length. It comes through
-//!   [`Bus::take_68k_hold`] and [`Bus::take_z80_hold`] and is spent by
-//!   [`Scheduler::charge_hold`] as `clock = max(clock, vdp_clock + hold)`.
+//!   [`Bus::take_68k_hold`] and [`Bus::take_z80_hold`] and is spent by gating the
+//!   chip: [`Scheduler::freeze`] records the instant in
+//!   [`Scheduler::m68k_frozen_until`] / [`Scheduler::z80_frozen_until`] and the
+//!   slice loop below stops clocking the chip at it.
 //!
-//! Adding the second kind to a chip clock lets a chip that is already ahead of the
-//! beam re-pay the part of one freeze that the next report of the same freeze has
-//! covered, and the over-charge compounds (#489). What the max does *not* fix is a
-//! freeze longer than the frame: it is still time the chips are charged without the
-//! raster being charged with it, and the beam only moves inside the slice loop below.
-//! That is the freeze-gate follow-up, not this.
+//! Adding the second kind to a chip clock - which is what it was until #489 took the
+//! max out of it - is wrong twice over. A chip that is already ahead of the beam
+//! re-pays the part of one freeze that the next report of the same freeze covers, so
+//! the over-charge compounds (#489); and however the max is written, it is still
+//! time charged to the chip clocks that the raster is not charged with, so a freeze
+//! longer than the watchdog slack of [`Scheduler::run_frame`] leaves a frame that
+//! cannot close (#517). A frozen chip therefore keeps its clock where the line puts
+//! it and loses its turn instead:
 //!
-//! Both are the same rule the stopped Z80 and the TMSS-frozen 68k
-//! ([`Bus::locked_up`]) already follow: move the clock, do not skip it, because a chip
-//! that is owed the time will be paid it back as a burst of instructions the moment it
-//! is let go.
+//! ```text
+//! while frozen_until > line_end:  clock = line_end, run nothing
+//! ```
+//!
+//! which is the rule the stopped Z80 and the TMSS-frozen 68k ([`Bus::locked_up`])
+//! already follow, and it pays for the freeze in raster lines: move the clock, do not
+//! skip it, because a chip that is owed the time will be paid it back as a burst of
+//! instructions the moment it is let go. No chip clock ends up more than one
+//! instruction ahead of the beam, so the loop cannot stall on one.
 
 use serde::{Deserialize, Serialize};
 
@@ -114,8 +123,9 @@ pub(crate) const VBLANK_LINE_SHIFT: u16 = 16;
 /// The line loop of the console: `docs/ARCHITECTURE.md`, "Clocks and timing".
 ///
 /// `Serialize`/`Deserialize` are for the save state of M6-07 (#127): the four
-/// clocks are the machine's position in its own frame, and a state that did not
-/// carry them would resume a frame from its start.
+/// clocks and the two freeze gates are the machine's position in its own frame, and a
+/// state that did not carry them would resume a frame from its start - or resume it
+/// with a freeze dropped, which is a frame whose chips are let go early.
 #[derive(Serialize, Deserialize)]
 pub struct Scheduler {
     /// Scanline now running, 0 at the top of the frame.
@@ -124,6 +134,21 @@ pub struct Scheduler {
     pub master_clock: u64,
     m68k_clock: u64,
     z80_clock: u64,
+    /// The 68000 is frozen until this master clock by a 68k -> VDP transfer: it is
+    /// clocked on normally, to the end of every line the freeze runs over, and runs no
+    /// instruction until the beam reaches here. `0` is "not frozen", which is also
+    /// "before any clock the machine will ever reach", so an unfrozen chip is held to
+    /// nothing.
+    ///
+    /// Not a second copy of [`Self::m68k_clock`]: the freeze the VDP reports is
+    /// measured from the beam, so it names an instant rather than a length, and
+    /// charging it into the clock is what leaves a chip that far ahead of a raster it
+    /// has not been charged with (#517, and see the module docs).
+    m68k_frozen_until: u64,
+    /// The sound CPU's half of [`Self::m68k_frozen_until`], held off the 68k bus by
+    /// the window accesses a transfer is running against
+    /// ([`Bus::take_z80_hold`]).
+    z80_frozen_until: u64,
     /// How far [`Bus::vdp`] has been advanced, in the same master clocks as the two
     /// CPU positions. It is never ahead of either of them, and it is never reset, so
     /// the VDP sees every clock the machine runs and sees it once.
@@ -149,6 +174,8 @@ impl Scheduler {
             master_clock: 0,
             m68k_clock: 0,
             z80_clock: 0,
+            m68k_frozen_until: 0,
+            z80_frozen_until: 0,
             vdp_clock: 0,
             lines_per_frame: if region.is_pal() {
                 LINES_PER_FRAME_PAL
@@ -197,7 +224,7 @@ impl Scheduler {
                 // to the position it started from: an instruction cannot be
                 // stopped half way (see [`crate::Audio::set_now`]).
                 bus.audio.set_now(self.z80_clock.min(line_end));
-                if bus.z80_can_run() {
+                if bus.z80_can_run() && self.z80_clock >= self.z80_frozen_until {
                     Self::charge(
                         &mut self.z80_clock,
                         step_z80(z80, bus),
@@ -207,8 +234,8 @@ impl Scheduler {
                     Self::charge_mclk(&mut self.z80_clock, bus.take_z80_stall());
                     let held = bus.take_z80_hold();
                     let beam = self.vdp_clock;
-                    Self::charge_hold(&mut self.z80_clock, beam, held);
-                } else {
+                    Self::freeze(&mut self.z80_frozen_until, beam, held);
+                } else if !bus.z80_can_run() {
                     // Stopped, but still clocked. The chip runs no instructions while
                     // the 68k holds it in reset or on its bus, yet the hardware is
                     // still being clocked, so the position moves to the end of the
@@ -216,6 +243,13 @@ impl Scheduler {
                     // `run_line` would pay them back as a burst of instructions the
                     // moment the 68k let go.
                     self.z80_clock = line_end;
+                } else {
+                    // The other way a sound CPU is held: inside the freeze of a
+                    // transfer it is waiting on through the 68k bus window. Clocked to
+                    // its gate and no further - which is `line_end` when the freeze
+                    // runs past the end of this line, and what lets a freeze longer
+                    // than a frame be paid a line at a time (#517).
+                    self.z80_clock = Self::held_to(self.z80_clock, self.z80_frozen_until, line_end);
                 }
             } else if bus.locked_up() {
                 // The 68k is frozen by the TMSS lock-up: like the stopped Z80 it
@@ -225,6 +259,14 @@ impl Scheduler {
                 // frozen chip every clock of the frame as a burst of instructions
                 // at the reset that frees it (M3-16, #77).
                 self.m68k_clock = line_end;
+                bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
+            } else if self.m68k_clock < self.m68k_frozen_until {
+                // The 68000 is inside a transfer's freeze: the same rule as the held
+                // Z80 above, on the other chip, and taken before the chip is stepped
+                // rather than charged afterwards so that the beam - which
+                // [`Self::sync_vdp`] walks to `min` of the two positions - moves on
+                // this slice instead of waiting for a chip that has nothing to run.
+                self.m68k_clock = Self::held_to(self.m68k_clock, self.m68k_frozen_until, line_end);
                 bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
             } else {
                 bus.audio.set_now(self.m68k_clock.min(line_end));
@@ -241,7 +283,7 @@ impl Scheduler {
                 Self::charge_mclk(&mut self.m68k_clock, bus.take_68k_stall());
                 let held = bus.take_68k_hold();
                 let beam = self.vdp_clock;
-                Self::charge_hold(&mut self.m68k_clock, beam, held);
+                Self::freeze(&mut self.m68k_frozen_until, beam, held);
                 bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
             }
 
@@ -285,6 +327,12 @@ impl Scheduler {
     pub fn restart_frame(&mut self) {
         self.line = 0;
         self.vdp_clock = self.m68k_clock.min(self.z80_clock);
+        // And a freeze that had not reached a clock yet goes with the transfer it
+        // came from, which [`Bus::reset_devices`] has just dropped along with the
+        // pending holds behind it: "`RESET` has just restarted the 68k: a machine that
+        // stayed frozen through a reset could not be restarted by one" (`Bus::reset`).
+        self.m68k_frozen_until = 0;
+        self.z80_frozen_until = 0;
     }
 
     /// Run one frame: [`Scheduler::run_line`] until the VDP says the frame is drawn,
@@ -420,37 +468,57 @@ impl Scheduler {
     /// the way a frozen chip's time always is: the clock moves and the chip does not.
     ///
     /// Only for the waits that are durations. The 68k -> VDP transfer and the data
-    /// port write to a full FIFO are [`Self::charge_hold`] instead, and #489 is why
+    /// port write to a full FIFO are [`Self::freeze`] instead, and #489 is why
     /// the two are not one total.
     fn charge_mclk(clock: &mut u64, mclk: u32) {
         *clock += u64::from(mclk);
     }
 
-    /// Hold one chip's clock until the beam reaches an instant `mclk` master clocks
-    /// in front of it, rather than pushing it along by that length.
+    /// Hold one chip until the beam reaches an instant `mclk` master clocks in front of
+    /// it, by gating the chip rather than by pushing its clock along.
     ///
     /// The transfer freeze the bus reports is not a duration at all.
     /// [`vdp::Vdp::dma_68k_stall_mclk`] is "how long a transfer of `slots` still has
     /// to run", counted *from the beam* by `vdp::slots::dma_mclk_to_slots`, so it
     /// names a moment on the raster rather than an amount of bus time the chip owes
     /// ([`vdp::Vdp::data_port_stall_mclk`] is measured off the beam the same way and
-    /// is still an additive wait - see [`Bus::vdp_data_write`]). Added to a chip clock
-    /// (`charge_mclk`), a chip already ahead of the beam re-pays the overlap of one
-    /// freeze with the next and the over-charge compounds (#489). Taken as a deadline
-    /// it is idempotent, and it is why [`Bus::take_68k_hold`] and
-    /// [`Bus::take_z80_hold`] are separate from the additive totals: a max swallows a
-    /// small wait the same way a sum swallows a deadline, so
-    /// [`Self::charge_mclk`] runs first and this runs second.
+    /// is still an additive wait - see [`Bus::vdp_data_write`]). Charged to a chip
+    /// clock, it is wrong twice over: a chip already ahead of the beam re-pays the
+    /// overlap of one freeze with the next and the over-charge compounds (#489), and
+    /// however the max is written it is time the raster is never charged with, so a
+    /// freeze longer than a frame - the 2_924_811 mclk, 855 lines, that `Sonic The
+    /// Hedgehog 3 (USA)` reaches - leaves [`Self::run_frame`] waiting for a VBlank line
+    /// the beam never gets to (#517). Gating is idempotent for the reason a max is, and
+    /// it is why [`Bus::take_68k_hold`] and [`Bus::take_z80_hold`] are separate from the
+    /// additive totals: a max swallows a small wait the same way a sum swallows a
+    /// deadline, so [`Self::charge_mclk`] runs first and this runs second.
     ///
     /// `beam` is [`Scheduler::vdp_clock`], the position [`Self::sync_vdp`] last walked
     /// the chip to, which is what the two VDP figures are measured from - so this has
     /// to be spent before the `sync_vdp` at the bottom of the slice loop, not after
     /// it, or the reference point has moved under the number.
-    fn charge_hold(clock: &mut u64, beam: u64, mclk: u32) {
+    fn freeze(frozen_until: &mut u64, beam: u64, mclk: u32) {
         if mclk == 0 {
             return;
         }
-        *clock = (*clock).max(beam + u64::from(mclk));
+        *frozen_until = (*frozen_until).max(beam + u64::from(mclk));
+    }
+
+    /// Where the clock of a held chip goes instead of running: on to its gate
+    /// `frozen_until` when that falls before the end of the line, and to `line_end`
+    /// when it does not. `0` is "no gate", and clamps to nothing.
+    ///
+    /// The clamp to `line_end` is what a freeze costs the machine instead of what it
+    /// costs the chip. A chip frozen past the end of the line is clocked along with it,
+    /// one line at a time, and the beam - which [`Self::sync_vdp`] walks to `min` of
+    /// the two chip positions, so it only moves at all once a chip has reached
+    /// `line_end` - walks with it and draws the lines the freeze is worth. Held to
+    /// `frozen_until` exactly when the gate falls inside the line, which is what makes
+    /// a freeze shorter than a line as exact as the deadline it replaced: the chip
+    /// resumes on the instruction boundary [`Self::freeze`] named, not at the end of
+    /// the line the machine happened to be in when it was frozen.
+    fn held_to(clock: u64, frozen_until: u64, line_end: u64) -> u64 {
+        clock.max(frozen_until.min(line_end))
     }
 
     /// Move one chip's clock on by a slice of `cycles` at its own rate,
@@ -1386,32 +1454,153 @@ mod tests {
         );
     }
 
+    /// Whole lines `run_line` before the 68000's loop counts again, bounded by
+    /// `cap` so that a freeze which never ends is a panic naming itself rather
+    /// than a hung test (the same shape of guard as [`MAX_SLICES_PER_LINE]).
+    fn lines_until_68k_runs(
+        s: &mut Scheduler,
+        cpu: &mut M68k,
+        z80: &mut Z80,
+        bus: &mut Bus,
+        cap: u64,
+    ) -> u64 {
+        let before = cpu.d[0];
+        for lines in 1..=cap {
+            s.run_line(cpu, z80, bus);
+            if cpu.d[0] != before {
+                return lines;
+            }
+        }
+        panic!("the 68000 was still frozen {cap} lines after the transfer started")
+    }
+
+    /// A freeze longer than a frame is raster time, and a frame still closes
+    /// while it runs (#517).
+    ///
+    /// [`vdp::Vdp::dma_68k_stall_mclk`] of a length-`0` transfer - `0x10000`
+    /// words, the longest the register file can ask for
+    /// (`vdp::dma::tests::a_length_of_zero_transfers_0x10000_words`) - is 2_924_811
+    /// master clocks, 855 raster lines and more than three frames. This is the
+    /// figure `Sonic The Hedgehog 3 (USA)` reaches, and the 26 carts of #354
+    /// reach with it. Charged to the chip clocks, a chip has then run past every
+    /// line the freeze is worth, so the body of the slice loop - which is the
+    /// only thing that calls [`Scheduler::sync_vdp`], and `sync_vdp` is the only
+    /// thing that walks the beam - never runs, the beam never reaches the VBlank
+    /// line that ends a frame, and `run_frame` gives up on its own line bound
+    /// instead of hanging. That is the assert this test is written to see fail,
+    /// and it needs the two chips frozen, not one: a Z80 still running gets its
+    /// slices to `line_end` every line and drags the beam after it, which is why
+    /// the machine is [`z80_contender`] reading the window at `0x8000` - the
+    /// [`Bus::z80_window_access`] path hands the sound CPU the same transfer
+    /// figure the 68000 gets, which is what #354's carts do.
+    ///
+    /// Spent as a gate instead, the raster keeps its 3420 clocks a line, the
+    /// beam walks with it, and the frame closes mid-freeze: the freeze outlives
+    /// it, and the next frame is still frozen.
+    #[test]
+    fn a_freeze_longer_than_a_frame_still_closes_the_frame() {
+        let (mut cpu, mut z80, mut bus) = z80_contender(0x8000);
+        let mut s = Scheduler::new(Region::Usa);
+        // The transfer starts on the line the machine was parked on, so that the
+        // frame `run_frame` is asked for below is the same whole raster
+        // `a_frame_that_starts_in_vblank_is_a_whole_raster` pins for this
+        // console with no freeze in it.
+        //
+        // `0` words is the length-0 form, not no transfer at all.
+        start_dma(&mut bus, 0);
+        let reported = u64::from(bus.vdp.dma_68k_stall_mclk());
+        assert!(
+            reported > u64::from(LINES_PER_FRAME_NTSC) * MASTER_CLOCKS_PER_LINE,
+            "the freeze has to be longer than a raster for this to be the case under test, and it is {reported}"
+        );
+
+        let before = s.master_clock;
+        s.run_frame(&mut cpu, &mut z80, &mut bus);
+        assert_eq!(
+            s.master_clock - before,
+            u64::from(LINES_PER_FRAME_NTSC) * MASTER_CLOCKS_PER_LINE,
+            "the frame closed, and closed as a whole raster: the beam walked while both chips were gated"
+        );
+
+        // 855 lines of freeze, 263 of them spent: the rest is carried across the
+        // frame boundary, and a 68000 in a freeze runs no instructions at all.
+        let paid = iterations(&mut s, &mut cpu, &mut z80, &mut bus, 60);
+        assert_eq!(
+            paid, 0,
+            "the frame was only a third of the way through the freeze, and the next 60 lines are still frozen"
+        );
+    }
+
+    /// And the freeze is paid for in full: a 68000 gated by a freeze of `f`
+    /// master clocks runs nothing for `f` of the raster, and not a line less.
+    ///
+    /// The gate is a way of spending the freeze, not of waiving it, so the
+    /// 68000's next instruction is due one raster after the last access slot of
+    /// the transfer that held it. A charge quietly dropped on the way to the
+    /// gate - the freeze recorded and never paid - has this test back at
+    /// [`Scheduler::run_line`] after a line or two instead of after the
+    /// 855 that the transfer costs.
+    #[test]
+    fn a_freeze_longer_than_a_frame_is_paid_in_full_by_the_raster() {
+        let (mut cpu, mut z80, mut bus) = machine();
+        let mut s = Scheduler::new(Region::Usa);
+        start_dma(&mut bus, 0);
+        let reported = u64::from(bus.vdp.dma_68k_stall_mclk());
+        assert!(
+            reported > u64::from(LINES_PER_FRAME_NTSC) * MASTER_CLOCKS_PER_LINE,
+            "as above: the freeze has to be longer than a raster, and it is {reported}"
+        );
+        // One line first, because the gate is taken by the slice after the control
+        // write that started the transfer - the 68000 runs that write's instruction
+        // and is held from the next one. The count below is the freeze, not that.
+        run_lines(&mut s, &mut cpu, &mut z80, &mut bus, 1);
+        // The freeze is an instant on the raster, so what it is worth in lines is
+        // the figure over the clocks in one - and the slack on the bound below
+        // is the part of a line the freeze ends partway along.
+        let expected = reported / MASTER_CLOCKS_PER_LINE;
+        let lines = lines_until_68k_runs(&mut s, &mut cpu, &mut z80, &mut bus, expected + 4);
+        assert!(
+            lines.abs_diff(expected) <= 2,
+            "{lines} raster lines to pay a freeze of {reported} master clocks, which is {expected}"
+        );
+    }
+
     /// A hold and a stall are spent the two ways round, and the order matters.
     ///
     /// [`Scheduler::charge_mclk`] adds a duration to a chip's own clock;
-    /// [`Scheduler::charge_hold`] takes it to an instant measured on the beam. The
-    /// tempting single quantity - one `clock = max(clock, beam + total)` for
-    /// everything the bus hands over - is wrong in the other direction: a chip that
-    /// is already ahead of the beam pays nothing for the additive part, which is how
-    /// a global deadline drops the 77 mclk a Z80 window steal costs and lands
-    /// 28854 mclk against the 148379 `z80_bank_access_steals_68k_cycles` expects.
-    /// So the two are separate calls, in this order, and this pins that.
+    /// [`Scheduler::freeze`] records an instant measured on the beam and spends it
+    /// without touching that clock at all (#517), [`Scheduler::held_to`] being what
+    /// turns it back into a position when the chip's turn comes round. The tempting
+    /// single quantity - one `clock = max(clock, beam + total)` for everything the bus
+    /// hands over - is wrong in the other direction: a chip that is already ahead of
+    /// the beam pays nothing for the additive part, which is how a global deadline
+    /// drops the 77 mclk a Z80 window steal costs and lands 28854 mclk against the
+    /// 148379 `z80_bank_access_steals_68k_cycles` expects. So the two are separate
+    /// calls, in this order, and this pins that.
     #[test]
     fn a_stall_next_to_a_hold_is_still_added() {
-        let mut clock = 1_000_u64;
-        Scheduler::charge_hold(&mut clock, 900, 500);
-        assert_eq!(
-            clock, 1_400,
-            "a chip behind the instant is brought up to it, not pushed past it by a length"
-        );
-        Scheduler::charge_mclk(&mut clock, 77);
-        assert_eq!(clock, 1_477, "and its per-access wait is still paid on top");
+        // A freeze is a gate on the chip, not a charge to its clock: the clock the
+        // instruction ended on is left exactly where it was.
+        let mut frozen = 0_u64;
+        let clock = 1_000_u64;
+        Scheduler::freeze(&mut frozen, 900, 500);
+        assert_eq!(frozen, 1_400, "a freeze names an instant on the beam");
+        assert_eq!(clock, 1_000, "and asks nothing of the chip's clock for it");
 
-        // A chip already past the instant pays nothing for the hold - it waited
-        // already - and everything for the wait.
-        let mut ahead = 2_000_u64;
-        Scheduler::charge_hold(&mut ahead, 900, 500);
-        assert_eq!(ahead, 2_000, "a deadline never winds a clock back");
+        // A chip behind that instant is held to it, not pushed past it by a length,
+        // and its per-access wait is still paid on top.
+        let mut held = Scheduler::held_to(clock, frozen, MASTER_CLOCKS_PER_LINE);
+        assert_eq!(
+            held, 1_400,
+            "a chip behind the instant is held to it, not pushed past it by a length"
+        );
+        Scheduler::charge_mclk(&mut held, 77);
+        assert_eq!(held, 1_477, "and its per-access wait is still paid on top");
+
+        // A chip already past the instant is held to nothing - it waited already -
+        // and pays everything for the wait.
+        let mut ahead = Scheduler::held_to(2_000, frozen, MASTER_CLOCKS_PER_LINE);
+        assert_eq!(ahead, 2_000, "a gate never winds a clock back");
         Scheduler::charge_mclk(&mut ahead, 77);
         assert_eq!(
             ahead, 2_077,
@@ -1419,10 +1608,18 @@ mod tests {
         );
 
         // One instant recorded twice is still the one instant.
-        let mut twice = 1_000_u64;
-        Scheduler::charge_hold(&mut twice, 900, 500);
-        Scheduler::charge_hold(&mut twice, 900, 500);
-        assert_eq!(twice, 1_400, "and a hold is a max, so it cannot compound");
+        let mut twice = 0_u64;
+        Scheduler::freeze(&mut twice, 900, 500);
+        Scheduler::freeze(&mut twice, 900, 500);
+        assert_eq!(twice, 1_400, "and a gate is a max, so it cannot compound");
+
+        // And a freeze that runs past the end of the line holds the chip to the end of
+        // the line, which is the whole of how the raster comes to pay for it (#517).
+        assert_eq!(
+            Scheduler::held_to(1_000, 9_000, MASTER_CLOCKS_PER_LINE),
+            MASTER_CLOCKS_PER_LINE,
+            "held to the line, not to a freeze 855 lines deep"
+        );
     }
 
     /// A Z80 reading the 68k bus window gets through less of its loop in a frame
