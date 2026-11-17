@@ -702,7 +702,7 @@ pub struct Bus {
     ///
     /// Kept apart from [`Bus::pending_68k_stall`] because the scheduler has to spend
     /// the two the other way round - that one added to the chip's clock, this one as
-    /// the deadline `beam + hold` ([`crate::Scheduler::charge_hold`]). Summed with
+    /// the gate `beam + hold` ([`crate::Scheduler::freeze`]). Summed with
     /// the additive waits it is the #489 runaway: an unmoved beam reports the rest of
     /// the same transfer again on every control write, and each reading of it is then
     /// paid for twice.
@@ -986,7 +986,7 @@ impl Bus {
     ///
     /// The other kind of time the bus produces: [`Bus::pending_68k_hold`] is measured
     /// from the beam, so the scheduler spends it as the deadline
-    /// `beam + mclk` ([`crate::Scheduler::charge_hold`]) and not as a duration. It is
+    /// `beam + mclk` ([`crate::Scheduler::freeze`]) and not as a duration. It is
     /// asked for at the same place as [`Bus::take_68k_stall`], after every 68000 step
     /// and before the VDP is walked to it, which is what keeps `beam` the position the
     /// two VDP figures were counted from.
