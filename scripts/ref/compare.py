@@ -8,7 +8,7 @@ images written by ``run-ref.sh`` (``bNNNNN.bin``) and ``run-ours.sh``
 
 usage::
 
-    compare.py OUTDIR [595-605 600 ...] [--sweep 4]
+    compare.py OUTDIR [595-605 600 ...] [--sweep 4] [--anchor 0x584]
     compare.py --selftest
 
 Why this is not a ``cmp`` of two files, which is what it looks like it should be:
@@ -232,6 +232,11 @@ class Report:
     phase: list = field(default_factory=list)
     #: reference frames with no image on our side at this shift (the list ran off the end)
     dropped: list = field(default_factory=list)
+    #: the address both dumpers stopped at (`--anchor`, `--stop-at-pc`), or "" when
+    #: the dumps are end-of-frame ones. It changes no arithmetic: it says what the
+    #: frame numbers mean, which is the difference between a dump of a moment and a
+    #: dump of whatever each machine's frame loop happened to end on (#526).
+    anchor: str = ""
 
     @property
     def agrees(self):
@@ -348,6 +353,8 @@ def print_report(report, stream=None):
 
     say(f"dir      {report.directory}")
     say(f"region   0x{RAM_BASE:06X}-0x{RAM_BASE + RAM_SIZE - 1:06X}, {RAM_SIZE} B per frame")
+    if report.anchor:
+        say(f"point    both sides stopped before 0x{report.anchor} (frame N = arrival N there)")
     compared = report.compared
     if len(compared) > 1:
         say(f"frames   {len(compared)}: {compared[0]}..{compared[-1]} (reference numbering)")
@@ -373,6 +380,17 @@ def print_report(report, stream=None):
         for shift, mean, pairs in report.sweep:
             mark = " <- best" if shift == report.shift else ""
             say(f"  shift {shift:+d} {mean:9.1f}  over {pairs} frame pair(s){mark}")
+        if report.anchor and report.shift:
+            # Unanchored, a measured shift is a property of two frame counters. At
+            # an anchor there is only one counter, the one the cart's own interrupt
+            # gives both machines, so a shift here is the two machines having taken
+            # that interrupt a different number of times - worth saying out loud,
+            # because it is the finding the shift used to hide.
+            say(
+                f"         anchored at 0x{report.anchor} but {report.shift:+d} arrivals apart: "
+                "the two machines have not"
+            )
+            say("         taken that interrupt the same number of times by this point")
     say("")
     if compared:
         every = len(compared)
@@ -558,6 +576,53 @@ def selftest():
         check("the report says which shift it compared at", "shift    +1 (measured" in out.getvalue(),
               out.getvalue()[:200])
 
+        print("selftest: an anchored comparison")
+        # The anchor of #526: both dumpers stop at one instruction, so a frame
+        # number is an arrival and the two machines are being looked at at the same
+        # moment. Two things have to stay true of that mode, and they are the two
+        # ways this harness fails worst: going blind, and inventing a divergence out
+        # of ordinary frame phase.
+        anchor = "584"
+        planted = 0xFFE100 - RAM_BASE
+        at_anchor = os.path.join(work, "anchored")
+        os.mkdir(at_anchor)
+        build(at_anchor, frames, images)
+        for frame in frames:
+            mutate(at_anchor, frame, OURS_PREFIX, planted, images[frame][planted] ^ 0x5C)
+        report = compare(at_anchor, frames)
+        report.anchor = anchor
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_report(report)
+        check(
+            "an anchored comparison still sees a difference planted in every frame",
+            report.differs_in_all == [planted],
+            f"{[address(o) for o in report.differs_in_all]}",
+        )
+        check("and prints the instruction it stopped at",
+              f"point    both sides stopped before 0x{anchor}" in out.getvalue(),
+              out.getvalue()[:200])
+
+        # Our images holding the previous arrival: one raster of phase, nothing else.
+        phase = os.path.join(work, "anchored-phase")
+        os.mkdir(phase)
+        phase_frames = [4, 5, 6, 7]
+        for frame in phase_frames:
+            with open(os.path.join(phase, f"{REF_PREFIX}{frame:05d}.bin"), "wb") as handle:
+                handle.write(images[frame])
+            with open(os.path.join(phase, f"{OURS_PREFIX}{frame:05d}.bin"), "wb") as handle:
+                handle.write(images[frame - 1])
+        report = run_comparison(phase, phase_frames, span=2)
+        report.anchor = anchor
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_report(report)
+        check(
+            "an anchored pair one arrival out of step is alignment, not divergence",
+            report.shift == 1 and report.agrees and not report.differs_in_all,
+            f"shift {report.shift:+d}, {len(report.differs_in_all)} persistent",
+        )
+        check("and the report says the arrivals are apart rather than naming bytes",
+              "arrivals apart" in out.getvalue(), out.getvalue()[-300:])
+
         print("selftest: broken input is an error, not an agreement")
         truncated = os.path.join(work, "trunc")
         os.mkdir(truncated)
@@ -614,6 +679,13 @@ def main(argv=None):
         help="frame offsets to try either way (default 4); 0 skips the sweep",
     )
     parser.add_argument(
+        "--anchor",
+        metavar="ADDRESS",
+        default="",
+        help="address both dumpers stopped at, as given to --stop-at-pc: labels the "
+        "report and says what a non-zero shift means at an anchor",
+    )
+    parser.add_argument(
         "--selftest",
         action="store_true",
         help="check this harness on canned dumps and exit (part of `just check`)",
@@ -628,6 +700,7 @@ def main(argv=None):
     try:
         frames = frames_requested(",".join(args.frames), args.directory)
         report = run_comparison(args.directory, frames, args.sweep)
+        report.anchor = args.anchor.strip().removeprefix("0x").upper()
         if report.shift:
             print(
                 f"compare: the two frame counters differ by {report.shift:+d}; "

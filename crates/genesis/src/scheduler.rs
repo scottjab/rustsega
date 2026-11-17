@@ -120,6 +120,38 @@ pub(crate) const LINES_PER_FRAME_PAL: u16 = 313;
 /// are both sized off it.
 pub(crate) const VBLANK_LINE_SHIFT: u16 = 16;
 
+/// Where [`Scheduler::run_line_to_pc`] stops the line, and the reason the line loop
+/// has to look at the 68000's address at all.
+///
+/// Not chip state: a stop is an outside question about where the machine has got
+/// to, so it is an argument rather than a field, and nothing about it reaches a
+/// save state (compare [`crate::Genesis::arm_cpu_trail`], which is a diagnostic
+/// for the same reason).
+pub enum Stop {
+    /// Run the line to its end, which is all [`Scheduler::run_line`] asks for.
+    Nothing,
+    /// Stop in front of the instruction at this address.
+    ///
+    /// An *arrival* is what stops it, not being there: an instruction retired at
+    /// the address and the 68000 was not already sitting on it. Without the
+    /// second half a caller stopped on the address could never get another stop
+    /// out of the machine, which is how the repeat calls of
+    /// [`crate::Genesis::run_until_pc`] would have to work - and it is what a
+    /// debugger's breakpoint does with the one it is stopped on.
+    Pc(u32),
+}
+
+impl Stop {
+    /// Did retiring the instruction that started at `from` and leaving the 68000
+    /// about to run at `to` arrive at this stop?
+    fn arrived(&self, from: u32, to: u32) -> bool {
+        match self {
+            Stop::Nothing => false,
+            Stop::Pc(pc) => *pc == to && *pc != from,
+        }
+    }
+}
+
 /// The line loop of the console: `docs/ARCHITECTURE.md`, "Clocks and timing".
 ///
 /// `Serialize`/`Deserialize` are for the save state of M6-07 (#127): the four
@@ -203,12 +235,49 @@ impl Scheduler {
     /// end, and [`MAX_SLICES_PER_LINE`] is the panic that says so if it turns out not
     /// to.
     pub fn run_line(&mut self, cpu: &mut M68k, z80: &mut Z80, bus: &mut Bus) {
+        self.run_line_stopping(cpu, z80, bus, &Stop::Nothing);
+    }
+
+    /// [`Scheduler::run_line`] with the line cut short at an instruction boundary:
+    /// run until the 68000 *arrives* at `pc`, meaning the instruction that just
+    /// retired left it there and it was not already sitting on it.
+    ///
+    /// Returns whether the line was run to its end, so `false` is "stopped on
+    /// `pc`", and the machine is then parked part way through the line with every
+    /// clock where it got to. The next call finishes it: `line_end` is read from
+    /// [`Scheduler::master_clock`], which only moves when a line completes, so it
+    /// names the same end of the line on every entry, and nothing that a stopped
+    /// line holds back is charged twice.
+    ///
+    /// This is for a caller that needs a point in the instruction stream rather
+    /// than a point in the raster - the work-RAM comparison of #526 - and it is
+    /// what [`crate::Genesis::run_until_pc`] is built on.
+    pub fn run_line_to_pc(
+        &mut self,
+        cpu: &mut M68k,
+        z80: &mut Z80,
+        bus: &mut Bus,
+        pc: u32,
+    ) -> bool {
+        self.run_line_stopping(cpu, z80, bus, &Stop::Pc(pc))
+    }
+
+    fn run_line_stopping(
+        &mut self,
+        cpu: &mut M68k,
+        z80: &mut Z80,
+        bus: &mut Bus,
+        stop: &Stop,
+    ) -> bool {
         let line_end = self.master_clock + MASTER_CLOCKS_PER_LINE;
         let mut slices = 0_u32;
 
         while self.m68k_clock < line_end || self.z80_clock < line_end {
             slices += 1;
             Self::slice_bound(slices, line_end);
+            // Only the 68000 step below can arrive anywhere: every other slice of
+            // a line moves a clock and not an address.
+            let mut arrived = false;
 
             // Both lines of the Z80 handshake are driven by the 68k from inside its
             // own step, so the edge is looked for at every slice boundary rather than
@@ -270,7 +339,11 @@ impl Scheduler {
                 bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
             } else {
                 bus.audio.set_now(self.m68k_clock.min(line_end));
+                // The address the instruction is retired *from* is what makes an
+                // arrival an arrival: see [`Stop::Pc`].
+                let from = cpu.pc;
                 let cycles = cpu.step(bus);
+                arrived = stop.arrived(from, cpu.pc);
                 Self::charge(
                     &mut self.m68k_clock,
                     cycles,
@@ -289,6 +362,14 @@ impl Scheduler {
 
             self.sync_vdp(bus);
             Self::update_interrupts(cpu, z80, &bus.vdp);
+
+            // After both, so that the stopped machine is a machine that has paid
+            // for the instruction it stopped on - the beam where the retired
+            // instruction got to, and the interrupt lines as the VDP now offers
+            // them - rather than one frozen mid-access.
+            if arrived {
+                return false;
+            }
         }
 
         // The line is over, so every clock it held is now payable to the sound
@@ -301,6 +382,7 @@ impl Scheduler {
 
         self.master_clock += MASTER_CLOCKS_PER_LINE;
         self.line = (self.line + 1) % self.lines_per_frame;
+        true
     }
 
     /// Restart the raster the scheduler is counting, because something outside
@@ -625,6 +707,46 @@ mod tests {
     /// The Z80's `A`, which is how many `INC A`s the test program has run (mod 256).
     fn z80_a(z80: &Z80) -> u8 {
         (z80.af() >> 8) as u8
+    }
+
+    /// A line cut short at an instruction boundary costs the machine nothing: the
+    /// clocks, the line counter and both chips finish the line exactly as an
+    /// unstopped [`Scheduler::run_line`] leaves them, because `line_end` is read
+    /// from a `master_clock` that only moves at the end of a line and nothing is
+    /// paid twice on the way back in. The anchored work-RAM dump of #526 stops
+    /// trusting nothing else if this is untrue.
+    #[test]
+    fn a_line_stopped_mid_way_finishes_as_the_line_that_was_never_stopped() {
+        let (mut cpu_one, mut z80_one, mut bus_one) = machine();
+        let mut plain = Scheduler::new(Region::Usa);
+        plain.run_line(&mut cpu_one, &mut z80_one, &mut bus_one);
+
+        let (mut cpu_two, mut z80_two, mut bus_two) = machine();
+        let mut stopped = Scheduler::new(Region::Usa);
+        // The 68k of `machine` is `ADDQ.L #1,D0` / `BRA.B` back to it, so the
+        // first arrival at CODE is two instructions in: part way along the line.
+        assert!(
+            !stopped.run_line_to_pc(&mut cpu_two, &mut z80_two, &mut bus_two, CODE),
+            "the line stops in front of the loop, not after it"
+        );
+        assert_eq!(cpu_two.pc, CODE);
+        assert_eq!(
+            stopped.master_clock, 0,
+            "a stopped line is not a charged one"
+        );
+        assert!(
+            stopped.m68k_clock > 0
+                && stopped.m68k_clock < stopped.master_clock + MASTER_CLOCKS_PER_LINE,
+            "and the stop is part way along the line, not at either end of it"
+        );
+
+        stopped.run_line(&mut cpu_two, &mut z80_two, &mut bus_two);
+
+        assert_eq!(stopped.master_clock, plain.master_clock);
+        assert_eq!(stopped.line, plain.line);
+        assert_eq!(cpu_two.pc, cpu_one.pc);
+        assert_eq!(cpu_two.d[0], cpu_one.d[0]);
+        assert_eq!(z80_a(&z80_two), z80_a(&z80_one));
     }
 
     fn run_lines(s: &mut Scheduler, cpu: &mut M68k, z80: &mut Z80, bus: &mut Bus, lines: u16) {

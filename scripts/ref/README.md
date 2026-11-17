@@ -9,16 +9,21 @@ emulator. This directory is the harness for one: run a cartridge in
 [blastem](https://www.retrobrute.com/) and in rustsega over the same number of
 frames, dump 68000 work RAM from both, and diff.
 
-The first finding it produced is [#526](https://github.com/scottjab/rustsega/issues/526):
-on `Sonic & Knuckles (World)`, with no input, work RAM agrees with blastem byte for
-byte at frame 2 and 25 addresses in `$FFF62A-$FFFFD7` never agree again.
+The first finding it produced is
+[#526](https://github.com/scottjab/rustsega/issues/526): on `Sonic & Knuckles
+(World)`, with no input, work RAM agrees with blastem byte for byte at frame 2 and 25
+addresses in `$FFF62A-$FFFFD7` never agree again. Follow-up measurement in the same
+ticket found most of that 25 was the two dumpers sampling the same per-frame handshake
+byte at two different places in the instruction stream, which is what
+[`--stop-at-pc`](#the-comparison-point---stop-at-pc-526) is for; at one shared
+instruction S&K is down to 12, of which one is scratch nothing reads.
 
 ## What is here
 
 | File | What it does |
 |---|---|
-| `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin` |
-| `run-ours.sh` | Run the same cart in rustsega with no input, save work RAM at the same frames -> `rNNNNN.bin` |
+| `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin`. `--stop-at-pc` names an instruction instead of a frame |
+| `run-ours.sh` | Run the same cart in rustsega with no input, save work RAM at the same frames -> `rNNNNN.bin`. Takes the same `--stop-at-pc` |
 | `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test. `--selftest` is in `just check` |
 | `terminal-standin.py` | The `x-terminal-emulator` blastem's `-d` wants and NixOS has not got; makes the debugger a pipe |
 | `bin/x-terminal-emulator` | The shim `run-ref.sh` puts on `PATH` so blastem finds the stand-in |
@@ -55,6 +60,59 @@ thing to read when the RAM diff says the picture is being programmed differently
 The frame numbers in the report are the **reference's**. If the two frame counters
 disagree - and on S&K they do, by one - the report says so and compares our images
 at that offset; see "Frame alignment" below.
+
+## The comparison point: `--stop-at-pc` (#526)
+
+By default both dumpers stop at the end of a frame. That is not one place in the
+instruction stream: ours ends when the VDP raises `frame_done` and the line it was
+running finishes, and blastem's ends wherever its own frame loop stops the 68000. The
+gap is wide enough to matter - a byte the game sets and clears once a frame holds
+different values at the two samples, and #526 counted 25 of them on S&K, every one of
+them written by the same game routine on both sides at the same cadence.
+
+`--stop-at-pc ADDRESS` replaces "frame" with "instruction". Frame `N` then means **the
+Nth time the 68000 is about to execute `ADDRESS`**: the reference runs `breakpoint
+ADDRESS` and `N` `continue`s, and our half runs
+[`Genesis::run_until_pc`](../crates/genesis/src/lib.rs) to the Nth arrival. Both stop
+at an instruction boundary, so the point is the same one on both machines and frame
+phase cannot leak into it:
+
+```sh
+scripts/ref/run-ref.sh  --stop-at-pc 0x584 "$ROM" 595-605
+scripts/ref/run-ours.sh --stop-at-pc 0x584 "$ROM" 595-605
+python3 scripts/ref/compare.py "target/ref/Sonic_&_Knuckles_(World)/anchor" 595-605 --anchor 0x584
+```
+
+On S&K that moves the persistent list from 25 addresses to 12, the measured frame
+offset from `+1` to `+0`, and the mean differing bytes from 25.6 to 13.1. What is left
+is one table (`$FFFF13-$FFFF3D`) and the write-only scratch byte `$FFFFD7`; what went
+away is the handshake set (`$FFF62A`, `$FFFDF0-$FFFDF7`, `$FFFB2D`, `$FFFB34`) that the
+end-of-frame comparison could not see past.
+
+Give it an address the cart reaches **once a frame**: the entry of the game's own
+vertical-blank routine.
+
+- Read it from the cartridge header. The VDP's vertical interrupt is IPL6, so the 68000
+  takes it on the autovector `24 + 6` = vector 30 (genvdp.txt section 4 for the level,
+  `crates/m68k/src/interrupts.rs` for the arithmetic): the long at `$78`.
+  `xxd -s $((0x78)) -l 4 "$ROM"`.
+- If that long is a ROM address, use it: `Golden Axe II (World)` -> `0xDD60`.
+- If it points into work RAM, the game has built itself a jump stub there and blastem
+  cannot stop on a work-RAM address at all (it accepts the `breakpoint` and never
+  reports the hit). Read the stub out of one of our own work-RAM dumps and use its
+  target: `Sonic & Knuckles (World)` has `$FFFFFFF0: jmp.l $584`, so `0x584`; `Ecco the
+  Dolphin` has `$FFFFFF00: trap #0; jsr $179E`, so `0x179E`.
+- Check it. The reference transcript `<dir>/anchor/blastem.log` prints `== arrival N
+  pc=... ==` beside every dump and that PC has to be the address you gave it. Neither
+  dumper checks anything else: any address is a legal comparison point, and a poor one
+  simply agrees badly.
+
+Anchored dumps go to `target/ref/<cart>/anchor/`, apart from the end-of-frame ones,
+because `b00600.bin` names a different moment in each and the comparator is handed only
+a directory and a frame list. `compare.py --anchor ADDRESS` changes no arithmetic: it
+names the comparison point in the report, and at an anchor a non-zero measured shift
+means something it did not mean before - the two machines have taken that interrupt a
+different number of times by there, which is a finding rather than a nuisance.
 
 ## What it says
 
@@ -93,6 +151,11 @@ is our state after 596, measured directly (70 bytes differ at our frame 595, 25 
 it is a property of the channel - how far blastem runs before it enters the
 debugger - and not of the game.
 
+At a `--stop-at-pc` anchor the sweep usually finds `+0` and means something different
+when it does not; that case is written up in "The comparison point" above rather than
+here, because there the counter being swept is the cart's own interrupt rather than
+either emulator's frame loop.
+
 Two caveats about the sweep, both paid for:
 
 - **It is only as good as the churn in the window you give it.** Over frames 2-17 of
@@ -108,12 +171,21 @@ Two caveats about the sweep, both paid for:
 
 ## Caveats, all of them paid for
 
+- **blastem needs a display.** It is a GUI emulator: with no `DISPLAY` it dies with
+  `Unable to init SDL: x11 not available`, and under `xvfb-run` it opens a zenity
+  dialog for `Failed to set vsync to off` and waits for somebody to press it. Point
+  `DISPLAY` at the session's real display, which is how every number in this file and
+  in #526 was measured. Nothing in here needs X for anything else.
 - **blastem ignores `SIGTERM`.** `run-ref.sh` runs it under `timeout -k 5 <n>` so a
   wedged run dies. `REF_TIMEOUT` raises the wall limit (default 300 s); 1200 frames
   with dumps is about 10 s.
-- **Never send `cont` to a piped debugger.** It never returns and the driver hangs
-  until its timeout. Advance with `frames N`, which returns a prompt after N frames,
-  and end the command file with `quit`.
+- **Never send `cont` to a piped debugger with nothing armed.** It never returns and
+  the driver hangs until its timeout. Advance with `frames N`, which returns a prompt
+  after N frames, and end the command file with `quit`. `--stop-at-pc` is the
+  exception, measured: with a breakpoint armed, `continue` *does* return a prompt on
+  the hit, which is what makes an anchored dump possible. It is also why an anchor that
+  is never reached hangs the reference instead of failing it; our half carries a scanline
+  budget and says `arrival N of 0x... never happened inside M scanlines`.
 - **`HOME` is isolated, deliberately.** blastem writes `~/.gen` (its config) on first
   run, and the config decides `ram_init`, `default_region` and `force_region`.
   `run-ref.sh` gives it a throwaway `HOME` so every run uses the shipped defaults -
@@ -175,8 +247,12 @@ nix develop -c just ref-selftest      # also part of `just check`
 
 It builds a canned pair of images that agree, a one-byte mutation of one frame, a
 mutation of the same address in every frame, a pair aligned only at a one-frame
-offset, a truncated dump and a half-present frame, and asserts the report
-distinguishes all seven. It is what stops a refactor of `compare.py` turning the
+offset, an anchored pair with a byte planted in every frame, an anchored pair that is
+one arrival out of step, a truncated dump and a half-present frame, and asserts the
+report distinguishes all of them. The two anchored ones are the pair that keeps
+`--stop-at-pc` honest: an anchor that quietly stopped reporting differences would be
+worse than the frame loop it replaced, and an anchor that reported a one-arrival
+offset as a divergence would be re-manufacturing #526. It is what stops a refactor of `compare.py` turning the
 oracle into something that prints `agree` for everything.
 
 ## Where the other channels went

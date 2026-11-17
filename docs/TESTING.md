@@ -32,7 +32,7 @@ compiled at all by the workspace run: `just check` adds the clippy and nextest o
 | Commercial smoke | `crates/genesis/tests/commercial.rs` | Boot real games N frames, assert no panic, non-blank output, golden frame hash. The games and what they say are in [`compat-commercial.md`](compat-commercial.md). |
 | Commercial gameplay | `crates/genesis/tests/gameplay.rs` | Replay a committed input movie (`tests/movies`, [`movie-format.md`](movie-format.md)) into the first level of five games and golden three frames of it plus the audio of the run. `cargo nextest run -p genesis --run-ignored only gameplay`. |
 | Collection sweep | `headless sweep <ROM DIR>` | Run every ROM in the local collection in a child process and report what happened. `cargo` runs none of it; the report is a committed artifact, [`compat.md`](compat.md) over [`compat.csv`](compat.csv). |
-| External reference | `scripts/ref/` | Run a cart in blastem and in rustsega over the same frames, dump 68000 work RAM from both, diff. Needs a cartridge, so `cargo` runs none of it; `just check` runs the comparator's own `--selftest`. |
+| External reference | `scripts/ref/` | Run a cart in blastem and in rustsega over the same frames, dump 68000 work RAM from both, diff. Both halves dump at the end of a frame, or at one shared instruction given by `--stop-at-pc` for the phase-safe comparison of #526. Needs a cartridge, so `cargo` runs none of it; `just check` runs the comparator's own `--selftest`. |
 | Frontend | `crates/web` with `wasm-bindgen-test` | Input mapping, settings, pure logic. Keep logic out of components so it is testable natively. What needs a browser runs under `just test-web`, and what a browser frame costs is measured under `just perf-web`. |
 
 `wasm-bindgen-test` runs the wasm tests in a real browser: the dev shell pins
@@ -146,9 +146,10 @@ commands, the caveats and the licensing line; the finding it produced first is
 
 It is outside `cargo test` for the same reason the commercial smoke tests are: it
 reads `$RUSTSEGA_ROM_DIR`, which CI has not got. Its own check is in `just check`
-twice over, once as `ref-selftest` (a canned pair of dumps, a mutated copy, and a
-pair aligned only at a one-frame offset - an oracle that silently always said
-"agree" would be worse than none) and once by clippy building
+twice over, once as `ref-selftest` (a canned pair of dumps, a mutated copy, a pair
+aligned only at a one-frame offset, an anchored pair with a byte planted in every
+frame, and an anchored pair one arrival out of step - an oracle that silently always
+said "agree" would be worse than none) and once by clippy building
 `crates/genesis/examples/ram_dump.rs`, which is our half of the dump.
 
 ## External test data

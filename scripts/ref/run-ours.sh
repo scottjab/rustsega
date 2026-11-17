@@ -5,12 +5,19 @@
 # The other half is scripts/ref/run-ref.sh, which does the same job in blastem;
 # scripts/ref/compare.py then compares the two sets. See scripts/ref/README.md.
 #
-# usage: run-ours.sh [-o OUTDIR] [--region REGION] [--tmss] ROM FRAME [FRAME ...]
+# usage: run-ours.sh [-o OUTDIR] [--region REGION] [--tmss] [--stop-at-pc PC] ROM FRAME [FRAME ...]
 #
 # Writes OUTDIR/rNNNNN.bin - one raw 64 KiB work-RAM image per named frame, the
 # 68000 address space $FF0000-$FFFFFF, the same region and naming run-ref.sh
 # produces. Frame N means the state after exactly N frames, counting from reset,
 # on both sides.
+#
+# --stop-at-pc PC moves that point to the Nth time the 68000 is about to execute
+# PC instead, for the phase-safe comparison of #526; run-ref.sh --stop-at-pc is
+# the other half and README.md says what to give it. The address is not checked
+# against anything: a frame list is a list of arrivals either way, so both halves
+# agree about the numbering whether or not the address is a good one, and a bad
+# one shows up as a comparison that agrees badly everywhere.
 #
 # This is the `Genesis::new` + `run_frame()` x N + `Bus::ram` half of the oracle,
 # run through crates/genesis/examples/ram_dump.rs. Nothing here is a debug build
@@ -20,10 +27,11 @@ set -euo pipefail
 
 self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=/dev/null
-. "$self_dir/common.sh"   # ref_out_dir, ref_frames
+. "$self_dir/common.sh"   # ref_dump_dir, ref_frames
 
 usage() {
-  echo "usage: $(basename "$0") [-o OUTDIR] [--region auto|usa|japan|europe] [--tmss] ROM FRAME [FRAME ...]" >&2
+  echo "usage: $(basename "$0") [-o OUTDIR] [--region auto|usa|japan|europe] [--tmss]" \
+       "[--stop-at-pc PC] ROM FRAME [FRAME ...]" >&2
   exit 2
 }
 
@@ -31,6 +39,7 @@ out=""
 rom=""
 region=""
 tmss=()
+stop_at=""
 frames=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,6 +56,11 @@ while [[ $# -gt 0 ]]; do
     --tmss)
       tmss=(--tmss)
       shift
+      ;;
+    --stop-at-pc)
+      [[ $# -ge 2 ]] || usage
+      stop_at=$2
+      shift 2
       ;;
     -*)
       echo "$(basename "$0"): unknown option $1" >&2
@@ -74,11 +88,15 @@ done
 
 [[ -n $rom ]] || usage
 [[ ${#frames[@]} -gt 0 ]] || usage
+if [[ -n $stop_at && ! $stop_at =~ ^(0x)?[0-9A-Fa-f]+$ ]]; then
+  echo "$(basename "$0"): --stop-at-pc wants a hex address, not $stop_at" >&2
+  exit 2
+fi
 rom=$(readlink -f "$rom")
 [[ -r $rom ]] || { echo "$(basename "$0"): cannot read $rom" >&2; exit 2; }
 
 repo=$(cd -- "$self_dir/../.." && pwd)
-out=${out:-$(ref_out_dir "$repo" "$rom")}
+out=${out:-$(ref_dump_dir "$repo" "$rom" "$stop_at")}
 mkdir -p "$out"
 out=$(readlink -f "$out")
 
@@ -92,6 +110,7 @@ cargo build --quiet --manifest-path "$repo/Cargo.toml" --release -p genesis --ex
 machine=()
 [[ -z $region ]] || machine+=(--region "$region")
 (( ${#tmss[@]} == 0 )) || machine+=("${tmss[@]}")
+[[ -z $stop_at ]] || machine+=(--stop-at-pc "$stop_at")
 
 count=0
 for frame in $(ref_frames "${frames[@]}"); do

@@ -320,6 +320,45 @@ impl Genesis {
         self.cpu.arm_trail(stop_at);
     }
 
+    /// Run the console until the 68000 is next about to execute at `pc`, and say
+    /// whether that happened before `max_lines` scanlines had run.
+    ///
+    /// The stop is at an instruction boundary, part way through a scanline if
+    /// that is where the address falls: [`Scheduler::run_line_to_pc`] cuts the
+    /// line there and nothing else about the machine is rounded up. An *arrival*
+    /// is what stops it, so calling this again from a stop runs the instruction it
+    /// stopped on and waits for the next arrival - which is what makes repeated
+    /// calls walk a once-a-frame address instead of returning without running.
+    ///
+    /// It is [`Genesis::run_frame`]'s alternative for a caller that needs a point
+    /// in the instruction stream rather than a whole picture: the external
+    /// reference oracle of #526 (`scripts/ref/`) dumps work RAM at the entry of a
+    /// cart's vertical-blank routine on both machines, and two machines agree
+    /// about an address they both stop at where they do not agree about where
+    /// their own frame loop happens to end.
+    ///
+    /// Two things follow from stopping in the middle of a raster and are worth
+    /// knowing before mixing the two drivers:
+    ///
+    /// * the frame flag is left for [`Genesis::run_frame`] to consume, so a
+    ///   `run_frame` that follows a stop may end on the next line rather than a
+    ///   whole raster after it, and
+    /// * the audio frame is the run between two stops: [`crate::Audio::start_frame`]
+    ///   is called on the way in, the same [`Genesis::run_frame`] does, so a long
+    ///   anchored run holds one raster of samples rather than the whole run.
+    pub fn run_until_pc(&mut self, pc: u32, max_lines: u32) -> bool {
+        self.bus.audio.start_frame();
+        for _ in 0..max_lines {
+            if !self
+                .scheduler
+                .run_line_to_pc(&mut self.cpu, &mut self.z80, &mut self.bus, pc)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     /// The memory map, for the tests that have to look at work RAM to see what a
     /// program did, and for a front end that wants [`Bus::take_dirty`] to know
     /// when the cart's save is worth writing out.
