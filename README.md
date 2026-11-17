@@ -136,4 +136,8 @@ Coding agents should read [AGENTS.md](AGENTS.md). Short version:
 nix develop -c scripts/next-ticket.sh
 ```
 
-prints the next ticket to work on.
+prints the next ticket to work on. It skips a ticket while the issues it depends
+on are still open, and reads those from GitHub's own blocking links
+(`gh issue edit <ticket> --add-blocked-by <dependency>`) plus a `Depends on: #12, #34`
+line in the body. Ordering the script could not read is reported on stderr rather
+than passed over quietly (#504).
