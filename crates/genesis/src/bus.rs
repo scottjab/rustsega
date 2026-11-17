@@ -681,19 +681,24 @@ pub struct Bus {
     /// counts in.
     ///
     /// Only the waits that are durations of the chip's own bus time belong here. The
-    /// two the VDP reports - a 68k -> VDP transfer and a data port write to a full
-    /// FIFO - are counted from the beam and live in [`Bus::pending_68k_hold`], and
-    /// #489 is the ticket that split the two because spending a beam-relative figure
-    /// as a duration makes the chip clocks run away from the raster.
+    /// freeze a 68k -> VDP transfer puts on the chip is counted from the beam, so it
+    /// lives in [`Bus::pending_68k_hold`]; #489 is the ticket that split the two
+    /// because spending a beam-relative figure as a duration lets a chip pay for one
+    /// freeze again on every report of it. The data port's full-FIFO wait is
+    /// beam-relative too and is still here - see [`Bus::vdp_data_write`].
     pending_68k_stall: u32,
     /// The sound CPU's half of [`Bus::pending_68k_stall`]: the extra T-states a
     /// Z80 access to the 68k bus costs the Z80 ([`Z80_WINDOW_WAIT_MCLK`]). Taken
     /// after every Z80 step by the scheduler ([`Bus::take_z80_stall`]).
     pending_z80_stall: u32,
     /// How far in front of the beam the 68000 is being held, in the master clocks
-    /// [`vdp::Vdp::dma_68k_stall_mclk`] and [`vdp::Vdp::data_port_stall_mclk`] count
-    /// from it: "the time left until the last of the transfer's access slots", which
-    /// is an instant on the raster, not a length of bus time.
+    /// [`vdp::Vdp::dma_68k_stall_mclk`] counts from it: "the time left until the last
+    /// of the transfer's access slots", which is an instant on the raster, not a
+    /// length of bus time.
+    ///
+    /// `vdp::Vdp::data_port_stall_mclk` is measured from the beam the same way and
+    /// belongs here too; it is still in [`Bus::pending_68k_stall`] for the golden
+    /// reason stated on [`Bus::vdp_data_write`].
     ///
     /// Kept apart from [`Bus::pending_68k_stall`] because the scheduler has to spend
     /// the two the other way round - that one added to the chip's clock, this one as
@@ -976,7 +981,8 @@ impl Bus {
         std::mem::take(&mut self.pending_z80_stall)
     }
 
-    /// Take how far in front of the beam the 68000 is being held, and clear it.
+    /// Take how far in front of the beam the 68000 is being held by a 68k -> VDP
+    /// transfer, and clear it.
     ///
     /// The other kind of time the bus produces: [`Bus::pending_68k_hold`] is measured
     /// from the beam, so the scheduler spends it as the deadline
@@ -1004,16 +1010,12 @@ impl Bus {
         self.pending_z80_stall = self.pending_z80_stall.saturating_add(mclk);
     }
 
-    /// Hold the 68000 until `mclk` master clocks in front of the beam, keeping the
-    /// further of that and any hold already recorded. The 68k half of
-    /// [`Bus::pending_68k_hold`]; a max, not a sum, because two figures counted from
-    /// one beam position are two names for one instant.
-    fn hold_68k(&mut self, mclk: u32) {
-        self.pending_68k_hold = self.pending_68k_hold.max(mclk);
-    }
-
-    /// Hold the sound CPU until `mclk` master clocks in front of the beam. The Z80
-    /// half of [`Bus::hold_68k`].
+    /// Hold the sound CPU until `mclk` master clocks in front of the beam, keeping the
+    /// further of that and any hold already recorded - a max, not a sum, because two
+    /// figures counted from one beam position are two names for one instant. The
+    /// 68000's own transfer freeze is recorded straight into
+    /// [`Bus::pending_68k_hold`] by [`Bus::vdp_control_write`], which holds the chip
+    /// for the whole of the transfer rather than for one access.
     fn hold_z80(&mut self, mclk: u32) {
         self.pending_z80_hold = self.pending_z80_hold.max(mclk);
     }
@@ -1428,8 +1430,17 @@ impl Bus {
         let held = self.vdp.data_port_stall_mclk() != 0;
         self.vdp.write_data(value);
         if held {
+            // TODO(#489): `data_port_stall_mclk` is beam-relative like the transfer
+            // freeze - `vdp::fifo::Fifo::data_port_stall_mclk` is
+            // `mclk_to_slots(head_slots)`, master clocks counted *from the beam* - so
+            // by rights it belongs in `pending_68k_hold` next to the DMA. It stays an
+            // additive stall here because that is what the six `md_test_pack` palette
+            // goldens are calibrated on: charging the same wait as a deadline moves
+            // `960pal`, `512pal`, `shltest`, `shltest2`, `md1536` and `mdtrans`, and
+            // reblessing six goldens is a decision this change does not make. #517 is
+            // the ticket where the two are finally spent the same way.
             let stall = self.vdp.data_port_stall_mclk();
-            self.hold_68k(stall);
+            self.stall_68k(stall);
         }
     }
 
@@ -4913,12 +4924,12 @@ mod tests {
             set_reg(&mut bus, 1, 0x40);
             bus.vdp.advance(line * TEST_VDP_LINE + mclk);
             vram_write_at(&mut bus, 0x0000);
-            assert_eq!(bus.take_68k_hold(), 0, "a command word holds nobody");
+            assert_eq!(bus.take_68k_stall(), 0, "a command word holds nobody");
 
             (0..writes)
                 .map(|_| {
                     bus.write_word(0xC0_0000, 0x1234);
-                    bus.take_68k_hold()
+                    bus.take_68k_stall()
                 })
                 .sum()
         }
@@ -4981,11 +4992,11 @@ mod tests {
         );
     }
 
-    /// The freeze a 68k -> VDP transfer puts on the 68000 is one instant on the
-    /// beam, so a control write that arrives while the transfer is still running
-    /// - which is what a cart's DMA loop does, and what
-    /// [`Bus::vdp_control_write`] reads the level for on *every* control write -
-    /// records the same instant again rather than a second freeze on top of it.
+    /// The freeze a 68k -> VDP transfer puts on the 68000 is one instant on the beam,
+    /// so a control write that arrives while the transfer is still running records the
+    /// same instant again rather than a second freeze on top of it. A cart's DMA loop
+    /// does make that write, and [`Bus::vdp_control_write`] reads the level on purpose
+    /// on *every* control write.
     ///
     /// Summed, the two records are the runaway of #489: the beam has not moved, so
     /// the number is the whole of the transfer twice, and each control write in a

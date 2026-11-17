@@ -56,16 +56,17 @@
 //!   halves of a Z80 window access - are durations of the chip's own bus time. They
 //!   come through [`Bus::take_68k_stall`] and [`Bus::take_z80_stall`] and are added
 //!   by [`Scheduler::charge_mclk`].
-//! * the VDP's two holds - a 68k -> VDP transfer and a data port write to a full
-//!   FIFO - are counted from the beam by `vdp::slots`, so they name an instant rather
-//!   than a length. They come through [`Bus::take_68k_hold`] and
-//!   [`Bus::take_z80_hold`] and are spent by [`Scheduler::charge_hold`] as
-//!   `clock = max(clock, vdp_clock + hold)`.
+//! * the freeze a 68k -> VDP transfer puts on the two chips is counted from the beam
+//!   by `vdp::slots`, so it names an instant rather than a length. It comes through
+//!   [`Bus::take_68k_hold`] and [`Bus::take_z80_hold`] and is spent by
+//!   [`Scheduler::charge_hold`] as `clock = max(clock, vdp_clock + hold)`.
 //!
-//! Adding the second kind to a chip clock is what the 26 carts of #354 die of: a chip
-//! already ahead of the beam re-pays the part of one freeze another freeze has
-//! covered, the over-charge compounds, and nothing any more stops both chips from
-//! running past the end of the line loop - which is the only place the beam is walked.
+//! Adding the second kind to a chip clock lets a chip that is already ahead of the
+//! beam re-pay the part of one freeze that the next report of the same freeze has
+//! covered, and the over-charge compounds (#489). What the max does *not* fix is a
+//! freeze longer than the frame: it is still time the chips are charged without the
+//! raster being charged with it, and the beam only moves inside the slice loop below.
+//! That is the freeze-gate follow-up, not this.
 //!
 //! Both are the same rule the stopped Z80 and the TMSS-frozen 68k
 //! ([`Bus::locked_up`]) already follow: move the clock, do not skip it, because a chip
@@ -428,12 +429,12 @@ impl Scheduler {
     /// Hold one chip's clock until the beam reaches an instant `mclk` master clocks
     /// in front of it, rather than pushing it along by that length.
     ///
-    /// Two of the waits the bus reports are not durations at all.
+    /// The transfer freeze the bus reports is not a duration at all.
     /// [`vdp::Vdp::dma_68k_stall_mclk`] is "how long a transfer of `slots` still has
-    /// to run" and [`vdp::Vdp::data_port_stall_mclk`] is the head entry's slots
-    /// counted along the slot schedule - both of them `vdp::slots` counting *from
-    /// the beam* (`dma_mclk_to_slots`, `mclk_to_slots`), so they name a moment on the
-    /// raster rather than an amount of bus time the chip owes. Added to a chip clock
+    /// to run", counted *from the beam* by `vdp::slots::dma_mclk_to_slots`, so it
+    /// names a moment on the raster rather than an amount of bus time the chip owes
+    /// ([`vdp::Vdp::data_port_stall_mclk`] is measured off the beam the same way and
+    /// is still an additive wait - see [`Bus::vdp_data_write`]). Added to a chip clock
     /// (`charge_mclk`), a chip already ahead of the beam re-pays the overlap of one
     /// freeze with the next and the over-charge compounds (#489). Taken as a deadline
     /// it is idempotent, and it is why [`Bus::take_68k_hold`] and
@@ -1387,7 +1388,7 @@ mod tests {
 
     /// A hold and a stall are spent the two ways round, and the order matters.
     ///
-    /// [`Scheduler::charge_mclk`] adds a duration to a chip's own clock; 
+    /// [`Scheduler::charge_mclk`] adds a duration to a chip's own clock;
     /// [`Scheduler::charge_hold`] takes it to an instant measured on the beam. The
     /// tempting single quantity - one `clock = max(clock, beam + total)` for
     /// everything the bus hands over - is wrong in the other direction: a chip that
@@ -1412,7 +1413,10 @@ mod tests {
         Scheduler::charge_hold(&mut ahead, 900, 500);
         assert_eq!(ahead, 2_000, "a deadline never winds a clock back");
         Scheduler::charge_mclk(&mut ahead, 77);
-        assert_eq!(ahead, 2_077, "and is no reason to stop charging the additive wait");
+        assert_eq!(
+            ahead, 2_077,
+            "and is no reason to stop charging the additive wait"
+        );
 
         // One instant recorded twice is still the one instant.
         let mut twice = 1_000_u64;
