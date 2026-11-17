@@ -356,7 +356,7 @@ fn format_op(r: &mut Reader<'_>, opcode: u16) -> String {
         }
         Op::LogicImmCcr => logic_imm(r, opcode, "CCR"),
         Op::LogicImmSr => logic_imm(r, opcode, "SR"),
-        op @ (Op::Addq | Op::Subq) => quick(op, opcode),
+        op @ (Op::Addq | Op::Subq) => quick(r, op, opcode),
         op @ (Op::Neg | Op::Negx | Op::Clr | Op::Not | Op::Tst | Op::Tas | Op::Chk) => {
             unary(r, opcode, op, ea)
         }
@@ -588,18 +588,23 @@ fn logic_imm(r: &mut Reader<'_>, opcode: u16, reg: &str) -> String {
 }
 
 /// `ADDQ`/`SUBQ`: the data field is the immediate, and `000` means 8 rather
-/// than nothing. A mode of `001` makes the destination an address register, and
-/// it is the only difference from the ALU shape (M68000UM ADDQ).
-fn quick(op: Op, opcode: u16) -> String {
+/// than nothing. A mode of `001` makes the destination an address register named
+/// by the `rrr` field alone; every other mode of Format V is a plain effective
+/// address, extension words and all (M68000UM ADDQ, "Instruction Formats"
+/// Format V). Reading those other modes as `Dn` was #513: `5378 FF0E` printed as
+/// `SUBQ.W #$1,D0` over a `DC.W $FF0E`, because the destination word was never
+/// counted.
+fn quick(r: &mut Reader<'_>, op: Op, opcode: u16) -> String {
     let name = if op == Op::Addq { "ADDQ" } else { "SUBQ" };
     let n = field(opcode, 9);
     let value = format!("#{}", num(u32::from(if n == 0 { 8 } else { n })));
+    let size = alu_size(opcode);
     let to = if field(opcode, 3) == 0b001 {
         an(field(opcode, 0))
     } else {
-        dn(field(opcode, 0))
+        ea_text(r, (opcode & 0x3F) as u8, size)
     };
-    format!("{name}{} {value},{to}", size_suffix(alu_size(opcode)))
+    format!("{name}{} {value},{to}", size_suffix(size))
 }
 
 /// The one-operand ALU handful, plus `CHK` (which reads `Dn,<ea>`).
@@ -829,10 +834,12 @@ mod tests {
             0b0111 => Some(1),
             0b0101 => {
                 // `0101 cccc 11 eeeeee` is `Scc`/`DBcc`; everything else in the
-                // group is `ADDQ`/`SUBQ`, which carries its count in the opcode
-                // (M68000UM Format V).
+                // group is `ADDQ`/`SUBQ`, whose count is the opcode plus
+                // whatever its destination mode asks for (M68000UM Format V).
                 if (opcode >> 6) & 0b11 != 0b11 {
-                    Some(1)
+                    // Format V: `An` direct and `Dn` need no extension word, and
+                    // every other destination carries its own (#513).
+                    Some(1 + ea_words(ea, false))
                 } else if (opcode >> 3) & 0b111 == 0b001 {
                     Some(2) // `DBcc Dn,d16`
                 } else {
@@ -995,6 +1002,57 @@ mod tests {
         ] {
             assert_eq!(text(words), want, "{:04X}", words[0]);
         }
+    }
+
+    /// `ADDQ`/`SUBQ` are M68000UM Format V, `0100/0101 quu1 ss mmm rrr`: mode
+    /// `001` is the only destination the `rrr` field names on its own, so every
+    /// other mode is a full effective address and carries its extension words
+    /// here too (#513).
+    #[test]
+    fn quick_instructions_print_a_memory_destination() {
+        for (words, want, len) in [
+            // The `Sonic & Knuckles` case of #513: `5378 FF0E` at `$001CE0`.
+            (&[0x5378u16, 0xFF0E][..], "SUBQ.W #$1,$FF0E", 2),
+            (&[0x5278, 0xFF0E][..], "ADDQ.W #$1,$FF0E", 2),
+            // All three sizes take the absolute word the same way.
+            (&[0x5338, 0xFF0E][..], "SUBQ.B #$1,$FF0E", 2),
+            (&[0x53B8, 0xFF0E][..], "SUBQ.L #$1,$FF0E", 2),
+            (&[0x5238, 0xFF0E][..], "ADDQ.B #$1,$FF0E", 2),
+            (&[0x52B8, 0xFF0E][..], "ADDQ.L #$1,$FF0E", 2),
+            // The absolute long sibling, and `quick` data `000` meaning 8.
+            (&[0x53B9, 0x0001, 0x2345][..], "SUBQ.L #$1,$012345", 3),
+            (&[0x5279, 0x0001, 0x2345][..], "ADDQ.W #$1,$012345", 3),
+            (&[0x5178, 0xFF0E][..], "SUBQ.W #$8,$FF0E", 2),
+            // The rest of the memory modes were read as `Dn` too.
+            (&[0x5350][..], "SUBQ.W #$1,(A0)", 1),
+            (&[0x5358][..], "SUBQ.W #$1,(A0)+", 1),
+            (&[0x5360][..], "SUBQ.W #$1,-(A0)", 1),
+            (&[0x5369, 0x0010][..], "SUBQ.W #$1,$10(A1)", 2),
+            (&[0x52B2, 0x1004][..], "ADDQ.L #$1,$4(A2,D1.W)", 2),
+            // Register destinations are unchanged: one word, no extension.
+            (&[0x5088][..], "ADDQ.L #$8,A0", 1),
+            (&[0x5901][..], "SUBQ.B #$4,D1", 1),
+        ] {
+            let (t, got) = disassemble(words, 0x1000);
+            assert_eq!(t, want, "{:04X}", words[0]);
+            assert_eq!(got, len, "{:04X} word count", words[0]);
+        }
+    }
+
+    /// The listing #513 was reported from: the `SUBQ.W #$1,$FF0E` at `$001CE0`
+    /// is one instruction, and the code the walk reaches next is `$001CE4`.
+    #[test]
+    fn quick_absolute_word_destination_does_not_split_the_listing() {
+        let words = [0x5378, 0xFF0E, 0x4E71];
+        let (seen, end) = walk_program(&words, 0x001CE0);
+        assert_eq!(end, words.len());
+        assert_eq!(
+            seen,
+            [
+                (String::from("SUBQ.W #$1,$FF0E"), 2),
+                (String::from("NOP"), 1),
+            ]
+        );
     }
 
     #[test]
