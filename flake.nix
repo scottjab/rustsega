@@ -266,6 +266,15 @@
             # what Firefox 159 asks for before it will create a GL context at all.
             # `just test-web` runs under it on CI - see the comment on that step.
             pkgs.xvfb-run
+            # Blastem, the reference emulator of the #525 oracle in `scripts/ref/`.
+            # Tool-only, and used as a separate process invoked by path: nothing from
+            # blastem - source, data, or the dumps it writes - enters this repo, and
+            # nothing in `scripts/ref/` is derived from its code. That is the GPLv3
+            # line the ticket draws, and it is why the packaged, unmodified 1.0.0 is
+            # driven through its own documented debugger protocol rather than patched.
+            # Nothing in `just check` runs it: the oracle compares a cartridge read from
+            # $RUSTSEGA_ROM_DIR, which CI does not have.
+            pkgs.blastem
           ];
 
           # Where the emulator tests look for commercial ROMs. Override if needed.
