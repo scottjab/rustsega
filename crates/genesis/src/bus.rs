@@ -1281,15 +1281,18 @@ impl Bus {
     /// An address-error exception frame is how the bus comes to be asked at all.
     /// A 68000 *data* word access at an odd address never reaches it - M68000UM
     /// section 6.3.5 "Address Error" raises the exception instead of starting the
-    /// cycle, and `crates/m68k` models that in `M68k::alignment_fault` - but the CPU's own
-    /// exception traffic uses the unchecked `_raw` accessors, because the frame write
-    /// has to land wherever the stack points (`crates/m68k/src/address_error.rs`).
+    /// cycle, and `crates/m68k` models that in `M68k::alignment_fault` - but the
+    /// CPU's own exception traffic uses the unchecked `_raw` accessors, because the
+    /// frame write has to land wherever the stack points
+    /// (`crates/m68k/src/address_error.rs`).
     /// Masking the address down to the aligned pair instead, on the grounds that the
     /// RAM chips do not see A0, is the other defensible reading and would break both
     /// this invariant and [`Bus::read_ram_byte`]'s agreement with it; it is not what
     /// this bus does anywhere else.
     fn read_ram_word(&mut self, addr: u32) -> u16 {
-        u16::from_be_bytes([self.read_ram_byte(addr), self.read_ram_byte(addr.wrapping_add(1))])
+        let high = self.read_ram_byte(addr);
+        let low = self.read_ram_byte(addr + 1);
+        u16::from_be_bytes([high, low])
     }
 
     /// Work RAM byte write.
@@ -1303,7 +1306,7 @@ impl Bus {
     /// top of the 64 KiB mirror (#488).
     fn write_ram_word(&mut self, addr: u32, value: u16) {
         self.write_ram_byte(addr, (value >> 8) as u8);
-        self.write_ram_byte(addr.wrapping_add(1), value as u8);
+        self.write_ram_byte(addr + 1, value as u8);
     }
 
     /// VDP port byte read: the lane of [`Bus::read_vdp_word`] that `addr` sits on.
