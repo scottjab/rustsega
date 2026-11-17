@@ -9,7 +9,7 @@ vdp-debug := "-p vdp --features debug-views"
 default: check
 
 # Everything a commit must pass.
-check: fmt-check actionlint clippy test wasm-core wasm-web
+check: fmt-check actionlint clippy test wasm-core wasm-web ref-selftest
 
 fmt:
     cargo fmt --all
@@ -23,6 +23,17 @@ fmt-check:
 # pass over two small YAML files, so it costs milliseconds.
 actionlint:
     actionlint .github/workflows/*.yml
+
+# The external reference oracle checking its own comparator (#525). It compares a
+# canned pair of work-RAM images that agree, a mutated copy of one, and a pair that
+# only lines up at a one-frame offset, and fails if the report gets any of the
+# three wrong. In `check` for the same reason `actionlint` is: nothing else runs
+# scripts/ref/ until someone is about to trust what it says, and a comparator that
+# quietly reported `agree` for everything is how #526 becomes a false negative. It
+# reads no ROM, starts no emulator and needs no network - arithmetic on a few files
+# it makes in a temp directory - so it costs milliseconds.
+ref-selftest:
+    python3 scripts/ref/compare.py --selftest
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings

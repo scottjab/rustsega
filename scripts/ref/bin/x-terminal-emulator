@@ -1,0 +1,18 @@
+#!/bin/sh
+# The ``x-terminal-emulator`` blastem's ``-d`` looks for and does not have.
+#
+# Blastem's debugger terminal is a pair of FIFOs plus whatever terminal it execs;
+# on NixOS there is no ``x-terminal-emulator`` and ``blastem -g -d`` segfaults.
+# This is the stand-in: put on ``PATH`` by ``scripts/ref/run-ref.sh``, it is
+# exec'd in place of a terminal and hands the FIFOs to ``terminal-standin.py``.
+#
+# Blastem's own arguments (``-title "BlastEm Debugger" -e .../termhelper``) are
+# dropped, deliberately: we are not starting its terminal helper, we are
+# replacing the terminal it would have run.
+#
+# Read by ``run-ref.sh``:
+#   REF_CMDS  the debugger command file (required)
+#   REF_LOG   where to write the debugger transcript (default /dev/null)
+self_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+: "${REF_CMDS:?run-ref.sh sets this: the file of debugger commands to send}"
+exec python3 "$self_dir/../terminal-standin.py" "$REF_CMDS" "${REF_LOG:-/dev/null}"
