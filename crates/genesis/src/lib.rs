@@ -323,6 +323,11 @@ impl Genesis {
     /// The memory map, for the tests that have to look at work RAM to see what a
     /// program did, and for a front end that wants [`Bus::take_dirty`] to know
     /// when the cart's save is worth writing out.
+    /// SCRATCH #441 accessor, not for merge.
+    pub fn z80(&self) -> &Z80 {
+        &self.z80
+    }
+
     pub fn bus(&self) -> &Bus {
         &self.bus
     }

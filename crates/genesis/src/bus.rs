@@ -1265,7 +1265,9 @@ impl Bus {
 
     /// Work RAM byte read.
     fn read_ram_byte(&mut self, addr: u32) -> u8 {
-        self.ram[Self::ram_index(addr)]
+        let v = self.ram[Self::ram_index(addr)];
+        scratch441::note('r', addr, 1, u32::from(v));
+        v
     }
 
     /// Work RAM word read, big endian (M68000UM, "Data Organization").
@@ -1297,6 +1299,7 @@ impl Bus {
 
     /// Work RAM byte write.
     fn write_ram_byte(&mut self, addr: u32, value: u8) {
+        scratch441::note('w', addr, 1, u32::from(value));
         self.ram[Self::ram_index(addr)] = value;
     }
 
@@ -5209,5 +5212,137 @@ mod tests {
             0xE0,
             "the rebuilt chip comes back on the first line of VBlank"
         );
+    }
+}
+
+// SCRATCH #441 probe j - a work-RAM watchpoint with the 68000 pc attached.
+// Not for merge; this module is reverted before any commit.
+pub mod scratch441 {
+    use m68k::ADDR_MASK;
+    use std::cell::Cell;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    const RANGE_A: u32 = 0x00FF_1B70;
+    const RANGE_B: u32 = 0x00FF_19D0;
+
+    #[derive(Debug, Clone)]
+    pub struct Stat {
+        pub count: u64,
+        pub first_frame: u32,
+        pub last_frame: u32,
+        pub last_value: u32,
+        pub non_zero: u64,
+    }
+
+    thread_local! {
+        static ON: Cell<bool> = const { Cell::new(false) };
+        static PC: Cell<u32> = const { Cell::new(0) };
+        static FRAME: Cell<u32> = const { Cell::new(0) };
+        static STATS: RefCell<BTreeMap<(char, u32, u32), Stat>> =
+            RefCell::new(BTreeMap::new());
+        static LOG: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        static VHIST: RefCell<BTreeMap<(char, u32, u32, u32), u64>> =
+            RefCell::new(BTreeMap::new());
+    }
+
+    pub fn set_on(v: bool) {
+        ON.with(|c| c.set(v));
+    }
+
+    pub fn set_pc(v: u32) {
+        PC.with(|c| c.set(v));
+    }
+
+    pub fn set_frame(v: u32) {
+        FRAME.with(|c| c.set(v));
+    }
+
+    pub fn reset() {
+        STATS.with(|s| s.borrow_mut().clear());
+        LOG.with(|l| l.borrow_mut().clear());
+        VHIST.with(|h| h.borrow_mut().clear());
+    }
+
+    fn watched(addr: u32) -> bool {
+        let a = addr & ADDR_MASK;
+        (RANGE_A..RANGE_A + 16).contains(&a) || (RANGE_B..RANGE_B + 16).contains(&a)
+    }
+
+    pub fn note(op: char, addr: u32, width: u32, value: u32) {
+        if !ON.with(|c| c.get()) || !watched(addr) {
+            return;
+        }
+        let width = if width == 0 { 2 } else { 1 };
+        VHIST.with(|h| {
+            let mut h = h.borrow_mut();
+            *h.entry((op, PC.with(|c| c.get()), addr & ADDR_MASK, value)).or_insert(0) += 1;
+        });
+        if op == 'w' {
+        LOG.with(|l| {
+            let line = format!(
+                "{} {op} {:08X}.{} pc={:08X} v={:08X}",
+                FRAME.with(|c| c.get()),
+                addr & ADDR_MASK,
+                width,
+                PC.with(|c| c.get()),
+                value
+            );
+            let mut l = l.borrow_mut();
+            if l.last() != Some(&line) {
+                l.push(line);
+            }
+        });
+        }
+        let pc = PC.with(|c| c.get());
+        let frame = FRAME.with(|c| c.get());
+        let a = addr & ADDR_MASK;
+        STATS.with(|s| {
+            let mut map = s.borrow_mut();
+            let e = map.entry((op, pc, a)).or_insert(Stat {
+                count: 0,
+                first_frame: frame,
+                last_frame: frame,
+                last_value: value,
+                non_zero: 0,
+            });
+            e.count += 1;
+            e.last_frame = frame;
+            e.last_value = value;
+            if value != 0 {
+                e.non_zero += 1;
+            }
+        });
+    }
+
+    pub fn vhist_dump() {
+        println!("---- scratch441 value histogram (op pc addr value -> n) ----");
+        let mut rows: Vec<_> = VHIST.with(|h| h.borrow().clone().into_iter().collect());
+        rows.sort_by_key(|((op, _, _, _), n)| (*op, std::cmp::Reverse(*n)));
+        for ((op, pc, addr, value), n) in rows {
+            println!("{op} pc={pc:08X} addr={addr:08X} v={value:08X} n={n}");
+        }
+    }
+
+    pub fn log_dump() {
+        println!("---- scratch441 chronological ----");
+        LOG.with(|l| {
+            for line in l.borrow().iter() {
+                println!("{line}");
+            }
+        });
+    }
+
+    pub fn dump(label: &str) {
+        println!("---- scratch441 {label} ----");
+        let mut rows: Vec<((char, u32, u32), Stat)> =
+            STATS.with(|s| s.borrow().clone().into_iter().collect());
+        rows.sort_by_key(|(k, v)| (k.0, v.first_frame));
+        for ((op, pc, addr), st) in rows {
+            println!(
+                "{op} addr={addr:08X} pc={pc:08X} n={} f{}..{} lastv={:08X} nonzero={}",
+                st.count, st.first_frame, st.last_frame, st.last_value, st.non_zero
+            );
+        }
     }
 }

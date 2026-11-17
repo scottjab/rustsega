@@ -270,6 +270,7 @@ impl Scheduler {
                 bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
             } else {
                 bus.audio.set_now(self.m68k_clock.min(line_end));
+                crate::bus::scratch441::set_pc(cpu.pc);
                 let cycles = cpu.step(bus);
                 Self::charge(
                     &mut self.m68k_clock,
