@@ -668,11 +668,9 @@ pub struct Bus {
     locked_up: bool,
     /// Master clocks the 68000 has been held off its own bus for by accesses this
     /// bus has already answered, waiting for the scheduler to take them out of its
-    /// clock: a 68k -> VDP DMA ([`vdp::Vdp::dma_68k_stall_mclk`]), a data port
-    /// write to a full FIFO ([`vdp::Vdp::data_port_stall_mclk`]), the one wait
-    /// state of the sound side at `0xA00000` ([`Z80_AREA_WAIT_MCLK`]), and the
-    /// 68000's share of every access the Z80 makes to the 68k bus
-    /// ([`Z80_WINDOW_STEAL_MCLK`]).
+    /// clock: the one wait state of the sound side at `0xA00000`
+    /// ([`Z80_AREA_WAIT_MCLK`]) and the 68000's share of every access the Z80 makes
+    /// to the 68k bus ([`Z80_WINDOW_STEAL_MCLK`]).
     ///
     /// A one-way door rather than something the CPU asks for, so that the timing
     /// lives here and the 68000 core stays unaware of the bus under it: the access
@@ -681,13 +679,44 @@ pub struct Bus {
     /// rather than a maximum because one instruction can make several contended
     /// accesses, and master clocks because that is the one unit the scheduler
     /// counts in.
+    ///
+    /// Only the waits that are durations of the chip's own bus time belong here. The
+    /// freeze a 68k -> VDP transfer puts on the chip is counted from the beam, so it
+    /// lives in [`Bus::pending_68k_hold`]; #489 is the ticket that split the two
+    /// because spending a beam-relative figure as a duration lets a chip pay for one
+    /// freeze again on every report of it. The data port's full-FIFO wait is
+    /// beam-relative too and is still here - see [`Bus::vdp_data_write`].
     pending_68k_stall: u32,
     /// The sound CPU's half of [`Bus::pending_68k_stall`]: the extra T-states a
-    /// Z80 access to the 68k bus costs the Z80 ([`Z80_WINDOW_WAIT_MCLK`]) and the
-    /// rest of a 68k -> VDP transfer it has to wait out before the 68k bus answers
-    /// it ([`vdp::Vdp::dma_68k_stall_mclk`]). Taken after every Z80 step by the
-    /// scheduler ([`Bus::take_z80_stall`]).
+    /// Z80 access to the 68k bus costs the Z80 ([`Z80_WINDOW_WAIT_MCLK`]). Taken
+    /// after every Z80 step by the scheduler ([`Bus::take_z80_stall`]).
     pending_z80_stall: u32,
+    /// How far in front of the beam the 68000 is being held, in the master clocks
+    /// [`vdp::Vdp::dma_68k_stall_mclk`] counts from it: "the time left until the last
+    /// of the transfer's access slots", which is an instant on the raster, not a
+    /// length of bus time.
+    ///
+    /// `vdp::Vdp::data_port_stall_mclk` is measured from the beam the same way and
+    /// belongs here too; it is still in [`Bus::pending_68k_stall`] for the golden
+    /// reason stated on [`Bus::vdp_data_write`].
+    ///
+    /// Kept apart from [`Bus::pending_68k_stall`] because the scheduler has to spend
+    /// the two the other way round - that one added to the chip's clock, this one as
+    /// the deadline `beam + hold` ([`crate::Scheduler::charge_hold`]). Summed with
+    /// the additive waits it is the #489 runaway: an unmoved beam reports the rest of
+    /// the same transfer again on every control write, and each reading of it is then
+    /// paid for twice.
+    ///
+    /// A maximum rather than a total for the same reason: two holds reported at one
+    /// beam position are two names for one instant, and the later one is the further
+    /// of the two. `0` is "nothing is holding it".
+    pending_68k_hold: u32,
+    /// The sound CPU's half of [`Bus::pending_68k_hold`]: the rest of a 68k -> VDP
+    /// transfer a window access has to wait out
+    /// ([`vdp::Vdp::dma_68k_stall_mclk`][vdp::Vdp::dma_68k_stall_mclk]), which is
+    /// beam-relative like the 68000's own hold and not the [`Z80_WINDOW_WAIT_MCLK`]
+    /// of the access itself. See [`Bus::z80_window_access`].
+    pending_z80_hold: u32,
     /// Bit 0 of [`TMSS_ROM_SELECT`]: 1 for the cartridge at 0x000000, 0 for the
     /// TMSS boot ROM. Stored and nothing more - this emulator ships no boot ROM, so
     /// the cart stays mapped whatever this says (see [`Bus::write_tmss_byte`]).
@@ -776,6 +805,8 @@ impl Bus {
             locked_up: false,
             pending_68k_stall: 0,
             pending_z80_stall: 0,
+            pending_68k_hold: 0,
+            pending_z80_hold: 0,
             // A TMSS console comes out of reset with its own boot ROM in front of the
             // cart (Genesis Plus GX's `gen_reset` maps `boot_rom` at 0x000000 again),
             // so the select bit starts at 0. The cart is what answers 0x000000 here
@@ -950,6 +981,25 @@ impl Bus {
         std::mem::take(&mut self.pending_z80_stall)
     }
 
+    /// Take how far in front of the beam the 68000 is being held by a 68k -> VDP
+    /// transfer, and clear it.
+    ///
+    /// The other kind of time the bus produces: [`Bus::pending_68k_hold`] is measured
+    /// from the beam, so the scheduler spends it as the deadline
+    /// `beam + mclk` ([`crate::Scheduler::charge_hold`]) and not as a duration. It is
+    /// asked for at the same place as [`Bus::take_68k_stall`], after every 68000 step
+    /// and before the VDP is walked to it, which is what keeps `beam` the position the
+    /// two VDP figures were counted from.
+    pub fn take_68k_hold(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_68k_hold)
+    }
+
+    /// Take the sound CPU's beam-relative hold, and clear it. The Z80 half of
+    /// [`Bus::take_68k_hold`].
+    pub fn take_z80_hold(&mut self) -> u32 {
+        std::mem::take(&mut self.pending_z80_hold)
+    }
+
     /// Hold the 68000 for `mclk` master clocks on top of the access being made.
     fn stall_68k(&mut self, mclk: u32) {
         self.pending_68k_stall = self.pending_68k_stall.saturating_add(mclk);
@@ -958,6 +1008,16 @@ impl Bus {
     /// Hold the sound CPU for `mclk` master clocks on top of the access being made.
     fn stall_z80(&mut self, mclk: u32) {
         self.pending_z80_stall = self.pending_z80_stall.saturating_add(mclk);
+    }
+
+    /// Hold the sound CPU until `mclk` master clocks in front of the beam, keeping the
+    /// further of that and any hold already recorded - a max, not a sum, because two
+    /// figures counted from one beam position are two names for one instant. The
+    /// 68000's own transfer freeze is recorded straight into
+    /// [`Bus::pending_68k_hold`] by [`Bus::vdp_control_write`], which holds the chip
+    /// for the whole of the transfer rather than for one access.
+    fn hold_z80(&mut self, mclk: u32) {
+        self.pending_z80_hold = self.pending_z80_hold.max(mclk);
     }
 
     /// One access by the sound CPU to the 68k address space through its bank
@@ -980,18 +1040,20 @@ impl Bus {
     /// the 68k is halted because it tried to read from the VDP while its FIFO is
     /// empty or write to the VDP while its FIFO is full it has to wait for that to
     /// complete first" - so a data-port stall holds the Z80 off the 68k bus too,
-    /// and `data_port_stall_mclk` is not added to the Z80's wait here. It is not
-    /// added because that figure is beam-relative, and charging a beam-relative
-    /// figure into a chip clock is the defect #489 is open on: adding it before
-    /// that lands would move the same bug into a second path. Filed separately
-    /// against #489's fix, not folded in here.
+    /// and `data_port_stall_mclk` is not added to the Z80's hold here. It was not
+    /// added while the two kinds of time were one number, because that figure is
+    /// beam-relative and charging it into a chip clock is the defect #489 was open
+    /// on. #489's split reduces it to the one line `hold_z80(...)`, and it is still
+    /// not folded in here: it is a timing change to every cart that writes the data
+    /// port while the sound CPU runs, and it wants a measurement of its own.
     ///
     /// Called from [`crate::z80_bus::Z80View`] for the window alone: the Z80's own
     /// RAM, the YM2612 and the PSG are on its side of the arbitration and cost it
     /// nothing extra.
     pub(crate) fn z80_window_access(&mut self) {
         let dma = self.vdp.dma_68k_stall_mclk();
-        self.stall_z80(Z80_WINDOW_WAIT_MCLK + dma);
+        self.stall_z80(Z80_WINDOW_WAIT_MCLK);
+        self.hold_z80(dma);
         self.stall_68k(Z80_WINDOW_STEAL_MCLK);
     }
 
@@ -1368,6 +1430,15 @@ impl Bus {
         let held = self.vdp.data_port_stall_mclk() != 0;
         self.vdp.write_data(value);
         if held {
+            // TODO(#489): `data_port_stall_mclk` is beam-relative like the transfer
+            // freeze - `vdp::fifo::Fifo::data_port_stall_mclk` is
+            // `mclk_to_slots(head_slots)`, master clocks counted *from the beam* - so
+            // by rights it belongs in `pending_68k_hold` next to the DMA. It stays an
+            // additive stall here because that is what the six `md_test_pack` palette
+            // goldens are calibrated on: charging the same wait as a deadline moves
+            // `960pal`, `512pal`, `shltest`, `shltest2`, `md1536` and `mdtrans`, and
+            // reblessing six goldens is a decision this change does not make. #517 is
+            // the ticket where the two are finally spent the same way.
             let stall = self.vdp.data_port_stall_mclk();
             self.stall_68k(stall);
         }
@@ -1402,16 +1473,20 @@ impl Bus {
             rom,
             ram,
             mapper,
-            pending_68k_stall,
+            pending_68k_hold,
             ..
         } = self;
         let mut source = VdpDmaSource { rom, ram, mapper };
         vdp.write_control(value);
         vdp.run_dma(&mut source);
         // The freeze the transfer just started, if it started one (#101 made the
-        // VDP report it, M3-16 #77 is the bus spending it).
-        let stall = vdp.dma_68k_stall_mclk();
-        *pending_68k_stall = pending_68k_stall.saturating_add(stall);
+        // VDP report it, M3-16 #77 is the bus spending it). A hold and not an
+        // additive wait, and maxed rather than summed: the figure is the transfer's
+        // end counted from the beam, so a control write that arrives while a transfer
+        // is running reports the same instant again, and summing it is what #489 found
+        // running the chip clocks away from the raster.
+        let held = vdp.dma_68k_stall_mclk();
+        *pending_68k_hold = (*pending_68k_hold).max(held);
     }
 
     /// One byte to the PSG, from the VDP's PSG port at `$C00011`.
@@ -2060,6 +2135,8 @@ impl m68k::Bus for Bus {
         // across a `RESET` would freeze a 68000 that `RESET` has just restarted.
         self.pending_68k_stall = 0;
         self.pending_z80_stall = 0;
+        self.pending_68k_hold = 0;
+        self.pending_z80_hold = 0;
         // The cart slot's `0xA130F1` goes back to 0 with the rest of the register
         // state, but the save itself and its dirty flag do not: `RESET` is not a
         // power cycle, and the battery is still holding those bytes. See
@@ -4722,11 +4799,14 @@ mod tests {
 
     // ---- Who pays for an access (M3-16, #77) --------------------------------
     //
-    // [`Bus::take_68k_stall`] and [`Bus::take_z80_stall`] are the whole of the
-    // bus's side of a wait: what the scheduler adds to a chip's clock without
-    // running it (`crate::Scheduler::charge_mclk`). These measure the time in the
-    // place it is decided; the scheduler's own tests (`crate::scheduler`) hold the
-    // two together on a running machine.
+    // [`Bus::take_68k_stall`] and [`Bus::take_z80_stall`] are the bus's side of an
+    // additive wait: what the scheduler adds to a chip's clock without running it
+    // (`crate::Scheduler::charge_mclk`). [`Bus::take_68k_hold`] and
+    // [`Bus::take_z80_hold`] are the other kind of time - a hold whose length is
+    // measured *from the beam*, which the scheduler spends as a deadline rather
+    // than as a duration (#489). These measure the time in the place it is
+    // decided; the scheduler's own tests (`crate::scheduler`) hold the two together
+    // on a running machine.
 
     /// The set-up of a 68k -> VDP transfer of `words` words from the 0xE00000
     /// block to VRAM 0, through the ports a game uses: R1 M1 allows DMA, R15 is
@@ -4894,12 +4974,57 @@ mod tests {
 
         let (_, second) = dma_cmd(0x0000);
         bus.write_word(0xC0_0004, second);
-        let stall = bus.take_68k_stall();
+        // The freeze is a hold, not an additive wait: it is the instant the last
+        // access slot of the transfer arrives, counted *from the beam*
+        // (`vdp::slots::Vdp::dma_mclk_to_slots`), and #489 is the ticket that says
+        // the scheduler cannot spend that as a duration.
+        assert_eq!(
+            bus.take_68k_stall(),
+            0,
+            "a freeze is not an additive per-access wait"
+        );
+        let stall = bus.take_68k_hold();
         assert!(stall > 0, "and the second freezes the 68000 for something");
         assert_eq!(
             stall,
             bus.vdp.dma_68k_stall_mclk(),
             "the VDP's own number, and charged once"
+        );
+    }
+
+    /// The freeze a 68k -> VDP transfer puts on the 68000 is one instant on the beam,
+    /// so a control write that arrives while the transfer is still running records the
+    /// same instant again rather than a second freeze on top of it. A cart's DMA loop
+    /// does make that write, and [`Bus::vdp_control_write`] reads the level on purpose
+    /// on *every* control write.
+    ///
+    /// Summed, the two records are the runaway of #489: the beam has not moved, so
+    /// the number is the whole of the transfer twice, and each control write in a
+    /// loop adds another whole transfer to a clock that is already ahead of the
+    /// raster. Maxed, they are the one deadline the transfer ends at.
+    #[test]
+    fn two_records_of_one_transfer_are_one_hold() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        set_reg(&mut bus, 1, 0x10);
+        set_reg(&mut bus, 15, 2);
+        for (reg, value) in [(19, 64), (20, 0), (21, 0), (22, 0), (23, 0x70)] {
+            set_reg(&mut bus, reg, value);
+        }
+        let (first, second) = dma_cmd(0x0000);
+        bus.write_word(0xC0_0004, first);
+        bus.write_word(0xC0_0004, second);
+        let held = bus.vdp.dma_68k_stall_mclk();
+        assert!(held > 0, "a transfer is running at an unmoved beam");
+
+        // A register write - not a command, so not a second transfer - made while
+        // the first is still running. The beam has not moved and neither has the
+        // end of the transfer.
+        set_reg(&mut bus, 1, 0x10);
+        assert_eq!(bus.take_68k_stall(), 0, "a register write adds no wait");
+        assert_eq!(
+            bus.take_68k_hold(),
+            held,
+            "two records of one transfer are the one instant it ends at, not twice its length"
         );
     }
 
@@ -4939,12 +5064,21 @@ mod tests {
         let dma = bus.vdp.dma_68k_stall_mclk();
         assert!(dma > 0, "and it is a transfer that takes time");
         bus.take_68k_stall();
+        bus.take_68k_hold();
 
         Z80View::new(&mut bus).read(0x8000);
+        // The two kinds of time the window costs the sound CPU come back apart:
+        // its own access, additive, and the rest of the 68000's transfer, which is
+        // an instant on the beam and therefore a hold (#489). Their sum is the
+        // figure this test used to ask the bus for in one number.
+        let wait = bus.take_z80_stall();
+        let held = bus.take_z80_hold();
+        assert_eq!(wait, Z80_WINDOW_WAIT_MCLK, "the access's own T-states");
+        assert_eq!(held, dma, "and the wait for the 68000's transfer");
         assert_eq!(
-            bus.take_z80_stall(),
+            wait + held,
             Z80_WINDOW_WAIT_MCLK + dma,
-            "the wait for the 68000's transfer on top of the access's own"
+            "both together are still what the window costs"
         );
     }
 
