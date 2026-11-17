@@ -219,6 +219,7 @@ impl<'a> Z80View<'a> {
 /// crate's own suites and its CP/M harness rely on reads answering [`OPEN_BUS`].
 impl Z80Bus for Z80View<'_> {
     fn read(&mut self, addr: u16) -> u8 {
+        crate::bus::scratch441::z80_note('r', crate::bus::scratch441::z80_pc_now(), addr, 0);
         match Region::decode(addr) {
             Region::Ram => self.sys.z80.ram[ram_index(addr)],
             // A read of the YM2612 reads its status, whatever the port was: the
@@ -239,6 +240,7 @@ impl Z80Bus for Z80View<'_> {
     }
 
     fn write(&mut self, addr: u16, value: u8) {
+        crate::bus::scratch441::z80_note('w', crate::bus::scratch441::z80_pc_now(), addr, value);
         match Region::decode(addr) {
             Region::Ram => self.sys.z80.ram[ram_index(addr)] = value,
             Region::Ym => self.sys.audio.ym_write(ym_port(addr), value),

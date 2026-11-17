@@ -1533,6 +1533,11 @@ impl Bus {
         if !self.z80_bus_granted() {
             return OPEN_BUS;
         }
+        let zi = z80_bus::ram_index(addr as u16);
+        if self.z80_bus_granted() {
+            let v = self.z80.ram[zi];
+            scratch441::z80_note('R', scratch441::pc_now(), zi as u16, v);
+        }
         match SoundSide::decode(addr) {
             SoundSide::Ram => self.z80.ram[z80_bus::ram_index(addr as u16)],
             // A read of the YM2612 is its status byte whichever port was used: the
@@ -1565,6 +1570,12 @@ impl Bus {
     /// way.
     fn write_z80_byte(&mut self, addr: u32, value: u8) {
         self.stall_68k(Z80_AREA_WAIT_MCLK);
+        let zi = z80_bus::ram_index(addr as u16);
+        if self.z80_bus_granted() {
+            scratch441::z80_note('W', scratch441::pc_now(), zi as u16, value);
+        } else {
+            scratch441::z80_write_dropped(scratch441::pc_now(), zi as u16);
+        }
         if !self.z80_bus_granted() {
             return;
         }
@@ -5258,10 +5269,18 @@ pub mod scratch441 {
         FRAME.with(|c| c.set(v));
     }
 
+    pub fn pc_now() -> u32 {
+        PC.with(|c| c.get())
+    }
+
     pub fn reset() {
         STATS.with(|s| s.borrow_mut().clear());
         LOG.with(|l| l.borrow_mut().clear());
         VHIST.with(|h| h.borrow_mut().clear());
+        ZHIST.with(|h| h.borrow_mut().clear());
+        ZLOG.with(|l| l.borrow_mut().clear());
+        DROPPED.with(|d| d.borrow_mut().clear());
+        ZSTEPS.with(|c| c.set(0));
     }
 
     fn watched(addr: u32) -> bool {
@@ -5343,6 +5362,130 @@ pub mod scratch441 {
                 "{op} addr={addr:08X} pc={pc:08X} n={} f{}..{} lastv={:08X} nonzero={}",
                 st.count, st.first_frame, st.last_frame, st.last_value, st.non_zero
             );
+        }
+    }
+
+    // ---- probe m: the Z80 side of the same question -------------------------
+    //
+    // op letters: 'r'/'w' are a Z80 read/write, 'R'/'W' a 68000 read/write of the
+    // Z80 area through 0xA00000 (the only way the sound driver gets loaded).
+
+    thread_local! {
+        static ZPC: Cell<u16> = const { Cell::new(0) };
+        static ZSTEPS: Cell<u64> = const { Cell::new(0) };
+        static ZHIST: RefCell<BTreeMap<(char, u32, u16), u64>> =
+            RefCell::new(BTreeMap::new());
+        static ZLOG: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        static DROPPED: RefCell<BTreeMap<(u32, u16), u64>> = RefCell::new(BTreeMap::new());
+    }
+
+    /// Called once per Z80 slice with the pc the instruction starts at, and counts
+    /// the slice: "is the chip being stepped at all, or is it pinned" is the question.
+    pub fn z80_step(pc: u16) {
+        if !ON.with(|c| c.get()) {
+            return;
+        }
+        ZPC.with(|c| c.set(pc));
+        ZSTEPS.with(|c| c.set(c.get() + 1));
+    }
+
+    thread_local! {
+        static ZW: Cell<u64> = const { Cell::new(0) };
+        static ZWHI: Cell<u16> = const { Cell::new(0) };
+        static ZWLO: Cell<u16> = const { Cell::new(0xFFFF) };
+    }
+
+    /// 68000 writes to sound RAM since the last call: count, and the address span.
+    pub fn z80_writes_take() -> (u64, u16, u16) {
+        ZW.with(|c| {
+            let n = c.get();
+            c.set(0);
+            let hi = ZWHI.with(|c| c.replace(0));
+            let lo = ZWLO.with(|c| c.replace(0xFFFF));
+            (n, lo, hi)
+        })
+    }
+
+    pub fn z80_pc_now() -> u32 {
+        u32::from(ZPC.with(|c| c.get()))
+    }
+
+    pub fn z80_steps_take() -> u64 {
+        ZSTEPS.with(|c| c.replace(0))
+    }
+
+    /// A Z80-side access to the low page `0x0000-0x000F`.
+    pub fn z80_note(op: char, pc: u32, addr: u16, value: u8) {
+        if !ON.with(|c| c.get()) {
+            return;
+        }
+        if op == 'W' {
+            ZW.with(|c| c.set(c.get() + 1));
+            ZWHI.with(|c| c.set(c.get().max(addr)));
+            ZWLO.with(|c| c.set(c.get().min(addr)));
+        }
+        if addr > 0x00FF {
+            return;
+        }
+        ZHIST.with(|h| {
+            *h.borrow_mut().entry((op, pc, addr)).or_insert(0) += 1;
+        });
+        if (op == 'w' || op == 'W') && addr <= 0x000F {
+            let line = format!(
+                "{} {op} Z{}={value:02X} pc={pc:08X}",
+                FRAME.with(|c| c.get()),
+                addr
+            );
+            ZLOG.with(|l| {
+                let mut l = l.borrow_mut();
+                if l.last().map(|s| s.as_str()) != Some(&line) {
+                    l.push(line);
+                }
+            });
+        }
+    }
+
+    /// A 68000 write to the Z80 area that was thrown away for want of a bus grant.
+    pub fn z80_write_dropped(pc: u32, addr: u16) {
+        if !ON.with(|c| c.get()) {
+            return;
+        }
+        DROPPED.with(|d| {
+            *d.borrow_mut().entry((pc, addr)).or_insert(0) += 1;
+        });
+    }
+
+    pub fn z80_dump() {
+        println!("---- scratch441 m: Z80 low-page access histogram ----");
+        let mut rows: Vec<((char, u32, u16), u64)> =
+            ZHIST.with(|h| h.borrow().clone().into_iter().collect());
+        rows.sort_by_key(|(k, n)| (k.0, std::cmp::Reverse(*n)));
+        let mut per_op = [0_u32; 4];
+        for ((op, pc, addr), n) in rows {
+            let slot = match op {
+                'r' => 0,
+                'w' => 1,
+                'R' => 2,
+                _ => 3,
+            };
+            if per_op[slot] >= 14 {
+                continue;
+            }
+            per_op[slot] += 1;
+            println!("{op} Z{addr:04X} n={n} pc={pc:08X}");
+        }
+        println!("---- scratch441 m: Z80 low-page write log ----");
+        ZLOG.with(|l| {
+            for line in l.borrow().iter() {
+                println!("{line}");
+            }
+        });
+        println!("---- scratch441 m: 68k writes to the Z80 area DROPPED (no grant) ----");
+        let mut rows: Vec<((u32, u16), u64)> =
+            DROPPED.with(|d| d.borrow().clone().into_iter().collect());
+        rows.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for ((pc, addr), n) in rows {
+            println!("dropped W A{:06X} n={n} pc={pc:08X}", u32::from(addr) + 0xA0_0000);
         }
     }
 }

@@ -545,6 +545,7 @@ impl Scheduler {
 /// away again, which is what [`Z80View`] is for - the bank register and the sound RAM
 /// live on the bus, so nothing outlives the instruction (see [`crate::z80_bus`]).
 fn step_z80(z80: &mut Z80, bus: &mut Bus) -> u32 {
+    crate::bus::scratch441::z80_step(z80.pc());
     let mut view = Z80View::new(bus);
     z80.step(&mut view)
 }
