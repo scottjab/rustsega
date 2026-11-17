@@ -24,7 +24,7 @@ instruction S&K is down to 12, of which one is scratch nothing reads.
 |---|---|
 | `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin`. `--stop-at-pc` names an instruction instead of a frame |
 | `run-ours.sh` | Run the same cart in rustsega with no input, save work RAM at the same frames -> `rNNNNN.bin`. Takes the same `--stop-at-pc` |
-| `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test. `--selftest` is in `just check` |
+| `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test, and `--meter`, which reads a cart's own parked progress counters as a cycle meter (#530). `--selftest` is in `just check` |
 | `terminal-standin.py` | The `x-terminal-emulator` blastem's `-d` wants and NixOS has not got; makes the debugger a pipe |
 | `bin/x-terminal-emulator` | The shim `run-ref.sh` puts on `PATH` so blastem finds the stand-in |
 | `common.sh` | The shared default output directory and frame-list handling |
@@ -42,6 +42,7 @@ ROM="$RUSTSEGA_ROM_DIR/Sonic & Knuckles (World).md"
 scripts/ref/run-ref.sh   "$ROM" 595-605               # ~12 s; blastem is the slow half
 scripts/ref/run-ours.sh  "$ROM" 595-605               # ~1 s
 python3 scripts/ref/compare.py "target/ref/Sonic_&_Knuckles_(World)" 595-605
+python3 scripts/ref/compare.py "target/ref/Sonic_&_Knuckles_(World)/anchor" 47-51 --anchor 0x584 --meter
 ```
 
 Frames are given the same way to all three: separate numbers or `A-B` ranges
@@ -113,6 +114,91 @@ a directory and a frame list. `compare.py --anchor ADDRESS` changes no arithmeti
 names the comparison point in the report, and at an anchor a non-zero measured shift
 means something it did not mean before - the two machines have taken that interrupt a
 different number of times by there, which is a finding rather than a nuisance.
+
+## Reading a cycle meter: `--meter` (#530)
+
+Some carts park a 68000 register set in work RAM from inside their own vertical
+interrupt, and two of the parked registers are pointers that only move forwards
+while the cart is working. `Sonic & Knuckles (World)` decompresses art in the
+background and saves the decoder's registers at `$FFFF10-$FFFF37` every time the
+V-Int preempts it (#529). `$FFFF2C` is its ROM input cursor and `$FFFF30` its
+work-RAM output cursor, so those two longs say exactly how far the 68000 got
+between two vertical interrupts, on a machine you are not instrumenting:
+
+```sh
+scripts/ref/compare.py "target/ref/Sonic_&_Knuckles_(World)/anchor" 47-51 --anchor 0x584 --meter
+```
+
+```
+meter 0xFFFF30    lead = ours - ref, signed
+   frame         ref        ours        lead   per frame
+      47   FFFF4E19   FFFF4E47         +46          -
+      48   FFFF55EB   FFFF5624         +57        +11
+      49   FFFF5CCD   FFFF5D31        +100        +43
+      50   FFFF645F   FFFF6503        +164        +64
+      51   FFFF6BF5   FFFF6CA8        +179        +15
+  run 47..51: lead +133 over 4 frame(s) = +33.2 per frame
+  ours ahead in 4 measured step(s) of 4, behind in 0, level in 0; per-frame lead +33.2
+
+RESULT: disagree - 0xFFFF30 leads +46..+179, +33.2 per frame (ours ahead)
+```
+
+That is one of the measurements behind #530: our 68000 got through 33 more bytes of
+the stream per frame than the reference's in that leg, and the same sign comes back
+from every window where the decoder is running (arrivals 46-51, 226-258 and 440-474,
+20-odd measured steps in all). The three things the tool does that reading the two
+longs out of the dumps by hand does not:
+
+- **The sign is the finding.** A count of differing addresses cannot say which
+  machine did more work. `lead` is `ours - ref`, so positive is us ahead and
+  negative is the reference ahead, and a stretch that is level in every step is two
+  machines that are not running at different speeds.
+- **A frame that is not comparable is labelled, not averaged.** Every load of the
+  stream starts from the same pointers on both machines and ends when the stream is
+  out, so a step is only a rate while both machines are inside the same load. Each
+  step gets one of four labels and only `measured` ones carry the slope:
+
+  | label | what happened | why it is not a rate |
+  |---|---|---|
+  | `restart` | a cursor went backwards, or was 0 | the lead is now a different stretch of art: thousands of bytes, all of it spurious |
+  | `stopped` | one machine's cursor moved and the other's did not | one of them finished the load; the lead changes by the whole advance of the one still running |
+  | `idle` | neither cursor moved | no decode is running, so the parked table is dead state |
+  | `measured` | both cursors moved | this is the frame-per-frame comparison |
+
+  All three exclusions are load-bearing. On arrivals 440-480 one `stopped` step is
+  -694 bytes on its own, and counting it as a frame turned a window in which we are
+  ahead into a report that said the reference was.
+- **It divides by frames, not samples.** `per frame` is the change in lead over the
+  arrivals a run spans, so a window sampled every tenth arrival reports the same
+  slope as the same work dumped every frame. Frame numbers are arrivals at a
+  `--stop-at-pc` anchor, which is what makes their difference a frame count; the
+  anchor is what makes them comparable at all.
+
+Because of that last point `--meter` aligns with the same sweep the byte comparison
+uses and reads our images at the shift it found. Our cursor read one arrival late is
+a frame's worth of work, and a frame's worth of work looks exactly like the cycle
+gap this tool is for. `--sweep 0` skips the sweep and reads at `+0`.
+
+`--meter` takes the addresses to read (`--meter 0xFFFF2C,0xFFFF30`); a bare
+`--meter` is those two, which are S&K's. It reads big-endian longs, the size the
+`MOVEM.L` that parks them writes. It does not diff the rest of the image: pass
+`--meter` for the cursors and leave it off for the byte comparison.
+
+Three things it is not:
+
+- **Not a cycle counter.** The units are cursor bytes. To get cycles you need how
+  many cycles this decoder spends per output byte, which is a property of the
+  decoder's opcode mix and is worth getting from a cycle table, not from this
+  tool. The ratio only has to be the same on both machines for a *comparison* to be
+  meaningful, which is why the tool reports a slope and lets you do the arithmetic.
+- **Not a measurement of a cart that parks nothing.** If every address reads 0 in
+  every frame the tool says so and exits 2: two machines agreeing about an address
+  no program has written is not agreement, it is a probe in mid-air. Find another
+  cart's cursor by reading the parked register set out of one work-RAM dump and
+  looking for a long that only ever grows.
+- **Not a second reference.** Same rule as the rest of this directory: it says the
+  two machines disagree about 68000 time per frame, and about which of them is
+  wrong it is silent (#530's own caveat).
 
 ## What it says
 
@@ -249,7 +335,14 @@ It builds a canned pair of images that agree, a one-byte mutation of one frame, 
 mutation of the same address in every frame, a pair aligned only at a one-frame
 offset, an anchored pair with a byte planted in every frame, an anchored pair that is
 one arrival out of step, a truncated dump and a half-present frame, and asserts the
-report distinguishes all of them. The two anchored ones are the pair that keeps
+report distinguishes all of them. Then the meter's own set: canned cursors that
+match, one planted in our favour growing at a known rate (it must report that rate,
+signed), the same planted the other way (it must go negative), one where the load
+restarts halfway through the window (it must split the window rather than average
+across the restart, which would report the same number with the wrong sign), one
+sampled every tenth arrival (it must divide by the frames it spanned), an unwritten
+cursor (exit 2, not `agree`), and a cursor one arrival behind (alignment, not a
+lead). The two anchored ones are the pair that keeps
 `--stop-at-pc` honest: an anchor that quietly stopped reporting differences would be
 worse than the frame loop it replaced, and an anchor that reported a one-arrival
 offset as a divergence would be re-manufacturing #526. It is what stops a refactor of `compare.py` turning the
