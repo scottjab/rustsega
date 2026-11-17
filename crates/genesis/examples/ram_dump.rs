@@ -37,7 +37,23 @@ struct Args {
     out: PathBuf,
     region: RegionSetting,
     tmss: bool,
+    /// Stop at this address instead of at the end of a frame: see [`USAGE`].
+    stop_at_pc: Option<u32>,
 }
+
+/// The longest a frame can be, in scanlines: a PAL raster. It bounds one leg of
+/// [`genesis::Genesis::run_until_pc`] below, and [`genesis::Scheduler`] is what
+/// says 313 is the most any region's raster holds.
+const LINES_PER_FRAME: u32 = 313;
+
+/// How many frames of slack each leg gets on top of the frames still to run.
+///
+/// A cart can be a long time getting to its own vertical interrupt: `Golden Axe
+/// II (World)` first reaches the handler of the long at `$78` around frame 56,
+/// and one that waits for a RAM test could wait longer. The slack is not free - a
+/// mistyped address costs this many frames of emulation before it is reported -
+/// and it is cheap, because only the leg that fails pays for it.
+const FIRST_ARRIVAL_SLACK: u32 = 600;
 
 fn main() {
     let args = match parse(std::env::args().skip(1)) {
@@ -69,8 +85,28 @@ fn main() {
         Ok(machine) => machine,
         Err(e) => fail(&format!("cannot load {}: {e}", args.rom.display())),
     };
-    for _ in 0..args.frames {
-        machine.run_frame();
+    // Two ways to reach the named frame. Without `--stop-at-pc` it is the frame
+    // loop the whole emulator is driven by. With it, a frame is one arrival at an
+    // address the cart reaches once a frame - its vertical-blank entry - which is
+    // the same point in the instruction stream on any machine, and is what #526
+    // needs the reference and us to agree on.
+    //
+    // The budget of each leg is the whole run: a cart that enables its VBlank
+    // interrupt late should still get to its first arrival, and an address that is
+    // never reached should cost one run before it is reported rather than hang.
+    if let Some(pc) = args.stop_at_pc {
+        let budget = (args.frames + FIRST_ARRIVAL_SLACK) * LINES_PER_FRAME;
+        for arrival in 1..=args.frames {
+            if !machine.run_until_pc(pc, budget) {
+                fail(&format!(
+                    "arrival {arrival} of {pc:#08X} never happened inside {budget} scanlines"
+                ));
+            }
+        }
+    } else {
+        for _ in 0..args.frames {
+            machine.run_frame();
+        }
     }
 
     let ram: &[u8] = &machine.bus().ram[..];
@@ -78,9 +114,13 @@ fn main() {
         fail(&format!("cannot write {}: {e}", args.out.display()));
     }
     println!(
-        "region={} frames={} ram={:?} bytes={}",
+        "region={} frames={} {}ram={:?} bytes={}",
         region.map(Region::name).unwrap_or("unknown"),
         args.frames,
+        match args.stop_at_pc {
+            Some(pc) => format!("stop={pc:#08X} "),
+            None => String::new(),
+        },
         args.out,
         ram.len()
     );
@@ -88,11 +128,19 @@ fn main() {
 
 const USAGE: &str = "\
 usage: ram_dump <ROM> --frames N --out PATH [--region auto|usa|japan|europe] [--tmss]
+                 [--stop-at-pc ADDRESS]
 
 Run <ROM> for N frames with no input and write its 64 KiB of 68000 work RAM
 (0xFF0000-0xFFFFFF) to PATH. --region forces a region instead of reading the
 cartridge header; --tmss starts with the security check enabled. Prints
-`region=... frames=... ram=... bytes=...`.";
+`region=... frames=... ram=... bytes=...`.
+
+--stop-at-pc makes a frame an arrival at ADDRESS instead of a whole raster: the
+run ends, and the RAM is written, the Nth time the 68000 is about to execute
+there. Give it an address the cart reaches once a frame - the entry of its
+vertical-blank routine, which the long at $78 of the cartridge points at - so
+that two emulators can be dumped at the same moment rather than at whatever
+their own frame loops happen to end on (#526).";
 
 /// Parse the command line. Hand-rolled, and deliberately so: this is four
 /// options, `clap` is not a dependency of this crate, and an example is not a
@@ -105,6 +153,7 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
     let mut out: Option<PathBuf> = None;
     let mut region = RegionSetting::Auto;
     let mut tmss = false;
+    let mut stop_at_pc: Option<u32> = None;
 
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -134,6 +183,14 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
                 };
             }
             "--tmss" => tmss = true,
+            "--stop-at-pc" => {
+                let value = argv.next().ok_or("--stop-at-pc wants an address")?;
+                let digits = value.strip_prefix("0x").unwrap_or(&value);
+                stop_at_pc = Some(
+                    u32::from_str_radix(digits, 16)
+                        .map_err(|_| format!("{value:?} is not a hex address"))?,
+                );
+            }
             other if other.starts_with("--") => return Err(format!("unknown option {other:?}")),
             other => {
                 if let Some(first) = &rom {
@@ -151,6 +208,7 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
         out: out.ok_or("no --out PATH: say where the RAM image goes")?,
         region,
         tmss,
+        stop_at_pc,
     })
 }
 
