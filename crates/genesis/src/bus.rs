@@ -1270,13 +1270,29 @@ impl Bus {
 
     /// Work RAM word read, big endian (M68000UM, "Data Organization").
     ///
-    /// Masking with [`RAM_MASK`] keeps the parity of the address, so an even
-    /// `addr` always lands on an even index and the second byte is inside the
-    /// array: the highest word the window can address is 0xFFFFFE. An odd
-    /// address here is a caller bug and panics on the index.
+    /// A word access is its two byte accesses, each decoded on its own through
+    /// [`Bus::ram_index`], exactly as [`Bus::read_rom_word`] does for the cartridge
+    /// slot. So the word at 0xFFFFFF is the byte at 0xFFFF and the byte at
+    /// 0x1000000 - and only the low 16 bits name a byte behind this window, which
+    /// makes the second one the byte at 0. Masking per half is what keeps the read
+    /// total: before #488 the `self.ram[index + 1]` walked off the array and panicked
+    /// the host.
+    ///
+    /// An address-error exception frame is how the bus comes to be asked at all.
+    /// A 68000 *data* word access at an odd address never reaches it - M68000UM
+    /// section 6.3.5 "Address Error" raises the exception instead of starting the
+    /// cycle, and `crates/m68k` models that in `M68k::alignment_fault` - but the
+    /// CPU's own exception traffic uses the unchecked `_raw` accessors, because the
+    /// frame write has to land wherever the stack points
+    /// (`crates/m68k/src/address_error.rs`).
+    /// Masking the address down to the aligned pair instead, on the grounds that the
+    /// RAM chips do not see A0, is the other defensible reading and would break both
+    /// this invariant and [`Bus::read_ram_byte`]'s agreement with it; it is not what
+    /// this bus does anywhere else.
     fn read_ram_word(&mut self, addr: u32) -> u16 {
-        let index = Self::ram_index(addr);
-        u16::from_be_bytes([self.ram[index], self.ram[index + 1]])
+        let high = self.read_ram_byte(addr);
+        let low = self.read_ram_byte(addr + 1);
+        u16::from_be_bytes([high, low])
     }
 
     /// Work RAM byte write.
@@ -1284,10 +1300,13 @@ impl Bus {
         self.ram[Self::ram_index(addr)] = value;
     }
 
-    /// Work RAM word write, big endian, at an even `addr`.
+    /// Work RAM word write, big endian: the two halves of `value` to `addr` and
+    /// `addr + 1`, each decoded by [`Bus::write_ram_byte`] for the reason
+    /// [`Bus::read_ram_word`] gives - including the wrap of the second half over the
+    /// top of the 64 KiB mirror (#488).
     fn write_ram_word(&mut self, addr: u32, value: u16) {
-        let index = Self::ram_index(addr);
-        self.ram[index..index + 2].copy_from_slice(&value.to_be_bytes());
+        self.write_ram_byte(addr, (value >> 8) as u8);
+        self.write_ram_byte(addr + 1, value as u8);
     }
 
     /// VDP port byte read: the lane of [`Bus::read_vdp_word`] that `addr` sits on.
@@ -2224,7 +2243,8 @@ mod tests {
         assert_eq!(bus.read_byte(RAM_START + 2), 0x12);
         assert_eq!(bus.read_byte(RAM_START + 3), 0x34);
 
-        // 0xFFFFFF is odd, so 0xFFFFFE is the last legal word of the window.
+        // 0xFFFFFE is the highest word-aligned address of the window. The odd 0xFFFF
+        // is a word too and its second byte wraps, which #488 pins below.
         bus.write_word(RAM_END - 1, 0xBEEF);
         assert_eq!(bus.read_word(RAM_END - 1), 0xBEEF);
         assert_eq!(&bus.ram[0xFFFE..], &[0xBE, 0xEF]);
@@ -2242,6 +2262,70 @@ mod tests {
         bus.write_word(0xE10020, 0xCAFE);
         assert_eq!(bus.read_word(0xF90020), 0xCAFE);
         assert_eq!(bus.read_byte(0xE90021), 0xFE);
+    }
+
+    /// A word access at an odd address is its two byte accesses, so the half of it
+    /// that falls past the top of the 64 KiB mirror continues at the bottom of the
+    /// mirror (#488).
+    ///
+    /// The access is reachable, and was a host panic: `crates/m68k` writes
+    /// exception frames with the unchecked `_raw` accessors precisely because the
+    /// stack pointer is what it is (see `crates/m68k/src/address_error.rs`, "the
+    /// exception path must never fault-check its own accesses"), so an
+    /// address-error frame on a cart whose SP is odd asks the bus for the word at
+    /// `0xFFFFFF`. `Star Odyssey (USA) (Super Fighter Team)` does exactly that, and
+    /// the old `ram[index..index + 2]` died with `range end index 65537 out of
+    /// range for slice of length 65536`.
+    #[test]
+    fn ram_word_write_straddling_the_top_of_the_mirror_wraps() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+
+        bus.write_word(RAM_END, 0xBEEF);
+        assert_eq!(bus.ram[0xFFFF], 0xBE);
+        assert_eq!(
+            bus.ram[0], 0xEF,
+            "the second byte is the byte at 0x1000000, and only the low 16 bits name a byte"
+        );
+        assert_eq!(bus.read_word(RAM_END), 0xBEEF);
+
+        // The same two bytes through the window's own mirrors.
+        assert_eq!(bus.read_byte(0xE0_FFFF), 0xBE);
+        assert_eq!(bus.read_byte(0xE1_0000), 0xEF);
+    }
+
+    /// The read side of [#488]: `read_ram_word` has the same shape one line above
+    /// [`Bus::write_ram_word`], so it walks off the array the same way.
+    #[test]
+    fn ram_word_read_straddling_the_top_of_the_mirror_wraps() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        bus.ram[0xFFFF] = 0xCA;
+        bus.ram[0] = 0xFE;
+
+        assert_eq!(bus.read_word(RAM_END), 0xCAFE);
+        assert_eq!(bus.read_word(0xE1_FFFF), 0xCAFE);
+
+        // A word is its two bytes, even across the wrap. The second byte's address,
+        // 0x1000000, masks to 0x000000 and so decodes as the cartridge slot; the
+        // mirror at 0xE10000 is the same byte inside the work-RAM window.
+        assert_eq!(
+            bus.read_word(RAM_END),
+            (u16::from(bus.read_byte(0xE0_FFFF)) << 8) | u16::from(bus.read_byte(0xE1_0000))
+        );
+    }
+
+    /// Away from the top of the mirror the same rule puts the two halves of an odd
+    /// word write in the two bytes the address names - what `ram[3..5]` did before
+    /// #488 as well, pinned so that the wrap above cannot be reached by shifting
+    /// every odd write down to the aligned pair instead.
+    #[test]
+    fn ram_word_access_at_an_odd_address_is_its_two_byte_accesses() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+
+        bus.write_word(RAM_START + 3, 0x1234);
+        assert_eq!(&bus.ram[3..5], &[0x12, 0x34]);
+        assert_eq!(bus.read_word(RAM_START + 3), 0x1234);
+        assert_eq!(bus.read_byte(RAM_START + 3), 0x12);
+        assert_eq!(bus.read_byte(RAM_START + 4), 0x34);
     }
 
     #[test]

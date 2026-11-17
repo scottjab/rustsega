@@ -14,8 +14,15 @@ pub const ADDR_MASK: u32 = 0x00FF_FFFF;
 /// Memory and I/O as seen by the 68000.
 ///
 /// All addresses are physical, already masked to 24 bits by the CPU. Words are
-/// big endian and, on real hardware, always even; the CPU guarantees even word
-/// addresses so implementors can index directly.
+/// big endian and, on real hardware, even: the checked accessors of
+/// [`crate::cpu::M68k`] raise the address error instead of starting the cycle
+/// (M68000UM section 6.3.5 "Address Error").
+///
+/// That is not something an implementor may index on, though. Exception entry
+/// writes its frame with the unchecked accessors, because the stack pointer is
+/// what it points at (`crate::address_error`), so a word access can arrive at an
+/// odd address and a mirrored region has to decode its two bytes separately -
+/// which is what #488 had to teach the Genesis bus to do.
 pub trait Bus {
     /// Read the byte at `addr` (A0 = 1 on real hardware).
     fn read_byte(&mut self, addr: u32) -> u8;
