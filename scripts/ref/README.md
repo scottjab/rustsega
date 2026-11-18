@@ -22,16 +22,18 @@ instruction S&K is down to 12, of which one is scratch nothing reads.
 
 | File | What it does |
 |---|---|
-| `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin`. `--stop-at-pc` names an instruction instead of a frame |
-| `run-ours.sh` | Run the same cart in rustsega with no input, save work RAM at the same frames -> `rNNNNN.bin`. Takes the same `--stop-at-pc` |
-| `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test, and `--meter`, which reads a cart's own parked progress counters as a cycle meter (#530). `--selftest` is in `just check` |
+| `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin`. `--stop-at-pc` names an instruction instead of a frame; `--vdp` saves the VDP's VRAM and CRAM instead -> `bvNNNNN.bin`, `bcNNNNN.bin` |
+| `run-ours.sh` | Run the same cart in rustsega with no input, save work RAM at the same frames -> `rNNNNN.bin`. Takes the same `--stop-at-pc` and `--vdp` (`rvNNNNN.bin`, `rcNNNNN.bin`) |
+| `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test, `--vdp` for the VDP's two memories (#534), and `--meter`, which reads a cart's own parked progress counters as a cycle meter (#530). `--selftest` is in `just check` |
 | `terminal-standin.py` | The `x-terminal-emulator` blastem's `-d` wants and NixOS has not got; makes the debugger a pipe |
 | `bin/x-terminal-emulator` | The shim `run-ref.sh` puts on `PATH` so blastem finds the stand-in |
 | `common.sh` | The shared default output directory and frame-list handling |
 
 Both dumpers write a raw 64 KiB image of `$FF0000-$FFFFFF` per frame - all of work
 RAM, no header, no address, no length - which is what makes the comparison a byte
-comparison. Frame `N` means **the state after N frames** on both sides.
+comparison. Frame `N` means **the state after N frames** on both sides. With
+`--vdp` they write the VDP's memories in the same shape: `v` images are the 64 KiB
+of VRAM and `c` images are the 64 colour words of CRAM as 128 raw bytes.
 
 ## The commands
 
@@ -43,6 +45,11 @@ scripts/ref/run-ref.sh   "$ROM" 595-605               # ~12 s; blastem is the sl
 scripts/ref/run-ours.sh  "$ROM" 595-605               # ~1 s
 python3 scripts/ref/compare.py "target/ref/Sonic_&_Knuckles_(World)" 595-605
 python3 scripts/ref/compare.py "target/ref/Sonic_&_Knuckles_(World)/anchor" 47-51 --anchor 0x584 --meter
+
+# the VDP's own memories instead of work RAM (#534): same frames, same directory
+scripts/ref/run-ref.sh  --vdp "$ROM" 595-605
+scripts/ref/run-ours.sh --vdp "$ROM" 595-605
+python3 scripts/ref/compare.py "target/ref/Sonic_&_Knuckles_(World)" 595-605 --vdp
 ```
 
 Frames are given the same way to all three: separate numbers or `A-B` ranges
@@ -114,6 +121,106 @@ a directory and a frame list. `compare.py --anchor ADDRESS` changes no arithmeti
 names the comparison point in the report, and at an anchor a non-zero measured shift
 means something it did not mean before - the two machines have taken that interrupt a
 different number of times by there, which is a finding rather than a nuisance.
+
+## `--vdp`: the VDP's own memories (#534)
+
+Work RAM cannot finish [#404](https://github.com/scottjab/rustsega/issues/404). Its
+surviving hypotheses are a wrong-but-present tile index, a scroll mis-coupling and a
+wrong palette line, and all three produce VDP state that is self-consistent, so
+nothing internal can separate them from correct emulation. What answers them is the
+VDP's VRAM and CRAM from both machines at one named frame.
+
+It needs no patch to the reference, and nothing from the reference's source. Blastem
+1.0.0 already registers the VDP's memories as **arrays in a debugger namespace**,
+and `save` takes arrays:
+
+```text
+> print size(vdp:vram)         65536
+> print size(vdp:cram)         64
+> save "v00600.bin" vdp:vram          65536 bytes, byte addressed like the chip
+> save/w "c00600.bin" vdp:cram        128 bytes: 64 colour words, low byte first
+```
+
+The separator is `:`. The VDP is a second debug context hanging off the 68000 one as
+`other_roots["vdp"]`, so `vram` on its own is not defined, and `.` is the element
+size suffix (`.b`, `.w`, `.l`) rather than a qualifier, which is why `vdp.vram` reads
+back as `Failed to eval vdp.v`.
+
+### Route 1, the whole table
+
+#525 wrote that `vram`, `vram_get` and `cram_get` "are not registered debugger
+expressions, so `save` cannot reach them", and #534 asked for that to be checked
+rather than repeated. This is what a stock `pkgs.blastem` 1.0.0 answers, so nobody
+runs the dead ends again.
+
+| tried | answered |
+|---|---|
+| `help` | the full command list; nothing in it dumps a memory that is not in the 68000 address space |
+| `symbols` | nothing: no symbol file is loaded, and symbols are 68000 addresses anyway |
+| `print vram`, `cram`, `vsram`, `vdp`, `reg` | `Failed to eval ...` |
+| `print vram_get(0)`, `cram_get(0)`, `vsram_get(0)`, `debug_vram_get(0)`, `debug_cram_get(0)`, `vdp_get_vram(0)`, `get_vram(0)`, `read_vram(0)` | `Failed to eval ...` - so #525's claim is right about the *names* |
+| `print vram[0]`, `cram[0]`, `vsram[0]`, `reg[0]` | `Failed to eval ...`: the arrays exist, but not in the 68000 context |
+| `print vdp.vram` | `Failed to eval vdp.v` - `.` is a size suffix, and `.vram` never reaches the parser as a name |
+| `print vdp:vram[0]`, `vdp:cram[0]`, `vdp:reg[0]` | **works.** `0`, `0`, `4`: VRAM and CRAM at zero, register 0 |
+| `print size(vdp:vram)` / `vdp:cram` / `vdp:vsram` / `vdp:reg` | **works.** 65536, 64, 40, 24 |
+| `save "v.bin" vdp:vram` | **works. 65536 bytes of VRAM**, byte addressed, no header |
+| `save "c.bin" vdp:cram` | 64 bytes: every colour narrowed to its low byte. `save/w` gives the 128 |
+| `print [0x100000]`, `[0xC0000000]`, `[0xC0000004]`, `[0xC0000006]` | the **68000** address space, masked to 24 bits: `[0xC0000006] == [0x6]` is S&K's reset PC and `[0xC0000000] == [0x0] == [0x100000]` is its reset SP. The VDP ports sit above the mask, so neither its memories nor its ports are reachable this way |
+| `set [0xC0000006] 0` | accepted silently, and it is a write to the ROM mirror. Not a VDP control-port write |
+| `set [0x3000].w 0xBEEF` | not written: the cart image is read-only, so a 68000 routine cannot be injected to copy VRAM out through the data port |
+| `print PC`, `set PC 0xFF8200` | PC reads; `set PC` does nothing. There is no way to redirect the 68000 into such a routine either |
+| `vdpregs`, `vdpsprites` | work, and are the only VDP state the debugger will print: the registers (with DMA, counters, status) and the 80-entry sprite table, as text |
+| `vdpsregs`, `dump`, `palette`, `mem`, `regions`, `call`, `ext`, `gdb`, `genesis`, `sregs`, `vdp` | `... is not a recognized command` (`vdp` only as an ambiguous prefix of `vdpregbreak`/`vdpregs`/`vdpsprites`) |
+| `binddown "ui.vram_debug"`, `ui.cram_debug` | those UI actions exist in the binary; a VRAM *window* is not a dump, and #525 already found the screenshot path unreachable from `binddown` |
+| `while (i < 3)`, `if`, `command BREAKPOINT` | they exist, but `{` and `}` on their own lines come back as `... is not a recognized command`, and a block holds only the commands above, none of which reach VDP memory |
+| `save "x.bin" 0xFF0000 65536` | `Argument 0xFF0000 did not evaluate to an array`: the address has to be `[0xFF0000]` |
+| `array a 1 2 3 4` then `save "x.bin" a 4` | writes `01 02 03 04`. `save` takes debugger arrays, which is the half of the trick `vdp:vram` needs |
+| `save/2 ...` | `Invalid size 2`; the size letters are `b`, `w`, `l` |
+
+The two things that made it work were `:` for the namespace and `save` taking an
+array. The first was found by reading blastem's error text (`%s is not a valid
+namespace`) and the second by reading its `save` help (`from the array or memory
+region specified by ARRAY`), which is the kind of thing this table is here to
+remember.
+
+### What the two sides write
+
+`run-ours.sh --vdp` writes the same two images out of our own chip: `Bus::vdp.vram`
+is already the 64 KiB byte-addressed image and `Bus::vdp.cram` is the 64 words, so
+the example narrows nothing and reconstructs nothing - it is the state the VDP was
+asked to hold, not a picture of it.
+
+`bcNNNNN.bin`/`rcNNNNN.bin` are therefore 128 bytes, and `compare.py` reads them as
+64 words and calls a difference a *colour* rather than two bytes:
+
+```sh
+scripts/ref/run-ref.sh  --vdp "$ROM" 595-605
+scripts/ref/run-ours.sh --vdp "$ROM" 595-605
+python3 scripts/ref/compare.py "target/ref/Sonic_&_Knuckles_(World)" 595-605 --vdp
+```
+
+The alignment sweep runs on VRAM and both memories are compared at the shift it
+found: CRAM is 128 B of mostly-still colour, which is nowhere near enough for a
+minimum of its own to mean anything, and a CRAM read at a different frame from the
+VRAM beside it would be a different moment.
+
+Both images have to be there. A directory with VRAM but no CRAM exits 2 saying so
+rather than reporting agreement about the half it had, and so does a CRAM image of
+64 bytes, which is what `save` without `/w` writes.
+
+### What it said first
+
+`Sonic & Knuckles (World)`, no input, frames 595-604 reference numbering, end of
+frame, measured 2026-11-17:
+
+- **CRAM agrees.** 0 of 64 colours differ in any of the 10 frames compared.
+- **VRAM differs by 1536 bytes in every one of them**, one contiguous block from
+  `$001640` to `$001C3F`, where the reference holds tile data and ours reads 0. Mean
+  1568.0 of 65536 bytes per frame, shift +1 measured, and another 32-52 addresses
+  around `$00F800` differing at frame phase rather than persistently.
+- First difference: VRAM `$001640`, `ref=11 ours=00`.
+
+That is the number #534 was for. What it means is #404's business, not this file's.
 
 ## Reading a cycle meter: `--meter` (#530)
 
@@ -327,12 +434,11 @@ Two caveats about the sweep, both paid for:
   parsed as an expression, and the address must be the memory form `[0xFF0000]`, not
   `0xFF0000`. It takes at most three arguments. Filenames are relative to the
   working directory, which `run-ref.sh` sets to the output directory.
-- **Work RAM only, today.** VRAM, CRAM and the cartridge are not reachable as
-  debugger expressions (`vram`, `vram_get(0)`, `cram_get(0)`, `debug_vram_get(0)`,
-  `[0x100000]` all fail; `[0x100000]` reads zeros). Exposing blastem's own
-  `debug_vram_get`/`debug_cram_get` as expressions is on the order of 20-40 lines of
-  C in one of its files and is the patch worth doing if #404 needs it - a separate
-  change from this harness, and this directory stays unpatched until then.
+- **Work RAM is what it reached first.** VRAM and CRAM are reachable now, but not
+  by the route #525 tried: see
+  [`--vdp`: the VDP's own memories](#vdp-the-vdps-own-memories-534) for the one
+  spelling that works and the handful that look like they should. The cartridge and
+  the Z80's own memory are still not dumpable.
 - **Neither side drives input yet.** Both dumps are no-input runs. blastem's
   debugger can press buttons (`binddown "gamepads.0.start"`), our side has
   `--pad1`; making a comparison drive both is the missing piece for anything that
@@ -355,6 +461,15 @@ blastem is GPLv3. It is used as **a separate process, invoked by path**
   and are not committed as goldens.
 
 Compare a cart and get numbers. Do not copy anything out of blastem into here.
+
+#534 is the case where that line mattered rather than annoyed. Getting VRAM and CRAM
+out of the reference looked like a 20-40 line patch to blastem's debugger, which is a
+derivative work of a GPLv3 program and so could not live here however useful it was.
+Reading the stock debugger instead - `--help`, then the namespace and array
+behaviour it documents - turned it into `save "v.bin" vdp:vram`, which needs no
+patch, derives from nothing, and keeps the packaged unmodified 1.0.0 in the dev
+shell. If a future ticket does need a patch, the question of where the diff lives is
+the maintainer's, not the harness's.
 
 ## No ROM here
 
@@ -384,6 +499,16 @@ lead). The two anchored ones are the pair that keeps
 worse than the frame loop it replaced, and an anchor that reported a one-arrival
 offset as a divergence would be re-manufacturing #526. It is what stops a refactor of `compare.py` turning the
 oracle into something that prints `agree` for everything.
+
+Then the VDP set of #534, which is the same discipline over two more memories:
+canned VRAM and CRAM that match, a byte planted in every frame of VRAM (found, and
+named by a VRAM offset rather than a work-RAM one), a colour planted in CRAM (found
+as one colour, and printed as one colour), a CRAM image saved at half width (exit 2,
+not `agree`), a run with VRAM but no CRAM (exit 2), a directory of work-RAM dumps
+asked to be a VDP comparison (exit 2), and a VDP pair aligned only at a one-frame
+offset (alignment, and not agreement when read at 0). The missing-memory checks are
+the point of the set: a comparison of a memory nobody dumped is the one case where
+an oracle can print `agree` about nothing.
 
 ## Where the other channels went
 
