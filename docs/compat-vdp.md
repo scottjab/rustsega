@@ -50,7 +50,7 @@ of what differs in every frame of the window.
 | `contrahc` Contra: Hard Corps | 0.0 | - | 0/0 | agrees | agree |
 | `thunderforce4` Thunder Force IV | 0.4 | `$00F9B3` ref=37 ours=00 | 0/0 | agrees | phase |
 | `castlevania` Castlevania: Bloodlines | 266.7 | `$00C61B` ref=00 ours=01 | 0/0 | agrees | phase |
-| `shinobi3` Shinobi III | **3235.2** | `$000029` ref=01 ours=00 | 1657/2 | agrees | **real** |
+| `shinobi3` Shinobi III | 38.4 | `$00D184` ref=00 ours=80 | 0/0 | agrees | phase |
 | `vectorman` Vectorman | 239.6 | `$002008` ref=A2 ours=C2 | 12/1 | 6.0/frame, none persistent | phase |
 | `comixzone` Comix Zone | 0.0 | - | 0/0 | agrees | agree |
 | `mk2` Mortal Kombat II | 0.0 | - | 0/0 | agrees | agree |
@@ -58,8 +58,8 @@ of what differs in every frame of the window.
 | `psiv` Phantasy Star IV | - | - | - | - | reference run failed |
 | `psii` Phantasy Star II | - | - | - | - | reference run failed |
 | `ssf2` Super Street Fighter II | 0.0 | - | 0/0 | agrees | agree |
-| `roadrash2` Road Rash II | **4653.0** | `$00000C` ref=55 ours=00 | 2450/2 | 3.9/frame, none persistent | **real** |
-| `ristar` Ristar | **1232.7** | `$00811C` ref=08 ours=FF | 358/5 | agrees | **real** |
+| `roadrash2` Road Rash II | 3.7 | `$007231` ref=2F ours=23 | 0/0 | 14.4/frame, none persistent | phase |
+| `ristar` Ristar | **982.6** | `$007E01` ref=78 ours=00 | 86/5 | agrees | **real** |
 | `toystory` Toy Story | 0.0 | - | 0/0 | agrees | agree |
 
 Nothing about CRAM has been confirmed yet: no cart has a colour differing in every frame of
@@ -67,16 +67,15 @@ its window, at end of frame or at an anchor. The three carts with moving colours
 
 ## The three confirmed ones
 
-Each was re-run at its own V-Int entry so the two machines are stopped at one instruction,
-and each still diverges there. Ranges and first bytes are from that phase-safe run, which is
-the number to work from; the end-of-frame mean in the table above is the same divergence
-plus phase.
+Each was re-run at its own V-Int entry so the two machines are stopped at one instruction.
+Ranges and first bytes are from that phase-safe run, which is the number to work from; the
+end-of-frame mean in the table above is the same divergence plus phase.
 
 | cart | anchor | VRAM mean/frame | range | runs/largest | first difference | CRAM |
 |---|---|---:|---|---|---|---|
-| `shinobi3` | `$522` | 3209.0 | `$000029-$00FBAD` | 1657/2 | `$000029` ref=01 ours=00 | agrees |
-| `roadrash2` | `$11b8` | 4653.0 | `$00000C-$00F6D9` | 2450/2 | `$00000C` ref=55 ours=00 | agrees |
-| `ristar` | `$4284` | 393.4 | `$00A895-$00EFF1` | 200/5 | `$00A895` ref=87 ours=83 | agrees |
+| `shinobi3` | `$522` | 0.0 | - | 0/0 | - | agrees |
+| `roadrash2` | `$11b8` | 0.0 | - | 0/0 | - | agrees |
+| `ristar` | `$4284` | 107.0 | `$00A897-$00A987` | 61/5 | `$00A897` ref=28 ours=16 | agrees |
 
 Filed as [#540](https://github.com/scottjab/rustsega/issues/540) (Shinobi III),
 [#541](https://github.com/scottjab/rustsega/issues/541) (Road Rash II) and
@@ -88,6 +87,25 @@ reference holds data - which is not the shape of one dropped transfer (#536's wa
 contiguous 1536-byte block) but of the same small loss repeated. Ristar is the odd one:
 most of its differing bytes have data on *both* sides, so something was written there and
 written differently, which is closer to what #404 is after than to either of the other two.
+
+### Shinobi III and Road Rash II: the second word of a long to the data port
+
+That repeated small loss was the write FIFO, and it is #540. The FIFO kept four entries and a
+single latch for a fifth, and a write arriving when the latch was taken overwrote it. The 68k
+makes two of them without a slot in between whenever it does a long to `$C00000`, because the
+port is mirrored at `$C00002` (genvdp.txt section 3) and a long is two word cycles, so every
+long written across a full FIFO lost its first word: two bytes of VRAM, gone. Shinobi III
+loses 6271 of them in the 600 frames the anchor window is taken over, and every one of the
+3209 VRAM bytes that differed at frame 600 lies inside a word lost that way.
+
+Queueing the write instead of latching it takes both carts to nothing at their anchors, and to
+38.4 and 3.7 bytes a frame at end of frame, which is `phase`: no run survives, the way
+`castlevania` and `vectorman` differ and nothing is wrong. The signature held as predicted,
+and #541 was the same bug. Ristar's 107.0 remains, and its shape says it is a different one.
+
+The three rows above and the three cart rows of the map were re-measured at this commit; the
+rest of the map has not been re-run, and the queueing moves writes for every cart that makes
+more than four of them across a full FIFO, so the next full sweep may move others.
 
 ## What phase looks like, so it does not get filed
 

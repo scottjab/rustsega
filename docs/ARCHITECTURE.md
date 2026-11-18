@@ -174,11 +174,16 @@ The VDP write FIFO (`crates/vdp/src/fifo.rs`, M4-21a #99) is what makes
   word, which is byte wide, one for a CRAM or VSRAM word.
 * Status bit 9 is FIFO empty and bit 8 is FIFO full; both read 0 in the neutral
   state of one to three entries.
-* A write that finds the FIFO full is not lost: it waits on the port, and
-  `data_port_stall_mclk` is how long the 68k is held for. That is the design
-  chosen over `write_data` returning an indication, because the bus has to be
-  able to act on it without the write being issued twice, and it matches the
-  `dma_68k_stall_mclk` the same glue already reads.
+* A write that finds the FIFO full is not lost: it joins the queue behind the
+  entries that filled it, and `data_port_stall_mclk` is how long the 68k is held
+  for. That is the design chosen over `write_data` returning an indication,
+  because the bus has to be able to act on it without the write being issued
+  twice, and it matches the `dma_68k_stall_mclk` the same glue already reads.
+  Keeping only the one write that a real chip could hold was #540: the second of
+  the two writes a long makes at `$C00000` overwrote it, and the first went
+  missing. Bit 8 and `data_port_stall_mclk` are still read against four entries,
+  so the queue running deeper than four is the bus running ahead of the
+  transfer, not a deeper FIFO.
 * A data port read drains the FIFO first, so a read never sees a location as it
   was before the write the 68k queued for it.
 * The slots are the ones `crates/vdp/src/slots.rs` tabulates per mode and per
