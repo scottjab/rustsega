@@ -202,9 +202,10 @@ S&K 226-262               +24.4/f            -268.8/f
 S&K 440-480               +41.1/f            -211.7/f
 ```
 
-The step is 12.5% of a frame of 68000 time in both directions, so the difference
-between the two columns divided by 12.5 is the scale, and it comes out the same way
-from all three windows:
+`master / 8` is 1/8 of a frame of 68000 time: 112,005 clocks in a frame instead of
+128,006. The difference between the two columns is therefore the work that 12.5% of a
+frame buys, and dividing by 12.5 gives the scale. It comes out the same way from all
+three windows:
 
 ```text
 window         bytes per 1% of a frame        shipped lead, in cycles    scanlines
