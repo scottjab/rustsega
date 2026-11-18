@@ -20,10 +20,13 @@
 //!
 //! Two of the numbers quoted below are the point of the pack rather than
 //! decoration: `MD1536` and `960PAL` leave **more than the 512 colours a single
-//! VDP palette can hold** in one frame (1407 and 872 distinct pixels
-//! respectively), which is only possible if the emulator honours the palette
-//! writes the ROM makes in the middle of the frame. That is the accuracy this
-//! suite exists to keep.
+//! VDP palette can hold** in one frame (1407 and 928 distinct pixels
+//! respectively, both from `headless run --colours` over the golden frame), which
+//! is only possible if the emulator honours the palette writes the ROM makes in
+//! the middle of the frame. That is the accuracy this suite exists to keep, and
+//! the 928 is a reminder to measure the frame rather than repeat the comment: the
+//! golden for `960PAL` was pinned on a 27-colour render with this prose claiming
+//! 872, and only #545's data port fix made the frame match what it always said.
 //!
 //! # Frame counts
 //!
@@ -104,9 +107,20 @@ fn md_test_pack_512pal_paints_the_whole_palette() {
 
 /// `960PAL.bin`: TmEE's follow-up ("960 color test - ... Is it possible to get
 /// more colors ???"). The console has 512 colours, so the ROM has to change the
-/// palette mid-frame to show more; the dumped frame holds 872 distinct pixels,
-/// 360 more than one palette can produce. Geometry is 256x240: H32, and 240
-/// lines because the ROM asks for them.
+/// palette mid-frame to show more; the dumped frame holds **928 distinct
+/// colours**, 416 more than one palette can produce. Geometry is 256x240: H32,
+/// and 240 lines because the ROM asks for them.
+///
+/// The 928 is measured, not transcribed: `headless run
+/// test-roms/genesis/md-test-pack/960PAL.bin --frames 60 --colours` counts what
+/// [`distinct_colours`] counts here, over the frame this test pins. It is worth
+/// saying because the number here was wrong
+/// once and said nothing about it: this comment claimed 872 from #125 while the
+/// frame the golden was pinned on held 27, and the test only compares a hash, so
+/// the gap survived until #545 changed the data port hold and took the frame to
+/// 928 - 27 colours being the palette writes never landing where the ROM aimed
+/// them, which is the one thing this ROM is a test of. Check the picture rather
+/// than the prose if you change either.
 #[test]
 fn md_test_pack_960pal_shows_more_colours_than_one_palette_holds() {
     check("md_test_pack_960pal", pack!("960PAL.bin"), FRAMES, &[]);

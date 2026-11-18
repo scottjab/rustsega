@@ -1463,28 +1463,28 @@ impl Bus {
     /// One data port word, and the wait the write FIFO charges for a write that
     /// finds it full.
     ///
-    /// [`Vdp::write_data`] queues the word, and [`Vdp::data_port_stall_mclk`] is a
-    /// level rather than an answer: it says the port is full, which it is from the
-    /// write that fills the four entries onwards (`vdp::fifo::Fifo::push`). The
-    /// write that *fills* the FIFO is still taken, so the level is asked for on
-    /// both sides of the write and only a port that was already full holds the
-    /// 68000 - the fifth write of a burst, not the fourth, which is what the full
-    /// bit of genvdp.txt section 6 and Nemesis's VDP FIFO research on SpritesMind
-    /// are describing.
+    /// [`Vdp::write_data`] queues the word, and [`Vdp::data_port_stall_mclk`] is
+    /// read on the state the port is in as the write arrives, which is before it is
+    /// queued: it is the wait until a write made now has a place among the entries
+    /// (`vdp::fifo::Fifo::slots_until_accepted`), and reading it after the queueing
+    /// charges this write for itself as well - a slot more than the chip would have
+    /// held for, on every write past the fourth (#545). The write that *fills* the
+    /// FIFO is still taken and holds nothing, so only the fifth write of a burst is
+    /// charged: what the full bit of genvdp.txt section 6 and Nemesis's VDP FIFO
+    /// research on SpritesMind are describing.
     fn vdp_data_write(&mut self, value: u16) {
-        let held = self.vdp.data_port_stall_mclk() != 0;
+        let stall = self.vdp.data_port_stall_mclk();
         self.vdp.write_data(value);
-        if held {
+        if stall != 0 {
             // TODO(#489): `data_port_stall_mclk` is beam-relative like the transfer
-            // freeze - `vdp::fifo::Fifo::data_port_stall_mclk` is
-            // `mclk_to_slots(head_slots)`, master clocks counted *from the beam* - so
-            // by rights it belongs in `pending_68k_hold` next to the DMA. It stays an
-            // additive stall here because that is what the six `md_test_pack` palette
-            // goldens are calibrated on: charging the same wait as a deadline moves
-            // `960pal`, `512pal`, `shltest`, `shltest2`, `md1536` and `mdtrans`, and
-            // reblessing six goldens is a decision this change does not make. #517 is
-            // the ticket where the two are finally spent the same way.
-            let stall = self.vdp.data_port_stall_mclk();
+            // freeze - it is `mclk_to_slots(slots_until_accepted)`, master clocks
+            // counted *from the beam* (`vdp::fifo`) - so by rights it belongs in
+            // `pending_68k_hold` next to the DMA. It stays an additive stall here
+            // because that is what the `md_test_pack` palette goldens are calibrated
+            // on: charging the same wait as a deadline moves `960pal`, `512pal`,
+            // `shltest`, `shltest2`, `md1536` and `mdtrans`, and reblessing six
+            // goldens is a decision this change does not make. #517 is the ticket
+            // where the two are finally spent the same way.
             self.stall_68k(stall);
         }
     }
