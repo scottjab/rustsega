@@ -24,7 +24,8 @@ instruction S&K is down to 12, of which one is scratch nothing reads.
 |---|---|
 | `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin`. `--stop-at-pc` names an instruction instead of a frame; `--vdp` saves the VDP's VRAM and CRAM instead -> `bvNNNNN.bin`, `bcNNNNN.bin` |
 | `run-ours.sh` | Run the same cart in rustsega with no input, save work RAM at the same frames -> `rNNNNN.bin`. Takes the same `--stop-at-pc` and `--vdp` (`rvNNNNN.bin`, `rcNNNNN.bin`) |
-| `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test, `--vdp` for the VDP's two memories (#534), and `--meter`, which reads a cart's own parked progress counters as a cycle meter (#530). `--selftest` is in `just check` |
+| `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test, `--vdp` for the VDP's two memories (#534), a `class` line separating a contiguous persistent divergence from frame phase (#539), and `--meter`, which reads a cart's own parked progress counters as a cycle meter (#530). `--selftest` is in `just check` |
+| `sweep-vdp.sh` | The #539 sweep: `--vdp` every cart in `crates/genesis/tests/commercial_list.toml`, one resumable cart at a time, and collect one row per cart into `target/ref/vdp-sweep/results.tsv` |
 | `terminal-standin.py` | The `x-terminal-emulator` blastem's `-d` wants and NixOS has not got; makes the debugger a pipe |
 | `bin/x-terminal-emulator` | The shim `run-ref.sh` puts on `PATH` so blastem finds the stand-in |
 | `common.sh` | The shared default output directory and frame-list handling |
@@ -221,6 +222,77 @@ frame, measured 2026-11-17:
 - First difference: VRAM `$001640`, `ref=11 ours=00`.
 
 That is the number #534 was for. What it means is #404's business, not this file's.
+
+## Sweeping it over the commercial list: `sweep-vdp.sh` (#539)
+
+`--vdp` on one cart is a measurement. #539 wants the map: run it over every cart in
+`crates/genesis/tests/commercial_list.toml` and file one issue per cart with a confirmed
+divergence. `sweep-vdp.sh` is that loop, and it is resumable because blastem costs minutes
+per cart.
+
+```sh
+DISPLAY=:0 nix develop -c bash scripts/ref/sweep-vdp.sh            # every cart without a row yet
+DISPLAY=:0 nix develop -c bash scripts/ref/sweep-vdp.sh --limit 5  # a handful, then stop
+                 nix develop -c bash scripts/ref/sweep-vdp.sh --only psiv,shinobi3 --force
+```
+
+For each cart it reads the exact ROM name and the frame count out of the cart list - the
+same file `tests/commercial.rs` reads, so the sweep cannot drift from the set the tests
+cover - dumps both halves at `--vdp` over the last 16 frames of that cart's own checkpoint
+run, runs `compare.py --vdp --tsv`, and appends one row to `target/ref/vdp-sweep/results.tsv`.
+A cart that has a row is skipped, and a cart whose dumps are on disk for the requested window
+skips straight to the comparison, so an interrupted sweep resumes. `--force` redoes one.
+
+| `results.tsv` column | what it says |
+|---|---|
+| `key`, `name`, `frames` | the cart, and the window dumped |
+| `shift` | the frame alignment the comparator measured for it |
+| `vram_mean` | mean VRAM bytes differing per frame at that shift |
+| `vram_first` | the first differing byte: address, then `ref=` and `ours=`, then the frame |
+| `vram_span`, `vram_runs`, `vram_largest` | the extent, run count and widest run of what differs in *every* frame: this is how contiguous the divergence is |
+| `cram_mean`, `cram_persistent` | CRAM, in colours |
+| `verdict` | `agree`, `phase`, or `real` - see the next section |
+| `phase_safe` | `-` until a `--phase-safe` re-run, then the anchor it was re-run at |
+
+Blastem cannot be run in parallel with itself - its debugger is driven over fixed FIFOs in
+`/tmp` (caveats below) - so carts go one at a time and `--limit` is there to bound a session,
+not to widen one. The rows and the dumps live under `target/`.
+
+## Telling a divergence from frame phase: `class`, and `--min-run` (#539)
+
+An end-of-frame comparison carries frame phase, and a byte count cannot see the difference.
+S&K at frames 595-604 reports a mean of 32.0 of 65536 VRAM bytes differing with nothing
+wrong in it, all of it scattered single bytes on a stride around `$F800`; the real bug
+beside it, #536, was 1536 bytes of one contiguous block. So every `--vdp` and work-RAM
+report ends with a `class` line that says which one it is looking at:
+
+```text
+class    real - 1536 bytes in all 10 frame(s), 1 contiguous run(s) of >= 4, spanning 0x001640-0x001C3F
+class    phase - no run of >= 4 addresses differs in all 10 frame(s); 0 bytes do, widest run 1, in 0 run(s)
+```
+
+`real` means a run of at least `--min-run` elements (default 4) differs in **every** frame
+compared: contiguous in address and not moving, which is what a dropped transfer looks
+like. `phase` is everything else. The threshold is 4 elements because one is a stray and
+every frame-phase family this harness has met arrives one element every four or eight,
+while a nametable cell, a tile row, and any burst the VDP would have taken in one go are
+all runs of four or more. `--min-run 1` lowers the bar rather than changing the rule, and
+the numbers the verdict was made from are printed next to it so it can be argued with.
+
+`--tsv` prints the same finding as one tab-separated line per compared memory, in the
+order `dir  memory  frames  compared  shift  mean  persistent  runs  largest  span  first
+verdict`, which is what `sweep-vdp.sh` builds its rows out of. Exit status is unchanged:
+0 agree, 1 disagree, 2 the harness could not run.
+
+What `real` does **not** mean is "confirmed". The confirmation is the `--stop-at-pc` rerun:
+
+```sh
+DISPLAY=:0 nix develop -c bash scripts/ref/sweep-vdp.sh --phase-safe --only psiv --anchor psiv=0xDD60
+```
+
+That re-dumps the cart at the anchor (its own V-Int entry, per "The comparison point" above)
+and rewrites the row with the numbers from there. A divergence that survives it is the kind
+an issue gets filed for; one that does not was frame phase wearing a block costume.
 
 ## Reading a cycle meter: `--meter` (#530)
 

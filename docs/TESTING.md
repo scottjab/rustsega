@@ -32,7 +32,7 @@ compiled at all by the workspace run: `just check` adds the clippy and nextest o
 | Commercial smoke | `crates/genesis/tests/commercial.rs` | Boot real games N frames, assert no panic, non-blank output, golden frame hash. The games and what they say are in [`compat-commercial.md`](compat-commercial.md). |
 | Commercial gameplay | `crates/genesis/tests/gameplay.rs` | Replay a committed input movie (`tests/movies`, [`movie-format.md`](movie-format.md)) into the first level of five games and golden three frames of it plus the audio of the run. `cargo nextest run -p genesis --run-ignored only gameplay`. |
 | Collection sweep | `headless sweep <ROM DIR>` | Run every ROM in the local collection in a child process and report what happened. `cargo` runs none of it; the report is a committed artifact, [`compat.md`](compat.md) over [`compat.csv`](compat.csv). |
-| External reference | `scripts/ref/` | Run a cart in blastem and in rustsega over the same frames, dump 68000 work RAM from both, diff. Both halves dump at the end of a frame, or at one shared instruction given by `--stop-at-pc` for the phase-safe comparison of #526. `--vdp` dumps the VDP's VRAM and CRAM instead, which is what #404 needed and #534 found a way to ask the reference for. `compare.py --meter` reads a cart's own parked progress counters (#529) out of the same dumps as a signed per-frame lead, which is how #530 measures 68000 time per frame with nothing bolted onto either emulator. Needs a cartridge, so `cargo` runs none of it; `just check` runs the comparator's own `--selftest`. |
+| External reference | `scripts/ref/` | Run a cart in blastem and in rustsega over the same frames, dump 68000 work RAM from both, diff. Both halves dump at the end of a frame, or at one shared instruction given by `--stop-at-pc` for the phase-safe comparison of #526. `--vdp` dumps the VDP's VRAM and CRAM instead, which is what #404 needed and #534 found a way to ask the reference for. `compare.py --meter` reads a cart's own parked progress counters (#529) out of the same dumps as a signed per-frame lead, which is how #530 measures 68000 time per frame with nothing bolted onto either emulator. `scripts/ref/sweep-vdp.sh` runs the `--vdp` comparison over every cart in the commercial list, one resumable cart at a time, and says for each whether what diverges is a contiguous block or frame phase (#539). Needs a cartridge, so `cargo` runs none of it; `just check` runs the comparator's own `--selftest`. |
 | Frontend | `crates/web` with `wasm-bindgen-test` | Input mapping, settings, pure logic. Keep logic out of components so it is testable natively. What needs a browser runs under `just test-web`, and what a browser frame costs is measured under `just perf-web`. |
 
 `wasm-bindgen-test` runs the wasm tests in a real browser: the dev shell pins
@@ -175,6 +175,19 @@ python3 scripts/ref/compare.py "target/ref/<cart>/anchor" 47-51 --anchor 0x584 -
 It reports `ours - ref` per arrival and the signed lead per frame. It is not a cycle
 counter and it does not say which machine is wrong; `scripts/ref/README.md` says what
 it can and cannot support.
+
+The other thing the harness does is run the VDP-memory comparison over the whole commercial
+list and keep score (#539). `scripts/ref/sweep-vdp.sh` walks
+`crates/genesis/tests/commercial_list.toml`, dumps both sides of each cart over the tail of
+its own checkpoint run, and records one row per cart, skipping any cart it already has a row
+for. Each report ends in a `class` line separating the two things an end-of-frame diff can
+be: `real`, a contiguous run differing in every frame compared, which is the shape of a
+dropped transfer (#536), or `phase`, scattered bytes that move with the frame alignment. The
+self-test plants both - a contiguous block, which must be called real, and a scattered set
+that differs in every frame, which must not be - because a sweep that called phase real
+would file an issue per cart and one that called real phase would miss the next #536. Only a
+`real` that survives the phase-safe `--stop-at-pc` re-run is a divergence, and the table of
+what the list says right now is [`compat-vdp.md`](compat-vdp.md).
 
 ## External test data
 
