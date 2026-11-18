@@ -100,11 +100,12 @@ is `--stop-at-pc`.
 
 ## Not covered
 
-- **Three carts.** `psii`, `psiv` and `nbajam` die in blastem's debugger with the driver
-  pipe breaking before the dumps land (SIGPIPE, no output). It is the same failure mode for
-  all three and it is not the emulator under test: our half dumps them fine. Someone with a
-  second machine's worth of patience should look at whether `-g -d` needs a different
-  invocation for those.
+- **Three carts.** `psii`, `psiv` and `nbajam`: blastem dies partway through the frame walk
+  (three of the fifteen dumps land on `psii`) and the run ends with a broken driver pipe and
+  no complete pair to compare. Our half dumps all three fine, so it is the reference dying on
+  those carts, not this harness losing data. A shorter, earlier window was tried and does not
+  help: `sweep-vdp.sh --only psii,psiv,nbajam --frames 96-110` fails the same three, so it is
+  the carts and not frame 586. Where blastem stops taking dumps is the thing to chase.
 - **Anything behind a button press.** Neither dumper drives input, so this sweep compares
   attract screens. #525 lists the missing piece.
 - **The Z80 and the cartridge.** Still not dumpable from the reference
