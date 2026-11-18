@@ -9,6 +9,7 @@ images written by ``run-ref.sh`` (``bNNNNN.bin``) and ``run-ours.sh``
 usage::
 
     compare.py OUTDIR [595-605 600 ...] [--sweep 4] [--anchor 0x584]
+    compare.py OUTDIR [47-51] [--anchor 0x584] --meter [0xFFFF2C,0xFFFF30]
     compare.py --selftest
 
 Why this is not a ``cmp`` of two files, which is what it looks like it should be:
@@ -32,6 +33,20 @@ constraint, and #526 is the finding that came out of doing it).
 
 Neither test says which side is wrong. Disagreement is evidence, not proof: a
 second reference is wanted before behaviour changes to match one.
+
+**``--meter`` reads a cycle meter instead of a diff** (#530). Some carts park a
+68000 register set in work RAM at every vertical interrupt, and two of the parked
+registers can be pointers that only ever move forwards through one run of the
+program: ``Sonic & Knuckles (World)`` parks the ROM input and work-RAM output
+cursors of a background decompressor it preempts at every V-Int, so those two longs
+say how far the 68000 got between two vertical interrupts and are a measurement of
+68000 time per frame that needs no instrumentation on either side (#529). Give
+``--meter`` two such addresses and it reports, per arrival, ``ours - ref`` for each
+of them and the **signed per-frame lead** that follows: positive means our 68000
+reached further through the stream by that instant, negative means the reference
+had, and a lead that grows by the same amount every arrival is a fixed number of
+cycles a frame, which is what #530 is about. A count of differing addresses cannot
+say that, and neither can a count of bytes: only the sign and the slope do.
 
 ``--selftest`` is the harness's own check and part of ``just check``: it compares
 a canned pair of images that agree, then a mutated copy, then a mutated-in-every-
@@ -62,6 +77,20 @@ byte for byte with no header - which is what makes `cmp`-shaped reasoning safe a
 
 REF_PREFIX = "b"
 OURS_PREFIX = "r"
+
+METER_LONG = 4
+"""Bytes a meter reads: one big-endian long, because the cursors this is for are the
+68000 registers a cart parks with `MOVEM.L` (#529)."""
+
+METER_DEFAULT = "0xFFFF2C,0xFFFF30"
+"""What a bare `--meter` reads: S&K's parked decoder cursors.
+
+`$FFFF2C` is A0, the ROM input pointer, and `$FFFF30` is A1, the work-RAM output
+pointer, of the Kosinski decompressor `Sonic & Knuckles (World)` runs in the
+background and saves at `$FFFF10-$FFFF37` from inside its own V-Int (#529). A cart
+that parks its progress somewhere else wants its own addresses, and a cart that
+park nothing has no cycle meter at all.
+"""
 
 
 class HarnessError(Exception):
@@ -155,6 +184,28 @@ def ranges(offsets, limit=8):
         for start, end in shown
     )
     return text + more
+
+
+def ranges_of(frames, limit=10):
+    """Arrival numbers as `454-461, 466`: a meter's step list is long and mostly runs.
+
+    Separate from :func:`ranges` because that one works in byte offsets and prints
+    addresses; the two collapse runs the same way and should not pretend otherwise.
+    """
+    ordered = sorted(frames)
+    runs = []
+    start = previous = ordered[0]
+    for item in ordered[1:]:
+        if item == previous + 1:
+            previous = item
+            continue
+        runs.append((start, previous))
+        start = previous = item
+    runs.append((start, previous))
+    if len(runs) > limit:
+        runs = runs[:limit]
+        return ", ".join(f"{a}-{b}" if a != b else f"{a}" for a, b in runs) + "..."
+    return ", ".join(f"{start}-{end}" if start != end else f"{start}" for start, end in runs)
 
 
 def frames_in(directory):
@@ -338,6 +389,350 @@ def run_comparison(directory, frames, span=4):
     return report
 
 
+@dataclass
+class Run:
+    """Consecutive arrivals the meter was measuring one uninterrupted stretch of work.
+
+    `steps` is the arrival count the run spans, `end - start`, not the number of
+    samples in it: a meter sampled every fifth arrival over 45..60 measured fifteen
+    frames of work, and dividing by three would call it five times the rate it was.
+    Frame numbers are arrivals at a `--stop-at-pc` anchor, which is what makes the
+    difference of two of them a frame count.
+    """
+
+    start: int
+    end: int
+    #: change in `ours - ref` across the run, signed
+    gain: int
+    steps: int
+
+    @property
+    def per_frame(self):
+        """Signed lead gained per arrival over the run: the slope #530 is about."""
+        return self.gain / self.steps if self.steps else 0.0
+
+
+@dataclass
+class Meter:
+    """What one cycle meter found. Printed by :func:`print_meter`, asserted by the self-test.
+
+    `shift` comes from the same alignment sweep the byte comparison uses, and it is
+    not optional here: read our cursor one arrival late and a machine that is
+    perfectly in step reports itself ahead by a frame's worth of work, which is the
+    one thing this tool exists to be able to tell apart from a real lead.
+    """
+
+    directory: str
+    #: the 68000 addresses read, ascending
+    addresses: list
+    #: reference frames that had a pair at `shift`, ascending
+    frames: list = field(default_factory=list)
+    shift: int = 0
+    shift_measured: bool = False
+    anchor: str = ""
+    #: address -> frame -> (reference value, our value)
+    values: dict = field(default_factory=dict)
+    #: address -> frame -> our value - reference value, signed
+    lead: dict = field(default_factory=dict)
+    #: address -> the :class:`Run` spans both machines were decoding across
+    runs: dict = field(default_factory=dict)
+    #: address -> frame -> that frame's :func:`classify_steps` label
+    labels: dict = field(default_factory=dict)
+    #: reference frames with no image on our side at this shift
+    dropped: list = field(default_factory=list)
+
+    @property
+    def agrees(self):
+        """Does every meter read the same value on both sides at every arrival?"""
+        return all(v == 0 for per_frame in self.lead.values() for v in per_frame.values())
+
+    @property
+    def unwritten(self):
+        """Did every meter read 0 on both sides in every frame, which is not a measurement?
+
+        A cursor no cart has parked there reads equal on both machines, so :attr:`agrees`
+        is true of it - and "agree" out of an oracle that was pointed at nothing is the
+        failure this harness calls fatal everywhere else. Worth its own exit status so a
+        scripted run cannot read "the two machines agree about 68000 time per frame" out
+        of an address that holds nothing.
+        """
+        return all(
+            ref == 0 and our == 0
+            for per_frame in self.values.values()
+            for (ref, our) in per_frame.values()
+        )
+
+    def per_frame(self, address):
+        """Signed lead per arrival for one meter, over the run(s) that were not load boundaries."""
+        steps = sum(run.steps for run in self.runs.get(address, []))
+        if not steps:
+            return 0.0
+        gain = sum(run.gain for run in self.runs.get(address, []))
+        return gain / steps
+
+    def step_signs(self, address):
+        """`(ahead, behind, level)` over the measured steps of one meter.
+
+        Counts steps rather than arrivals: a machine ahead by the same amount every
+        frame is the cycle gap this tool is for, and one ahead across a single step of
+        several thousand is a load restart that went undetected. The lead column alone
+        cannot tell those two apart.
+        """
+        lead = self.lead.get(address, {})
+        labels = self.labels.get(address, {})
+        ahead = behind = level = 0
+        for first, second in zip(self.frames, self.frames[1:]):
+            if labels.get(second) != MEASURED:
+                continue
+            step = lead[second] - lead[first]
+            ahead += step > 0
+            behind += step < 0
+            level += step == 0
+        return ahead, behind, level
+
+
+def parse_meters(spec):
+    """`--meter 0xFFFF2C,0xFFFF30` -> ``[0xFFFF2C, 0xFFFF30]`, ascending and deduplicated.
+
+    Empty means the default pair, and anything that is not a number inside the
+    compared window is the harness being pointed at nonsense, which is an error
+    rather than a silent empty report.
+    """
+    spec = (spec or METER_DEFAULT).strip()
+    found = set()
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part, 0)
+        except ValueError:
+            raise HarnessError(f"meter address {part!r} is not a number: give it as 0xFFFF2C") from None
+        if not RAM_BASE <= value <= RAM_BASE + RAM_SIZE - METER_LONG:
+            raise HarnessError(
+                f"meter address 0x{value:06X} is outside the dumped region "
+                f"0x{RAM_BASE:06X}-0x{RAM_BASE + RAM_SIZE - 1:06X}"
+            )
+        found.add(value)
+    if not found:
+        raise HarnessError("--meter wants at least one address")
+    return sorted(found)
+
+
+def read_long(image, address):
+    """The big-endian long at a 68000 address inside a dump."""
+    offset = address - RAM_BASE
+    if offset < 0 or offset + METER_LONG > len(image):
+        raise HarnessError(
+            f"meter address 0x{address:06X} is not readable in a {len(image)}-byte image "
+            f"based at 0x{RAM_BASE:06X}"
+        )
+    return int.from_bytes(image[offset : offset + METER_LONG], "big")
+
+
+MEASURED = "measured"
+"""A step where both machines moved their cursor, so the change in lead is a rate."""
+
+RESTART = "restart"
+"""A step where a cursor went backwards, or was 0: a new load started (#529), so the
+lead across it belongs to two different stretches of compressed art."""
+
+STOPPED = "stopped"
+"""A step where one machine's cursor moved and the other's did not. One of them had
+finished the load and stopped parking, which is the frame-count signature of #529 and
+a finding in its own right - but not a rate: the lead changes by the whole advance of
+the one still running, which would swamp the dozen bytes a frame this tool is for.
+On S&K arrivals 454-461 of one load read exactly this, ours parked at the end of the
+stream while the reference was still in it."""
+
+IDLE = "idle"
+"""A step where neither cursor moved: no decode is running, so the parked frame is
+dead state and says nothing about either machine."""
+
+
+def classify_steps(frames, values):
+    """Label every step of one meter: :data:`MEASURED`, :data:`STOPPED`, :data:`IDLE`, :data:`RESTART`.
+
+    `values` is ``frame -> (reference cursor, our cursor)``. The labels are decided by
+    the two cursors and never by the lead: a step where the lead *shrinks* is a frame
+    where the reference got further, which is exactly what a rate has to be allowed to
+    average over, while a step where a cursor goes backwards is a new load starting and
+    on S&K that moves the pointer by tens of kilobytes (#529: every load starts from the
+    same pointers, so the lead resets to about zero). Averaging the two together is how
+    a tool reports the difference between two unrelated stretches of art as a cycle gap.
+
+    A cursor of 0 is a :data:`RESTART` too: it is the parked frame before the game ever
+    wrote it, which is why arrival 46 of S&K reads 0 and arrival 47 does not.
+    """
+    labels = {}
+    for earlier, later in zip(frames, frames[1:]):
+        ref_was, our_was = values[earlier]
+        ref_now, our_now = values[later]
+        if min(ref_now, our_now) == 0 or ref_now < ref_was or our_now < our_was:
+            labels[later] = RESTART
+        elif ref_now == ref_was and our_now == our_was:
+            labels[later] = IDLE
+        elif ref_now == ref_was or our_now == our_was:
+            labels[later] = STOPPED
+        else:
+            labels[later] = MEASURED
+    return labels
+
+
+def cursor_runs(frames, labels, lead):
+    """The maximal :data:`MEASURED` stretches of one meter, with their slope.
+
+    A run is broken by anything that is not a measured step, so the slope of a run is
+    always a rate over frames in which both machines were decoding.
+    """
+    runs = []
+    group = [frames[0]] if frames else []
+    for frame in frames[1:]:
+        if labels.get(frame) == MEASURED:
+            group.append(frame)
+        else:
+            runs.append(_one_run(group, lead))
+            group = [frame]
+    runs.append(_one_run(group, lead))
+    return [run for run in runs if run and run.steps], [
+        frame for frame in frames if labels.get(frame) in (RESTART, STOPPED, IDLE)
+    ]
+
+
+def _one_run(group, lead):
+    """One :class:`Run` over the arrival numbers in `group`, which are consecutive samples."""
+    if len(group) < 2:
+        return None
+    return Run(
+        start=group[0],
+        end=group[-1],
+        gain=lead[group[-1]] - lead[group[0]],
+        steps=group[-1] - group[0],
+    )
+
+
+def measure(directory, addresses, frames, shift=0):
+    """Read each meter out of every frame pair at `shift`: the values, the lead, the slope.
+
+    Frames whose shifted image was never dumped drop out exactly as they do in
+    :func:`compare`; a truncated or missing reference image is fatal there and here.
+    """
+    meter = Meter(directory=directory, addresses=list(addresses), shift=shift)
+    for frame in frames:
+        reference = load_one(directory, REF_PREFIX, frame)
+        try:
+            ours = load_one(directory, OURS_PREFIX, frame + shift)
+        except MissingDump:
+            if shift == 0:
+                raise
+            meter.dropped.append(frame)
+            continue
+        meter.frames.append(frame)
+        for address in addresses:
+            ref_value = read_long(reference, address)
+            our_value = read_long(ours, address)
+            meter.values.setdefault(address, {})[frame] = (ref_value, our_value)
+            meter.lead.setdefault(address, {})[frame] = our_value - ref_value
+    if not meter.frames:
+        raise HarnessError(f"no frame of {len(frames)} could be metered in {directory}")
+    for address in addresses:
+        meter.labels[address] = classify_steps(meter.frames, meter.values[address])
+        meter.runs[address], _ = cursor_runs(meter.frames, meter.labels[address], meter.lead[address])
+    return meter
+
+
+def run_meter(directory, addresses, frames, span=4):
+    """Measure the frame alignment, then meter at it: the cursor twin of :func:`run_comparison`.
+
+    Same order and for the same reason: a cursor read at the wrong shift is a
+    different arrival, and the lead printed for it is the distance between two
+    arrivals rather than the difference between two machines.
+    """
+    if span <= 0:
+        return measure(directory, addresses, frames, 0)
+    _, shift = sweep(directory, frames, span)
+    meter = measure(directory, addresses, frames, shift)
+    meter.shift_measured = True
+    return meter
+
+
+def print_meter(meter, stream=None):
+    """The per-arrival table, the slope, and a RESULT line in the same shape as the diff report."""
+    stream = sys.stdout if stream is None else stream
+
+    def say(text):
+        print(text, file=stream)
+
+    say(f"dir      {meter.directory}")
+    if meter.anchor:
+        say(f"point    both sides stopped before 0x{meter.anchor} (frame N = arrival N there)")
+    if meter.frames:
+        say(
+            f"frames   {len(meter.frames)}: {meter.frames[0]}..{meter.frames[-1]} "
+            "(reference numbering)"
+        )
+    if meter.shift:
+        basis = "measured" if meter.shift_measured else "asked for"
+        say(f"shift    {meter.shift:+d} ({basis}: reference frame N read against our frame N{meter.shift:+d})")
+    else:
+        basis = "measured" if meter.shift_measured else "assumed, --sweep 0"
+        say(f"shift    +0 ({basis})")
+    if meter.dropped:
+        say(f"         {len(meter.dropped)} frame(s) had no image on our side at this shift")
+    for address in meter.addresses:
+        lead = meter.lead[address]
+        labels = meter.labels.get(address, {})
+        say("")
+        say(f"meter 0x{address:06X}    lead = ours - ref, signed")
+        say("   frame         ref        ours        lead   per frame")
+        previous = None
+        for frame in meter.frames:
+            ref_value, our_value = meter.values[address][frame]
+            label = labels.get(frame, "")
+            step = "-" if previous is None or label != MEASURED else f"{lead[frame] - previous:+d}"
+            say(
+                f"{frame:8d}  {ref_value:9X}  {our_value:9X}  {lead[frame]:+10d}  {step:>9}"
+                f"{'' if label in ('', MEASURED) else ' ' + label}"
+            )
+            previous = lead[frame]
+        for run in meter.runs.get(address, []):
+            say(
+                f"  run {run.start}..{run.end}: lead {run.gain:+d} over {run.steps} "
+                f"frame(s) = {run.per_frame:+.1f} per frame"
+            )
+        if not meter.runs.get(address):
+            say("  no two arrivals where both machines were decoding, so no slope")
+        for label, what in (
+            (RESTART, "the cursor went backwards, so the lead is a new load's, not a frame's"),
+            (STOPPED, "only one machine was still decoding: one of them finished the load"),
+            (IDLE, "neither cursor moved: no decode is running, so the table is dead state"),
+        ):
+            frames = [frame for frame in meter.frames if labels.get(frame) == label]
+            if frames:
+                say(f"  {label} at {ranges_of(frames)}: {what}")
+        ahead, behind, level = meter.step_signs(address)
+        say(
+            f"  ours ahead in {ahead} measured step(s) of {ahead + behind + level}, "
+            f"behind in {behind}, level in {level}; "
+            f"per-frame lead {meter.per_frame(address):+.1f}"
+        )
+    say("")
+    if meter.agrees:
+        say("RESULT: agree - every meter reads the same value on both sides at every arrival")
+    else:
+        # The meter with the steepest slope is the one to name in the headline: a lead
+        # that is large but flat is a load boundary, and a lead of 12 bytes a frame is
+        # the finding, wherever its absolute value happens to sit.
+        steepest = max(meter.addresses, key=lambda a: abs(meter.per_frame(a)))
+        slope = meter.per_frame(steepest)
+        direction = "ours ahead" if slope > 0 else "reference ahead" if slope < 0 else "no slope"
+        leads = meter.lead[steepest].values()
+        say(
+            f"RESULT: disagree - 0x{steepest:06X} leads {min(leads):+d}..{max(leads):+d}, "
+            f"{slope:+.1f} per frame ({direction})"
+        )
+
+
 def print_report(report, stream=None):
     """The human-facing report. The exit code is what scripts read.
 
@@ -431,6 +826,14 @@ def build(directory, frames, images):
         for prefix in (REF_PREFIX, OURS_PREFIX):
             with open(os.path.join(directory, f"{prefix}{frame:05d}.bin"), "wb") as handle:
                 handle.write(data)
+
+
+def mutate_long(directory, frame, side, addr, value):
+    """Write one big-endian long of one dump on one side, for the meter's self-test."""
+    path = os.path.join(directory, f"{side}{frame:05d}.bin")
+    with open(path, "r+b") as handle:
+        handle.seek(addr - RAM_BASE)
+        handle.write(int(value).to_bytes(METER_LONG, "big"))
 
 
 def mutate(directory, frame, side, offset, value):
@@ -623,6 +1026,214 @@ def selftest():
         check("and the report says the arrivals are apart rather than naming bytes",
               "arrivals apart" in out.getvalue(), out.getvalue()[-300:])
 
+        print("selftest: the cycle meter (#530)")
+        # S&K parks the two cursors of its background decompressor in work RAM at
+        # every V-Int (#529), so two longs say how far each machine's 68000 got in a
+        # frame. Four ways for that measurement to be wrong are worth canned dumps:
+        # reporting a lead where the cursors match, getting the sign of one that does
+        # not match, calling it a count instead of a per-frame rate, and averaging a
+        # load restart into the slope.
+        def capture(printer, thing):
+            """One printer into a string: most of these checks are about the printed line."""
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                printer(thing)
+            return out.getvalue()
+
+        meter_frames = [47, 48, 49, 50, 51]
+        meter_images = churned_images(60, seed=0x530)
+        a0, a1 = 0xFFFF2C, 0xFFFF30
+        check("a bare --meter reads S&K's two parked cursors",
+              parse_meters("") == [a0, a1], f"{[f'0x{a:06X}' for a in parse_meters('')]}")
+        try:
+            parse_meters("0x10")
+            check("a meter outside the dumped region is an error", False, "it was accepted")
+        except HarnessError as error:
+            check("a meter outside the dumped region is an error",
+                  "outside the dumped region" in str(error), str(error))
+        try:
+            parse_meters("the-pc")
+            check("a meter that is not an address is an error", False, "it was accepted")
+        except HarnessError as error:
+            check("a meter that is not an address is an error",
+                  "not a number" in str(error), str(error))
+
+        def meter_case(name, trajectory, frames=None):
+            """One directory of dumps with `trajectory[frame] = (ref cursor, our cursor)`."""
+            case = os.path.join(work, name)
+            os.mkdir(case)
+            build(case, sorted(trajectory) if frames is None else frames, meter_images)
+            for frame, (ref_value, our_value) in trajectory.items():
+                mutate_long(case, frame, REF_PREFIX, a1, ref_value)
+                mutate_long(case, frame, OURS_PREFIX, a1, our_value)
+            return case
+
+        step = [0, 2500, 5100, 7700, 10300]
+        cursor_at = lambda index: 0xFFFF4E19 + step[index]
+        in_step = meter_case(
+            "meter-in-step",
+            {frame: (cursor_at(i), cursor_at(i)) for i, frame in enumerate(meter_frames)},
+        )
+        meter = run_meter(in_step, [a1], meter_frames, span=0)
+        check("cursors that match give no lead",
+              meter.agrees and meter.per_frame(a1) == 0.0, f"{meter.lead[a1]}")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_meter(meter)
+        check("and a meter with nothing in it says agree", "RESULT: agree" in out.getvalue(),
+              out.getvalue()[-200:])
+
+        ahead = meter_case(
+            "meter-ahead",
+            {frame: (cursor_at(i), cursor_at(i) + 46 + 11 * i)
+             for i, frame in enumerate(meter_frames)},
+        )
+        meter = run_meter(ahead, [a1], meter_frames, span=0)
+        check("a cursor planted in our favour is seen at its arrival",
+              meter.lead[a1][47] == 46, f"{meter.lead[a1][47]:+d}")
+        check("its slope is a signed per-frame lead, not a count",
+              meter.per_frame(a1) == 11.0, f"{meter.per_frame(a1):+.1f}")
+        check("and every step of it is counted as ours ahead",
+              meter.step_signs(a1) == (4, 0, 0), f"{meter.step_signs(a1)}")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_meter(meter)
+        check("the report prints the slope with its sign", " +11.0 per frame" in out.getvalue(),
+              out.getvalue()[-260:])
+        check("and names which machine is ahead", "ours ahead" in out.getvalue(),
+              out.getvalue()[-140:])
+
+        behind = meter_case(
+            "meter-behind",
+            {frame: (cursor_at(i), cursor_at(i) - 46 - 11 * i)
+             for i, frame in enumerate(meter_frames)},
+        )
+        meter = run_meter(behind, [a1], meter_frames, span=0)
+        check("a cursor planted the other way is negative, not merely different",
+              meter.per_frame(a1) == -11.0 and meter.lead[a1][51] == -90,
+              f"{meter.per_frame(a1):+.1f}, {meter.lead[a1][51]:+d}")
+        check("our cursor falling behind is a measured step, not a restart",
+              set(meter.labels[a1].values()) == {MEASURED}, f"{meter.labels[a1]}")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_meter(meter)
+        check("and the report says the reference is the one ahead",
+              "reference ahead" in out.getvalue(), out.getvalue()[-160:])
+
+        # A long window sampled every tenth arrival, which is what a first pass over
+        # 600 frames looks like. The lead grows 11 an arrival, so the answer is 11.0
+        # per frame; divide by the three samples instead of the twenty arrivals between
+        # the ends and the report says 110 and nobody notices.
+        sparse = meter_case(
+            "meter-sparse",
+            {frame: (0xFFFF4E19 + 300 * frame, 0xFFFF4E19 + 300 * frame + 11 * frame)
+             for frame in (10, 20, 30)},
+        )
+        meter = run_meter(sparse, [a1], [10, 20, 30], span=0)
+        check("a meter sampled every tenth arrival divides by the frames it spanned",
+              meter.per_frame(a1) == 11.0, f"{meter.per_frame(a1):+.1f}")
+
+        # Arrival 49 is the next load starting: the output pointer goes back to a lower
+        # address on both sides. A lead that grows +20 a frame and then sits flat is
+        # +20 over the one frame that worked and 0 over the two afterwards; averaged
+        # across the restart the whole window reads -3.25, which is the same number
+        # with the wrong sign. This is the one way the meter can invent a finding.
+        restart = {
+            frame: (cursor_at(i), cursor_at(i) + 20 + 20 * i)
+            for i, frame in enumerate(meter_frames[:2])
+        }
+        restart.update(
+            {frame: (0x0040_0000 + 900 * i, 0x0040_0000 + 900 * i + 7)
+             for i, frame in enumerate(meter_frames[2:])}
+        )
+        loaded = meter_case("meter-restart", restart)
+        meter = run_meter(loaded, [a1], meter_frames, span=0)
+        check("a cursor that goes backwards is a load restart, not a frame",
+              meter.labels[a1][49] == RESTART, f"{meter.labels[a1]}")
+        check("and the window splits into the two loads",
+              [(r.start, r.end) for r in meter.runs[a1]] == [(47, 48), (49, 51)],
+              f"{[(r.start, r.end) for r in meter.runs[a1]]}")
+        check("so the per-frame lead is the two runs, not the slope across their join",
+              abs(meter.per_frame(a1) - 20 / 3) < 0.01, f"{meter.per_frame(a1):+.2f}")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_meter(meter)
+        check("and the report says the lead is not claimed across the restart",
+              "restart at 49" in out.getvalue(), out.getvalue()[-300:])
+
+        # Arrivals 454-461 of one #530 load are the two machines finishing at different
+        # times: ours parks and stops moving while the reference is still writing, then
+        # both go quiet. Neither step is a rate, and the first of them moves the lead by
+        # 694 bytes on its own: counted as a frame it turned a window where we are ahead
+        # into one whose headline said the reference was.
+        stopping = {frame: (cursor_at(i), cursor_at(i) + 40 + 10 * i)
+                    for i, frame in enumerate(meter_frames[:3])}
+        stopping.update({frame: (cursor_at(i) + 9000, stopping[meter_frames[2]][1])
+                         for i, frame in enumerate(meter_frames[3:])})
+        stopped_case = meter_case("meter-one-stopped", stopping)
+        meter = run_meter(stopped_case, [a1], meter_frames, span=0)
+        check("a frame where only one machine is still decoding is not a measured step",
+              meter.labels[a1][50] == STOPPED and meter.labels[a1][49] == MEASURED,
+              f"{meter.labels[a1]}")
+        check("so the slope is the two comparable frames, not the four sampled ones",
+              meter.per_frame(a1) == 10.0, f"{meter.per_frame(a1):+.1f}")
+        check("and who finished first is still in the report, because that is #529's "
+              "frame-count signature",
+              "stopped at 50-51" in capture(print_meter, meter),
+              capture(print_meter, meter)[-200:])
+
+        frozen = {frame: (cursor_at(0) + 5000, cursor_at(0) + 5000 + 30)
+                  for frame in meter_frames}
+        frozen_case = meter_case("meter-frozen", frozen)
+        meter = run_meter(frozen_case, [a1], meter_frames, span=0)
+        check("a cursor nobody is moving measures nothing",
+              set(meter.labels[a1].values()) == {IDLE} and not meter.runs[a1],
+              f"{meter.labels[a1]}")
+        check("and a meter that measured nothing does not claim a rate",
+              meter.per_frame(a1) == 0.0 and "no slope" in capture(print_meter, meter),
+              capture(print_meter, meter)[-200:])
+
+        # Our images holding the previous arrival. The byte comparison calls this
+        # alignment and the meter has to agree: read at the measured shift the lead is
+        # zero, and read at shift 0 it is a frame's worth of work pretending to be a
+        # cycle gap, which is the exact mistake #526 was made of.
+        stepped = os.path.join(work, "meter-stepped")
+        os.mkdir(stepped)
+        for index, frame in enumerate(meter_frames):
+            with open(os.path.join(stepped, f"{REF_PREFIX}{frame:05d}.bin"), "wb") as handle:
+                handle.write(meter_images[frame])
+            with open(os.path.join(stepped, f"{OURS_PREFIX}{frame:05d}.bin"), "wb") as handle:
+                handle.write(meter_images[frame - 1])
+            mutate_long(stepped, frame, REF_PREFIX, a1, cursor_at(index))
+            mutate_long(stepped, frame, OURS_PREFIX, a1, cursor_at(index - 1))
+        meter = run_meter(stepped, [a1], meter_frames, span=2)
+        check("a cursor one arrival behind is alignment, not a lead",
+              meter.shift == 1 and meter.agrees,
+              f"shift {meter.shift:+d}, {meter.lead[a1]}")
+        check("which is worth more than the same data read at the shift it was not taken at",
+              run_meter(stepped, [a1], meter_frames, span=0).per_frame(a1) != 0.0)
+
+        # An address no cart has parked in reads equal everywhere, which is not the same
+        # as a measurement: an oracle that says "agree" about nothing is the failure this
+        # file calls fatal in its own inputs, so it is an exit status rather than a pass.
+        blank = os.path.join(work, "meter-blank")
+        os.mkdir(blank)
+        build(blank, meter_frames, {frame: bytes(RAM_SIZE) for frame in meter_frames})
+        meter = run_meter(blank, [a1], meter_frames, span=0)
+        check("a cursor nothing parked at is called what it is, not agreement",
+              meter.unwritten, f"{meter.values[a1][47]}")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+            status = main([blank, "47-51", "--meter", f"0x{a1:06X}", "--sweep", "0"])
+        check("and pointing the meter at it fails the run instead of passing it",
+              status == 2 and "nothing was measured" in err.getvalue(), f"status {status}")
+        check("a parked cursor is not unwritten",
+              not run_meter(ahead, [a1], meter_frames, span=0).unwritten)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            status = main([ahead, "47-51", "--meter", f"0x{a1:06X}", "--sweep", "0"])
+        check("--meter on the command line reaches the meter and not the diff",
+              status == 1 and "per-frame lead +11.0" in out.getvalue(),
+              f"status {status}: {out.getvalue()[-160:]}")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            status = main([ahead, "47-51", "--meter", "0x10"])
+        check("a bad meter address is the harness failing, not an agreement",
+              status == 2 and "outside the dumped" in err.getvalue(), f"status {status}")
+
         print("selftest: broken input is an error, not an agreement")
         truncated = os.path.join(work, "trunc")
         os.mkdir(truncated)
@@ -686,6 +1297,17 @@ def main(argv=None):
         "report and says what a non-zero shift means at an anchor",
     )
     parser.add_argument(
+        "--meter",
+        metavar="ADDRESS,ADDRESS",
+        nargs="?",
+        default="",
+        const=METER_DEFAULT,
+        help="read these addresses as a cycle meter instead of diffing the image: one "
+        f"big-endian long each, comma-separated (bare --meter is {METER_DEFAULT}, "
+        "S&K's parked decoder cursors, #529). Reports ours - ref per arrival and the "
+        "signed lead per frame. Use it at a --stop-at-pc anchor",
+    )
+    parser.add_argument(
         "--selftest",
         action="store_true",
         help="check this harness on canned dumps and exit (part of `just check`)",
@@ -697,21 +1319,37 @@ def main(argv=None):
     if not args.directory:
         parser.error("a directory of dumps is needed (or --selftest)")
 
+    # A Report and a Meter carry the same three things the harness needs before it
+    # prints: the shift it aligned at, the anchor that says what the frame numbers
+    # mean, and whether the two sides agree. Only the printing differs.
     try:
         frames = frames_requested(",".join(args.frames), args.directory)
-        report = run_comparison(args.directory, frames, args.sweep)
-        report.anchor = args.anchor.strip().removeprefix("0x").upper()
-        if report.shift:
+        if args.meter:
+            outcome = run_meter(args.directory, parse_meters(args.meter), frames, args.sweep)
+        else:
+            outcome = run_comparison(args.directory, frames, args.sweep)
+        outcome.anchor = args.anchor.strip().removeprefix("0x").upper()
+        if outcome.shift:
             print(
-                f"compare: the two frame counters differ by {report.shift:+d}; "
+                f"compare: the two frame counters differ by {outcome.shift:+d}; "
                 "the table below is ours read at that offset",
                 file=sys.stderr,
             )
     except HarnessError as error:
         print(f"compare: {error}", file=sys.stderr)
         return 2
-    print_report(report)
-    return 0 if report.agrees else 1
+    if args.meter:
+        print_meter(outcome)
+        if outcome.unwritten:
+            print(
+                "compare: every meter read 0 in every frame, so those addresses hold no "
+                "parked cursor in this cart and nothing was measured",
+                file=sys.stderr,
+            )
+            return 2
+        return 0 if outcome.agrees else 1
+    print_report(outcome)
+    return 0 if outcome.agrees else 1
 
 
 if __name__ == "__main__":
