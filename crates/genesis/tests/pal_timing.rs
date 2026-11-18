@@ -270,14 +270,22 @@ fn vint_v_counter(reg1: u8) -> u16 {
 }
 
 /// [`vint_v_counter`] on a console of `region`.
+///
+/// The counter is read on the line the interrupt belongs to rather than after it:
+/// genvdp.txt section 4 raises the level 6 "when the V counter is at line E0h,
+/// roughly at H counter cycle 08h", which is part way into the line, so a sampler
+/// that only looked at the end of each line would report the line the beam had
+/// walked on to rather than the line the interrupt happened on (#439).
 fn vint_v_counter_on(region: Region, reg1: u8) -> u16 {
     let (mut cpu, mut z80, mut bus, mut scheduler) = console(region);
     bus.vdp.write_register(1, reg1);
+    let mut before = bus.vdp.hv_counter() >> 8;
     for _ in 0..PAL_LINES as u32 * 2 {
         scheduler.run_line(&mut cpu, &mut z80, &mut bus);
         if bus.vdp.pending_irq() == Some(6) {
-            return bus.vdp.hv_counter() >> 8;
+            return before;
         }
+        before = bus.vdp.hv_counter() >> 8;
     }
     panic!("no VINT in two rasters with R1 = {reg1:#04x}");
 }

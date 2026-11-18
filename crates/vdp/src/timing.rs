@@ -18,7 +18,7 @@
 //! A DMA in flight is paid out of the same slots, one segment of the line at a
 //! time (`dma::Vdp::dma_clock`, M4-22 #101).
 
-use crate::hv::MCLKS_PER_LINE;
+use crate::hv::{MCLKS_PER_LINE, pixel_to_mclk};
 use crate::{InterlaceMode, LINES_V28, LINES_V30, Vdp};
 
 /// Interrupt level 6: the vertical interrupt (genvdp.txt section 4
@@ -34,6 +34,16 @@ const FRAME_LINES_NTSC: u16 = 262;
 /// Lines per frame, PAL: 313 (`docs/ARCHITECTURE.md`: "262 lines per frame
 /// (313 PAL)"; `hv` uses the same number for the V counter table).
 const FRAME_LINES_PAL: u16 = 313;
+
+/// The H counter cycle the vertical interrupt is raised at.
+///
+/// genvdp.txt section 4 "Vertical interrupts": "a level 6 interrupt will occur
+/// when the V counter is at line E0h, roughly at H counter cycle 08h", and
+/// section 6 says the same of the flag it sets - "Bit 7 is set when a vertical
+/// interrupt occurs. This happens at line E0h, roughly after H counter cycle
+/// 08h." Both name the cycle, so the interrupt is not the first thing in the
+/// line.
+pub(crate) const VINT_H_COUNTER: u32 = 0x08;
 
 /// Master clocks into the line at which status bit 2 (HB) goes up, H40.
 ///
@@ -152,20 +162,73 @@ impl Vdp {
         self.line_started = true;
         self.in_hblank = true;
         self.in_vblank = true;
+        // And the line's vertical interrupt is spent without ever having been
+        // raised, for the same reason: `advance` walks the beam from here to the
+        // end of this line, and the VINT event of it is on the way. The first
+        // interrupt of the run is the one on the VBlank line that follows.
+        self.line_vint_taken = true;
     }
 
     /// The first point in [`Vdp::line`] after the beam's current clock.
     ///
-    /// The release always precedes the back porch in a line (100 clocks, 2940
-    /// in H32), so the two are tested in that order and the first one ahead of
-    /// the beam wins.
+    /// The release always precedes the vertical interrupt, which always precedes
+    /// the back porch (81, 156 and 2915 in H40; 100, 192 and 2940 in H32), so the
+    /// three are tested in that order and the first one ahead of the beam wins.
     fn next_event_mclk(&self) -> u32 {
-        for event in [self.hblank_clear_mclk(), self.hblank_set_mclk()] {
+        for event in self.line_events() {
             if event > self.line_mclk {
                 return event;
             }
         }
         MCLKS_PER_LINE
+    }
+
+    /// The points of [`Vdp::line`] that are not the line end, in clock order.
+    ///
+    /// The vertical interrupt is one of them, on the VBlank line and once per
+    /// that line: [`Vdp::line_vint_taken`] is what says it has been spent, so a
+    /// beam parked on the VBlank line by [`Vdp::start_in_vblank`] - the state of
+    /// a chip that has just been reset - is not handed an interrupt it never saw
+    /// the front porch of.
+    fn line_events(&self) -> impl Iterator<Item = u32> {
+        let vint = self.vint_event_pending().then(|| self.vint_mclk());
+        [
+            Some(self.hblank_clear_mclk()),
+            vint,
+            Some(self.hblank_set_mclk()),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// Whether [`Vdp::line`] still has its vertical interrupt to give.
+    #[inline]
+    fn vint_event_pending(&self) -> bool {
+        self.on_vblank_line() && !self.line_vint_taken
+    }
+
+    /// The point of the line the vertical interrupt is raised at: the cycle of
+    /// [`VINT_H_COUNTER`] in the mode of the line - the counter holds for two
+    /// pixels (`hv::h_count`), so cycle 08h is pixel 16.
+    ///
+    /// The line is named by [`Vdp::on_vblank_line`] because the interrupt is the
+    /// start of VBlank, and the cycle is named because the line is not: a program
+    /// that waits for status bit 7, or for the V counter to read `E0h`, has to be
+    /// left the clocks between the line and the interrupt to be answered in. A
+    /// cart polling either reads the port every few tens of clocks, so an
+    /// interrupt raised at clock 0 of the line is taken in place of the read it
+    /// was waiting for and the wait never ends (#439).
+    #[inline]
+    fn vint_mclk(&self) -> u32 {
+        pixel_to_mclk(VINT_H_COUNTER * 2, self.h40())
+    }
+
+    /// The line VBlank starts on: the one line of the frame with a vertical
+    /// interrupt on it, and so the one with a third event beyond the two of every
+    /// other line.
+    #[inline]
+    fn on_vblank_line(&self) -> bool {
+        self.line == self.vblank_line()
     }
 
     /// The back-porch point of the line, where status bit 2 goes up.
@@ -233,13 +296,18 @@ impl Vdp {
             self.hint_counter = self.hint_reload();
         }
 
-        if self.line == self.vblank_line() {
+        // A line of its own begins with its vertical interrupt unspent; the
+        // cycle of [`VINT_H_COUNTER`] later in the line is what spends it.
+        self.line_vint_taken = false;
+
+        if self.on_vblank_line() {
             // "Set on line E0h ... and cleared on line FFh" for the flag, and
             // "a level 6 interrupt will occur when the V counter is at line
             // E0h" for the interrupt, both genvdp.txt sections 6 and 4. `frame_ready`
-            // is the scheduler's copy of the same moment.
+            // is the scheduler's copy of the same moment; the interrupt itself
+            // waits for the cycle of [`VINT_H_COUNTER`], which is later in the
+            // line - see [`Vdp::vint_mclk`].
             self.in_vblank = true;
-            self.vint_pending = true;
             self.frame_ready = true;
             // The frame is over, so the frame buffer's height is sized for the
             // picture it just drew rather than for the next one: see
@@ -258,10 +326,23 @@ impl Vdp {
         // A beam that `set_position` jumped into the middle of this line walked
         // past no event of it, so if where it landed is past the latch point the
         // line still has to be latched - the `render_line` at the end of it reads
-        // that latch (#102).
+        // that latch (#102). The vertical interrupt of the VBlank line is taken
+        // the same way (#439).
+        let past_vint = self.vint_event_pending() && self.line_mclk >= self.vint_mclk();
         if self.line_mclk >= self.hblank_clear_mclk() {
             self.latch_line_state();
         }
+        if past_vint {
+            self.take_vint();
+        }
+    }
+
+    /// Spend the vertical interrupt of [`Vdp::line`]: the flag goes up and this
+    /// line has no second one to give.
+    #[inline]
+    fn take_vint(&mut self) {
+        self.vint_pending = true;
+        self.line_vint_taken = true;
     }
 
     /// The first line of a frame.
@@ -279,7 +360,9 @@ impl Vdp {
         self.frame_buffer.odd_frame = self.weave_field();
     }
 
-    /// One of the two points of the line that are not the line end.
+    /// One of the points of the line that are not the line end: the release of
+    /// the horizontal blanking, the vertical interrupt on the VBlank line, and
+    /// the back porch.
     fn line_event(&mut self) {
         if self.line_mclk == self.hblank_clear_mclk() {
             self.in_hblank = false;
@@ -287,6 +370,11 @@ impl Vdp {
             // and mode state stops being writable: `latch` is what the line is
             // drawn from from now on (M4-23, #102).
             self.latch_line_state();
+        } else if self.vint_event_pending() && self.line_mclk == self.vint_mclk() {
+            // "A level 6 interrupt will occur when the V counter is at line E0h,
+            // roughly at H counter cycle 08h" (genvdp.txt section 4), and section
+            // 6 sets the flag it names at the same point.
+            self.take_vint();
         } else {
             self.in_hblank = true;
             self.hint_step();
@@ -478,22 +566,83 @@ mod tests {
         );
     }
 
+    /// The lines whose vertical interrupt went up, `lines` whole lines of walking
+    /// with every VINT acknowledged as it shows up.
+    ///
+    /// [`hint_lines`] for the loop index: the flag goes up part way through the
+    /// line, at [`Vdp::vint_mclk`], so it is the line being stepped - and not
+    /// `vdp.line`, which has moved on by the time the flag is read - that the
+    /// interrupt belongs to.
+    fn vint_lines(vdp: &mut Vdp, lines: u16) -> Vec<u16> {
+        let mut fired = Vec::new();
+        for line in 0..lines {
+            vdp.advance(MCLKS_PER_LINE);
+            if vdp.vint_pending {
+                fired.push(line);
+                vdp.ack_irq(6);
+            }
+        }
+        fired
+    }
+
     /// genvdp.txt section 4: the level 6 interrupt happens "when the V counter is
     /// at line E0h", which is 224, once per frame.
     #[test]
     fn vint_fires_once_per_frame_at_line_224() {
         let mut vdp = running(false);
-        let mut fired = Vec::new();
 
-        for _ in 0..262 {
+        assert_eq!(
+            vint_lines(&mut vdp, 262),
+            vec![224],
+            "once, and on the first line of VBlank"
+        );
+    }
+
+    /// The point of #439: the interrupt is not the first thing on the line.
+    ///
+    /// genvdp.txt section 4 puts it at "line E0h, roughly at H counter cycle
+    /// 08h", and section 6 says the same of the flag. A cart that waits for the
+    /// flag, or for the V counter to read `E0h`, reads the port every few tens of
+    /// clocks, so raising the interrupt at clock 0 of the line takes the line
+    /// before any read of it can happen and the wait never ends.
+    #[test]
+    fn vint_goes_up_inside_the_line_not_at_its_front_porch() {
+        let mut vdp = running(false);
+        let mut raised_at = None;
+        let mut flags_of_line = Vec::new();
+
+        for _ in 0..224 {
             vdp.advance(MCLKS_PER_LINE);
-            if vdp.vint_pending {
-                fired.push(vdp.line);
-                vdp.ack_irq(6);
+        }
+        for _ in 0..MCLKS_PER_LINE {
+            vdp.advance(1);
+            if vdp.line != 224 {
+                break;
+            }
+            flags_of_line.push(vdp.vint_pending);
+            if vdp.vint_pending && raised_at.is_none() {
+                raised_at = Some((vdp.line_mclk, vdp.hv_counter()));
             }
         }
 
-        assert_eq!(fired, vec![224], "once, and on the first line of VBlank");
+        let (at, counter) = raised_at.expect("the vertical interrupt went up inside line 224");
+        assert!(
+            at > 0 && at < MCLKS_PER_LINE,
+            "inside the line, not on its first clock: {at}"
+        );
+        assert_eq!(
+            counter, 0xE0_08,
+            "the counter reads line E0h and H counter cycle 08h at the moment the flag goes up, which is the pair genvdp.txt names for the interrupt and for the flag"
+        );
+
+        // And the flag is up for part of the line rather than all of it: the
+        // reads either side of `at` are the two answers a waiting cart tells
+        // apart, and a cart that never sees the second one is the bug.
+        assert!(!flags_of_line[0], "the line starts with the flag down");
+        assert!(
+            flags_of_line[flags_of_line.len() - 1],
+            "and it is up by the end of it"
+        );
     }
 
     /// NTSC in V30 takes its VBlank line from the same row of Kabuto's timing
@@ -506,15 +655,7 @@ mod tests {
     fn ntsc_v30_vint_is_at_line_240() {
         let mut vdp = Vdp::new(false);
         vdp.write_register(1, 0x68);
-        let mut fired = Vec::new();
-
-        for _ in 0..262 {
-            vdp.advance(MCLKS_PER_LINE);
-            if vdp.vint_pending {
-                fired.push(vdp.line);
-                vdp.ack_irq(6);
-            }
-        }
+        let fired = vint_lines(&mut vdp, 262);
 
         assert_eq!(
             fired,
@@ -560,17 +701,12 @@ mod tests {
     fn pal_v30_vint_is_at_line_240() {
         let mut vdp = Vdp::new(true);
         vdp.write_register(1, 0x68);
-        let mut fired = Vec::new();
 
-        for _ in 0..313 {
-            vdp.advance(MCLKS_PER_LINE);
-            if vdp.vint_pending {
-                fired.push(vdp.line);
-                vdp.ack_irq(6);
-            }
-        }
-
-        assert_eq!(fired, vec![240], "V30 moves VBlank, and VINT with it");
+        assert_eq!(
+            vint_lines(&mut vdp, 313),
+            vec![240],
+            "V30 moves VBlank, and VINT with it"
+        );
     }
 
     /// IE0 is read when the interrupt is offered rather than when it happened:
