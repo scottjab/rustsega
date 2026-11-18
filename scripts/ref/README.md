@@ -184,13 +184,49 @@ gap this tool is for. `--sweep 0` skips the sweep and reads at `+0`.
 `MOVEM.L` that parks them writes. It does not diff the rest of the image: pass
 `--meter` for the cursors and leave it off for the byte comparison.
 
+### What a byte of lead is worth in cycles
+
+Counting the decoder's opcode mix to get cycles per output byte is easy to get wrong
+in exactly the direction you are trying to measure. Perturbing the emulator is not:
+change the 68000's clock ratio by a known amount, re-dump our side, and read how far
+the cursor moves. The ratio is a hardware constant (`MASTER_CLOCKS_PER_68K` in
+`crates/genesis/src/scheduler.rs`, 7 on real hardware), so the size of the step is
+known even when the decoder's cost is not:
+
+```text
+scratch: MASTER_CLOCKS_PER_68K 7 -> 8, which is 12.5% less 68000 time in a frame
+
+frame window        lead as shipped    lead at master/8
+S&K 47-51                 +33.2/f            -241.0/f
+S&K 226-262               +24.4/f            -268.8/f
+S&K 440-480               +41.1/f            -211.7/f
+```
+
+The step is 12.5% of a frame of 68000 time in both directions, so the difference
+between the two columns divided by 12.5 is the scale, and it comes out the same way
+from all three windows:
+
+```text
+window         bytes per 1% of a frame        shipped lead, in cycles    scanlines
+S&K 47-51                    21.9                     1940                   4.0
+S&K 226-262                  23.5                     1330                   2.7
+S&K 440-480                  20.2                     2600                   5.3
+```
+
+So the gap this cart reports is **1.0% to 2.0% of a frame of 68000 time, 1300 to 2600
+cycles, 2.7 to 5.3 scanlines**, and a byte of output on this loader is worth 54 to 63
+cycles. Two things about the method are worth noticing. The swing reverses sign
+cleanly, which is the independent check that the meter is reading 68000 time and not
+something else about the decoder; and the calibration run is a scratch change to the
+emulator, made and thrown away, never committed. It is written up here because the
+number it produces is the only honest way to read the tool's units: it comes from
+moving the machine by a known amount, not from a model of the decoder that could be
+wrong in the same direction as the thing being measured.
+
 Three things it is not:
 
-- **Not a cycle counter.** The units are cursor bytes. To get cycles you need how
-  many cycles this decoder spends per output byte, which is a property of the
-  decoder's opcode mix and is worth getting from a cycle table, not from this
-  tool. The ratio only has to be the same on both machines for a *comparison* to be
-  meaningful, which is why the tool reports a slope and lets you do the arithmetic.
+- **Not a cycle counter.** The units are cursor bytes; see the next section for the
+  one way to turn them into cycles that does not depend on modelling the decoder.
 - **Not a measurement of a cart that parks nothing.** If every address reads 0 in
   every frame the tool says so and exits 2: two machines agreeing about an address
   no program has written is not agreement, it is a probe in mid-air. Find another
