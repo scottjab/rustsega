@@ -159,6 +159,30 @@ pub(crate) const Z80_WINDOW_WAIT_MCLK: u32 = (33 * MCLK_PER_Z80 + 5) / 10;
 /// more than the sound CPU because it also loses the cycle it was already running:
 /// "if the 68k is just about to access the bus itself it finishes its own access
 /// cycle first before releasing the bus".
+///
+/// **#532 measured what it multiplies**, on `Sonic & Knuckles (World)` at the
+/// `0x584` anchor. Over 480 frames the sound CPU charges this 64,827 times, a
+/// mean of 135 a frame with 134 frames charging none; over the decompress leg at
+/// arrivals 47-51 it charges 208 a frame, and over 440-480 (where a voice sample
+/// is also playing) 171. Every one of the 64,827 is a byte read of banked 68k
+/// ROM, and there is not one write, so the split made at
+/// [`Bus::z80_window_access`] is the split the cart gives: the 6,825,388 accesses
+/// to its own RAM, the 106,984 to the YM2612 and the 1,921 PSG writes of the same
+/// run charge the 68000 nothing.
+///
+/// **The count is the driver's, not the emulator's**, so it is not a lever. 97% of
+/// it is three instructions streaming the YM2612 DAC: `LD A,(HL)` straight into
+/// `LD ($4001),A` at `0x1150`, and the 4 bit version of the same pair at `0x10d5`
+/// and `0x10f2`, where one ROM byte holds two samples and is read twice. Each of
+/// those loops paces itself with a `DJNZ` delay, which is what sets the rate: 240
+/// reads a frame is a 14.4 kHz 8 bit sample, and the sound CPU is 98.7% busy
+/// running the loop on those frames (58,993 of the 59,736 T-states a frame holds),
+/// so there is no reading left to find either way. On 47-51 the steal is therefore
+/// 2,292 of the 128,006 clocks a frame holds, and that is the whole of the 68000
+/// hold measured at the scheduler on those frames. Closing #530's gap from this
+/// mechanism at the measured count would take 20 cycles an access on 47-51 and 26
+/// on 440-480: two figures outside the quoted 10 to 12, and no single figure for
+/// both. The count is right, and #530 does not live here.
 pub(crate) const Z80_WINDOW_STEAL_MCLK: u32 = 11 * MCLK_PER_68K;
 
 // Region boundaries, from plutiedev "Memory map".
@@ -1049,7 +1073,9 @@ impl Bus {
     ///
     /// Called from [`crate::z80_bus::Z80View`] for the window alone: the Z80's own
     /// RAM, the YM2612 and the PSG are on its side of the arbitration and cost it
-    /// nothing extra.
+    /// nothing extra - which #532 checked rather than took on faith, on a cart where
+    /// those three take 6.8M, 107k and 1.9k accesses to the window's 64,827. See
+    /// `z80_side_accesses_steal_nothing`.
     pub(crate) fn z80_window_access(&mut self) {
         let dma = self.vdp.dma_68k_stall_mclk();
         self.stall_z80(Z80_WINDOW_WAIT_MCLK);
@@ -5135,6 +5161,28 @@ mod tests {
         Z80View::new(&mut bus).write(0x8000, 0x34);
         assert_eq!(bus.take_z80_stall(), Z80_WINDOW_WAIT_MCLK);
         assert_eq!(bus.take_68k_stall(), Z80_WINDOW_STEAL_MCLK);
+    }
+
+    /// The other side of [`z80_window_access_costs_both_cpus`], which #532 measured
+    /// rather than assumed: over 480 frames of `Sonic & Knuckles (World)` the sound
+    /// CPU made 6,825,388 accesses to its own RAM, 106,984 to the YM2612 and 1,921
+    /// PSG writes, and not one of them charged the 68000 a clock. Those are the ports
+    /// below, and they have to stay free for [`Z80_WINDOW_STEAL_MCLK`] to keep
+    /// meaning "the 68k bus": the same cart reads the window 64,827 times across the
+    /// same 480 frames, and it is the reading of the window, not any of this, that is
+    /// supposed to cost the 68000 a cycle.
+    #[test]
+    fn z80_side_accesses_steal_nothing() {
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+
+        // Sound RAM, the YM2612 address and data ports, the bank register, and the
+        // PSG behind the VDP ports at 0x7F11.
+        for addr in [0x0100u16, 0x4000, 0x4001, 0x6000, 0x7F11] {
+            Z80View::new(&mut bus).read(addr);
+            Z80View::new(&mut bus).write(addr, 0x2A);
+            assert_eq!(bus.take_z80_stall(), 0, "{addr:#06x} is not the 68k bus");
+            assert_eq!(bus.take_68k_stall(), 0, "and it steals no 68000 clock");
+        }
     }
 
     /// The 68000's transfer owns the whole of its side of the bus, including the
