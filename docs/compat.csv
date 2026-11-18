@@ -290,16 +290,16 @@ Boogerman - A Pick and Flick Adventure (USA).md,BOOGERMAN,GM T-125066-00,usa,Boo
 Boogie Woogie Bowling (Japan).md,BOOGIE WOOGIE BOWLING.,GM T-058033-00,japan,Boots,17,49,,0x474ca9b3d67bd574,3.852,49 colours
 Bottle Taps Race (Europe) (Sega Reactor).md,JogosDevworks,GM 00000000-00,usa,Boots,18,24,,0x38dd8ef070c2f39b,3.771,24 colours
 Bottle Taps Race (USA) (Unl).md,JogosDevworks,GM 00000000-00,usa,Boots,18,24,,0x38dd8ef070c2f39b,2.467,24 colours
-Boxing Legends of the Ring (USA).md,BOXING LEGENDS OF THE RING,GM 00107026-00,usa,Panic,0,0,,,0.023,263 lines and the VDP has not raised `frame_done`
+Boxing Legends of the Ring (USA).md,BOXING LEGENDS OF THE RING,GM 00107026-00,usa,Boots,1,20,,0xb3d415c7c3801d4a,3.344,20 colours
 Bram Stoker's Dracula (Europe).md,DRACULA,GM T-93016 -50,usa,Boots,2,16,,0x37de8f38719dbcd8,3.773,16 colours
 Bram Stoker's Dracula (USA).md,DRACULA,GM T-93016 -01,usa,Boots,2,16,,0x37de8f38719dbcd8,2.750,16 colours
 "Brave Battle Saga - Legend of the Magic Warrior (USA, Europe) (Unl).md",Brave Battle Saga - Legend of the Magic Warrior,GM MK-XXXXX-XX,usa,Boots,2,2,"START@300,START@301",0x25185d56fdf8140f,6.303,"23 colours with START@300,START@301"
 Breach (USA) (Proto).md,unknown,,usa,Boots,16,16,,0x1f9ad25cd8b2d07f,3.891,16 colours
 Brett Hull Hockey 95 (USA).md,Brett Hull Hockey '95,GM T-119076-00,usa,Boots,1,49,,0xb3d415c7c3801d4a,3.953,49 colours
-Brian Lara Cricket (Australia).md,BRIAN LARA CRICKET,GM T-120106-50,europe,Panic,0,0,,,0.041,314 lines and the VDP has not raised `frame_done`
-Brian Lara Cricket (Europe).md,BRIAN LARA CRICKET,GM T-120106-00,europe,Panic,0,0,,,0.041,314 lines and the VDP has not raised `frame_done`
-Brian Lara Cricket 96 (Europe) (Rev 1).md,BRIAN LARA 96,GM T-120146-50,europe,Panic,0,0,,,0.041,314 lines and the VDP has not raised `frame_done`
-Brian Lara Cricket 96 (Europe).md,BRIAN LARA 96,GM T-120146-50,europe,Panic,0,0,,,0.041,314 lines and the VDP has not raised `frame_done`
+Brian Lara Cricket (Australia).md,BRIAN LARA CRICKET,GM T-120106-50,europe,Boots,43,43,,0x445555c4369d0eb6,4.327,43 colours
+Brian Lara Cricket (Europe).md,BRIAN LARA CRICKET,GM T-120106-00,europe,Boots,43,43,,0x445555c4369d0eb6,4.347,43 colours
+Brian Lara Cricket 96 (Europe) (Rev 1).md,BRIAN LARA 96,GM T-120146-50,europe,Boots,52,52,,0xd8070d3b783c7d3c,4.587,52 colours
+Brian Lara Cricket 96 (Europe).md,BRIAN LARA 96,GM T-120146-50,europe,Boots,52,52,,0xd8070d3b783c7d3c,4.607,52 colours
 "Brutal - Paws of Fury (Europe) (En,Fr,De).md",BRUTAL - PAWS OF FURY,GM T-83136 -50,europe,Boots,13,19,,0x3c6643fda415f7f0,4.073,19 colours
 Brutal - Paws of Fury (USA).md,BRUTAL - PAWS OF FURY,GM T-83136 -00,usa,Boots,13,39,,0x7e52a2014d119067,2.849,39 colours
 Bubba 'N' Stix (Europe).md,BUBBA 'N' STIX,GM T-115026-00,europe,Boots,37,46,,0x8bf1855564184aa9,3.370,46 colours
@@ -308,7 +308,7 @@ Bubba N Stix (Europe) (Beta).md,BUBBA 'N' STIX,GM T-000000-00,usa,Boots,37,46,,0
 Bubble and Squeak (Europe).md,BUBBLE AND SQUEAK,GM T-015096 50,europe,Boots,15,31,,0x4bd1b9479e8bb990,4.174,31 colours
 Bubble and Squeak (USA).md,BUBBLE AND SQUEAK,GM T-015096 00,usa,Blank,1,1,,0xb3d415c7c3801d4a,6.760,1 colours
 "Bubsy II (USA, Europe).md",BUBSY 2,GM T-119136-00,usa,Boots,20,43,,0xc8ad0f7aa6649910,4.217,43 colours
-"Bubsy in - Claws Encounters of the Furred Kind (USA, Europe).md",Bubsy,GM T-119026-00,usa,Panic,0,0,,,2.648,263 lines and the VDP has not raised `frame_done`
+"Bubsy in - Claws Encounters of the Furred Kind (USA, Europe).md",Bubsy,GM T-119026-00,usa,Boots,35,36,,0xa2f4e9ba30e38758,3.432,36 colours
 "Buck Rogers - Countdown to Doomsday (USA, Europe).md",BUCK RODGERS COUNTDOWN TO DOOMSD,GM T-50286 -00,usa,Boots,3,13,,0x32294724768d088a,3.691,13 colours
 Budokan - The Martial Spirit (Europe).md,BUDOKAN,GM T-50016 -00,usa,Boots,33,33,,0xe6e0a398b41ef382,2.848,33 colours
 Budokan - The Martial Spirit (USA) (Rev 1) (Beta) (1990-09-25).md,BUDOKAN,GM T-50016 -00,usa,Boots,33,33,,0xe6e0a398b41ef382,3.931,33 colours
@@ -367,7 +367,7 @@ Chaoji Poker (Taiwan) (En) (Unl).md,............................................
 "Chaos Engine 2, The (Europe) (Proto).md",CHAOS ENGINE TWO,GM Txxxxx  -00,europe,Boots,44,44,,0x6374ae41fa511861,4.112,44 colours
 "Chaos Engine, The (Europe).md",THE CHAOS ENGINE,GM T-104066-00,europe,Boots,8,15,,0xf6d1dd54a72e3b2c,3.994,15 colours
 Chase H.Q. II (USA).md,CHASE_HQ2,GM T-11106 -00,usa,Boots,12,39,,0x2d214541ba317adc,3.210,39 colours
-Chavez II (Mexico).md,CHAVEZ 2,GM T-137036-00,usa,Panic,0,0,,,0.021,263 lines and the VDP has not raised `frame_done`
+Chavez II (Mexico).md,CHAVEZ 2,GM T-137036-00,usa,Boots,11,36,,0x7614d8d9897eba67,3.744,36 colours
 "Cheese Cat-Astrophe Starring Speedy Gonzales (Europe) (En,Fr,De,Es).md",CHEESE CAT-ASTROPHE STARRING SPEEDY GONZALES,GM MK-1540 -00,europe,Boots,15,34,,0xe88414e890db479c,4.175,34 colours
 Chelnov (Japan).md,ATOMIC RUNNER,GM T-13073 -00,japan,Boots,16,34,,0xd38b6f6049342460,3.533,34 colours
 Chengjisihan II - Yuanchao Mishi Zhi Canglang Yu Bailu (China) (Pirate).md,.....T...........E.......j,GM T-76103 -00,japan,Boots,1,24,,0xb3d415c7c3801d4a,2.829,24 colours
@@ -427,8 +427,8 @@ Columns III (USA).md,COLUMNS 3,GM T-23056 -00,usa,Boots,44,44,,0x3dead305ef395cb
 "Columns III - Taiketsu! Columns World (Japan, Korea) (Ja).md",COLUMNS 3,GM 00004801-00,japan,Boots,44,44,,0x8438e68a11066016,3.895,44 colours
 Combat Aces (USA) (Proto).md,"*....(.Z.z. ._...p. ...`."".U.. .......",,usa,Boots,37,37,,0x258c9c7f7ce2cb8b,3.149,37 colours
 "Combat Cars (USA, Europe).md",COMBAT CARS,GM T-119106-00,usa,Boots,29,30,,0x2adb49b12f948240,2.931,30 colours
-Comix Zone (Europe) (Beta) (1995-06-28).md,COMIX ZONE,GM MK-1569 -50,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
-Comix Zone (Europe) (Beta) (1995-07-12).md,COMIX ZONE,GM MK-1569 -50,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
+Comix Zone (Europe) (Beta) (1995-06-28).md,COMIX ZONE,GM MK-1569 -50,europe,Boots,8,28,,0xc17add2e103bb056,4.315,28 colours
+Comix Zone (Europe) (Beta) (1995-07-12).md,COMIX ZONE,GM MK-1569 -50,europe,Boots,8,28,,0xc17add2e103bb056,4.333,28 colours
 "Comix Zone (Europe) (En,Fr,De,Es).md",COMIX ZONE,GM MK-1569 -50,europe,Boots,8,28,,0xdac68a65bf6ba206,4.257,28 colours
 "Comix Zone (Japan) (En,Ja).md",COMIX ZONE,GM G-4132  -00,japan,Boots,11,28,,0x3a8cd5768681546e,3.856,28 colours
 Comix Zone (USA) (1995-06-09) (Virtual Console).md,COMIX ZONE,GM MK-1569 -00,usa,Boots,8,28,,0xdac68a65bf6ba206,3.050,28 colours
@@ -516,7 +516,7 @@ Daikoukai Jidai II (Japan).md,...q.C.....U,GM T-76163 -00,japan,Boots,4,30,,0xf2
 Daimakaimura (Japan).md,GHOULS'N GHOSTS,GM 00004013-00,japan,Boots,15,34,,0x9cbd83f5f84221f2,3.631,34 colours
 Dangerous Seed (Japan) (En).md,DANGEROUS SEED,GM T-14033 -00,japan,Boots,2,22,,0xcbdc7864a8d3ee9a,3.209,22 colours
 Danny Sullivan's Indy Heat (USA) (Proto).md,Game title here,** ****??? -00,japan,Boots,10,37,,0x3859b63fc1f5b803,4.216,37 colours
-"Darius (World) (Genesis Mini, Mega Drive Mini).md",DARIUS MD,GM 00000000-00,usa,Panic,0,0,,,2.674,263 lines and the VDP has not raised `frame_done`
+"Darius (World) (Genesis Mini, Mega Drive Mini).md",DARIUS MD,GM 00000000-00,usa,Boots,17,29,,0xbf62b5d2dddf5a18,2.617,29 colours
 Darius - Extra Version (Japan) (En) (Columbus Circle).md,DARIUS MD EXTRA VER.,GM T-11193 -00,usa,Boots,18,29,,0xa1a093d95e160015,4.742,29 colours
 "Darius - Extra Version (USA, Europe) (Strictly Limited Games).md",DARIUS MD,GM HC-0005  01,usa,Boots,18,29,,0xa1a093d95e160015,4.778,29 colours
 Darius II (Japan).md,DARIUS 2,GM T-11083 -00,japan,Boots,1,25,,0x3251a7a3e3991d0a,2.969,25 colours
@@ -596,7 +596,7 @@ Dr. Robotnik's Mean Bean Machine (Europe).md,Dr. Robotnik's Mean Bean Machine,GM
 Dr. Robotnik's Mean Bean Machine (USA) (Beta 1).md,Dr. Robotnik's Mean Bean Machine,GM ??-???? -00,usa,Boots,8,48,,0xc05eefa9e1d076c5,3.090,48 colours
 Dr. Robotnik's Mean Bean Machine (USA) (Beta 2).md,Dr. Robotnik's Mean Bean Machine,GM MK-1706 -00,usa,Boots,8,48,,0xc05eefa9e1d076c5,4.478,48 colours
 Dr. Robotnik's Mean Bean Machine (USA).md,Dr. Robotnik's Mean Bean Machine,GM MK-1706 -00,usa,Boots,8,48,,0xc05eefa9e1d076c5,4.073,48 colours
-Dragon - The Bruce Lee Story (Europe).md,DRAGON,GM T-70286 -00,europe,Panic,0,0,,,0.042,314 lines and the VDP has not raised `frame_done`
+Dragon - The Bruce Lee Story (Europe).md,DRAGON,GM T-70286 -00,europe,Boots,17,36,,0x974b5eea5a54b1f3,4.312,36 colours
 Dragon - The Bruce Lee Story (USA).md,DRAGON BRUCE LEE,GM T-81496 -00,usa,Boots,33,36,,0x4493359dda3dd81a,3.893,36 colours
 Dragon Ball - Final Bout (Taiwan) (En) (Unl).md,".,........g.. N.....E.....N.....E.....N.....N..",..L...Ns,usa,Boots,19,36,,0x5fac463eb3fe9fe5,3.499,36 colours
 Dragon Ball Z - Buyuu Retsuden (Japan).md,DRAGON BALL Z,GM T-133013-00,japan,Boots,16,49,,0x19ddf9955e9e0e9b,4.216,49 colours
@@ -606,8 +606,8 @@ Dragon Slayer - Eiyuu Densetsu II (Japan).md,........... .p.Y.`...Q,GM G-5544   
 Dragon's Eye Plus - Shanghai III (Japan).md,SHANGHAI 3 DRAGON'S EYE,GM T-67023 -00,japan,Boots,9,21,,0x96d2d4465fcf9ff6,3.691,21 colours
 "Dragon's Fury (USA, Europe).md",DRAGON'S FURY,GM T-48116 -00,usa,Boots,21,32,,0x4637af337130a913,2.808,32 colours
 Dragon's Lair (USA) (Proto) (1994-06-xx).md,Dragon's Lair The Adventure Continues,GM T-11136-00,usa,Boots,1,38,,0x3251a7a3e3991d0a,3.632,38 colours
-Dragon's Revenge (Japan) (En).md,DRAGON'S FURY2,GM T-48143 -00,usa,Panic,0,0,,,0.021,263 lines and the VDP has not raised `frame_done`
-"Dragon's Revenge (USA, Europe).md",DRAGON'S REVENGE,GM T-048266-00,usa,Panic,0,0,,,0.021,263 lines and the VDP has not raised `frame_done`
+Dragon's Revenge (Japan) (En).md,DRAGON'S FURY2,GM T-48143 -00,usa,Boots,33,45,,0xf711eedf2aa86e6e,3.401,45 colours
+"Dragon's Revenge (USA, Europe).md",DRAGON'S REVENGE,GM T-048266-00,usa,Boots,33,45,,0xf711eedf2aa86e6e,3.881,45 colours
 Dream Team USA (Japan).md,TEAM USA BASKETBALL,GM T-50376 -00,usa,Boots,18,35,,0xa31bee86825e3a95,3.832,35 colours
 Du Shen Zhi - Menghuan Poker (Taiwan) (Unl).md,"Super Majon ClubVersion 1.00 Bill,Will & Andy",MDGM-0000-0001,japan,Boots,39,41,,0xb1b27cc7c3e467fd,3.271,41 colours
 Duke Nukem 3D (Brazil) (En).md,DUKE NUKEM 3D,GM T-274026-01,usa,Boots,10,15,,0x392d0c02b3eb6f78,3.536,15 colours
@@ -655,7 +655,7 @@ Earthworm Jim 2 (Europe) (Beta) (1995-08-24).md,EARTHWORM JIM 2,GM T-132056-50,e
 Earthworm Jim 2 (Europe).md,EARTHWORM JIM 2,GM T-70446-50,europe,Boots,38,44,,0x16f12da2dae01a2a,3.784,44 colours
 Earthworm Jim 2 (USA) (Beta) (1995-08-09).md,EARTHWORM JIM 2,GM T-132056-00,usa,Boots,41,42,,0x300a9b23bfde8db5,3.679,42 colours
 Earthworm Jim 2 (USA).md,EARTHWORM JIM 2,GM T-132056-00,usa,Boots,41,44,,0x0db7b3fd23c66ffe,3.662,44 colours
-"Ecco - The Tides of Time (Europe) (En,Fr,De,Es).md",ECCO THE TIDES OF TIME,GM MK-1553 -00,europe,Panic,0,0,,,0.334,314 lines and the VDP has not raised `frame_done`
+"Ecco - The Tides of Time (Europe) (En,Fr,De,Es).md",ECCO THE TIDES OF TIME,GM MK-1553 -00,europe,Boots,24,49,,0x2d9bd79ca6821ec0,4.472,49 colours
 Ecco - The Tides of Time (USA) (Beta) (1994-03-xx).md,ECCO 2,GM MK-1042 -01,usa,Boots,15,26,,0x03635e7b8a754692,4.176,26 colours
 Ecco - The Tides of Time (USA) (Beta) (1994-04-13).md,ECCO 2,GM MK-1042 -01,usa,Boots,28,48,,0x9fd0f4e8b1c906aa,4.395,48 colours
 Ecco - The Tides of Time (USA) (Beta) (1994-04-29).md,ECCO 2,GM MK-1042 -01,usa,Boots,28,48,,0x9fd0f4e8b1c906aa,4.396,48 colours
@@ -710,7 +710,7 @@ Exile (USA) (Sega Channel).md,.d.w.h.k.d,GM T-49186 -00,usa,Boots,15,15,,0x75ad4
 Exile (USA).md,EXILE,GM T-49186 -00,usa,Boots,15,15,,0x75ad472412f4632c,3.330,15 colours
 Exile (World) (Evercade).md,EXILE,GM T-49186 -00,usa,Boots,15,15,,0xc233c493a1a5cb52,2.312,15 colours
 Exile - Toki no Hazama he (Japan).md,XZR,GM T-49093 -00,japan,Boots,15,15,,0xc233c493a1a5cb52,2.791,15 colours
-Exo Squad (Europe).md,EXO-SQUAD,GM T-132026-00,europe,Panic,0,0,,,1.147,314 lines and the VDP has not raised `frame_done`
+Exo Squad (Europe).md,EXO-SQUAD,GM T-132026-00,europe,Boots,5,39,,0x3899d00cd94ef84a,3.898,39 colours
 Exo Squad (USA) (Beta).md,EXO-SQUAD,GM T-132086-00,usa,Boots,1,39,,0x3251a7a3e3991d0a,4.053,39 colours
 Exo Squad (USA).md,EXO-SQUAD,GM T-132026-00,usa,Boots,1,39,,0x3251a7a3e3991d0a,4.301,39 colours
 Exodus - Journey to the Promised Land (USA) (Unl).md,INC..09....09... 09... .9.... .. g.#.SEGA..@.09,"...@..@..F.,|",usa,Boots,2,23,,0x230c10e0eec88402,3.812,23 colours
@@ -987,7 +987,7 @@ Instruments of Chaos Starring Young Indiana Jones (USA) (Beta) (1994-01-26).md,I
 Instruments of Chaos Starring Young Indiana Jones (USA) (Beta) (1994-01-27).md,INSTRUMENTS OF CHAOS,GM MK-1048 -00,usa,Boots,26,26,,0x169ed2e6c04e332e,4.743,26 colours
 Instruments of Chaos Starring Young Indiana Jones (USA).md,INSTRUMENTS OF CHAOS,GM MK-1048 -00,usa,Boots,26,26,,0x169ed2e6c04e332e,4.552,26 colours
 International Rugby (Europe).md,RUGBY,T-88056-50,usa,Boots,15,21,,0xad7f9c5f3cc536d5,3.917,21 colours
-"International Sensible Soccer (Europe) (En,Fr,De,It).md",SENSIBLE SOCCER-INTERNATIONAL EDITION,GM T-93146  00,europe,Panic,0,0,,,0.061,314 lines and the VDP has not raised `frame_done`
+"International Sensible Soccer (Europe) (En,Fr,De,It).md",SENSIBLE SOCCER-INTERNATIONAL EDITION,GM T-93146  00,europe,Boots,15,18,,0x84ba41f186058e33,2.492,18 colours
 "International Superstar Soccer Deluxe (Europe, Brazil) (En).md",INTERNATIONAL SUPER STAR SOCCER DELUXE,GM T-95196-50,usa,Boots,25,31,,0x27d9e808c0ecf956,3.716,31 colours
 Ishido - The Way of Stones (USA) (Unl).md,`...`...`...`...`...`...`...`...`...`...`...`...,`...`...`...`,usa,Boots,11,26,,0xeb45a04af1bf6cbd,4.015,26 colours
 It Came from the Desert (USA) (Proto).md,IT CAME FROM THEDESERT,GM T-XXXXX -XX,usa,Boots,1,19,,0x3251a7a3e3991d0a,4.212,19 colours
@@ -1055,7 +1055,7 @@ Jungle Strike - Uketsugareta Kyouki (Japan).md,JUNGLE STRIKE,GM T-106203-00,usa,
 Junker's High (Japan) (En) (Beta 1).md,JUNKERS HIGH,GM T-101016-00,japan,Boots,9,28,,0x33e0f1052ecb327a,3.994,28 colours
 Junker's High (Japan) (En) (Beta 2).md,JUNKER'S HIGH,GM T-44033 -00,japan,Boots,9,28,,0x33e0f1052ecb327a,2.367,28 colours
 Junte 4 (Brazil) (Mega Drive 4).md,Junte 4,GM 00000000-00,usa,Boots,27,27,,0x156104ac0a376b31,2.650,27 colours
-Jurassic Park (Europe) (1993-06-14) (Sega Channel).md,JURASSIC PARK,GM MK-1056 -00,europe,Panic,0,0,,,0.041,314 lines and the VDP has not raised `frame_done`
+Jurassic Park (Europe) (1993-06-14) (Sega Channel).md,JURASSIC PARK,GM MK-1056 -00,europe,Boots,38,40,,0xcc738388001d8009,2.928,40 colours
 Jurassic Park (Europe).md,JURASSIC PARK,GM MK-1056 -00,europe,Boots,38,40,,0x557fb66bf3539e59,4.516,40 colours
 Jurassic Park (Japan) (En).md,JURASSIC PARK,GM MK-1056 -00,japan,Boots,34,40,,0xaffed4b659954859,4.664,40 colours
 Jurassic Park (USA) (1993-05-26) (Sega Channel).md,JURASSIC PARK,GM MK-1056 -00,usa,Boots,34,40,,0xaffed4b659954859,4.134,40 colours
@@ -1091,7 +1091,7 @@ King Salmon (Japan).md,KING SALMON,GM T-28053 -00,japan,Boots,12,17,,0xfab9eaebd
 King Salmon - The Big Catch (USA).md,KING SALMON,GM T-23026 -00,usa,Boots,12,17,,0xc787f3716a41237a,3.374,17 colours
 "King of Fighters '99, The (Taiwan) (En) (Unl).md",g.. N....LE.....N.....E.....N.....N....:L...Ns,,usa,Panic,0,0,,,0.303,not implemented: m68k opcode 4741
 "King of Fighters 2000, The (Taiwan) (En) (Unl).md",...g.. N....*E.....N....$E.....N....$N.. R.L.,..Ns,usa,Boots,23,23,,0x83debe95b66e29b1,0.675,23 colours
-"King of Fighters 98', The (Taiwan) (En) (Unl).md",...g.. N....*E.....N....$E.....N....$N.. R.L.,..Ns,usa,Panic,0,0,,,0.763,263 lines and the VDP has not raised `frame_done`
+"King of Fighters 98', The (Taiwan) (En) (Unl).md",...g.. N....*E.....N....$E.....N....$N.. R.L.,..Ns,usa,Boots,1,44,,0x1b3b48fb160d9d4a,3.790,44 colours
 King of the Monsters (Europe).md,KING OF THE MONSTERS,GM MK-1086-50,europe,Boots,2,41,,0xbfb088e3412fa222,4.317,41 colours
 King of the Monsters (Japan).md,KING OF THE MONSTERS,GM G-4104 00,japan,Boots,15,42,,0x1920894ecae45f0c,3.373,42 colours
 King of the Monsters (USA).md,KING OF THE MONSTERS,GM T-103026-00,usa,Boots,2,41,,0xbfb088e3412fa222,3.911,41 colours
@@ -1139,8 +1139,8 @@ Last Action Hero (USA).md,LAST ACTION HERO,GM T-93066 -00,usa,Boots,15,15,,0xe9a
 "Lawnmower Man, The (USA, Europe).md",THE LAWNMOWER MAN,GM T-48336  00,usa,Boots,11,15,,0xfd08edafea982911,3.811,15 colours
 "Legend of Galahad, The (USA, Europe).md",GALAHAD,GM T-50406 -01,usa,Boots,16,30,,0x400e0f9a9d2cb688,3.833,30 colours
 "Legend of Wukong (USA, Europe) (Super Fighter Team) (Unl).md",LEGEND OF WUKONG,SF-002,usa,Boots,1,28,,0xb3d415c7c3801d4a,2.830,28 colours
-"Legende de Thor, La (France) (Mega Drive Mini).md",THE STORY OF THOR,GM MK-1354 -00,europe,Panic,0,0,,,0.023,314 lines and the VDP has not raised `frame_done`
-"Legende de Thor, La (France).md",THE STORY OF THOR,GM MK-1354 -00,europe,Panic,0,0,,,0.022,314 lines and the VDP has not raised `frame_done`
+"Legende de Thor, La (France) (Mega Drive Mini).md",THE STORY OF THOR,GM MK-1354 -00,europe,Boots,13,27,,0x8d751dafad66bc10,4.293,27 colours
+"Legende de Thor, La (France).md",THE STORY OF THOR,GM MK-1354 -00,europe,Boots,13,27,,0x8d751dafad66bc10,4.211,27 colours
 Leidian Chuanshuo II (Thunderbolt II) (Taiwan) (En) (Unl).md,H.. E....h09........3.......N...v`L...Nu........,............y,usa,Boots,19,20,,0x3b06722628aabcf4,3.692,20 colours
 Lemmings (Europe).md,LEMMINGS,GM MK-1704 -00,europe,Boots,21,28,,0x630fd57e2d7498c7,4.092,28 colours
 "Lemmings (Japan, Korea) (En).md",LEMMINGS,GM T-15063 -01,usa,Boots,21,28,,0x630fd57e2d7498c7,4.071,28 colours
@@ -1195,7 +1195,7 @@ Mad Stalker - Full Metal Forth (Japan) (En) (Columbus Circle).md,MAD STALKER,GM 
 "Madden NFL 95 (USA, Europe).md",Madden NFL '95,GM T-50926 -00,usa,Boots,16,39,,0x8cf4f4ce232e5421,3.934,39 colours
 "Madden NFL 96 (USA, Europe).md",Madden NFL 96,GM T-172076-00,usa,Boots,18,23,,0xd53659c7cd5f63a5,3.752,23 colours
 "Madden NFL 97 (USA, Europe).md",Madden NFL 97,GM T-172136-00,usa,Boots,15,42,,0x1f86372cd298c32f,4.233,42 colours
-Madden NFL 98 (USA).md,MADDEN NFL 98,GM T-172196-00,usa,Panic,0,0,,,3.090,263 lines and the VDP has not raised `frame_done`
+Madden NFL 98 (USA).md,MADDEN NFL 98,GM T-172196-00,usa,Boots,10,41,,0xb4d186d64fc0b407,3.829,41 colours
 Madou Monogatari I (Japan).md,........ .T,GM T-66023 -00,japan,Boots,18,35,,0x66a4d5d5eb25635a,2.548,35 colours
 Magic Bubble (Taiwan) (En) (Unl).md,unknown,GM 4024  -00,japan,Boots,30,30,,0xcac7460b6b1b1a2b,3.331,30 colours
 "Magic Girl (USA, Europe) (Super Fighter Team) (Unl).md",MAGIC GIRL FEATURING LING LING THE LITTLE WITCH,SF-008,usa,Boots,27,36,,0x15f3176a628e07c0,3.610,36 colours
@@ -1271,10 +1271,10 @@ Mega Turrican (USA).md,MEGA TURRICAN,GM T-13086-00,usa,Boots,5,16,,0xd6e0434a846
 "Mega Turrican (USA, Europe) (Virtual Console).md",MEGA TURRICAN,GM T-13086-00,usa,Boots,15,24,,0xd04c09e8e6031098,2.692,24 colours
 "Mega Turrican - Director's Cut (USA, Europe).md",MEGA TURRICAN MULTI,GM T-13086-00,usa,Boots,15,15,,0x2e2e2f61dd6259ec,3.150,15 colours
 Mega lo Mania (Japan).md,MEGA lo MANIA,GM T-68053  00,japan,Blank,1,1,,0x3251a7a3e3991d0a,6.643,1 colours
-Mega-lo-Mania (Europe) (Beta).md,MEGA lo MANIA,CD C-19921  01,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
-Mega-lo-Mania (Europe).md,MEGA lo MANIA,GM T-70056  00,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
-Mega-lo-Mania (France).md,MEGA lo MANIA,GM T-70056  00,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
-Mega-lo-Mania (World) (Evercade).md,MEGA lo MANIA,GM T-70056  00,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
+Mega-lo-Mania (Europe) (Beta).md,MEGA lo MANIA,CD C-19921  01,europe,Blank,1,1,,0xb6a99e4b07a6061a,8.080,1 colours
+Mega-lo-Mania (Europe).md,MEGA lo MANIA,GM T-70056  00,europe,Blank,1,1,,0xb6a99e4b07a6061a,8.297,1 colours
+Mega-lo-Mania (France).md,MEGA lo MANIA,GM T-70056  00,europe,Blank,1,1,,0xb6a99e4b07a6061a,5.223,1 colours
+Mega-lo-Mania (World) (Evercade).md,MEGA lo MANIA,GM T-70056  00,europe,Blank,1,1,,0xb6a99e4b07a6061a,7.202,1 colours
 MegaMind (Japan) (Sega Game Toshokan).md,SEGANET GAME,GM 00054503-00,japan,Boots,2,14,,0xe70ee8209d0048da,4.033,14 colours
 MegaPanel (Japan).md,MEGAPANEL,GM T-14073 -00,japan,Boots,12,49,,0x863da3897d442915,3.009,49 colours
 MegaTrax (Japan) (En).md,QUAD CHALLENGE,GM T-14113 -00,japan,Boots,25,40,,0x9e4888f22f03ea67,4.395,40 colours
@@ -1347,7 +1347,7 @@ Mortal Kombat (World) (Beta).md,T2 ; THE ARCADE GAME,GM T-081156-01,usa,Boots,16
 Mortal Kombat (World).md,MORTAL KOMBAT,GM T-81186  00,usa,Boots,16,16,,0x9c22a9a3c27bd27b,3.711,16 colours
 Mortal Kombat 3 (China) (En) (Pirate).md,MORTAL KOMBAT 3,GM T-097116 00,usa,Boots,2,30,,0x7c4825b2e01534ba,2.328,30 colours
 Mortal Kombat 3 (Europe).md,MORTAL KOMBAT 3,GM T-81536 -50,europe,Boots,4,30,,0xa5f5c2a312ff9253,3.331,30 colours
-Mortal Kombat 3 (USA) (Beta).md,unknown,,usa,Panic,0,0,,,0.022,263 lines and the VDP has not raised `frame_done`
+Mortal Kombat 3 (USA) (Beta).md,unknown,,usa,Boots,2,30,,0xde71fc1a3a0fa26e,2.249,30 colours
 Mortal Kombat 3 (USA).md,MORTAL KOMBAT 3,GM T-097116 00,usa,Boots,2,30,,0x7c4825b2e01534ba,3.511,30 colours
 Mortal Kombat II (World).md,MORTAL KOMBAT II,GM T-081346 00,usa,Boots,14,15,,0xd68751e4b10f3566,3.992,15 colours
 Mosaico (Brazil) (Super Mega Drive 3).md,JogosDevworks,GM 00000000-00,usa,Boots,12,24,,0xdb719fb457a94762,3.972,24 colours
@@ -1492,7 +1492,7 @@ New Horizons (USA).md,UNCHARTED WATERS NEW HORIZONS,GM T-76126 -00,usa,Boots,6,2
 "NewZealand Story, The (Japan) (En).md",NEWZEALAND STORY,GM T-11013 -00,japan,Boots,31,32,,0x4258250d3b5df6d2,3.946,32 colours
 Newman Haas IndyCar Featuring Nigel Mansell (World).md,Newman-Haas IndyCar Featuring Nigel Mansell,GM T-081366-00,usa,Boots,3,32,,0xf91f886c0513cb36,3.370,32 colours
 Nigel Mansell's World Championship Racing (Europe).md,NIGEL MANSELLS WORLD CHAMPIONSHIP,GM T-95186-00,europe,Boots,3,39,,0x85a1721c0cbd214a,3.944,39 colours
-Nigel Mansell's World Championship Racing (USA).md,NIGEL MANSELLS WORLD CHAMPIONSHIP,GM T-83066 -00,usa,Panic,0,0,,,1.966,263 lines and the VDP has not raised `frame_done`
+Nigel Mansell's World Championship Racing (USA).md,NIGEL MANSELLS WORLD CHAMPIONSHIP,GM T-83066 -00,usa,Boots,11,39,,0x607917e6a831924b,2.169,39 colours
 Nightmare Circus (Brazil) (En) (Beta 1).md,Nightmare circus,GM T-000000-00,usa,Boots,40,40,,0xd118d14efdc064e6,3.813,40 colours
 Nightmare Circus (Brazil) (En) (Beta 2).md,Nightmare Circus,GM MK-1575 -00,usa,Boots,39,39,,0x3996864da021f8d9,2.755,39 colours
 Nightmare Circus (Brazil) (En).md,Nightmare Circus,GM MK-1575 -00,usa,Boots,39,39,,0x3996864da021f8d9,3.540,39 colours
@@ -1527,8 +1527,8 @@ On Dal Jang Goon (Korea).md,MYSTIC DEFENDER,GM 00001011-00,usa,Boots,10,11,,0x3f
 "Ooze, The (USA) (Beta) (1995-06-29).md",THE OOZE,GM MK-1572 -00,usa,Boots,12,25,,0x484bc32b5decec86,4.213,25 colours
 Operation Europe - Path to Victory 1939-45 (USA).md,OPERATION EUROPE PATH TO VICTORY 1939-45,GM T-76096 -00,usa,Boots,6,20,,0x4ca0e4a1f087e65a,4.075,20 colours
 Osomatsu-kun Hachamecha Gekijou (Japan).md,osomatsu,GM 00004005-01,usa,Boots,15,18,,0x332310e48c2ea54e,3.997,18 colours
-"Ottifants, The (Europe) (De) (Beta).md",OTTIFANT,GM MK1531  -00,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
-"Ottifants, The (Europe) (En,Fr,De,Es,It).md",THE OTTIFANTS,GM MK1531  -00,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
+"Ottifants, The (Europe) (De) (Beta).md",OTTIFANT,GM MK1531  -00,europe,Boots,12,25,,0xc8d48b21cd93ceaf,4.272,25 colours
+"Ottifants, The (Europe) (En,Fr,De,Es,It).md",THE OTTIFANTS,GM MK1531  -00,europe,Boots,9,42,,0x0ca17afb827e0ca5,4.075,42 colours
 Out of This World (USA) (Beta).md,OUT OF THIS WORLD,GM 00000000-00,usa,Boots,5,13,,0x024e83b8925f57c7,3.692,13 colours
 Out of This World (USA).md,OUT OF THIS WORLD,GM T-70106  00,usa,Boots,14,14,,0x3300e72af581711c,3.311,14 colours
 Out of the Vortex (USA) (Proto) (1995-07-10).md,OUT OF THE VORTEX,GM ????????-??,usa,Boots,48,48,,0x415d98a5a8a9850d,3.893,48 colours
@@ -1573,9 +1573,9 @@ Panorama Cotton (Japan) (Beta) (1993-11-27).md,PANORAMA COTTON,GM 00000000-0,usa
 Panorama Cotton (Japan).md,PANORAMA COTTON,GM T-15103-00,japan,Boots,16,43,,0x5cc90c68037f7c0c,3.030,43 colours
 Panorama Cotton (USA) (Strictly Limited Games).md,PANORAMA COTTON ENGLISH,GM T-15XXX-00,usa,Boots,15,43,,0xb9d69fe40ff234a6,3.895,43 colours
 "Paperboy (Japan) (En,Ja).md",PaperBoy,GM T-48086 -00,usa,Boots,20,36,,0x3a444d25e0fe193b,3.253,36 colours
-"Paperboy (USA, Europe) (Beta) (1991-10-28).md",PaperBoy,GM T-48086 -00,usa,Panic,0,0,,,0.021,263 lines and the VDP has not raised `frame_done`
+"Paperboy (USA, Europe) (Beta) (1991-10-28).md",PaperBoy,GM T-48086 -00,usa,Boots,20,36,,0x73856d70ae8578f5,2.768,36 colours
 "Paperboy (USA, Europe).md",PaperBoy,GM T-48086 -00,usa,Boots,20,37,,0xbf5d75edd1355137,4.292,37 colours
-"Paperboy 2 (USA, Europe).md",PAPERBOY 2,GM T-48176 -00,usa,Panic,0,0,,,0.021,263 lines and the VDP has not raised `frame_done`
+"Paperboy 2 (USA, Europe).md",PAPERBOY 2,GM T-48176 -00,usa,Boots,18,27,,0xd242c760c7c48a15,3.852,27 colours
 Party Quiz Mega Q (Japan).md,PARTY QUIZ MEGA Q,GM 00004107-00,japan,Boots,10,38,,0xc159a5dcf5c3ee00,3.876,38 colours
 Pat Riley Basketball (USA) (Beta) (1990-06-14).md,PAT RILEY BASKETBALL,GM MK-1201 -00,usa,Boots,28,37,,0x0418c0042dee61a2,4.112,37 colours
 Pat Riley Basketball (USA).md,PAT RILEY BASKETBALL,GM MK-1201 -00,usa,Boots,28,37,,0x0418c0042dee61a2,3.490,37 colours
@@ -1663,7 +1663,7 @@ Populous (Japan) (En).md,POPULOUS,GM T-50026 -00,usa,Boots,29,34,,0x387846d9e62e
 Populous (USA) (Unl).md,N...>x8..tF.#.N... .J.f.J9....g.P.....A.....N.,.0`...P.....N.,usa,Boots,29,33,,0x39266b466cfe493b,2.795,33 colours
 "Power Athlete (Japan, Korea) (En).md",Deadly MOVES,GM T-33033 -00,japan,Boots,19,19,,0x107bff8fad183c9a,2.890,19 colours
 "Power Drive (Europe) (En,Fr,De,Es,Pt).md",POWERDRIVE,GM T7914650-00,usa,Boots,25,25,,0x312699930142e95f,3.622,25 colours
-Power Football (World) (Evercade) (Unl).md,Piko Super Power Football,GM ACLD005 -00,usa,Panic,0,0,,,3.512,263 lines and the VDP has not raised `frame_done`
+Power Football (World) (Evercade) (Unl).md,Piko Super Power Football,GM ACLD005 -00,usa,Boots,25,25,,0x1700c4f37d61e367,3.296,25 colours
 "Power Monger (Japan, Korea) (Ja).md",POWERMONGER,GM T-106103-00,japan,Boots,33,33,,0x7fe5d0231aa1d3c5,2.894,33 colours
 "Power Monger (USA, Europe).md",Power Monger,GM T-50426 -00,usa,Boots,33,33,,0x7fe5d0231aa1d3c5,3.893,33 colours
 Power Rangers - The Fighting Edition (Russia) (En) (Unl).md,g.. N.....E.....N.....E.....N.....N.. . L...Ns,,usa,Boots,42,42,,0xb9a7ec1235067236,4.157,42 colours
@@ -1754,8 +1754,8 @@ Ransei no Hasha (Japan).md,.V......,GM T-20053 -00,japan,Boots,3,11,,0x39848ffa5
 Rastan Saga II (Japan) (En).md,RASTAN2,GM T-11043 -00,japan,Boots,25,25,,0x2b7f303793644a62,3.993,25 colours
 Rastan Saga II (USA).md,RASTAN2,GM T-11026 -00,japan,Boots,25,25,,0xeea786ce0467853a,3.309,25 colours
 "Red Zone (USA, Europe).md",RED-ZONE,GM T-48376  00,usa,Boots,8,25,,0xe386aea3fa7d2a23,2.352,25 colours
-"Ren & Stimpy Show Presents, The - Stimpy's Invention (Europe) (1993-12-09) (Sega Channel).md",STIMPY'S INVENTION,GM MK-1068 -00,europe,Panic,0,0,,,0.042,314 lines and the VDP has not raised `frame_done`
-"Ren & Stimpy Show Presents, The - Stimpy's Invention (Europe).md",STIMPY'S INVENTION,GM MK-1068 -00,europe,Panic,0,0,,,0.041,314 lines and the VDP has not raised `frame_done`
+"Ren & Stimpy Show Presents, The - Stimpy's Invention (Europe) (1993-12-09) (Sega Channel).md",STIMPY'S INVENTION,GM MK-1068 -00,europe,Boots,13,29,,0xbb0d4f095d8a74ab,4.415,29 colours
+"Ren & Stimpy Show Presents, The - Stimpy's Invention (Europe).md",STIMPY'S INVENTION,GM MK-1068 -00,europe,Boots,13,29,,0xbb0d4f095d8a74ab,4.178,29 colours
 "Ren & Stimpy Show Presents, The - Stimpy's Invention (USA) (Beta).md",REN AND STIMPY,GM ??-???? -00,usa,Boots,40,40,,0x660c69dda8eb2862,4.155,40 colours
 "Ren & Stimpy Show Presents, The - Stimpy's Invention (USA).md",STIMPY'S INVENTION,GM MK-1068 -00,usa,Boots,13,29,,0x2bb8ad08bdfeadbe,4.155,29 colours
 Rent a Hero (Japan).md,RENT A HERO,GM    55508-00,usa,Boots,3,9,,0x8d966dec14f25f9c,3.775,9 colours
@@ -1780,7 +1780,7 @@ Richard Scarry's Busytown (USA).md,BUSYTOWN,GM MK-1552 -00,usa,Boots,28,28,,0x82
 Riddle Wired (Japan) (Sega Game Toshokan).md,SEGANET GAME,GM 00054503-00,japan,Boots,9,13,,0xf79905037701a81b,3.792,13 colours
 "Rings of Power (USA, Europe).md",RINGS OF POWER,GM T-50176 -00,usa,Boots,29,42,,0x23afbce9ad7233b1,3.912,42 colours
 Rise of the Robots (Europe).md,RISE OF THE ROBOTS,GM T-081426-50,usa,Boots,25,34,,0xfca5a5e5215e3d99,4.336,34 colours
-Risk (USA).md,RISK,GM T-89036  00,usa,Panic,0,0,,,0.021,263 lines and the VDP has not raised `frame_done`
+Risk (USA).md,RISK,GM T-89036  00,usa,Boots,27,27,,0x9e6ceb9cf0c09272,3.470,27 colours
 "Risky Woods (USA, Europe).md",Risky Woods,GM T-50466 -00,usa,Boots,22,25,,0x8e9933217b25fcb6,4.335,25 colours
 "Ristar (USA, Europe) (Beta) (1995-01-06).md",* RISTAR *,GM MK-1555 -00,usa,Boots,7,38,,0x25fcad6a484a6170,4.373,38 colours
 "Ristar (USA, Europe).md",* RISTAR *,GM MK-1555 -00,usa,Boots,7,38,,0x25fcad6a484a6170,3.371,38 colours
@@ -1803,7 +1803,7 @@ RoadBlasters (USA).md,Road Blasters,GM T-48066 -00,usa,Boots,14,39,,0xebb60e2fa8
 "RoboCop 3 (USA, Europe).md",ROBOCOP 3,GM T-081226 00,usa,Boots,9,42,,0x627d5386f16086f7,4.513,42 colours
 RoboCop Versus The Terminator (China) (En) (Pirate).md,ROBOCOP VS TRMTR,GM T-70066 -00,usa,Boots,17,17,,0xccd9e3fd94b708c2,3.775,17 colours
 RoboCop Versus The Terminator (Europe) (Beta) (1993-07-27).md,ROBOCOP VS TRMTR,GM T-70066 -00,europe,Boots,8,17,,0x7cbe7741e9ff32ab,4.034,17 colours
-RoboCop Versus The Terminator (Europe).md,ROBOCOP VERSUS THE TERMINATOR,GM T-70216-50,europe,Panic,0,0,,,1.987,314 lines and the VDP has not raised `frame_done`
+RoboCop Versus The Terminator (Europe).md,ROBOCOP VERSUS THE TERMINATOR,GM T-70216-50,europe,Boots,8,17,,0x7cbe7741e9ff32ab,4.078,17 colours
 "RoboCop Versus The Terminator (Japan, Korea) (En).md",ROBOCOP VERSUS THE TERMINATOR,GM T-70043 -00,japan,Boots,8,17,,0x7cbe7741e9ff32ab,3.573,17 colours
 RoboCop Versus The Terminator (USA) (Beta) (1993-04-30).md,GLOBAL GLADIATOR,GM T-70066 -00,usa,Boots,4,4,"START@300,START@301",0x2edaebe00f6b2d28,6.341,"47 colours with START@300,START@301"
 RoboCop Versus The Terminator (USA).md,ROBOCOP VERSUS THE TERMINATOR,GM T-70166,usa,Boots,8,17,,0x7cbe7741e9ff32ab,3.715,17 colours
@@ -1842,7 +1842,7 @@ Saint Sword (USA).md,SAINT SWORD,GM T-11056 -00,usa,Boots,27,28,,0xdc976490cacb7
 Same! Same! Same! (Japan) (En) (Beta) (1990-07-30).md,FIRE SHARK,GM T-34016 -00,japan,Boots,31,31,,0x963dd5c28723e37f,4.355,31 colours
 Same! Same! Same! (Japan) (En).md,FIRE SHARK,GM T-40013 -00,japan,Boots,31,31,,0x963dd5c28723e37f,3.718,31 colours
 Sampras Tennis 96 (Europe) (J-Cart).md,PETE SAMPRAS TENNIS '96,GM T-123456-00,europe,Boots,31,44,,0xd18febde656491e5,4.694,44 colours
-Samurai Shodown (Europe).md,SAMURAI SHODOWN,GM MK-1184 -00,europe,Panic,0,0,,,0.023,314 lines and the VDP has not raised `frame_done`
+Samurai Shodown (Europe).md,SAMURAI SHODOWN,GM MK-1184 -00,europe,Boots,5,22,,0x87e79dfd2fd3642a,3.953,22 colours
 Samurai Shodown (USA).md,SAMURAI SHODOWN,GM T-103066-00,usa,Boots,7,11,,0x6e5b1cf3c7b1ba33,3.737,11 colours
 Samurai Shodown vs Soul Edge (Taiwan) (En) (Unl).md,"R....,........g...N...A..9.....(g..,...... .g",N....NE.....G.,europe,Blank,1,1,,0x3251a7a3e3991d0a,4.960,1 colours
 Samurai Spirits (Japan).md,SAMURAI SHODOWN,GM G-4127-00,japan,Boots,5,22,,0xe158360a46585b6d,3.896,22 colours
@@ -1872,9 +1872,9 @@ Sega Sound Tool (USA) (v2.2) (Program).md,Interface GM XXXXXXXX-XX,,usa,Boots,11
 Sega Sports 1 (Europe).md,SEGA SPORTS 1,GM MK-1183 -00,europe,Boots,29,29,,0x2844ed972e460d92,4.377,29 colours
 Sega Top Five (Brazil) (En).md,5IN1,GM MK-1721-45,usa,Boots,18,40,,0x662133d0b1576596,3.956,40 colours
 Segapede (USA) (Proto).md,SEGAPEDE,GM 00001014-00,usa,Boots,27,27,,0x17f177381c40d0b7,4.437,27 colours
-"Sensible Soccer (Europe) (En,Fr,De,It) (Beta).md",SENSIBLE SOCCER,GM T-93076  00,europe,Panic,0,0,,,0.061,314 lines and the VDP has not raised `frame_done`
-"Sensible Soccer (Europe) (En,Fr,De,It).md",SENSIBLE SOCCER,GM T-93076  00,europe,Panic,0,0,,,0.061,314 lines and the VDP has not raised `frame_done`
-"Sensible Soccer (World) (En,Fr,De,It) (Evercade).md",SENSIBLE SOCCER,GM T-93076  00,europe,Panic,0,0,,,0.061,314 lines and the VDP has not raised `frame_done`
+"Sensible Soccer (Europe) (En,Fr,De,It) (Beta).md",SENSIBLE SOCCER,GM T-93076  00,europe,Boots,4,11,,0x41f2012d666d2189,3.932,11 colours
+"Sensible Soccer (Europe) (En,Fr,De,It).md",SENSIBLE SOCCER,GM T-93076  00,europe,Boots,15,18,,0x84ba41f186058e33,4.098,18 colours
+"Sensible Soccer (World) (En,Fr,De,It) (Evercade).md",SENSIBLE SOCCER,GM T-93076  00,europe,Boots,1,18,,0x3251a7a3e3991d0a,4.097,18 colours
 "Separation Anxiety (USA, Europe).md",SEPARATION ANXIETY,GM T-81556 -00,usa,Boots,1,41,,0xb3d415c7c3801d4a,3.552,41 colours
 Sesame Street Counting Cafe (USA).md,Sesame Street: Counting Cafe,GM T-50896 -00,usa,Blank,1,1,,0xb3d415c7c3801d4a,4.995,1 colours
 Shadow Blasters (USA).md,SHADOW BLASTERS,GM T-47016 -00,usa,Boots,13,13,,0x1564898dfc5f6c52,3.129,13 colours
@@ -1892,7 +1892,7 @@ Shadowrun (USA) (Beta) (1993-12-31).md,SHADOWRUN,GM MK-1352 -00,usa,Boots,8,25,,
 Shadowrun (USA) (Beta) (1994-01-25) (Alt).md,SHADOWRUN,GM MK-1352 -00,usa,Boots,8,25,,0x77e99fc7c5cb3376,3.998,25 colours
 Shadowrun (USA) (Beta) (1994-01-25).md,SHADOWRUN,GM MK-1352 -00,usa,Boots,8,25,,0x77e99fc7c5cb3376,3.952,25 colours
 Shadowrun (USA).md,SHADOWRUN,GM MK-1352 -00,usa,Boots,8,25,,0x77e99fc7c5cb3376,2.891,25 colours
-Shane Warne Cricket (Australia).md,SHANE WARNE CRICKET,GM T-120146-50,europe,Panic,0,0,,,0.041,314 lines and the VDP has not raised `frame_done`
+Shane Warne Cricket (Australia).md,SHANE WARNE CRICKET,GM T-120146-50,europe,Boots,48,48,,0x2efc6177fd80313d,3.916,48 colours
 Shanghai II - Dragon's Eye (USA) (Beta).md,SHANGHAI II: DRAGON'S EYE,GN 8MeT-130016,usa,Boots,14,35,,0xd934be174fdac750,3.871,35 colours
 Shanghai II - Dragon's Eye (USA).md,SHANGHAI II: DRAGON'S EYE,GM T-130016 00,usa,Boots,14,35,,0xd934be174fdac750,3.952,35 colours
 "Shaq-Fu (USA, Europe).md",SHAQ-FU,GM T-50876 -0,usa,Boots,25,41,,0x10fdf5b375709293,3.431,41 colours
@@ -1936,11 +1936,11 @@ Shiten Myouou (Japan).md,SHADOW BLASTER,GM T-26023 -00,japan,Boots,33,33,,0x72cf
 Shougi no Hoshi (Japan).md,........,GM T-67013 -00,japan,Boots,8,39,,0x0cad2b86ba79fb2a,3.797,39 colours
 Shove It! ...The Warehouse Game (USA).md,SHOVE IT!,GM T-25036 -00,usa,Boots,14,15,,0x1608473104b7f80c,3.329,15 colours
 Show do Milhao (Brazil).md,SHOW DO MILHAO,TECTOY 2001-02,usa,Boots,13,29,,0x6dd69fd044532545,3.956,29 colours
-Show do Milhao - Volume 2 (Brazil).md,SHOW DO MILHAO VOL 2,TECTOY 2001-03,usa,Panic,0,0,,,1.048,263 lines and the VDP has not raised `frame_done`
+Show do Milhao - Volume 2 (Brazil).md,SHOW DO MILHAO VOL 2,TECTOY 2001-03,usa,Boots,14,54,,0x125ab04746e1cbac,3.450,54 colours
 Shuihu Fengyun Zhuan (Taiwan) (Unl).md,><..#.....Q...Nu.................. ..-....- -.-.,"-.-.-.-.""2#2.#",usa,Boots,10,14,,0x30e4867385c9cdf4,3.436,14 colours
 Shuihu Zhuan (Taiwan) (Unl).md,z> 9......f.. N.....`... 9......f...N...'h3..t..,.F.L.|.NsJ9..,usa,Boots,6,23,,0xe20e7eff8798b818,3.714,23 colours
 Shura no Mon (Japan).md,......,G  00004073-00,japan,Boots,8,25,,0xa986d43dee7fd410,2.610,25 colours
-Side Pocket (Europe).md,SIDE POCKET,GM MK-1218 -00,europe,Panic,0,0,,,0.081,314 lines and the VDP has not raised `frame_done`
+Side Pocket (Europe).md,SIDE POCKET,GM MK-1218 -00,europe,Boots,26,36,,0xdc5f77242dcb5018,4.274,36 colours
 "Side Pocket (Japan, Korea) (En).md",SIDE POCKET,GM T-13083 -00,usa,Boots,26,36,,0x0bad96a602c26068,4.132,36 colours
 Side Pocket (USA).md,SIDE POCKET,GM T-13083 -00,usa,Boots,26,36,,0x0bad96a602c26068,3.030,36 colours
 "Simpsons, The - Bart vs. the Space Mutants (China) (En) (Pirate).md",SIMPSONS,GM T-081026-00,usa,Boots,7,16,,0x05af991c0cda70f7,3.813,16 colours
@@ -2115,16 +2115,16 @@ Stone Protectors (USA) (Proto).md,STONE PROTECTORS,GM T-00000 -00,usa,Boots,8,30
 Stone Protectors (World) (Steam).md,STONE PROTECTORS,GM T-00000 -00,usa,Boots,24,30,,0xc350302c26f6640b,2.428,30 colours
 Stormlord (Japan) (En).md,STORMLORD,GM T-49113 -00,japan,Boots,12,15,,0xbbc3037a1d156d99,3.750,15 colours
 Stormlord (USA).md,STORMLORD,GM T-56026 -00,usa,Boots,12,15,,0x8d37cd3544ac9083,2.769,15 colours
-"Story of Thor, The (Europe) (Beta) (1994-04-xx).md",The Story of Thor,GM MK-1054 -00,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
+"Story of Thor, The (Europe) (Beta) (1994-04-xx).md",The Story of Thor,GM MK-1054 -00,europe,Boots,32,32,,0xbdab369ea4463fe1,4.055,32 colours
 "Story of Thor, The (Europe) (Beta) (1994-10-04).md",THE STORY OF THOR,GM G-5543  -00,usa,Boots,15,27,,0xf9832defaa086c20,3.672,27 colours
 "Story of Thor, The (Europe) (Beta) (1994-10-17).md",THE STORY OF THOR,GM MK-1354 -00,usa,Boots,15,27,,0xf9832defaa086c20,3.695,27 colours
-"Story of Thor, The (Europe) (Mega Drive Mini).md",THE STORY OF THOR,GM MK-1354 -00,europe,Panic,0,0,,,0.022,314 lines and the VDP has not raised `frame_done`
-"Story of Thor, The (Europe).md",THE STORY OF THOR,GM MK-1354 -00,europe,Panic,0,0,,,0.022,314 lines and the VDP has not raised `frame_done`
-"Story of Thor, The (Germany) (Mega Drive Mini).md",THE STORY OF THOR,GM MK-1354 -00,europe,Panic,0,0,,,0.022,314 lines and the VDP has not raised `frame_done`
-"Story of Thor, The (Germany).md",THE STORY OF THOR,GM MK-1354 -00,europe,Panic,0,0,,,0.022,314 lines and the VDP has not raised `frame_done`
+"Story of Thor, The (Europe) (Mega Drive Mini).md",THE STORY OF THOR,GM MK-1354 -00,europe,Boots,13,27,,0x8d751dafad66bc10,4.139,27 colours
+"Story of Thor, The (Europe).md",THE STORY OF THOR,GM MK-1354 -00,europe,Boots,13,27,,0x8d751dafad66bc10,2.792,27 colours
+"Story of Thor, The (Germany) (Mega Drive Mini).md",THE STORY OF THOR,GM MK-1354 -00,europe,Boots,13,27,,0x8d751dafad66bc10,2.533,27 colours
+"Story of Thor, The (Germany).md",THE STORY OF THOR,GM MK-1354 -00,europe,Boots,13,27,,0x8d751dafad66bc10,2.957,27 colours
 "Story of Thor, The (Korea).md",THE STORY OF THOR,GM G-5543  -00,japan,Boots,15,27,,0xf9832defaa086c20,3.052,27 colours
-"Story of Thor, The (Spain) (Mega Drive Mini).md",THE STORY OF THOR,GM MK-1354 -00,europe,Panic,0,0,,,0.023,314 lines and the VDP has not raised `frame_done`
-"Story of Thor, The (Spain).md",THE STORY OF THOR,GM MK-1354 -00,europe,Panic,0,0,,,0.024,314 lines and the VDP has not raised `frame_done`
+"Story of Thor, The (Spain) (Mega Drive Mini).md",THE STORY OF THOR,GM MK-1354 -00,europe,Boots,13,27,,0x8d751dafad66bc10,3.535,27 colours
+"Story of Thor, The (Spain).md",THE STORY OF THOR,GM MK-1354 -00,europe,Boots,13,27,,0x8d751dafad66bc10,4.073,27 colours
 "Story of Thor, The - Hikari o Tsugumono (Japan).md",THE STORY OF THOR,GM G-5543  -00,japan,Boots,15,27,,0xf9832defaa086c20,3.673,27 colours
 Street Fighter II' - Champion Edition (Europe) (Beta) (1993-03-25).md,STREET FIGHTR.U.fCHAMPION EDITION,"T-12016,0.1",usa,Boots,18,18,,0xd17a58749260e65a,4.353,18 colours
 Street Fighter II' - Champion Edition (USA) (Beta) (1993-07-30).md,STREET FIGHTR.U.fCHAMPION EDITION,"T-12016,0.0",usa,Boots,18,18,,0x1a63237a276a20da,3.473,18 colours
@@ -2140,15 +2140,15 @@ Street Racer (Europe).md,STREET RACER,GM T-177016-00,usa,Boots,1,89,,0x3251a7a3e
 "Street Smart (Japan, USA) (En).md",STREET SMART,GM T-24083 -00,usa,Boots,24,38,,0xc3aea079efc3b2e6,4.317,38 colours
 "Streets of Rage (World) (En,Ja).md",STREETS OF RAGE,MK 00001019-00,usa,Boots,16,16,,0xbd388010346e3f83,2.408,16 colours
 Streets of Rage (World) (Rev A).md,STREETS OF RAGE,MK 00001019-01,usa,Boots,16,16,,0xbd388010346e3f83,3.751,16 colours
-"Streets of Rage 2 (Japan) (En,Ja) (Mega Drive Mini).md",STREETS OF RAGE 2,GM MK-1054 -00,europe,Panic,0,0,,,0.022,314 lines and the VDP has not raised `frame_done`
+"Streets of Rage 2 (Japan) (En,Ja) (Mega Drive Mini).md",STREETS OF RAGE 2,GM MK-1054 -00,europe,Boots,18,23,,0x90a5b854aa7bb9f4,3.912,23 colours
 Streets of Rage 2 (USA).md,STREETS OF RAGE 2,GM MK-1054 -00,usa,Boots,20,22,,0xc069883ec8898c67,3.733,22 colours
 Streets of Rage 3 (Asia) (En).md,STREETS OF RAGE3,GM   MK-153900,japan,Boots,12,19,,0x9524453b5c68fe60,3.873,19 colours
-Streets of Rage 3 (Europe) (Beta) (1994-04-12).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Panic,0,0,,,0.365,314 lines and the VDP has not raised `frame_done`
-Streets of Rage 3 (Europe) (Beta) (1994-04-13).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Panic,0,0,,,0.443,314 lines and the VDP has not raised `frame_done`
-Streets of Rage 3 (Europe) (Beta) (1994-04-15).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Panic,0,0,,,0.463,314 lines and the VDP has not raised `frame_done`
-Streets of Rage 3 (Europe) (Beta) (1994-04-20).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Panic,0,0,,,0.424,314 lines and the VDP has not raised `frame_done`
-Streets of Rage 3 (Europe) (Beta) (1994-04-25).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Panic,0,0,,,0.483,314 lines and the VDP has not raised `frame_done`
-Streets of Rage 3 (Europe).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Panic,0,0,,,0.383,314 lines and the VDP has not raised `frame_done`
+Streets of Rage 3 (Europe) (Beta) (1994-04-12).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Boots,12,19,,0x3583d577f7c11271,2.448,19 colours
+Streets of Rage 3 (Europe) (Beta) (1994-04-13).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Boots,12,19,,0x3583d577f7c11271,3.716,19 colours
+Streets of Rage 3 (Europe) (Beta) (1994-04-15).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Boots,12,19,,0x3583d577f7c11271,3.210,19 colours
+Streets of Rage 3 (Europe) (Beta) (1994-04-20).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Boots,12,19,,0x3583d577f7c11271,2.367,19 colours
+Streets of Rage 3 (Europe) (Beta) (1994-04-25).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Boots,12,19,,0x3583d577f7c11271,3.751,19 colours
+Streets of Rage 3 (Europe).md,STREETS OF RAGE3,GM MK-1539 -00,europe,Boots,12,19,,0x3583d577f7c11271,2.528,19 colours
 Streets of Rage 3 (USA) (Beta) (1994-03-08).md,STREETS OF RAGE3,GM   G-4116-00,usa,Boots,18,18,,0xa88e2a1ca7e68242,3.696,18 colours
 Streets of Rage 3 (USA) (Beta) (1994-03-17).md,STREETS OF RAGE3,GM   G-4116-00,usa,Boots,18,18,,0xa88e2a1ca7e68242,3.733,18 colours
 Streets of Rage 3 (USA) (Beta) (1994-03-18).md,STREETS OF RAGE3,GM   G-4116-00,usa,Boots,18,18,,0xa88e2a1ca7e68242,3.716,18 colours
@@ -2160,7 +2160,7 @@ Streets of Rage 3 (USA) (Rev A) (Beta) (1994-04-11).md,STREETS OF RAGE3,GM MK-15
 Streets of Rage 3 (USA) (Rev A) (Beta) (1994-04-12).md,STREETS OF RAGE3,GM MK-1539 -00,usa,Boots,12,19,,0x9524453b5c68fe60,2.269,19 colours
 Streets of Rage 3 (USA) (Rev A) (Beta) (1994-04-13).md,STREETS OF RAGE3,GM MK-1539 -00,usa,Boots,12,19,,0x9524453b5c68fe60,2.732,19 colours
 Streets of Rage 3 (USA).md,STREETS OF RAGE3,GM MK-1539 -00,usa,Boots,12,19,,0x9524453b5c68fe60,3.553,19 colours
-"Streets of Rage II (Japan, Europe) (En,Ja).md",STREETS OF RAGE 2,GM MK-1054 -00,europe,Panic,0,0,,,0.022,314 lines and the VDP has not raised `frame_done`
+"Streets of Rage II (Japan, Europe) (En,Ja).md",STREETS OF RAGE 2,GM MK-1054 -00,europe,Boots,18,23,,0x90a5b854aa7bb9f4,3.657,23 colours
 Strider (USA) (Sega Channel).md,STRIDER HIRYU,GM 00001112-00,usa,Boots,9,36,,0x24e880d7c6adda2d,2.528,36 colours
 "Strider (USA, Europe) (Virtual Console).md",STRIDER HIRYU,GM 00001112-00,usa,Boots,9,36,,0x24e880d7c6adda2d,3.777,36 colours
 "Strider (USA, Europe).md",STRIDER HIRYU,GM 00001112-00,usa,Boots,9,36,,0x24e880d7c6adda2d,3.713,36 colours
@@ -2223,8 +2223,8 @@ Super Real Basketball (Europe).md,SUPER REAL BASKET BALL,GM MK-1201 -00,europe,B
 "Super Shinobi II, The (Japan, Korea) (Ja).md",Shinobi3 Return of the Ninja Master,GM 00004085-00,japan,Boots,18,23,,0x5802c7a3af768890,3.954,23 colours
 "Super Shinobi, The (Japan) (En) (Beta) (1989-08-21) (Sega Channel).md",SUPER SHINOBI,GM 00000000-00,japan,Boots,1,44,,0x3251a7a3e3991d0a,3.813,44 colours
 "Super Shinobi, The (Japan) (En) (Beta) (1989-xx-xx) (Sega Smash Pack).md",SUPER SHINOBI,GM 00000000-00,japan,Boots,1,44,,0x3251a7a3e3991d0a,2.448,44 colours
-Super Skidmarks (Europe) (Beta) (1995-09-22) (J-Cart).md,unknown,GM 00000000-00,europe,Panic,0,0,,,0.041,314 lines and the VDP has not raised `frame_done`
-Super Skidmarks (Europe) (J-Cart).md,unknown,GM 00000000-00,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
+Super Skidmarks (Europe) (Beta) (1995-09-22) (J-Cart).md,unknown,GM 00000000-00,europe,Boots,1,13,,0xb6a99e4b07a6061a,3.392,13 colours
+Super Skidmarks (Europe) (J-Cart).md,unknown,GM 00000000-00,europe,Boots,43,51,,0x103a0141b2128de1,3.309,51 colours
 "Super Smash T.V. (USA, Europe).md",SMASH T.V.,GM T-081066 00,usa,Boots,8,41,,0xc8a405f994aa0a8b,2.909,41 colours
 Super Street Fighter II (Europe) (Virtual Console).md,SUPER STREET FIGHTER2 The New Challengers,GM MK-12056-00,europe,Boots,12,35,,0xf9d01a51b8cdff13,4.617,35 colours
 Super Street Fighter II (Europe).md,SUPER STREET FIGHTER2 The New Challengers,GM MK-12056-00,europe,Boots,13,35,,0xc5bec3397e54745b,4.078,35 colours
@@ -2296,7 +2296,7 @@ Tecmo Super Bowl II - Special Edition (USA).md,TECMO SUPER BOWL2 SPECIAL EDITION
 Tecmo Super Bowl III - Final Edition (USA).md,TECMO SUPER BOWL3 FINAL EDITION,GM T-36066 -00,usa,Boots,7,17,,0x4e105cea50e49ce9,3.835,17 colours
 Tecmo Super Hockey (USA).md,SUPER HOCKEY,GM T-36036 -00,usa,Boots,23,24,,0x013277c1a55a4821,3.771,24 colours
 Tecmo Super NBA Basketball (Japan) (En).md,Tecmo Super NBA BAsketball,GM T-36033-00,usa,Boots,6,30,,0x2ad2d34601612044,3.516,30 colours
-Tecmo Super NBA Basketball (USA).md,Tecmo Super NBA BAsketball,GM T-36026-00,usa,Panic,0,0,,,0.021,263 lines and the VDP has not raised `frame_done`
+Tecmo Super NBA Basketball (USA).md,Tecmo Super NBA BAsketball,GM T-36026-00,usa,Boots,6,30,,0x8568e8396176de45,2.728,30 colours
 Tecmo World Cup '92 (Japan) (En).md,TECMO WORLD CUP 92,GM T-44023 -00,usa,Boots,9,30,,0xe1e53302720b0d85,4.072,30 colours
 Tecmo World Cup (USA).md,TECMO WORLD CUP,GM T-44016,usa,Boots,9,29,,0xfdf091bda60fb04f,2.729,29 colours
 Teddy Boy Blues (Japan) (Sega Game Toshokan).md,SEGANET GAME,GM 00054503-00,japan,Boots,10,10,,0x6cdd200424af706a,2.728,10 colours
@@ -2324,7 +2324,7 @@ Terminator 2 (China) (En) (Pirate).md,Terminator 2,GM T-081176 00,usa,Boots,15,3
 "Terminator, The (USA) (Beta) (1992-04-14).md",THE TERMINATOR,GM T-70026-00,usa,Boots,1,12,,0x3251a7a3e3991d0a,2.728,12 colours
 "Terminator, The (USA).md",THE TERMINATOR,GM T-70026-00,usa,Boots,1,12,,0x3251a7a3e3991d0a,3.714,12 colours
 Teshu Budui 357 (China) (Pirate).md,...... 357 VIXEN 357,GM T-25133 -00,japan,Boots,13,19,,0xf29b3bf6a2ea2bdd,3.370,19 colours
-"Test Drive II - The Duel (USA, Europe) (Unl).md",The Duel TDII,GM ACLD008 -00,usa,Panic,0,0,,,1.726,263 lines and the VDP has not raised `frame_done`
+"Test Drive II - The Duel (USA, Europe) (Unl).md",The Duel TDII,GM ACLD008 -00,usa,Boots,17,17,,0xfbfa60fdef7389e1,2.928,17 colours
 Tetris (Japan) (En) (Mega 6).md,TETRIS,GM 00004007-00,usa,Boots,18,29,,0x599bfbba432686d4,3.894,29 colours
 Tetris (Japan) (Mega Drive Mini).md,TETRIS,GM XXXXXXXX-XX,usa,Boots,22,49,,0xb648c52aa8ef8d6a,3.712,49 colours
 Tetris (USA) (Genesis Mini).md,TETRIS,GM XXXXXXXX-XX,usa,Boots,22,22,,0xb648c52aa8ef8d6a,3.492,22 colours
@@ -2432,10 +2432,10 @@ Ultimate Mortal Kombat 3 (USA).md,ULTIMATE MORTAL KOMBAT 3,GM T-097146-00,usa,Bo
 Ultimate QIX (USA).md,VOLFIDE,GM T-11046  00,usa,Boots,32,32,,0x5e1d2f67ed3b94f4,4.054,32 colours
 "Ultimate Soccer (Europe) (En,Fr,De,Es,It) (Beta).md",ULTIMATE SOCCER,GM MK1219  -00,europe,Boots,34,57,,0x4f481aef46831541,2.892,57 colours
 "Ultimate Soccer (Europe) (En,Fr,De,Es,It).md",ULTIMATE SOCCER,GM MK1219  -00,europe,Boots,34,57,,0x4f481aef46831541,4.115,57 colours
-Ultracore (Europe) (Strictly Limited Games).md,ULTRACORE,GM T-SNAKE-MOD,europe,Panic,0,0,,,0.021,314 lines and the VDP has not raised `frame_done`
+Ultracore (Europe) (Strictly Limited Games).md,ULTRACORE,GM T-SNAKE-MOD,europe,Boots,48,48,,0x5a5e26a39d54e684,3.633,48 colours
 Ultracore (Japan) (En) (Columbus Circle).md,ULTRACORE,GM T-SNAKE-MOD,japan,Boots,1,47,,0x3251a7a3e3991d0a,4.094,47 colours
 Ultracore (USA) (Strictly Limited Games).md,ULTRACORE,GM T-SNAKE-MOD,usa,Boots,47,47,,0x92ff15ba3aa16c9d,4.172,47 colours
-"Ultracore (USA, Europe) (Switch, PS Vita).md",ULTRACORE,GM T-113066-00,europe,Panic,0,0,,,0.041,314 lines and the VDP has not raised `frame_done`
+"Ultracore (USA, Europe) (Switch, PS Vita).md",ULTRACORE,GM T-113066-00,europe,Boots,48,48,,0xfe4e24c6c52f6b9f,3.993,48 colours
 Ultraman (Japan).md,.E...g...}..,GMT-16023-0000,japan,Boots,2,11,,0xc4f01c485d89631a,3.674,11 colours
 Uncharted Waters (USA).md,UNCHARTED WATERS,GM T-76026 -10,usa,Boots,4,11,,0xf2df2861c8476ce9,3.535,11 colours
 Undead Line (Japan).md,UNDEAD LINE,GM T-74013 -00,japan,Boots,9,11,,0x75f7c86ddbffc190,4.400,11 colours
@@ -2465,7 +2465,7 @@ Vectorman (USA) (Sega Channel).md,VECTORMAN,GM MK-1577 -00,usa,Boots,9,29,,0x646
 "Vectorman (USA, Europe) (Beta 2).md",JAPAN GAME NAME,xx xx-xxxx -xx,usa,Boots,9,88,,0x91bf249a4e30cc04,4.277,88 colours
 "Vectorman (USA, Europe) (Beta 3) (1995-07-24).md",VECTORMAN,GM MX-1577 -00,usa,Boots,9,29,,0x6461002525e48034,3.932,29 colours
 "Vectorman (USA, Europe).md",VECTORMAN,GM MK-1577 -00,usa,Boots,9,29,,0x6461002525e48034,3.937,29 colours
-Vectorman 2 (USA) (Beta) (1995-08-xx).md,VECTORMAN,GM MK-1577 -00,usa,Panic,0,0,,,1.848,263 lines and the VDP has not raised `frame_done`
+Vectorman 2 (USA) (Beta) (1995-08-xx).md,VECTORMAN,GM MK-1577 -00,usa,Boots,32,37,,0x391fca844967a439,2.870,37 colours
 Vectorman 2 (USA) (Beta) (1996-08-15).md,VECTORMAN 2,GM MK-1843 -00,usa,Boots,37,37,,0x67cd72065234a271,3.515,37 colours
 Vectorman 2 (USA) (Beta) (1996-08-16).md,VECTORMAN 2,GM MK-1843 -00,usa,Boots,37,37,,0x67cd72065234a271,3.053,37 colours
 Vectorman 2 (USA) (Beta) (1996-08-19).md,VECTORMAN 2,GM MK-1843 -00,usa,Boots,36,37,,0xa70c23bca5065561,2.649,37 colours
@@ -2497,8 +2497,8 @@ Vixen 357 (Japan).md,...... 357 VIXEN 357,GM T-25133 -00,japan,Boots,14,19,,0x9b
 Volfied (Japan) (En).md,VOLFIDE,GM T-11103,usa,Boots,27,27,,0xd43539cf651b8c75,4.356,27 colours
 WWF RAW (World).md,WWF RAW,GM T-081316-00,usa,Boots,33,34,,0x3191a6a618f0c5ab,3.571,34 colours
 WWF Royal Rumble (World).md,WWF ROYAL RUMBLE,GM T-081196 00,usa,Boots,14,46,,0xb75e89a4d8b6f2ed,4.053,46 colours
-"WWF Super WrestleMania (USA, Europe).md",WWF,GM T-081086 00,usa,Panic,0,0,,,0.021,263 lines and the VDP has not raised `frame_done`
-"WWF WrestleMania - The Arcade Game (USA, Europe) (Beta).md",unknown,,usa,Panic,0,0,,,0.020,263 lines and the VDP has not raised `frame_done`
+"WWF Super WrestleMania (USA, Europe).md",WWF,GM T-081086 00,usa,Boots,1,36,,0xb3d415c7c3801d4a,2.748,36 colours
+"WWF WrestleMania - The Arcade Game (USA, Europe) (Beta).md",unknown,,usa,Blank,1,2,,0xb3d415c7c3801d4a,3.953,2 colours
 "WWF WrestleMania - The Arcade Game (USA, Europe).md",WRESTLEMANIA,GM T-81546 -00,usa,Boots,1,48,,0xb3d415c7c3801d4a,3.491,48 colours
 Wacky Races (USA) (Proto).md,WACCAWACCAWACCA RACES,T-70406-50,usa,Boots,24,24,,0xf623568deaf303c0,4.198,24 colours
 Wacky Worlds Creativity Studio (USA) (Beta) (1994-08-08).md,FIREWORKS,GM MK-1032 -00,usa,Boots,15,15,,0x60dd66466a2bcf49,4.152,15 colours
@@ -2717,8 +2717,8 @@ Zero Tolerance (Germany) (En).md,ZERO TOLERANCE,GM T-119146-00,usa,Boots,8,22,,0
 Zero Tolerance (World) (Switch).md,ZERO TOLERANCE,GM T-119146-01,usa,Boots,21,22,,0x9af4d0226491893e,3.110,22 colours
 Zero Tolerance Underground (World) (Proto) (Switch).md,ZERO TOLERANCE,GM T-119146-00,usa,Boots,15,22,,0x7a5451f556a4a65c,3.953,22 colours
 Zero Wing (Europe).md,ZERO WING,GM MK-1138-50,europe,Boots,15,31,,0x23114f010698dc56,4.716,31 colours
-Zero Wing (Japan).md,ZERO WING,GM T-40023 -00,japan,Panic,0,0,,,2.688,263 lines and the VDP has not raised `frame_done`
-"Zero Wing (USA, Europe) (Retro-Bit).md",ZERO WING,GM T-40023 -00,japan,Panic,0,0,,,2.589,263 lines and the VDP has not raised `frame_done`
+Zero Wing (Japan).md,ZERO WING,GM T-40023 -00,japan,Boots,13,32,,0x5d2d7893571bbe9c,3.430,32 colours
+"Zero Wing (USA, Europe) (Retro-Bit).md",ZERO WING,GM T-40023 -00,japan,Boots,15,32,,0x8fba4a4eec6dedb4,3.554,32 colours
 Zero the Kamikaze Squirrel (Europe).md,ZERO THE KAMIKAZE SQUIRREL,GM T-15176 -50,europe,Boots,4,51,,0x47201664f04ef16b,3.351,51 colours
 Zero the Kamikaze Squirrel (USA) (Limited Run Games).md,ZERO THE KAMIKAZE SQUIRREL,GM T-15176 -00,usa,Boots,4,51,,0x05b3f777257ba3de,3.512,51 colours
 Zero the Kamikaze Squirrel (USA).md,ZERO THE KAMIKAZE SQUIRREL,GM T-15176 -00,usa,Boots,4,51,,0x47201664f04ef16b,3.390,51 colours

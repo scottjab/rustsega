@@ -4,11 +4,13 @@
 
 | Status | ROMs |
 |---|---|
-| Boots | 2517 |
-| Blank | 148 |
-| Panic | 110 |
+| Boots | 2607 |
+| Blank | 153 |
+| Panic | 15 |
 
-These tables are the #373 resweep: every cart runs for the 600-frame checkpoint *and on to 1800 frames*, every frame of that run watched for a picture, and a cart that never drew is run a second time holding START. One sampled frame was the wrong measurement - a title screen fades in, holds and fades out - so `Blank` used to mean "frame 600 held four colours or fewer" and now means "no frame of the run drew, with or without a button". Against the table below that is **Boots 2517 / Blank 148 / Panic 110** where it read Boots 2111 / Blank 567 / Panic 97: 416 carts move to `Boots`, 13 of them only once START is held (each named in the CSV's `input_gate` column and listed under "Boots with input" below), and the rest of the `Blank` set is the carts that genuinely never draw - 31 of them BIOS images, so 117 Mega Drive carts. `Panic` is up from 97 for the same reason: three times the frames find three times as many crashes, which is a better picture of what is broken, not a new fault.
+These tables are the #373 resweep: every cart runs for the 600-frame checkpoint *and on to 1800 frames*, every frame of that run watched for a picture, and a cart that never drew is run a second time holding START. One sampled frame was the wrong measurement - a title screen fades in, holds and fades out - so `Blank` used to mean "frame 600 held four colours or fewer" and now means "no frame of the run drew, with or without a button". Against the table that resweep wrote it was **Boots 2517 / Blank 148 / Panic 110** where it read Boots 2111 / Blank 567 / Panic 97: 416 carts move to `Boots`, 13 of them only once START is held (each named in the CSV's `input_gate` column and listed under "Boots with input" below), and the rest of the `Blank` set is the carts that genuinely never draw - 31 of them BIOS images, so 117 Mega Drive carts. `Panic` is up from 97 for the same reason: three times the frames find three times as many crashes, which is a better picture of what is broken, not a new fault.
+
+Those counts have moved twice since, both times over the `frame_done` watchdog: [#523](https://github.com/scottjab/rustsega/issues/523) re-ran the 26 carts [#354](https://github.com/scottjab/rustsega/issues/354) named, and [#489](https://github.com/scottjab/rustsega/issues/489) re-ran the 69 that still carried the note in [`compat.csv`](compat.csv), with `scripts/resweep.sh` so the rows are the sweep's own rather than somebody's arithmetic. All 95 finish the watched 1800-frame run today and 90 of them draw, which is where **Boots 2607 / Blank 153 / Panic 15** comes from. The other 2680 rows are still the #373 sweep, so read one of those as a claim about that build and not about this one.
 
 ## Known issues
 
@@ -40,7 +42,7 @@ failure, so the exclusion cannot outlive the bug.
 
 | Issue | Cause | ROMs |
 |---|---|---|
-| [#371](https://github.com/scottjab/rustsega/issues/371) | A mid-frame V28/V30 switch moves the VBlank line, so `run_frame`'s watchdog fires a frame early. 48 carts report `314 lines` (all PAL) and 35 report `263` (33 `usa`, 2 `japan`): the same event on the two rasters, since the guard is `lines_per_frame + 1`. [#354](https://github.com/scottjab/rustsega/issues/354) is the inventory of these 83 and should close into #371. | 83 |
+| [#371](https://github.com/scottjab/rustsega/issues/371) | A mid-frame V28/V30 switch moves the VBlank line, so `run_frame`'s watchdog fires a frame early: the same event on the two rasters, since the guard was `lines_per_frame + 1`. [#354](https://github.com/scottjab/rustsega/issues/354) was the inventory and [#523](https://github.com/scottjab/rustsega/issues/523) emptied it. **Re-measured for [#489](https://github.com/scottjab/rustsega/issues/489): the class is empty.** The 95 carts that carried `N lines and the VDP has not raised frame_done` (49 at `314`, 46 at `263`) have all been run again on current `main`, 26 by #523 and the last 69 by `scripts/resweep.sh`, and every one of them now closes 1800 frames. 90 draw a picture; the 5 that do not are listed under `Blank` with causes that already have owners: the four `Mega-lo-Mania` dumps measure exactly what [#439](https://github.com/scottjab/rustsega/issues/439) records for that engine (`max_colours=1` at 1800 frames, 0 CRAM words written; its US dump is on the shelf as `Tyrants - Fight Through Time (USA)` and was already in this table), and `WWF WrestleMania - The Arcade Game (USA, Europe) (Beta)` is one of the truncated images named under "Truncated dumps" below. **A re-measurement, not proof the class never existed.** It could not have fired in that shape either: #447 widened the guard to a raster, plus the 16 lines the VBlank line moves when R1 bit 3 is written ahead of the beam, plus a raster of slack, so a cart that still never closed a frame would say `541 lines` on NTSC and `642` on PAL, not `263` or `314`. | 0 |
 | [#355](https://github.com/scottjab/rustsega/issues/355) | Unimplemented 68000 opcodes: `4741` x9, `00FF` x3, `00FA` x1. Seven of the nine `4741` hits are five betas of `NFL '95` and two Pro Action Replay carts, so it is narrower than nine separate instruction gaps. `0AC6` is gone since #78. | 13 |
 | [#374](https://github.com/scottjab/rustsega/issues/374) | **A named gap, not an unexplained one:** the SVP - the Fujitsu SSP1601 DSP, its program ROM and its 2 KB of DRAM that the `Virtua Racing` cartridge carries and the 68k addresses at `0xA15000` and `0x300000` - is unemulated, so `Virtua Racing (USA)` and `(Japan) (En)` are expected to be blank. Measured on this tree: `headless run "Virtua Racing (USA).md" --frames 1800 --max-colours` is `max_colours=1` with no input, and the `17 colours` in the START-gated table below is the same cart poked, not its 3D layer. `virtua_racing_boots_to_non_blank_screen` in `crates/genesis/tests/boot.rs` is the measurement, and [#433](https://github.com/scottjab/rustsega/issues/433) is what is left. | 2 |
 | [#375](https://github.com/scottjab/rustsega/issues/375) | **Diagnosed; the causes are [#435](https://github.com/scottjab/rustsega/issues/435)-[#441](https://github.com/scottjab/rustsega/issues/441) and they are not one bug.** 28 retail carts that draw pure black at all 21 sampled frame counts, with and without input. Where it started and what it turned out to be is the section below. | 28 |
@@ -313,7 +315,7 @@ what the single colour actually was (`#000000`).
 | `Virtua Racing (Japan) (En).md` | Virtua Racing | 17 colours with START@300,START@301 |
 | `Virtua Racing (USA).md` | Virtua Racing | 17 colours with START@300,START@301 |
 
-### Blank (148 - see the CSV for the full table)
+### Blank (153 - see the CSV for the full table)
 
 | ROM | Title | Notes |
 |---|---|---|
@@ -365,6 +367,10 @@ what the single colour actually was (`#000000`).
 | `Mahjong Emo Ta - Devilish Mahjong Tower (Taiwan) (Unl).md` | "\|.... <.........n..Q...N.....3..D.....9......g. | 1 colours |
 | `Mamono Hunter Youko - Dai 7 no Keishou (Japan).md` | .....n...^.[.d.q | 1 colours |
 | `Mega lo Mania (Japan).md` | MEGA lo MANIA | 1 colours |
+| `Mega-lo-Mania (Europe) (Beta).md` | MEGA lo MANIA | 1 colours |
+| `Mega-lo-Mania (Europe).md` | MEGA lo MANIA | 1 colours |
+| `Mega-lo-Mania (France).md` | MEGA lo MANIA | 1 colours |
+| `Mega-lo-Mania (World) (Evercade).md` | MEGA lo MANIA | 1 colours |
 | `Mr. Nutz - Hoppin' Mad (Europe) (Proto).md` | MR NUTZ HOPPIN MAD | 1 colours |
 | `NBA Action '95 Starring David Robinson (USA, Europe) (Beta) (1994-12-15).md` | NBA Basketball '95 | 1 colours |
 | `NBA Action '95 Starring David Robinson (USA, Europe) (Beta) (1995-01-08).md` | NBA Basketball '95 | 1 colours |
@@ -423,6 +429,7 @@ what the single colour actually was (`#000000`).
 | `Twinkle Tale (Japan).md` | TWINKL TALE | 1 colours |
 | `Tyrants - Fight Through Time (USA).md` | MEGA lo MANIA | 1 colours |
 | `VS Puyo Puyo Sun (USA, Europe) (Mega Drive Mini 2, Genesis Mini 2).md` | PUYO PUYO SUN | 1 colours |
+| `WWF WrestleMania - The Arcade Game (USA, Europe) (Beta).md` | unknown | 2 colours |
 | `Warrior of Rome II (USA).md` | worrior of rome2 | 1 colours |
 | `Wisdom Tree Collection (USA) (Piko Interactive) (Unl).md` | INC..09....09... 09... .9.... .. g.#.SEGA..@.09 | 4 colours |
 | `Wonder Library (Japan) (Program).md` | WONDER LIBRARY | 1 colours |
@@ -466,118 +473,23 @@ what the single colour actually was (`#000000`).
 | `[BIOS] WonderMega M2 (Japan) (En).md` | WONDERMEGA2 BOOT | 1 colours |
 | `[BIOS] X'Eye (USA).md` | X EYE BOOT for(MP) | 1 colours |
 
-### Panic (110 - see the CSV for the full table)
+
+### Panic (15 - see the CSV for the full table)
 
 | ROM | Title | Notes |
 |---|---|---|
-| `Boxing Legends of the Ring (USA).md` | BOXING LEGENDS OF THE RING | 263 lines and the VDP has not raised `frame_done` |
-| `Brian Lara Cricket (Australia).md` | BRIAN LARA CRICKET | 314 lines and the VDP has not raised `frame_done` |
-| `Brian Lara Cricket (Europe).md` | BRIAN LARA CRICKET | 314 lines and the VDP has not raised `frame_done` |
-| `Brian Lara Cricket 96 (Europe) (Rev 1).md` | BRIAN LARA 96 | 314 lines and the VDP has not raised `frame_done` |
-| `Brian Lara Cricket 96 (Europe).md` | BRIAN LARA 96 | 314 lines and the VDP has not raised `frame_done` |
-| `Bubsy in - Claws Encounters of the Furred Kind (USA, Europe).md` | Bubsy | 263 lines and the VDP has not raised `frame_done` |
 | `Chaoji Mahjong Club (Taiwan) (Unl).md` | Super Majon ClubVersion 1.00 Bill,Will & Andy | not implemented: m68k opcode 4741 |
-| `Chavez II (Mexico).md` | CHAVEZ 2 | 263 lines and the VDP has not raised `frame_done` |
-| `Comix Zone (Europe) (Beta) (1995-06-28).md` | COMIX ZONE | 314 lines and the VDP has not raised `frame_done` |
-| `Comix Zone (Europe) (Beta) (1995-07-12).md` | COMIX ZONE | 314 lines and the VDP has not raised `frame_done` |
-| `Cyber Police - ESWAT (Japan) (En).md` | ESWAT | 263 lines and the VDP has not raised `frame_done` |
-| `Darius (World) (Genesis Mini, Mega Drive Mini).md` | DARIUS MD | 263 lines and the VDP has not raised `frame_done` |
-| `Dragon - The Bruce Lee Story (Europe).md` | DRAGON | 314 lines and the VDP has not raised `frame_done` |
-| `Dragon's Revenge (Japan) (En).md` | DRAGON'S FURY2 | 263 lines and the VDP has not raised `frame_done` |
-| `Dragon's Revenge (USA, Europe).md` | DRAGON'S REVENGE | 263 lines and the VDP has not raised `frame_done` |
-| `ESWAT - City under Siege (USA, Europe) (Rev A).md` | ESWAT | 263 lines and the VDP has not raised `frame_done` |
-| `Ecco - The Tides of Time (Europe) (En,Fr,De,Es).md` | ECCO THE TIDES OF TIME | 314 lines and the VDP has not raised `frame_done` |
-| `Exo Squad (Europe).md` | EXO-SQUAD | 314 lines and the VDP has not raised `frame_done` |
-| `International Sensible Soccer (Europe) (En,Fr,De,It).md` | SENSIBLE SOCCER-INTERNATIONAL EDITION | 314 lines and the VDP has not raised `frame_done` |
-| `John Madden Football '93 (USA, Europe).md` | John Madden Football '93 | 263 lines and the VDP has not raised `frame_done` |
-| `John Madden Football (USA, Europe) (1990-11-07) (Sega Channel).md` | DO NOT USE | 263 lines and the VDP has not raised `frame_done` |
-| `John Madden Football (USA, Europe).md` | DO NOT USE | 263 lines and the VDP has not raised `frame_done` |
-| `John Madden Football - Championship Edition (USA).md` | John Madden Football '93 Championship Edition | 263 lines and the VDP has not raised `frame_done` |
-| `Jurassic Park (Europe) (1993-06-14) (Sega Channel).md` | JURASSIC PARK | 314 lines and the VDP has not raised `frame_done` |
 | `King of Fighters '99, The (Taiwan) (En) (Unl).md` | g.. N....LE.....N.....E.....N.....N....:L...Ns | not implemented: m68k opcode 4741 |
-| `King of Fighters 2000, The (Taiwan) (En) (Unl).md` | ...g.. N....*E.....N....$E.....N....$N.. R.L. | 263 lines and the VDP has not raised `frame_done` |
-| `King of Fighters 98', The (Taiwan) (En) (Unl).md` | ...g.. N....*E.....N....$E.....N....$N.. R.L. | 263 lines and the VDP has not raised `frame_done` |
-| `Legende de Thor, La (France) (Mega Drive Mini).md` | THE STORY OF THOR | 314 lines and the VDP has not raised `frame_done` |
-| `Legende de Thor, La (France).md` | THE STORY OF THOR | 314 lines and the VDP has not raised `frame_done` |
-| `MK5 - Mortal Kombat Mythologies - Sub-Zero (Taiwan) (En) (Unl).md` | g&N.....E.....N.....Jy...lg E.....N.....N.. _^L. | 263 lines and the VDP has not raised `frame_done` |
-| `Madden NFL 98 (USA).md` | MADDEN NFL 98 | 263 lines and the VDP has not raised `frame_done` |
-| `Mega Turrican (Europe).md` | MEGA TURRICAN | 314 lines and the VDP has not raised `frame_done` |
-| `Mega Turrican (USA).md` | MEGA TURRICAN | 263 lines and the VDP has not raised `frame_done` |
-| `Mega-lo-Mania (Europe) (Beta).md` | MEGA lo MANIA | 314 lines and the VDP has not raised `frame_done` |
-| `Mega-lo-Mania (Europe).md` | MEGA lo MANIA | 314 lines and the VDP has not raised `frame_done` |
-| `Mega-lo-Mania (France).md` | MEGA lo MANIA | 314 lines and the VDP has not raised `frame_done` |
-| `Mega-lo-Mania (World) (Evercade).md` | MEGA lo MANIA | 314 lines and the VDP has not raised `frame_done` |
-| `Mike Ditka Power Football (USA, Europe) (Unl) (Alt).md` | Mike Ditka Power Football | 263 lines and the VDP has not raised `frame_done` |
-| `Mike Ditka Power Football (USA, Europe) (Unl).md` | Mike Ditka Power Football | 263 lines and the VDP has not raised `frame_done` |
-| `Mortal Kombat 3 (USA) (Beta).md` | unknown | 263 lines and the VDP has not raised `frame_done` |
-| `NBA Action '94 (USA) (Beta) (1994-01-04).md` | NBA Action | 263 lines and the VDP has not raised `frame_done` |
-| `NBA Action '94 (USA) (Beta) (1994-01-16).md` | NBA Action | 263 lines and the VDP has not raised `frame_done` |
 | `NFL '95 (USA) (Beta) (1994-08-17) (Alt).md` | NFL 95 | not implemented: m68k opcode 4741 |
 | `NFL '95 (USA) (Beta) (1994-09-04).md` | NFL 95 | not implemented: m68k opcode 4741 |
 | `NFL '95 (USA) (Beta) (1994-09-06).md` | NFL 95 | not implemented: m68k opcode 00FA |
 | `NFL '95 (USA) (Beta) (1994-09-07).md` | NFL 95 | not implemented: m68k opcode 4741 |
 | `NFL '95 (USA) (Beta) (1994-09-08).md` | NFL 95 | not implemented: m68k opcode 4741 |
 | `NFL '95 (USA) (Beta) (1994-09-09).md` | NFL 95 | not implemented: m68k opcode 4741 |
-| `Nigel Mansell's World Championship Racing (USA).md` | NIGEL MANSELLS WORLD CHAMPIONSHIP | 263 lines and the VDP has not raised `frame_done` |
-| `Ottifants, The (Europe) (De) (Beta).md` | OTTIFANT | 314 lines and the VDP has not raised `frame_done` |
-| `Ottifants, The (Europe) (En,Fr,De,Es,It).md` | THE OTTIFANTS | 314 lines and the VDP has not raised `frame_done` |
-| `Paperboy (USA, Europe) (Beta) (1991-10-28).md` | PaperBoy | 263 lines and the VDP has not raised `frame_done` |
-| `Paperboy 2 (USA, Europe).md` | PAPERBOY 2 | 263 lines and the VDP has not raised `frame_done` |
-| `Power Football (World) (Evercade) (Unl).md` | Piko Super Power Football | 263 lines and the VDP has not raised `frame_done` |
 | `Pro Action Replay (Europe) (Program) (Unl).md` | ACTION REPLAY 2 | not implemented: m68k opcode 4741 |
 | `Pro Action Replay 2 (Europe) (v2.1) (Program) (Unl) (Alt).md` | ACTION REPLAY 2 | not implemented: m68k opcode 4741 |
 | `Pro Action Replay 2 (Europe) (v2.1) (Program) (Unl).md` | unknown | not implemented: m68k opcode 00FF |
-| `Ren & Stimpy Show Presents, The - Stimpy's Invention (Europe) (1993-12-09) (Sega Channel).md` | STIMPY'S INVENTION | 314 lines and the VDP has not raised `frame_done` |
-| `Ren & Stimpy Show Presents, The - Stimpy's Invention (Europe).md` | STIMPY'S INVENTION | 314 lines and the VDP has not raised `frame_done` |
-| `Risk (USA).md` | RISK | 263 lines and the VDP has not raised `frame_done` |
-| `RoboCop Versus The Terminator (Europe).md` | ROBOCOP VERSUS THE TERMINATOR | 314 lines and the VDP has not raised `frame_done` |
-| `Samurai Shodown (Europe).md` | SAMURAI SHODOWN | 314 lines and the VDP has not raised `frame_done` |
-| `Sensible Soccer (Europe) (En,Fr,De,It) (Beta).md` | SENSIBLE SOCCER | 314 lines and the VDP has not raised `frame_done` |
-| `Sensible Soccer (Europe) (En,Fr,De,It).md` | SENSIBLE SOCCER | 314 lines and the VDP has not raised `frame_done` |
-| `Sensible Soccer (World) (En,Fr,De,It) (Evercade).md` | SENSIBLE SOCCER | 314 lines and the VDP has not raised `frame_done` |
-| `Shane Warne Cricket (Australia).md` | SHANE WARNE CRICKET | 314 lines and the VDP has not raised `frame_done` |
-| `Show do Milhao - Volume 2 (Brazil).md` | SHOW DO MILHAO VOL 2 | 263 lines and the VDP has not raised `frame_done` |
-| `Side Pocket (Europe).md` | SIDE POCKET | 314 lines and the VDP has not raised `frame_done` |
-| `Sonic & Knuckles (World) (Beta) (1994-05-25).md` | SONIC & KNUCKLES | 263 lines and the VDP has not raised `frame_done` |
-| `Sonic & Knuckles + Sonic The Hedgehog 2 + Sonic The Hedgehog 3 (World) (Virtual Console).md` | SONIC & KNUCKLES | 263 lines and the VDP has not raised `frame_done` |
-| `Sonic & Knuckles + Sonic The Hedgehog 3 (Europe) (Lock-on Combination).md` | SONIC & KNUCKLES | 263 lines and the VDP has not raised `frame_done` |
-| `Sonic & Knuckles + Sonic The Hedgehog 3 (Japan) (En) (Lock-on Combination).md` | SONIC & KNUCKLES | 263 lines and the VDP has not raised `frame_done` |
-| `Sonic & Knuckles + Sonic The Hedgehog 3 (USA) (Lock-on Combination).md` | SONIC & KNUCKLES | 263 lines and the VDP has not raised `frame_done` |
-| `Sonic 3 (Europe).md` | SONIC THE HEDGEHOG 3 | 314 lines and the VDP has not raised `frame_done` |
-| `Sonic The Hedgehog 3 (Japan, Korea) (En).md` | SONIC THE HEDGEHOG 3 | 263 lines and the VDP has not raised `frame_done` |
-| `Sonic The Hedgehog 3 (USA) (1993-11-20) (Sega Channel).md` | SONIC THE HEDGEHOG 3 | 263 lines and the VDP has not raised `frame_done` |
-| `Sonic The Hedgehog 3 (USA).md` | SONIC THE HEDGEHOG 3 | 263 lines and the VDP has not raised `frame_done` |
-| `Sonic The Hedgehog 3 Limited Edition (Japan) (En) (Proto) (1994-04-08).md` | SONIC THE HEDGEHOG 3 | 263 lines and the VDP has not raised `frame_done` |
-| `Sonic The Hedgehog 3 Limited Edition (Japan) (En) (Proto) (1994-05-17).md` | SONIC THE HEDGEHOG 3 | 263 lines and the VDP has not raised `frame_done` |
 | `Star Odyssey (USA) (Super Fighter Team).md` | STAR ODYSSEY | not implemented: m68k opcode 00FF |
-| `Story of Thor, The (Europe) (Beta) (1994-04-xx).md` | The Story of Thor | 314 lines and the VDP has not raised `frame_done` |
-| `Story of Thor, The (Europe) (Mega Drive Mini).md` | THE STORY OF THOR | 314 lines and the VDP has not raised `frame_done` |
-| `Story of Thor, The (Europe).md` | THE STORY OF THOR | 314 lines and the VDP has not raised `frame_done` |
-| `Story of Thor, The (Germany) (Mega Drive Mini).md` | THE STORY OF THOR | 314 lines and the VDP has not raised `frame_done` |
-| `Story of Thor, The (Germany).md` | THE STORY OF THOR | 314 lines and the VDP has not raised `frame_done` |
-| `Story of Thor, The (Spain) (Mega Drive Mini).md` | THE STORY OF THOR | 314 lines and the VDP has not raised `frame_done` |
-| `Story of Thor, The (Spain).md` | THE STORY OF THOR | 314 lines and the VDP has not raised `frame_done` |
-| `Streets of Rage 2 (Japan) (En,Ja) (Mega Drive Mini).md` | STREETS OF RAGE 2 | 314 lines and the VDP has not raised `frame_done` |
-| `Streets of Rage 3 (Europe) (Beta) (1994-04-12).md` | STREETS OF RAGE3 | 314 lines and the VDP has not raised `frame_done` |
-| `Streets of Rage 3 (Europe) (Beta) (1994-04-13).md` | STREETS OF RAGE3 | 314 lines and the VDP has not raised `frame_done` |
-| `Streets of Rage 3 (Europe) (Beta) (1994-04-15).md` | STREETS OF RAGE3 | 314 lines and the VDP has not raised `frame_done` |
-| `Streets of Rage 3 (Europe) (Beta) (1994-04-20).md` | STREETS OF RAGE3 | 314 lines and the VDP has not raised `frame_done` |
-| `Streets of Rage 3 (Europe) (Beta) (1994-04-25).md` | STREETS OF RAGE3 | 314 lines and the VDP has not raised `frame_done` |
-| `Streets of Rage 3 (Europe).md` | STREETS OF RAGE3 | 314 lines and the VDP has not raised `frame_done` |
-| `Streets of Rage II (Japan, Europe) (En,Ja).md` | STREETS OF RAGE 2 | 314 lines and the VDP has not raised `frame_done` |
-| `Super Skidmarks (Europe) (Beta) (1995-09-22) (J-Cart).md` | unknown | 314 lines and the VDP has not raised `frame_done` |
-| `Super Skidmarks (Europe) (J-Cart).md` | unknown | 314 lines and the VDP has not raised `frame_done` |
-| `Tecmo Super NBA Basketball (USA).md` | Tecmo Super NBA BAsketball | 263 lines and the VDP has not raised `frame_done` |
-| `Test Drive II - The Duel (USA, Europe) (Unl).md` | The Duel TDII | 263 lines and the VDP has not raised `frame_done` |
 | `Triple Play - Gold Edition (USA).md` | Triple Play Gold | not implemented: m68k opcode 00FF |
 | `Triple Play 96 (USA).md` | Triple Play Baseball | not implemented: m68k opcode 00FF |
-| `Ultracore (Europe) (Strictly Limited Games).md` | ULTRACORE | 314 lines and the VDP has not raised `frame_done` |
-| `Ultracore (USA, Europe) (Switch, PS Vita).md` | ULTRACORE | 314 lines and the VDP has not raised `frame_done` |
-| `Vectorman 2 (USA) (Beta) (1995-08-xx).md` | VECTORMAN | 263 lines and the VDP has not raised `frame_done` |
-| `WWF Super WrestleMania (USA, Europe).md` | WWF | 263 lines and the VDP has not raised `frame_done` |
-| `WWF WrestleMania - The Arcade Game (USA, Europe) (Beta).md` | unknown | 263 lines and the VDP has not raised `frame_done` |
-| `WildSnake (USA) (Proto).md` | WILDSNAKE | 263 lines and the VDP has not raised `frame_done` |
 | `World Heroes (Asia) (En) (Beta) (1994-04-20) (Alt) [b].md` | O.L. .E.O.S | not implemented: m68k opcode 00FF |
-| `Zero Wing (Japan).md` | ZERO WING | 263 lines and the VDP has not raised `frame_done` |
-| `Zero Wing (USA, Europe) (Retro-Bit).md` | ZERO WING | 263 lines and the VDP has not raised `frame_done` |
-
