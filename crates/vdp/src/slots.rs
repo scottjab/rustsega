@@ -274,18 +274,33 @@ impl Vdp {
     /// [`OFF_TRANSFERS_H40`]'s 198 rather than 205 - and #302 is where that is
     /// paid.
     pub(crate) fn dma_slot_table(&self, fill: bool) -> &'static [u16] {
-        let line = if self.in_vblank || !self.display_enabled() {
-            if self.h40() {
-                &BLANK_H40 as &[u16]
-            } else {
-                &BLANK_H32
-            }
-        } else if self.h40() {
-            &ACTIVE_H40 as &[u16]
-        } else {
-            &ACTIVE_H32
-        };
+        let line = self.dma_line_slots(self.in_vblank || !self.display_enabled());
         if fill { &line[1..] } else { line }
+    }
+
+    /// The DMA's slots of a line the walk of [`Vdp::dma_mclk_to_slots`] has
+    /// reached, which [`Vdp::dma_slot_table`] cannot answer because it keys on
+    /// `in_vblank` and that is the chip's present tense.
+    ///
+    /// VBlank is the span [`Vdp::start_line`] keeps the flag up over: `vblank_line`
+    /// through to but not including the last line of the frame. The display is read
+    /// as it stands, which is all a prediction of a line the beam has not got to
+    /// can do, and it is the same reading [`Vdp::dma_slot_table`] makes.
+    fn dma_line_slots_at(&self, line: u16, fill: bool) -> &'static [u16] {
+        let blank = !self.display_enabled()
+            || (line >= self.vblank_line() && line + 1 < self.frame_lines());
+        let table = self.dma_line_slots(blank);
+        if fill { &table[1..] } else { table }
+    }
+
+    /// The two DMA lines of the mode, blank or drawn.
+    fn dma_line_slots(&self, blank: bool) -> &'static [u16] {
+        match (blank, self.h40()) {
+            (true, true) => &BLANK_H40 as &[u16],
+            (true, false) => &BLANK_H32 as &[u16],
+            (false, true) => &ACTIVE_H40 as &[u16],
+            (false, false) => &ACTIVE_H32 as &[u16],
+        }
     }
 
     /// How many of the DMA's access slots the master clocks in `(from, to]` of
@@ -314,13 +329,31 @@ impl Vdp {
     /// The loop is one turn per line the transfer spans - at most 640 of them for
     /// the whole of VRAM, and every table has slots in it, so it always makes the
     /// `left` it is counting down smaller.
+    ///
+    /// Each turn is counted against **that line's** table, which is what makes the
+    /// figure a real deadline rather than an estimate. Held to the table of the line
+    /// the walk started on, a transfer begun in blanking was timed at 205 slots a
+    /// line for all of them while [`Vdp::dma_clock`] was spending them at the 18 an
+    /// active line leaves free, so the 68000 was let off the bus long before the
+    /// transfer was over - far enough ahead of it that the cart's next control write,
+    /// a register write, cleared the code register (genvdp.txt section 7) and the
+    /// rest of the transfer wrote nothing. #536 is `Sonic & Knuckles` losing the last
+    /// 1536 bytes of a 7232-slot DMA to exactly that.
     pub(crate) fn dma_mclk_to_slots(&self, fill: bool, slots: u32) -> u32 {
-        let table = self.dma_slot_table(fill);
         let h40 = self.h40();
         let mut left = slots;
+        let mut line = self.line;
         let mut from = self.line_mclk;
         let mut clocks = 0;
         loop {
+            // The line the beam is on is answered by `dma_slot_table` because the
+            // chip is already saying whether it is blank; the ones after it are what
+            // the walk is for.
+            let table = if line == self.line {
+                self.dma_slot_table(fill)
+            } else {
+                self.dma_line_slots_at(line, fill)
+            };
             let mut ahead = 0;
             for &slot in table {
                 let at = slot_mclk(usize::from(slot), h40);
@@ -337,6 +370,11 @@ impl Vdp {
             left -= ahead;
             clocks += MCLKS_PER_LINE - from;
             from = 0;
+            line = if line + 1 >= self.frame_lines() {
+                0
+            } else {
+                line + 1
+            };
         }
     }
 

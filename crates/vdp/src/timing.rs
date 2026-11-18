@@ -321,7 +321,7 @@ impl Vdp {
 
     /// The last line of the frame, so the beam wraps after it.
     #[inline]
-    fn frame_lines(&self) -> u16 {
+    pub(crate) fn frame_lines(&self) -> u16 {
         if self.pal {
             FRAME_LINES_PAL
         } else {
@@ -345,7 +345,7 @@ impl Vdp {
     /// half of NTSC V30 that #446 leaves for a golden run against a real capture.
     /// Everywhere else the VBlank line and the last line drawn are the same line.
     #[inline]
-    fn vblank_line(&self) -> u16 {
+    pub(crate) fn vblank_line(&self) -> u16 {
         // 224 and 240, both of which fit a `u16`.
         if self.v30_mode() {
             LINES_V30 as u16

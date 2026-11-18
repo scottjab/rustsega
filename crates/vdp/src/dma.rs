@@ -1303,6 +1303,57 @@ mod tests {
         );
     }
 
+    /// The freeze a 68k -> VDP transfer puts on the 68000 is the instant the last
+    /// of its access slots arrives, so the transfer cannot still be running when
+    /// the freeze is paid - and a transfer that outlives VBlank runs the rest of
+    /// its slots at the 18 an active line leaves free, not the 205 of the blank
+    /// one it started on (#536).
+    ///
+    /// The 200 words here are 400 slots. Line 260 - the last one `in_vblank`
+    /// covers - gives 205 of them, so 195 are owed over the active display at 18
+    /// a line: about twelve lines in all. Charged the blank line's rate for every
+    /// one of them, the freeze came out near two, the 68000 woke with the
+    /// transfer in mid air, and its next control write (a register write clears
+    /// the code register, genvdp.txt section 7) silently abandoned what was left.
+    #[test]
+    fn a_transfer_that_outlives_vblank_is_frozen_for_the_whole_of_it() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(12, 0x81);
+        dma_from(&mut vdp, 0x000100, 200);
+        // R1 bit 6 both enables the DMA and is the display, so from line 261 the
+        // transfer is timed against a line that is being drawn.
+        vdp.write_register(1, 0x50);
+        vdp.in_vblank = true;
+        vdp.set_position(260, 0);
+        start_dma(&mut vdp, vram_write_cmd(0x2000));
+
+        let source: Vec<u16> = (0..200).map(|index| 0x1000 + index).collect();
+        let mut bus = FakeBus::laid_at(0x000100, &source);
+        vdp.run_dma(&mut bus);
+
+        let stall = vdp.dma_68k_stall_mclk();
+        assert!(
+            stall > 5 * MCLKS_PER_LINE,
+            "195 slots over the active display is not a couple of lines: {stall}"
+        );
+
+        vdp.advance(stall - 1);
+        assert!(
+            vdp.dma_busy,
+            "one clock short of the last slot of the last word"
+        );
+        vdp.advance(1);
+        assert!(
+            !vdp.dma_busy,
+            "the freeze is the transfer's last slot, so it is over with the freeze"
+        );
+        assert_eq!(
+            &vdp.vram[0x218E..0x2190],
+            [0x10, 0xC7],
+            "and the 200th word is in VRAM, not abandoned with the freeze"
+        );
+    }
+
     /// Status bit 1 is "set for the duration of a DMA operation ... only useful
     /// for fills and copies" (genvdp.txt section 6), and a duration is what a
     /// slot-timed DMA has: 300 bytes of fill is two lines of a blank H32 line's
