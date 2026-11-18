@@ -181,9 +181,11 @@ The VDP write FIFO (`crates/vdp/src/fifo.rs`, M4-21a #99) is what makes
   twice, and it matches the `dma_68k_stall_mclk` the same glue already reads.
   Keeping only the one write that a real chip could hold was #540: the second of
   the two writes a long makes at `$C00000` overwrote it, and the first went
-  missing. Bit 8 and `data_port_stall_mclk` are still read against four entries,
-  so the queue running deeper than four is the bus running ahead of the
-  transfer, not a deeper FIFO.
+  missing. Bit 8 reads against four entries, and `data_port_stall_mclk` is the
+  wait until the queue is short enough for the write to fit among them - the
+  charge for everything standing in front of it, not for the entry at the head
+  alone, which is what let a cart run the queue 28 deep (#545). A queue deeper
+  than four is still the bus running ahead of the transfer, not a deeper FIFO.
 * A data port read drains the FIFO first, so a read never sees a location as it
   was before the write the 68k queued for it.
 * The slots are the ones `crates/vdp/src/slots.rs` tabulates per mode and per

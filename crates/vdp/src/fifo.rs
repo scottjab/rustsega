@@ -112,17 +112,17 @@ pub(crate) struct Fifo {
     /// `Road Rash II (USA, Europe)` lose 3209 and 4653 bytes a frame that way, and
     /// every differing byte of theirs sits inside a word lost like this.
     ///
-    /// The second is that "past four" is normal here rather than a corner. A real
-    /// 68000 never has a fifth word to put because the fourth already froze it;
-    /// [`Vdp::data_port_stall_mclk`] charges the bus for the entry at the head of
-    /// the queue alone, not for everything standing in front of a new write, so a
-    /// cart writing words back to back runs ahead of the drain. The deepest queue
-    /// seen across the carts of `docs/compat-vdp.md` is 28 entries - 24 past
-    /// `FIFO_DEPTH` - and all 24 of those are writes the 68k is still owed time
-    /// for. That under-charge is the shape of the freeze #489 and #517 are about,
-    /// not of this queue, and this queue is a `VecDeque` so the two can be fixed
-    /// in either order: the depth here is a measurement of the bus, not a limit
-    /// the 68k is kept to.
+    /// The second is that "past four" is a state the bus reaches rather than a
+    /// corner, because a write is performed and charged rather than refused: the
+    /// 68k is told how long the chip would have held it, and this queue is where
+    /// those writes wait while the beam runs. [`Vdp::data_port_stall_mclk`] now
+    /// charges the wait for the whole of what stands in front of a new write
+    /// (#545), which holds the queue to a couple of entries past `FIFO_DEPTH` on
+    /// the carts of `docs/compat-vdp.md` - it was 28 before that fix. A real 68000
+    /// never has a fifth word to put, because the fourth already froze it, so the
+    /// depth is still a read-out on the bus rather than a limit the 68k is kept to:
+    /// the two writes of a long to `$C00000` are made at one beam position and the
+    /// second of them is queued before the first has been paid for.
     queue: VecDeque<Entry>,
 }
 
@@ -196,17 +196,36 @@ impl Fifo {
         self.queue.len() >= FIFO_DEPTH
     }
 
-    /// The access slots the entry at the head is still waiting for, and `0`
-    /// whenever the port is not being held.
+    /// The access slots a write arriving now is still owed before the queue has a
+    /// place for it, and `0` whenever the port takes it straight away.
     ///
-    /// Only a full queue holds the port, and only the entry at the head has to
-    /// clear first: see [`Vdp::data_port_stall_mclk`], which turns this many
-    /// slots into the clocks the bus waits.
-    pub(crate) fn head_slots(&self) -> u32 {
+    /// Four entries is the whole chip, so a queue under four has a place and owes
+    /// the write nothing. At four it does not, and genvdp.txt section 6 is exact
+    /// about what the wait is: "Once the 68K has written the fourth word, FULL is
+    /// raised. If the processor attempts to write one more time, it will be frozen
+    /// (/DTACK high) until the FIFO unit manages to deliver the first stacked word
+    /// to its rightful owner". The first word, and only when the queue is deeper
+    /// than the chip's does "the first" stop being enough: a write arriving behind
+    /// six entries is behind six of them, not one, so the wait is until there is
+    /// room - `len + 1 - FIFO_DEPTH` entries delivered, each owing the slots the
+    /// beam has not spent on it yet.
+    ///
+    /// Counting the head entry alone - which is what this did before #545 - is the
+    /// same figure whenever the queue is exactly four deep and a smaller one
+    /// whenever it is deeper, so it is right at the depth the chip can reach and
+    /// short at every depth past it. That is what let a cart's queue run to 28.
+    ///
+    /// See [`Vdp::data_port_stall_mclk`], which turns this many slots into clocks.
+    pub(crate) fn slots_until_accepted(&self) -> u32 {
         if !self.is_full() {
             return 0;
         }
-        u32::from(self.queue.front().map_or(1, |entry| entry.slots))
+        let clear = self.queue.len() + 1 - FIFO_DEPTH;
+        self.queue
+            .iter()
+            .take(clear)
+            .map(|entry| u32::from(entry.slots))
+            .sum()
     }
 }
 
@@ -281,6 +300,16 @@ impl Vdp {
         self.fifo.is_full()
     }
 
+    /// How many entries the queue is holding.
+    ///
+    /// Not a chip report - status bit 8 is [`Vdp::fifo_full`] and that one reads
+    /// against `FIFO_DEPTH` whatever the queue holds - but it is what a test of the
+    /// hold has to be able to see, because the hold is what decides it.
+    #[cfg(test)]
+    pub(crate) fn fifo_len(&self) -> usize {
+        self.fifo.queue.len()
+    }
+
     /// Master clocks a write to the data port is held for, `0` when the port
     /// takes it straight away.
     ///
@@ -293,21 +322,19 @@ impl Vdp {
     /// [`Vdp::dma_68k_stall_mclk`], which is a stall on the other side of the
     /// same transfer.
     ///
-    /// "How long" is the head entry's own slots counted along the slot schedule:
-    /// the entry cannot move until every slot it needs has come round, and a slot
-    /// at the beam's own clock does not count. Over the active display that is two
-    /// of the 18 free slots a line offers, so two of the gaps `slots` tabulates -
-    /// the largest of which is the documented 32-pixel FIFO-full stall; in
-    /// blanking it is under two pixels.
+    /// "How long" is the slots every entry in front of the arriving write still
+    /// owes, counted along the slot schedule: nothing moves until its slots have
+    /// come round, and a slot at the beam's own clock does not count. At the
+    /// chip's four entries that is one VRAM word, two of the 18 free slots an
+    /// active H40 line offers - the largest of which is the documented 32-pixel
+    /// FIFO-full stall, and in blanking under two pixels. Past four it is the wait
+    /// for the whole of what is in front, which is why the depth a cart leaves the
+    /// queue at is a read-out on this hold and not on the queue.
     ///
-    /// The write is not lost meanwhile: it joins the queue behind the entries
-    /// that filled it, in order, whatever that costs the clock. Note that this
-    /// counts the head entry's slots alone, so it is the wait for one entry and
-    /// not the wait for the queue - which is why a cart can leave the queue
-    /// several writes deep (see [`Fifo::queue`]), and why the depth it reaches is
-    /// a read-out on this hold rather than on the queue.
+    /// The write is not lost meanwhile: it joins the queue behind the entries that
+    /// filled it, in order, whatever that costs the clock.
     pub fn data_port_stall_mclk(&self) -> u32 {
-        let slots = self.fifo.head_slots();
+        let slots = self.fifo.slots_until_accepted();
         if slots == 0 {
             0
         } else {
@@ -749,6 +776,127 @@ mod tests {
         let entry = fifo.take_slot().expect("second slot");
         assert_eq!((entry.addr, entry.value), (0x0100, 0xBEEF));
         assert!(fifo.is_empty());
+    }
+
+    /// The first write past the four entries waits for the word at the head, and
+    /// nothing else: genvdp.txt section 6 freezes the 68k "until the FIFO unit
+    /// manages to deliver the first stacked word to its rightful owner", which at
+    /// four VRAM words is the two slots of the entry at the head.
+    #[test]
+    fn the_fifth_write_waits_for_the_word_at_the_head() {
+        let mut vdp = active_display();
+        set_reg(&mut vdp, 15, 2);
+        vram_write_at(&mut vdp, 0x0000);
+        for _ in 0..4 {
+            vdp.write_data(0xABCD);
+        }
+        assert!(vdp.fifo_full());
+        assert_eq!(
+            vdp.data_port_stall_mclk(),
+            vdp.mclk_to_slots(2),
+            "one VRAM word in front of the arriving write"
+        );
+    }
+
+    /// A write behind a queue that is past the chip's four is behind all of it.
+    ///
+    /// The hold is the wait until there is a place for the write, so behind six
+    /// entries three of them have to reach memory before the seventh is taken: six
+    /// slots, not the two of the entry at the head alone. That depth is the one a
+    /// cart reaches when the hold is short - see [`Fifo::queue`] and #545.
+    #[test]
+    fn a_write_behind_a_deeper_queue_waits_for_everything_in_front_of_it() {
+        let mut vdp = active_display();
+        set_reg(&mut vdp, 15, 2);
+        vram_write_at(&mut vdp, 0x0000);
+        // Six VRAM words with no clock between them: nothing has drained, so the
+        // queue holds six and each still owes its two slots.
+        for _ in 0..6 {
+            vdp.write_data(0xABCD);
+        }
+        assert_eq!(vdp.fifo_len(), 6);
+        assert_eq!(
+            vdp.data_port_stall_mclk(),
+            vdp.mclk_to_slots(6),
+            "three VRAM words have to reach memory before the arriving word fits"
+        );
+
+        // And the queue the carts of #545 reach: one write behind 28 entries is
+        // held for the wait of the 25 in front of the four the chip holds.
+        for _ in 0..22 {
+            vdp.write_data(0xABCD);
+        }
+        assert_eq!(vdp.fifo_len(), 28);
+        assert_eq!(
+            vdp.data_port_stall_mclk(),
+            vdp.mclk_to_slots(50),
+            "25 VRAM words, 50 slots, before the arriving word has a place"
+        );
+    }
+
+    /// The wait is the slots the entries in front actually owe, so a CRAM word -
+    /// one slot, not two - shortens it at the head and in the middle alike.
+    #[test]
+    fn the_wait_counts_the_width_of_every_entry_in_front() {
+        let mut vdp = active_display();
+        set_reg(&mut vdp, 15, 3);
+        cram_write_at(&mut vdp, 0x0000);
+        for _ in 0..4 {
+            vdp.write_data(0x0EEE);
+        }
+        assert_eq!(
+            vdp.data_port_stall_mclk(),
+            vdp.mclk_to_slots(1),
+            "four CRAM words, and the first owes one slot"
+        );
+
+        // Two more of them, so three of the six in front have to clear: three slots.
+        for _ in 0..2 {
+            vdp.write_data(0x0EEE);
+        }
+        assert_eq!(vdp.fifo_len(), 6);
+        assert_eq!(vdp.data_port_stall_mclk(), vdp.mclk_to_slots(3));
+    }
+
+    /// The other half of the regression: paying the hold once takes a queue deeper
+    /// than the chip back to the chip's own depth.
+    ///
+    /// This is the cart-level check #545 asks for, without a cart. `Vdp::write_data`
+    /// performs a write that a real port would have refused, so the only thing
+    /// keeping the queue to the four entries the chip has is the charge, and the
+    /// charge is right exactly when paying it buys back `FIFO_DEPTH`: the hold for
+    /// the write that would be the fifth is the wait for the head to go, the wait
+    /// for the queue to stand at four again. The hold used to be the head entry's
+    /// remaining slots, a slot short of that every second write, and the carts of
+    /// `docs/compat-vdp.md` ran the queue to 28 on the shortfall.
+    #[test]
+    fn paying_the_hold_once_takes_a_deep_queue_back_to_the_chip() {
+        // Queue depths past the four the chip has, and the entries behind them:
+        // four is where the first write is refused, twelve is a burst in flight, 28
+        // is the deepest queue a cart has been measured with.
+        for depth in [FIFO_DEPTH + 1, 12, 28] {
+            // Display on, and inside the active display rather than a blanking line:
+            // a word queued for VRAM takes a slot pair there, which is the case the
+            // shortfall is measured on.
+            let mut vdp = active_display();
+            set_reg(&mut vdp, 15, 2);
+            vram_write_at(&mut vdp, 0x0000);
+            for _ in 0..depth {
+                vdp.write_data(0xABCD);
+            }
+            assert_eq!(vdp.fifo_len(), depth);
+
+            let hold = vdp.data_port_stall_mclk();
+            assert!(hold > 0, "a queue {depth} deep must hold the port at all");
+            vdp.advance(hold);
+            assert!(
+                vdp.fifo_len() <= FIFO_DEPTH,
+                "paying the {hold} mclk a write at depth {depth} is charged for left {} \
+                 entries queued: the 68k is let go before it could have been, and every \
+                 write like that is one more entry the chip never had room for",
+                vdp.fifo_len(),
+            );
+        }
     }
 
     /// The stall is the head entry's slots along the schedule, so a CRAM word at
