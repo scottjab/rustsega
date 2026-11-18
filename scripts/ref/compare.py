@@ -235,14 +235,16 @@ def address(offset):
     return WORK_RAM.base + offset
 
 
-def ranges(offsets, region=WORK_RAM, limit=8):
-    """A human-readable summary of a set of offsets: `$FF0000-$FF0003, $FF1234`.
+def runs_of(offsets, region=WORK_RAM):
+    """A set of offsets collapsed into contiguous runs: ``[(start, end)]``, inclusive.
 
-    Collapsed into runs because these are always either nothing or a run of a
-    dozen, and a list of 26 addresses is harder to read than two ranges.
+    The one place that decides what contiguous means, so :func:`ranges` (which prints
+    it) and :class:`Shape` (which judges it) cannot drift apart. Contiguity is measured
+    in the region's element, which is why CRAM runs in colours rather than in the two
+    bytes a colour is saved as.
     """
     if not offsets:
-        return "-"
+        return []
     ordered = sorted(set(offsets))
     runs = []
     start = previous = ordered[0]
@@ -253,6 +255,156 @@ def ranges(offsets, region=WORK_RAM, limit=8):
         runs.append((start, previous))
         start = previous = item
     runs.append((start, previous))
+    return runs
+
+
+MIN_REAL_RUN = 4
+"""The smallest contiguous run of persistent divergence that reads as a lost transfer.
+
+Four elements is one nametable cell, one tile row of a plane, and the tail of any
+burst the VDP would have taken in one go; and the frame-phase noise this screen has
+to survive has always arrived as single elements on a stride - S&K's `$F8xx` family
+is one byte every eight (#534), and Sonic 1's is one byte every four. So four
+separates the two shapes without picking either one arbitrarily.
+"""
+
+MIN_REAL_VOLUME = 256
+"""How much persistent divergence is too much to be frame phase, however it is spread.
+
+Contiguity alone is not enough: Shinobi III at frames 586-600 came back with 3209 VRAM
+bytes differing in every frame of the window, as 1657 separate runs of two bytes each,
+so no run test calls it anything but scattered - and it is ours reading 0 where the
+reference holds tile data, which is not what frame phase does. The bar is five times the
+largest frame-phase family this harness has measured (52 addresses on S&K, #534) and two
+orders below the divergences it is meant to let through, so it sits in the gap rather than
+inside either population.
+"""
+
+
+@dataclass(frozen=True)
+class Shape:
+    """The address shape of a set of divergent elements: runs, width, contiguity.
+
+    #539 is the reason this exists. An end-of-frame comparison carries frame phase, and
+    the byte count alone cannot tell the two kinds of difference apart: S&K reported a
+    mean of 32.0 of 65536 VRAM bytes a frame with no bug left in it, all of it scattered
+    single bytes that move with phase, while the real bug next to it was 1536 bytes of
+    one contiguous block (#536). What separates them is shape, not size.
+    """
+
+    region: Region
+    #: the runs of offsets, ascending, as :func:`runs_of` returns them
+    runs: list
+
+    @property
+    def elements(self):
+        """How many elements the whole set holds, in the region's unit."""
+        return sum((end - start) // self.region.unit + 1 for start, end in self.runs)
+
+    @property
+    def largest(self):
+        """The widest run, or None for an empty set."""
+        if not self.runs:
+            return None
+        return max(self.runs, key=lambda r: (r[1] - r[0]) // self.region.unit)
+
+    @property
+    def largest_run(self):
+        """How wide the widest run is, in elements: 1 for a set of strays, 0 for nothing."""
+        widest = self.largest
+        return 0 if widest is None else (widest[1] - widest[0]) // self.region.unit + 1
+
+    @property
+    def contiguous(self):
+        """Is every divergent element next to another: one run, and more than one element in it?"""
+        return len(self.runs) == 1 and self.largest_run > 1
+
+    def span(self):
+        """First and last element of the whole set: `0x001640-0x001C3F`, or `-`."""
+        if not self.runs:
+            return "-"
+        low, high = self.runs[0][0], self.runs[-1][-1]
+        return self.region.label(low) if low == high else f"{self.region.label(low)}-{self.region.label(high)}"
+
+
+def classify(report, min_run=MIN_REAL_RUN):
+    """`real` or `phase` for one report, from the shape of what persists (#539).
+
+    **Real** is a divergence contiguous in address across at least `min_run` elements
+    that holds in *every* frame compared: the shape a dropped transfer or a lost burst
+    leaves, and the shape #536's 1536-byte VRAM hole was. **Phase** is everything else,
+    and it is where the scattered single bytes live: the `$F8xx` family on S&K, which
+    differs in a mean of 32 VRAM bytes a frame with nothing wrong, and which moves when
+    the frame alignment shifts.
+
+    Contiguity is measured on the persistent set rather than on each frame's
+    differences because persistence is what this harness already trusts; a contiguous
+    block that only holds in nine frames of ten still shows in the per-frame table
+    above the verdict line, and the phase-safe re-run is the tie-breaker either way.
+    """
+    if report.agrees:
+        return "agree"
+    shape = shape_of(report, min_run)
+    if shape.largest_run >= min_run or shape.elements >= MIN_REAL_VOLUME:
+        return "real"
+    return "phase"
+
+
+def real_reason(report, min_run=MIN_REAL_RUN):
+    """Why :func:`classify` called a report real: `run`, `volume`, or neither.
+
+    Both shapes are divergences, but they are different-looking bugs and the issue filed
+    for them wants the shape: a contiguous run is one transfer that did not land, and a
+    large set of strays is many writes that did not land (Shinobi III, #539).
+    """
+    shape = shape_of(report, min_run)
+    if shape.largest_run >= min_run:
+        return "run"
+    if shape.elements >= MIN_REAL_VOLUME:
+        return "volume"
+    return ""
+
+
+def shape_of(report, min_run=MIN_REAL_RUN):
+    """The :class:`Shape` of the elements that differ in every frame of `report`."""
+    return Shape(report.region, runs_of(report.differs_in_all, report.region))
+
+
+def classify_line(report, min_run=MIN_REAL_RUN):
+    """One line on what a report's divergence is: the verdict, and why it is that one."""
+    verdict = classify(report, min_run)
+    shape = shape_of(report)
+    unit = "bytes" if report.region.unit == 1 else report.region.plural
+    compared = len(report.compared)
+    if verdict == "agree":
+        return "class    agree - nothing differs in any frame compared"
+    if verdict == "real" and real_reason(report, min_run) == "run":
+        return (
+            f"class    real - {shape.elements} {unit} differ in all {compared} frames, "
+            f"contiguous: {len(shape.runs)} run(s) of >= {min_run}, {shape.span()}"
+        )
+    if verdict == "real":
+        return (
+            f"class    real - {shape.elements} {unit} differ in all {compared} frames: "
+            f"too many for frame phase, though scattered over {len(shape.runs)} runs "
+            f"of <= {shape.largest_run}, {shape.span()}"
+        )
+    return (
+        f"class    phase - no run of >= {min_run} {report.region.plural} differs in all "
+        f"{compared} frames; {shape.elements} {unit} do, widest run {shape.largest_run}, "
+        f"in {len(shape.runs)} run(s)"
+    )
+
+
+def ranges(offsets, region=WORK_RAM, limit=8):
+    """A human-readable summary of a set of offsets: `$FF0000-$FF0003, $FF1234`.
+
+    Collapsed into runs because these are always either nothing or a run of a
+    dozen, and a list of 26 addresses is harder to read than two ranges.
+    """
+    if not offsets:
+        return "-"
+    runs = runs_of(offsets, region)
     if len(runs) > limit:
         shown = runs[:limit]
         more = f" (+{len(runs) - limit} more)"
@@ -376,6 +528,9 @@ class Report:
     #: frame numbers mean, which is the difference between a dump of a moment and a
     #: dump of whatever each machine's frame loop happened to end on (#526).
     anchor: str = ""
+    #: the smallest contiguous persistent run that :func:`classify` calls real
+    #: (`--min-run`, #539)
+    min_run: int = MIN_REAL_RUN
 
     @property
     def agrees(self):
@@ -391,6 +546,17 @@ class Report:
     def compared(self):
         """The reference frames actually compared, ascending."""
         return sorted(self.per_frame)
+
+    @property
+    def mean(self):
+        """Mean differing elements per compared frame, in the region's unit.
+
+        A headline, not a result: one frame of work RAM or VRAM churns, so the number
+        only means something beside the persistence test and the :func:`classify` verdict.
+        """
+        if not self.per_frame:
+            return 0.0
+        return sum(len(v) for v in self.per_frame.values()) / len(self.per_frame)
 
     def first_difference(self):
         """The first place any compared frame differs, as `(frame, offset)`.
@@ -412,7 +578,7 @@ class Report:
         and colours for CRAM, where the same arithmetic counts words and naming the
         unit bytes there would be a different unit carrying the same number.
         """
-        count = sum(len(v) for v in self.per_frame.values()) / len(self.per_frame)
+        count = self.mean
         scale = self.region.size // self.region.unit
         unit = "bytes" if self.region.unit == 1 else self.region.plural
         found = len(self.differs_in_all)
@@ -527,6 +693,8 @@ class Memory:
     shift: int = 0
     shift_measured: bool = False
     anchor: str = ""
+    #: the `--min-run` the two memories were classified with (#539)
+    min_run: int = MIN_REAL_RUN
 
     @property
     def agrees(self):
@@ -977,6 +1145,7 @@ def print_report(report, stream=None, result=True):
         if report.phase:
             say(f"differ in fewer frames - frame phase, {len(report.phase)} {report.region.plural}: "
                 f"{ranges(report.phase, report.region)}")
+    say(classify_line(report, report.min_run))
     first = report.first_difference()
     if first is not None:
         frame, offset = first
@@ -996,6 +1165,65 @@ def print_report(report, stream=None, result=True):
         say(f"RESULT: {report.summary()}")
 
 
+def tsv_row(report, min_run=None):
+    """One tab-separated line describing one report, for a sweep to collect (#539).
+
+    The columns are :data:`TSV_COLUMNS`, in order, and no field contains a tab or a
+    newline. It exists so `sweep-vdp.sh` does not have to parse the human report: the
+    sweep runs over a list of carts, and a report whose wording moved would otherwise
+    turn a results table into a table of `-`s with no complaint.
+    """
+    min_run = report.min_run if min_run is None else min_run
+    compared = report.compared
+    first = report.first_difference()
+    if first is None:
+        first_text = "-"
+    else:
+        frame, offset = first
+        reference, ours = load_at(report.directory, frame, report.shift, report.region)
+        first_text = (
+            f"{report.region.label(offset)} "
+            f"ref={report.region.value(reference, offset)} "
+            f"ours={report.region.value(ours, offset)} "
+            f"@{frame}"
+        )
+    shape = shape_of(report, min_run)
+    return "\t".join(
+        str(field)
+        for field in (
+            report.directory,
+            report.region.name,
+            f"{report.frames[0]}-{report.frames[-1]}" if report.frames else "-",
+            len(compared),
+            report.shift,
+            f"{report.mean:.1f}",
+            len(report.differs_in_all),
+            len(shape.runs),
+            shape.largest_run,
+            shape.span(),
+            first_text,
+            classify(report, min_run),
+        )
+    )
+
+
+TSV_COLUMNS = (
+    "dir",
+    "memory",
+    "frames",
+    "compared",
+    "shift",
+    "mean",
+    "persistent",
+    "runs",
+    "largest",
+    "span",
+    "first",
+    "verdict",
+)
+"""The fields of :func:`tsv_row`, in order: what `--tsv` prints and `sweep-vdp.sh` reads."""
+
+
 def print_vdp(memory, stream=None):
     """Both VDP memories at one alignment, under one verdict (#534).
 
@@ -1011,6 +1239,7 @@ def print_vdp(memory, stream=None):
 
     for index, report in enumerate(memory.reports):
         report.anchor = memory.anchor
+        report.min_run = memory.min_run
         print_report(report, stream=stream, result=False)
         if index + 1 < len(memory.reports):
             say("")
@@ -1024,7 +1253,7 @@ def print_vdp(memory, stream=None):
         if report.agrees:
             parts.append(f"{report.region.name} agrees")
             continue
-        mean = sum(len(v) for v in report.per_frame.values()) / len(report.per_frame)
+        mean = report.mean
         region = report.region
         unit = "bytes" if region.unit == 1 else region.plural
         found = len(report.differs_in_all)
@@ -1587,6 +1816,123 @@ def selftest():
         check("and the same dumps read where they were not taken are not agreement",
               not run_vdp(late, vram_frames, span=0).agrees)
 
+        print("selftest: real divergence versus frame phase (#539)")
+        # An end-of-frame comparison carries frame phase, and a byte count cannot tell
+        # the two apart: S&K reported 32.0 of 65536 VRAM bytes a frame with nothing
+        # wrong in it, all of it scattered single bytes on a stride, while #536's real
+        # bug was 1536 bytes of one contiguous block. So a planted block has to be
+        # called real and a planted scatter, even one that differs in every frame, has
+        # to be called phase. Get this backwards and the sweep either files an issue
+        # per cart for a phase artefact or misses the next #536.
+        shape_dir = os.path.join(work, "vdp-shape")
+        os.mkdir(shape_dir)
+        build(shape_dir, vram_frames, vram_at, VRAM)
+        build(shape_dir, vram_frames, cram_images(vram_frames), CRAM)
+        clean = compare(shape_dir, vram_frames, 0, VRAM)
+        check("a memory that matches is neither real nor phase", classify(clean) == "agree",
+              classify(clean))
+
+        block = [(0x1A00 + i) for i in range(16)]
+        for frame in vram_frames:
+            for offset in block:
+                mutate(shape_dir, frame, OURS_PREFIX, offset, vram_at[frame][offset] ^ 0xFF, VRAM)
+        report = compare(shape_dir, vram_frames, 0, VRAM)
+        shape = shape_of(report)
+        check("a contiguous block planted in every frame is called real",
+              classify(report) == "real", classify(report))
+        check("and the block is one contiguous run of its full width",
+              shape.contiguous and shape.largest_run == 16 and shape.elements == 16,
+              f"{shape.runs}, {shape.largest_run}")
+        check("naming its span, since that is the number an issue is filed with",
+              shape.span() == "0x001A00-0x001A0F", shape.span())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_report(report)
+        check("and the report says so in words",
+              "class    real - 16 bytes differ in all 4 frames, contiguous: 1 run(s) of >= 4"
+              in out.getvalue(), out.getvalue()[-260:])
+
+        # The same 16 bytes, spread out one every eight like S&K's `$F8xx` family. They
+        # differ in every frame compared, which is exactly what the persistence test
+        # alone cannot dismiss, and the verdict still has to be phase.
+        build(shape_dir, vram_frames, vram_at, VRAM)
+        stray = [0x2000 + 8 * i for i in range(16)]
+        for frame in vram_frames:
+            for offset in stray:
+                mutate(shape_dir, frame, OURS_PREFIX, offset, vram_at[frame][offset] ^ 0xFF, VRAM)
+        report = compare(shape_dir, vram_frames, 0, VRAM)
+        check("a scattered difference is phase even when it holds in every frame",
+              classify(report) == "phase", f"{classify(report)}: {len(report.differs_in_all)} persistent")
+        check("which is not the same as finding nothing: they are persistent, just strays",
+              len(report.differs_in_all) == 16 and shape_of(report).largest_run == 1,
+              f"{len(report.differs_in_all)} persistent, widest {shape_of(report).largest_run}")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_report(report)
+        check("and the report says phase and why", "class    phase - no run of >= 4" in out.getvalue(),
+              out.getvalue()[-260:])
+        check("a smaller --min-run is the operator overriding the screen, and it works",
+              classify(report, min_run=1) == "real", classify(report, min_run=1))
+
+        # Volume is a real-on-its-own: Shinobi III came back with 3209 bytes differing in
+        # every frame of its window as 1657 runs of two bytes, scattered, and ours reading
+        # 0 where the reference holds tile data. A run test alone calls that scattered and
+        # a sweep that reports it as frame phase is the false negative this whole ticket
+        # exists to avoid, so a lot of it has to be called real on its own.
+        build(shape_dir, vram_frames, vram_at, VRAM)
+        many = [0x3000 + 6 * i for i in range(MIN_REAL_VOLUME + 8)]
+        for frame in vram_frames:
+            for offset in many:
+                mutate(shape_dir, frame, OURS_PREFIX, offset, vram_at[frame][offset] ^ 0xFF, VRAM)
+        report = compare(shape_dir, vram_frames, 0, VRAM)
+        check("that much persistent divergence is real however scattered it is",
+              classify(report) == "real" and real_reason(report) == "volume",
+              f"{classify(report)}/{real_reason(report)}: {shape_of(report).elements} elements, "
+              f"widest {shape_of(report).largest_run}")
+        check("and the report says it is scattered rather than pretending otherwise",
+              "too many for frame phase, though scattered" in capture(print_report, report),
+              capture(print_report, report)[-200:])
+        build(shape_dir, vram_frames, vram_at, VRAM)
+        few = [0x3000 + 6 * i for i in range(MIN_REAL_VOLUME // 4)]
+        for frame in vram_frames:
+            for offset in few:
+                mutate(shape_dir, frame, OURS_PREFIX, offset, vram_at[frame][offset] ^ 0xFF, VRAM)
+        report = compare(shape_dir, vram_frames, 0, VRAM)
+        check("a quarter of the volume bar, scattered, is still phase",
+              classify(report) == "phase", f"{classify(report)}: {shape_of(report).elements}")
+
+        # A block that is only there once the frames are aligned: the sweep of #525 has
+        # to line the images up before the shape is judged, or a real block looks like a
+        # hundred strays across a misread frame.
+        build(shape_dir, vram_frames, vram_at, VRAM)
+        for frame in vram_frames:
+            for offset in block:
+                mutate(shape_dir, frame, OURS_PREFIX, offset, vram_at[frame][offset] ^ 0xFF, VRAM)
+        # And the shape screen over a comparison made at the wrong shift: misaligned
+        # churn is what makes an address look persistent (#525 measured 25 real
+        # addresses turning into 35 that way), and none of it is contiguous, so the
+        # verdict still has to be phase rather than a block nobody dropped.
+        misaligned = compare(late, vram_frames, 0, VRAM)
+        check("misaligned churn is not mistaken for a block",
+              not misaligned.agrees and classify(misaligned) == "phase",
+              f"{classify(misaligned)}: {len(misaligned.differs_in_all)} persistent")
+        check("which is what it looks like once the sweep has aligned the two",
+              classify(run_comparison(late, vram_frames, span=1, region=VRAM)) == "agree")
+
+        # And the machine-readable line the sweep builds its table from.
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            status = main([shape_dir, "20-23", "--vdp", "--sweep", "0", "--tsv"])
+        lines = [line for line in out.getvalue().splitlines() if line.strip()]
+        check("--tsv prints one line per compared memory", len(lines) == 2, out.getvalue()[:200])
+        fields = lines[0].split("\t") if lines else []
+        check("--tsv has one field per column of the contract",
+              len(fields) == len(TSV_COLUMNS), f"{len(fields)}: {fields}")
+        check("--tsv carries the verdict, the span and the first byte",
+              fields[1] == "VRAM" and fields[11] == "real"
+              and fields[9] == "0x001A00-0x001A0F" and fields[10].startswith("0x001A00 ref="),
+              f"{fields}")
+        check("--tsv still fails the run when the memories disagree", status == 1, f"status {status}")
+        check("--tsv agrees to nothing it did not compare: the clean CRAM line says agree",
+              len(lines) > 1 and lines[1].split("\t")[11] == "agree", out.getvalue()[-120:])
+
         print("selftest: broken input is an error, not an agreement")
         truncated = os.path.join(work, "trunc")
         os.mkdir(truncated)
@@ -1668,6 +2014,20 @@ def main(argv=None):
         "and CRAM, at one shared frame alignment (#534)",
     )
     parser.add_argument(
+        "--min-run",
+        type=int,
+        default=MIN_REAL_RUN,
+        metavar="N",
+        help="how many contiguous elements differing in every frame compared make a "
+        f"divergence real rather than frame phase (default {MIN_REAL_RUN}, #539)",
+    )
+    parser.add_argument(
+        "--tsv",
+        action="store_true",
+        help="print one tab-separated line per compared memory instead of the report "
+        "(the columns of `TSV_COLUMNS`), for sweep-vdp.sh and the results table of #539",
+    )
+    parser.add_argument(
         "--selftest",
         action="store_true",
         help="check this harness on canned dumps and exit (part of `just check`)",
@@ -1678,6 +2038,8 @@ def main(argv=None):
         return selftest()
     if not args.directory:
         parser.error("a directory of dumps is needed (or --selftest)")
+    if args.tsv and args.meter:
+        parser.error("--tsv is for the image comparison and --vdp; --meter has its own report")
 
     # A Report and a Meter carry the same three things the harness needs before it
     # prints: the shift it aligned at, the anchor that says what the frame numbers
@@ -1695,6 +2057,7 @@ def main(argv=None):
             frames = frames_requested(wanted, args.directory)
             outcome = run_comparison(args.directory, frames, args.sweep)
         outcome.anchor = args.anchor.strip().removeprefix("0x").upper()
+        outcome.min_run = args.min_run
         if outcome.shift:
             print(
                 f"compare: the two frame counters differ by {outcome.shift:+d}; "
@@ -1705,7 +2068,11 @@ def main(argv=None):
         print(f"compare: {error}", file=sys.stderr)
         return 2
     if args.vdp:
-        print_vdp(outcome)
+        if args.tsv:
+            for report in outcome.reports:
+                print(tsv_row(report, args.min_run))
+        else:
+            print_vdp(outcome)
         return 0 if outcome.agrees else 1
     if args.meter:
         print_meter(outcome)
@@ -1717,7 +2084,10 @@ def main(argv=None):
             )
             return 2
         return 0 if outcome.agrees else 1
-    print_report(outcome)
+    if args.tsv:
+        print(tsv_row(outcome, args.min_run))
+    else:
+        print_report(outcome)
     return 0 if outcome.agrees else 1
 
 
