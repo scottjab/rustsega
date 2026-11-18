@@ -26,6 +26,8 @@
 //! and are not the FIFO's business, but they do wait for what is already
 //! queued, so [`Vdp::read_data`] drains it first.
 
+use std::collections::VecDeque;
+
 use crate::Vdp;
 use crate::ports::{DataTarget, data_target};
 #[cfg(feature = "serde")]
@@ -36,6 +38,12 @@ use serde::{Deserialize, Serialize};
 /// Four is the depth of the real thing (Nemesis on SpritesMind, and the number
 /// the `VDPFIFOTesting` ROMs push against), and it is what lets a game lay down
 /// a burst of palette writes and carry on without waiting for any of them.
+///
+/// It is also the only depth the chip's own numbers are read against: reaching it
+/// raises status bit 8 ([`Fifo::is_full`]) and starts the wait of
+/// [`Vdp::data_port_stall_mclk`]. How many entries the queue is *actually*
+/// carrying is a separate question, and the answer is not always four - see
+/// [`Fifo::queue`].
 pub(crate) const FIFO_DEPTH: usize = 4;
 
 /// One data port write, waiting its turn at the memories.
@@ -88,32 +96,41 @@ impl Entry {
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Fifo {
-    /// The queue, `queue[head]` being the entry next in line. `len` is kept
-    /// alongside rather than read from the slots, so nothing looks at the
-    /// entries past `head + len` and this is a ring rather than a puzzle.
-    queue: [Option<Entry>; FIFO_DEPTH],
-    head: usize,
-    len: usize,
-    /// The write the port is holding while the queue is full.
+    /// The writes the port has made that the memories have not, oldest first.
     ///
-    /// A write that finds no room cannot happen: the 68k is left waiting with
-    /// the word on the bus until a slot frees an entry, which is
-    /// [`Vdp::data_port_stall_mclk`]. Until the bus waits (M3-16, #77) the word
-    /// waits here rather than being dropped, so the only write that ever goes
-    /// missing is a second one made while the first is still held - which on
-    /// real hardware is one of the bus locks Nemesis's FIFO tests circle, and
-    /// which no ticket has taken on yet.
-    waiting: Option<Entry>,
+    /// Four of them is the chip's FIFO. Past four is writes the 68k got away with
+    /// while it should have been sitting on /DTACK, and the queue keeps them
+    /// rather than losing them for two reasons.
+    ///
+    /// The first is that losing one is #540. The queue used to be four entries
+    /// plus a latch for the fifth, so a write arriving when the latch was taken
+    /// overwrote it: `Bus::vdp_data_write` is called for both words of a long to
+    /// `$C00000` (the port is mirrored at `$C00002`, genvdp.txt section 3, and a
+    /// long is two word cycles) with no slot between them, so every long written
+    /// across a full FIFO lost the first of its two words and left a two-byte
+    /// hole in VRAM. `Shinobi III - Return of the Ninja Master (USA)` and
+    /// `Road Rash II (USA, Europe)` lose 3209 and 4653 bytes a frame that way, and
+    /// every differing byte of theirs sits inside a word lost like this.
+    ///
+    /// The second is that "past four" is normal here rather than a corner. A real
+    /// 68000 never has a fifth word to put because the fourth already froze it;
+    /// [`Vdp::data_port_stall_mclk`] charges the bus for the entry at the head of
+    /// the queue alone, not for everything standing in front of a new write, so a
+    /// cart writing words back to back runs ahead of the drain. The deepest queue
+    /// seen across the carts of `docs/compat-vdp.md` is 28 entries - 24 past
+    /// `FIFO_DEPTH` - and all 24 of those are writes the 68k is still owed time
+    /// for. That under-charge is the shape of the freeze #489 and #517 are about,
+    /// not of this queue, and this queue is a `VecDeque` so the two can be fixed
+    /// in either order: the depth here is a measurement of the bus, not a limit
+    /// the 68k is kept to.
+    queue: VecDeque<Entry>,
 }
 
 impl Fifo {
     /// An empty FIFO, which is what a VDP that has never been written to has.
     pub(crate) fn new() -> Self {
         Self {
-            queue: [None; FIFO_DEPTH],
-            head: 0,
-            len: 0,
-            waiting: None,
+            queue: VecDeque::new(),
         }
     }
 
@@ -121,19 +138,16 @@ impl Fifo {
     ///
     /// A write with nothing to write - a code register naming a read, whose
     /// write "is ignored" (genvdp.txt section 7) - takes no entry, so it cannot
-    /// fill the FIFO or hold up the write behind it. A write that arrives when
-    /// all four entries are taken goes to [`Fifo::waiting`], the port's own
-    /// latch, and joins the queue behind them as each slot empties one.
+    /// fill the FIFO or hold up the write behind it. Any other write joins the
+    /// back of the queue, whether or not the FIFO is already full: a write that
+    /// finds no room at the chip is queued rather than dropped, and still holds
+    /// the port through [`Fifo::is_full`]. See [`Fifo::queue`] for why that is
+    /// #540.
     pub(crate) fn push(&mut self, entry: Entry) {
         if entry.slots == 0 {
             return;
         }
-        if self.len < FIFO_DEPTH {
-            self.queue[(self.head + self.len) % FIFO_DEPTH] = Some(entry);
-            self.len += 1;
-        } else {
-            self.waiting = Some(entry);
-        }
+        self.queue.push_back(entry);
     }
 
     /// One access slot has come round: `None` when the entry at the head still
@@ -143,14 +157,14 @@ impl Fifo {
     /// come round is `slots`' question rather than this module's - see
     /// [`Vdp::fifo_clock`], which is what calls this once for each of them.
     pub(crate) fn take_slot(&mut self) -> Option<Entry> {
-        if self.len == 0 {
+        if self.queue.is_empty() {
             return None;
         }
 
-        // `len` says there is an entry at the head, and the slots it has left
+        // The queue is not empty, and the slots the entry at the front has left
         // are what stands between it and memory: this one is spent, and only a
         // VRAM word still has another to wait for.
-        if let Some(head) = self.queue[self.head].as_mut() {
+        if let Some(head) = self.queue.front_mut() {
             head.slots -= 1;
             if head.slots > 0 {
                 return None;
@@ -161,32 +175,25 @@ impl Fifo {
 
     /// The next write off the queue, whatever slots it still had left.
     ///
-    /// The write that [`Fifo::waiting`] holds goes into the space this frees,
-    /// so a drain of the queue reaches it too and the order the 68k wrote in is
-    /// the order the memories see.
+    /// Every write the port made is in the queue, including the ones that
+    /// arrived while it was full (see [`Fifo::queue`]), so a drain reaches them
+    /// in the order the 68k wrote them.
     pub(crate) fn pop(&mut self) -> Option<Entry> {
-        if self.len == 0 {
-            return None;
-        }
-        let entry = self.queue[self.head].take();
-        self.head = (self.head + 1) % FIFO_DEPTH;
-        self.len -= 1;
-        if let Some(waiting) = self.waiting.take() {
-            self.queue[(self.head + self.len) % FIFO_DEPTH] = Some(waiting);
-            self.len += 1;
-        }
-        entry
+        self.queue.pop_front()
     }
 
     /// Nothing on the queue: status bit 9.
     pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
+        self.queue.is_empty()
     }
 
-    /// All four entries taken: status bit 8. A held write implies this, since
-    /// a write is only held when there was no room for it.
+    /// All four entries taken: status bit 8.
+    ///
+    /// `FIFO_DEPTH` and not the length of the queue, because four is what the
+    /// chip reports: writes past the fourth are ones the bus should not have had
+    /// room to make yet, and they do not make a full FIFO read as any less full.
     pub(crate) fn is_full(&self) -> bool {
-        self.len == FIFO_DEPTH
+        self.queue.len() >= FIFO_DEPTH
     }
 
     /// The access slots the entry at the head is still waiting for, and `0`
@@ -199,7 +206,7 @@ impl Fifo {
         if !self.is_full() {
             return 0;
         }
-        u32::from(self.queue[self.head].map_or(1, |entry| entry.slots))
+        u32::from(self.queue.front().map_or(1, |entry| entry.slots))
     }
 }
 
@@ -293,10 +300,12 @@ impl Vdp {
     /// the largest of which is the documented 32-pixel FIFO-full stall; in
     /// blanking it is under two pixels.
     ///
-    /// The write is not lost meanwhile: [`Fifo::waiting`] holds it, and joins the
-    /// queue as each slot frees a place. A second write made while the first is
-    /// still held is the bus lock every FIFO document describes and which
-    /// nothing here models yet.
+    /// The write is not lost meanwhile: it joins the queue behind the entries
+    /// that filled it, in order, whatever that costs the clock. Note that this
+    /// counts the head entry's slots alone, so it is the wait for one entry and
+    /// not the wait for the queue - which is why a cart can leave the queue
+    /// several writes deep (see [`Fifo::queue`]), and why the depth it reaches is
+    /// a read-out on this hold rather than on the queue.
     pub fn data_port_stall_mclk(&self) -> u32 {
         let slots = self.fifo.head_slots();
         if slots == 0 {
@@ -548,6 +557,38 @@ mod tests {
         assert_eq!(
             &vdp.vram[0..10],
             [0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55]
+        );
+    }
+
+    /// A long to the data port is two writes and the FIFO is not allowed to take
+    /// the second in place of the first.
+    ///
+    /// The port is mirrored at `$C00002` as well as `$C00000` (genvdp.txt section
+    /// 3), so `move.l #$11223333,($C00000).w` reaches it as the two words `$1122`
+    /// and `$3333` with no access slot between them. Once the queue is full the
+    /// second of those used to overwrite the first where it was held, so the long
+    /// wrote its second word and lost its first: two bytes of VRAM missing, every
+    /// time, which is #540.
+    #[test]
+    fn a_long_to_the_data_port_arrives_as_its_two_words() {
+        let mut vdp = active_display();
+        set_reg(&mut vdp, 15, 2);
+        vram_write_at(&mut vdp, 0x0000);
+        // Three longs' worth of words: the first two take the four entries, and
+        // the third is written across a FIFO that has no room left for it.
+        for word in [0x1111u16, 0x2222, 0x3333, 0x4444, 0x5555, 0x6666] {
+            vdp.write_data(word);
+        }
+
+        // Six VRAM words, so twelve of the line's free slots.
+        let to = vdp.mclk_to_slots(12);
+        vdp.advance(to);
+        assert_eq!(
+            &vdp.vram[0..12],
+            [
+                0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x66, 0x66
+            ],
+            "the fifth word, written across a full FIFO, is the one that went missing"
         );
     }
 
