@@ -290,6 +290,14 @@ pub struct Vdp {
     /// [`Vdp::line`]: false for the line 0 of a VDP that has never been
     /// advanced, and cleared each time the beam moves to a new line (M4-06 #84).
     line_started: bool,
+    /// Whether the vertical interrupt of [`Vdp::line`] has been raised.
+    ///
+    /// The VINT is an event part way through [`Vdp::line`] rather than the work
+    /// of arriving on it (#439), so it needs its own once-a-line marker:
+    /// [`Vdp::line_started`] is already true for the VBlank line a reset chip is
+    /// parked on, and that park is deliberately a line with no interrupt on it
+    /// (see [`Vdp::start_in_vblank`]).
+    line_vint_taken: bool,
     /// The scroll and mode state of [`Vdp::line`], read at the start of that
     /// line's active display (`latch`, M4-23 #102).
     ///
@@ -394,6 +402,7 @@ impl Vdp {
             line: 0,
             line_mclk: 0,
             line_started: false,
+            line_vint_taken: false,
             line_latch: None,
             line_drawing: false,
             hv_latch: None,
