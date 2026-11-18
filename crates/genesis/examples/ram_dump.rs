@@ -1,5 +1,7 @@
-//! Run a cartridge with no input and write the 68000 work RAM of a named frame
-//! to a file: `cargo run -p genesis --release --example ram_dump`.
+//! Run a cartridge with no input and write out the memories of a named frame:
+//! 68000 work RAM, VRAM or CRAM. `cargo run -p genesis --release --example
+//! ram_dump -- ROM --frames N --out PATH` writes the work RAM one; `--vram` and
+//! `--cram` (#534) write the VDP's two.
 //!
 //! The reference oracle of #525 (`scripts/ref/`, its README has the whole
 //! story) compares this machine against a second emulator by work RAM state at a
@@ -26,19 +28,39 @@
 //! Nothing about the reference appears in this file, on purpose: it knows about a
 //! ROM, a region and some RAM, and about no second emulator.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use genesis::{Config, Genesis, Region, RegionSetting};
 
 /// What the command line said, after parsing.
+///
+/// `out`, `vram` and `cram` are each optional and at least one is required: the
+/// work-RAM comparison of #525 wants the 68000's memory and the VDP comparison of
+/// #534 wants the chip's, and both are the same run of the same machine up to the
+/// point where the images get written. Naming them from one invocation is the
+/// point - at a `--stop-at-pc` anchor the images are meant to be one moment, and
+/// three runs that each stopped at their own arrival would not be.
 struct Args {
     rom: PathBuf,
     frames: u32,
-    out: PathBuf,
+    /// Where the 64 KiB work-RAM image goes, if it is wanted.
+    out: Option<PathBuf>,
+    /// Where the 64 KiB VRAM image goes, if it is wanted (#534).
+    vram: Option<PathBuf>,
+    /// Where the 128 B CRAM image goes, if it is wanted (#534).
+    cram: Option<PathBuf>,
     region: RegionSetting,
     tmss: bool,
     /// Stop at this address instead of at the end of a frame: see [`USAGE`].
     stop_at_pc: Option<u32>,
+}
+
+/// One memory this run was asked to write out.
+struct Image {
+    /// What the report calls it: `ram`, `vram`, `cram`.
+    name: &'static str,
+    path: PathBuf,
+    bytes: usize,
 }
 
 /// The longest a frame can be, in scanlines: a PAL raster. It bounds one leg of
@@ -109,31 +131,83 @@ fn main() {
         }
     }
 
-    let ram: &[u8] = &machine.bus().ram[..];
-    if let Err(e) = std::fs::write(&args.out, ram) {
-        fail(&format!("cannot write {}: {e}", args.out.display()));
+    // Every image comes off the same stopped machine, in the order the caller
+    // named them, so a VRAM dump and a work-RAM dump of "frame 600" are the same
+    // instant rather than two runs that hoped to agree.
+    let bus = machine.bus();
+    let mut written: Vec<Image> = Vec::new();
+    if let Some(path) = &args.out {
+        written.push(write_image("ram", path.as_path(), &bus.ram[..]));
     }
+    if let Some(path) = &args.vram {
+        // VRAM is 64 KiB addressed as the chip addresses it, which is the one
+        // representation in which two emulators' pattern tables can be compared
+        // byte for byte (#534).
+        written.push(write_image("vram", path.as_path(), &bus.vdp.vram));
+    }
+    if let Some(path) = &args.cram {
+        written.push(write_image(
+            "cram",
+            path.as_path(),
+            &cram_image(&bus.vdp.cram),
+        ));
+    }
+
+    let images = written
+        .iter()
+        .map(|image| format!("{}={:?} bytes={}", image.name, image.path, image.bytes))
+        .collect::<Vec<_>>()
+        .join(" ");
     println!(
-        "region={} frames={} {}ram={:?} bytes={}",
+        "region={} frames={} {}{}",
         region.map(Region::name).unwrap_or("unknown"),
         args.frames,
         match args.stop_at_pc {
             Some(pc) => format!("stop={pc:#08X} "),
             None => String::new(),
         },
-        args.out,
-        ram.len()
+        images
     );
 }
 
-const USAGE: &str = "\
-usage: ram_dump <ROM> --frames N --out PATH [--region auto|usa|japan|europe] [--tmss]
-                 [--stop-at-pc ADDRESS]
+/// Write one image out and describe it, failing the run if the disk said no.
+fn write_image(name: &'static str, path: &Path, bytes: &[u8]) -> Image {
+    if let Err(e) = std::fs::write(path, bytes) {
+        fail(&format!("cannot write {}: {e}", path.display()));
+    }
+    Image {
+        name,
+        path: path.to_path_buf(),
+        bytes: bytes.len(),
+    }
+}
 
-Run <ROM> for N frames with no input and write its 64 KiB of 68000 work RAM
-(0xFF0000-0xFFFFFF) to PATH. --region forces a region instead of reading the
-cartridge header; --tmss starts with the security check enabled. Prints
-`region=... frames=... ram=... bytes=...`.
+/// CRAM as an image: sixty-four colour words, little endian, 128 bytes.
+///
+/// Little endian because the reference this is compared against writes a word low
+/// byte first, and a byte order is the one thing here that has to match a second
+/// emulator's choice rather than ours. The colour itself is unchanged: `0000
+/// BBB0 GGG0 RRR0` either way (genvdp.txt section 9), so an image of a palette is
+/// an image of the palette and not of a convention.
+fn cram_image(cram: &[u16]) -> Vec<u8> {
+    let mut image = Vec::with_capacity(cram.len() * 2);
+    for colour in cram {
+        image.extend_from_slice(&colour.to_le_bytes());
+    }
+    image
+}
+
+const USAGE: &str = "\
+usage: ram_dump <ROM> --frames N [--out PATH] [--vram PATH] [--cram PATH]
+                 [--region auto|usa|japan|europe] [--tmss] [--stop-at-pc ADDRESS]
+
+Run <ROM> for N frames with no input and write out the memories named: 64 KiB of
+68000 work RAM (0xFF0000-0xFFFFFF) with --out, 64 KiB of VRAM with --vram, and 64
+colour words of CRAM (128 B, little endian) with --cram. At least one of the three
+is needed and they are all written from one stopped machine. --region forces a
+region instead of reading the cartridge header; --tmss starts with the security
+check enabled. Prints `region=... frames=...` and one `name=PATH bytes=N` for
+every image written.
 
 --stop-at-pc makes a frame an arrival at ADDRESS instead of a whole raster: the
 run ends, and the RAM is written, the Nth time the 68000 is about to execute
@@ -151,6 +225,8 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
     let mut rom: Option<PathBuf> = None;
     let mut frames: Option<u32> = None;
     let mut out: Option<PathBuf> = None;
+    let mut vram: Option<PathBuf> = None;
+    let mut cram: Option<PathBuf> = None;
     let mut region = RegionSetting::Auto;
     let mut tmss = false;
     let mut stop_at_pc: Option<u32> = None;
@@ -166,6 +242,12 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
                 );
             }
             "--out" => out = Some(PathBuf::from(argv.next().ok_or("--out wants a path")?)),
+            "--vram" => {
+                vram = Some(PathBuf::from(argv.next().ok_or("--vram wants a path")?));
+            }
+            "--cram" => {
+                cram = Some(PathBuf::from(argv.next().ok_or("--cram wants a path")?));
+            }
             "--region" => {
                 let value = argv
                     .next()
@@ -202,10 +284,15 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
     }
 
     let frames = frames.ok_or("no --frames N: say which frame to dump")?;
+    if out.is_none() && vram.is_none() && cram.is_none() {
+        return Err("no memory named: give at least one of --out, --vram, --cram".to_string());
+    }
     Ok(Args {
         rom: rom.ok_or("no ROM named")?,
         frames,
-        out: out.ok_or("no --out PATH: say where the RAM image goes")?,
+        out,
+        vram,
+        cram,
         region,
         tmss,
         stop_at_pc,

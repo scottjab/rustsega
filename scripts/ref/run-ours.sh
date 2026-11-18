@@ -5,12 +5,18 @@
 # The other half is scripts/ref/run-ref.sh, which does the same job in blastem;
 # scripts/ref/compare.py then compares the two sets. See scripts/ref/README.md.
 #
-# usage: run-ours.sh [-o OUTDIR] [--region REGION] [--tmss] [--stop-at-pc PC] ROM FRAME [FRAME ...]
+# usage: run-ours.sh [-o OUTDIR] [--region REGION] [--tmss] [--stop-at-pc PC] [--vdp] ROM FRAME [FRAME ...]
 #
 # Writes OUTDIR/rNNNNN.bin - one raw 64 KiB work-RAM image per named frame, the
 # 68000 address space $FF0000-$FFFFFF, the same region and naming run-ref.sh
 # produces. Frame N means the state after exactly N frames, counting from reset,
 # on both sides.
+#
+# --vdp writes the VDP's memories instead, named to match run-ref.sh --vdp:
+# rvNNNNN.bin is the 64 KiB of VRAM and rcNNNNN.bin the 64 colour words of CRAM as
+# 128 raw bytes, little endian per colour (#534). They come out of the chip's own
+# state - `Bus::vdp.vram` and `Bus::vdp.cram` - not out of a reconstruction of what
+# it drew.
 #
 # --stop-at-pc PC moves that point to the Nth time the 68000 is about to execute
 # PC instead, for the phase-safe comparison of #526; run-ref.sh --stop-at-pc is
@@ -31,7 +37,7 @@ self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 usage() {
   echo "usage: $(basename "$0") [-o OUTDIR] [--region auto|usa|japan|europe] [--tmss]" \
-       "[--stop-at-pc PC] ROM FRAME [FRAME ...]" >&2
+       "[--stop-at-pc PC] [--vdp] ROM FRAME [FRAME ...]" >&2
   exit 2
 }
 
@@ -40,6 +46,7 @@ rom=""
 region=""
 tmss=()
 stop_at=""
+vdp=""
 frames=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,6 +68,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || usage
       stop_at=$2
       shift 2
+      ;;
+    --vdp)
+      vdp=vdp
+      shift
       ;;
     -*)
       echo "$(basename "$0"): unknown option $1" >&2
@@ -111,12 +122,27 @@ machine=()
 [[ -z $region ]] || machine+=(--region "$region")
 (( ${#tmss[@]} == 0 )) || machine+=("${tmss[@]}")
 [[ -z $stop_at ]] || machine+=(--stop-at-pc "$stop_at")
+# Which images the example writes, and under what names: `v` and `c` are the same
+# letters run-ref.sh puts between the side and the frame number, so one directory can
+# hold both sides of a comparison and compare.py tells them apart by name alone.
+if [[ -n $vdp ]]; then
+  kinds=(v c)
+else
+  kinds=("")
+fi
 
 count=0
 for frame in $(ref_frames "${frames[@]}"); do
-  file=$out/$(printf 'r%05d.bin' "$frame")
-  "$bin" "$rom" --frames "$frame" --out "$file" "${machine[@]}"
+  images=()
+  for kind in "${kinds[@]}"; do
+    case $kind in
+      v) images+=(--vram "$out/$(printf 'rv%05d.bin' "$frame")") ;;
+      c) images+=(--cram "$out/$(printf 'rc%05d.bin' "$frame")") ;;
+      *) images+=(--out "$out/$(printf 'r%05d.bin' "$frame")") ;;
+    esac
+  done
+  "$bin" "$rom" --frames "$frame" "${images[@]}" "${machine[@]}"
   count=$((count + 1))
 done
 
-echo "ours: $count work-RAM image(s) in $out"
+echo "ours: $count frame(s) x ${#kinds[@]} image(s) in $out"

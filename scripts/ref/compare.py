@@ -64,16 +64,87 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 
-IMAGE_NAME = re.compile(r"^([br])(\d{5})\.bin$")
-"""What a dump file is called: `b00600.bin` from the reference, `r00600.bin` from us."""
+IMAGE_NAME = re.compile(r"^([br])([vc]?)(\d{5})\.bin$")
+"""What a dump file is called: `b00600.bin` from the reference, `r00600.bin` from
+us, with a memory letter for the VDP's own memories between the two (`bv00600.bin`
+for VRAM, `bc00600.bin` for CRAM) so that one directory can hold a whole frame."""
 
-RAM_BASE = 0xFF0000
-"""Start of the compared region: the bottom of the 68000's work RAM mirror."""
 
-RAM_SIZE = 1 << 16
-"""Bytes per image. Both dumpers write exactly this much, and they are compared
-byte for byte with no header - which is what makes `cmp`-shaped reasoning safe and
-`run-ref.sh` check it on the way out."""
+@dataclass(frozen=True)
+class Region:
+    """One compared memory: what a pair of dump files is an image of.
+
+    A region is the letter that sits between the side and the frame number in a dump
+    file name, the address offset 0 belongs to, the exact length every image must
+    be, and the width of the thing worth naming in a report - a byte for the two
+    byte-addressed memories, a whole colour word for CRAM, because a palette entry
+    that differs by a nibble is one finding rather than two.
+
+    The length is checked on every read rather than trusted. A dump that came out at
+    half length - which is what saving CRAM with the reference's default element
+    size does, writing 64 narrowed values instead of 64 words - would otherwise be
+    compared against nothing and reported as agreement.
+    """
+
+    #: what to call it in a report
+    name: str
+    #: the memory letter of the file name: `""` for work RAM, `"v"`, `"c"`
+    letter: str
+    #: the address the first byte of an image belongs to
+    base: int
+    #: bytes per image, exactly
+    size: int
+    #: bytes per element named in a report
+    unit: int = 1
+
+    @property
+    def noun(self):
+        """One thing that differs: an address in RAM, a colour in CRAM."""
+        return "colour" if self.unit > 1 else "address"
+
+    @property
+    def plural(self):
+        """What to call several of them: addresses in RAM, colours in CRAM."""
+        return "colours" if self.unit > 1 else "addresses"
+
+    def image_name(self, side, frame):
+        """One dump file: `side` is :data:`REF_PREFIX` or :data:`OURS_PREFIX`."""
+        return f"{side}{self.letter}{frame:05d}.bin"
+
+    def label(self, offset):
+        """Where an offset is: `$FF1A2F` for work RAM, `word 7` for CRAM."""
+        if self.unit == 1:
+            return f"0x{self.base + offset:06X}"
+        return f"word {offset // self.unit}"
+
+    def value(self, image, offset):
+        """The element at ``offset``, printed the way the chip holds it."""
+        if self.unit == 1:
+            return f"{image[offset]:02X}"
+        return f"{int.from_bytes(image[offset : offset + self.unit], 'little'):04X}"
+
+    def describe(self):
+        """The header line: what a byte of these images is."""
+        span = f"0x{self.base:06X}-0x{self.base + self.size - 1:06X}, {self.size} B per frame"
+        if not self.letter:
+            return span
+        words = f" ({self.size // self.unit} {self.unit}-byte words)" if self.unit > 1 else ""
+        return f"{self.name} {span}{words}"
+
+
+WORK_RAM = Region("work RAM", "", 0xFF0000, 1 << 16)
+"""The 64 KiB of 68000 work RAM at `$FF0000`: what this harness compared first."""
+
+VRAM = Region("VRAM", "v", 0, 1 << 16)
+"""The VDP's 64 KiB, holding the pattern, name and sprite tables (genvdp.txt
+section 8). Byte addressed, big endian a word at a time, on both machines."""
+
+CRAM = Region("CRAM", "c", 0, 128, unit=2)
+"""The VDP's colour RAM: 64 words of `0000 BBB0 GGG0 RRR0` (genvdp.txt section 9),
+which both machines hold as 64 16-bit entries and neither holds as anything else."""
+
+VDP_REGIONS = (VRAM, CRAM)
+"""What `--vdp` compares: the two memories of #534, in the order they are printed."""
 
 REF_PREFIX = "b"
 OURS_PREFIX = "r"
@@ -111,52 +182,60 @@ class MissingDump(HarnessError):
     """
 
 
-def load_one(directory, side, frame):
+def load_one(directory, side, frame, region=WORK_RAM):
     """One dump: `side` is ``REF_PREFIX`` or ``OURS_PREFIX``.
 
     A missing or short image is an error rather than a silently skipped frame: an
     oracle that dropped a frame and reported agreement on what was left is worse
     than no oracle.
     """
-    name = f"{side}{frame:05d}.bin"
+    name = region.image_name(side, frame)
     path = os.path.join(directory, name)
     if not os.path.isfile(path):
         raise MissingDump(f"no {name} for frame {frame} in {directory}")
     size = os.path.getsize(path)
-    if size != RAM_SIZE:
+    if size != region.size:
         raise HarnessError(
-            f"{name} is {size} bytes, expected {RAM_SIZE}; "
+            f"{name} is {size} bytes, expected {region.size}; "
             "a truncated dump cannot be compared byte for byte"
         )
     with open(path, "rb") as handle:
         return handle.read()
 
 
-def load_at(directory, frame, shift=0):
+def load_at(directory, frame, shift=0, region=WORK_RAM):
     """The (reference, ours) pair for one frame, ours read at ``frame + shift``.
 
     ``shift`` is the measured alignment of the two frame counters, not a fudge: see
     :func:`sweep`.
     """
     return (
-        load_one(directory, REF_PREFIX, frame),
-        load_one(directory, OURS_PREFIX, frame + shift),
+        load_one(directory, REF_PREFIX, frame, region),
+        load_one(directory, OURS_PREFIX, frame + shift, region),
     )
 
 
-def diff_offsets(reference, ours):
-    """Offsets of the bytes the two images disagree on."""
+def diff_offsets(reference, ours, region=WORK_RAM):
+    """Offsets of the elements the two images disagree on.
+
+    An element is a byte except in CRAM, where it is a colour word: a palette entry
+    that differs at all is one difference at one address, which is what a report is
+    for.
+    """
     if len(reference) != len(ours):
         raise HarnessError("cannot compare images of different lengths")
-    return [i for i, (a, b) in enumerate(zip(reference, ours)) if a != b]
+    if region.unit == 1:
+        return [i for i, (a, b) in enumerate(zip(reference, ours)) if a != b]
+    unit = region.unit
+    return [i for i in range(0, len(reference), unit) if reference[i : i + unit] != ours[i : i + unit]]
 
 
 def address(offset):
-    """The 68000 address a byte offset in an image belongs to."""
-    return RAM_BASE + offset
+    """The 68000 address a byte offset in a work-RAM image belongs to."""
+    return WORK_RAM.base + offset
 
 
-def ranges(offsets, limit=8):
+def ranges(offsets, region=WORK_RAM, limit=8):
     """A human-readable summary of a set of offsets: `$FF0000-$FF0003, $FF1234`.
 
     Collapsed into runs because these are always either nothing or a run of a
@@ -168,7 +247,7 @@ def ranges(offsets, limit=8):
     runs = []
     start = previous = ordered[0]
     for item in ordered[1:]:
-        if item == previous + 1:
+        if item == previous + region.unit:
             previous = item
             continue
         runs.append((start, previous))
@@ -180,7 +259,7 @@ def ranges(offsets, limit=8):
     else:
         shown, more = runs, ""
     text = ", ".join(
-        f"0x{address(start):06X}" if start == end else f"0x{address(start):06X}-0x{address(end):06X}"
+        region.label(start) if start == end else f"{region.label(start)}-{region.label(end)}"
         for start, end in shown
     )
     return text + more
@@ -208,26 +287,30 @@ def ranges_of(frames, limit=10):
     return ", ".join(f"{start}-{end}" if start != end else f"{start}" for start, end in runs)
 
 
-def frames_in(directory):
+def frames_in(directory, region=WORK_RAM):
     """``(reference frames, our frames)`` that have an image on disk, ascending.
 
     Kept apart rather than intersected because they are not compared at the same
     number: the whole point of :func:`sweep` is that reference frame N is matched
     against our frame N+shift, so intersecting here would throw away exactly the
     frames the sweep needs to find its offset with.
+
+    Only of `region`: one directory holds a cart's work RAM, VRAM and CRAM dumps
+    side by side, and a listing that mixed them would report a frame as present for
+    a memory that was never dumped.
     """
     if not os.path.isdir(directory):
         raise HarnessError(f"{directory} is not a directory; run run-ref.sh and run-ours.sh first")
     sides = {REF_PREFIX: set(), OURS_PREFIX: set()}
     for name in os.listdir(directory):
         matched = IMAGE_NAME.match(name)
-        if not matched:
+        if not matched or matched.group(2) != region.letter:
             continue
-        sides[matched.group(1)].add(int(matched.group(2)))
+        sides[matched.group(1)].add(int(matched.group(3)))
     return sorted(sides[REF_PREFIX]), sorted(sides[OURS_PREFIX])
 
 
-def frames_requested(spec, directory, shift=0):
+def frames_requested(spec, directory, shift=0, region=WORK_RAM):
     """Resolve ``--frames 595-605,600`` to reference frames with a pair at ``shift``.
 
     The list is a request: a frame with no image on either side is not compared and
@@ -235,9 +318,12 @@ def frames_requested(spec, directory, shift=0):
     the end of what was dumped by construction. Only a request that matches nothing
     at all is an error.
     """
-    available, ours = frames_in(directory)
+    available, ours = frames_in(directory, region)
     if not available:
-        raise HarnessError(f"no bNNNNN.bin/rNNNNN.bin pair to compare in {directory}")
+        raise HarnessError(
+            f"no {REF_PREFIX}{region.letter}NNNNN.bin/{OURS_PREFIX}{region.letter}NNNNN.bin "
+            f"pair to compare in {directory}"
+        )
     wanted = set()
     if spec:
         for part in spec.split(","):
@@ -269,6 +355,8 @@ class Report:
     directory: str
     #: reference frame numbers the caller asked for
     frames: list
+    #: the memory the images are of; see :class:`Region`
+    region: Region = WORK_RAM
     #: reference frame -> offsets that differ, ours read at frame + shift
     per_frame: dict = field(default_factory=dict)
     #: (shift, mean differing bytes, pairs) for each shift the sweep tried
@@ -304,8 +392,39 @@ class Report:
         """The reference frames actually compared, ascending."""
         return sorted(self.per_frame)
 
+    def first_difference(self):
+        """The first place any compared frame differs, as `(frame, offset)`.
 
-def compare(directory, frames, shift=0):
+        #534 asks for the first byte where the two machines differ: the lowest
+        offset of the earliest frame that has a difference at all. It is an address
+        to go and read rather than a count, and in a memory as big as VRAM a count is
+        not something a person can act on.
+        """
+        for frame in self.compared:
+            if self.per_frame[frame]:
+                return frame, min(self.per_frame[frame])
+        return None
+
+    def summary(self):
+        """One line on what this memory diverged by: the RESULT text, without the label.
+
+        Bytes for the byte-addressed memories, which is what the mean is measured in,
+        and colours for CRAM, where the same arithmetic counts words and naming the
+        unit bytes there would be a different unit carrying the same number.
+        """
+        count = sum(len(v) for v in self.per_frame.values()) / len(self.per_frame)
+        scale = self.region.size // self.region.unit
+        unit = "bytes" if self.region.unit == 1 else self.region.plural
+        found = len(self.differs_in_all)
+        return (
+            f"disagree at shift {self.shift:+d}, "
+            f"{count:.1f} of {scale} {unit} per frame on average, "
+            f"{found} {self.region.plural if found != 1 else self.region.noun} "
+            "in every frame compared"
+        )
+
+
+def compare(directory, frames, shift=0, region=WORK_RAM):
     """Compare each reference frame against our frame ``frame + shift``.
 
     The persistence test runs over the frames compared here, which is why the
@@ -317,19 +436,21 @@ def compare(directory, frames, shift=0):
     a frame list walked with a shift runs off the end of the dumps by construction.
     Anything else - a truncated file, a missing reference frame - is fatal.
     """
-    report = Report(directory=directory, frames=list(frames), shift=shift)
+    report = Report(directory=directory, frames=list(frames), region=region, shift=shift)
     for frame in frames:
-        reference = load_one(directory, REF_PREFIX, frame)
+        reference = load_one(directory, REF_PREFIX, frame, region)
         try:
-            ours = load_one(directory, OURS_PREFIX, frame + shift)
+            ours = load_one(directory, OURS_PREFIX, frame + shift, region)
         except MissingDump:
             if shift == 0:
                 raise
             report.dropped.append(frame)
             continue
-        report.per_frame[frame] = diff_offsets(reference, ours)
+        report.per_frame[frame] = diff_offsets(reference, ours, region)
     if not report.per_frame:
-        raise HarnessError(f"no frame of {len(frames)} could be compared in {directory}")
+        raise HarnessError(
+            f"no frame of {len(frames)} could be compared in {directory} ({region.name})"
+        )
     counts = {}
     for offsets in report.per_frame.values():
         for offset in offsets:
@@ -340,7 +461,7 @@ def compare(directory, frames, shift=0):
     return report
 
 
-def sweep(directory, frames, span):
+def sweep(directory, frames, span, region=WORK_RAM):
     """Mean differing bytes at each frame offset, over the frames given.
 
     ``shift`` is added to the frame number of *our* side only: shift +1 compares
@@ -355,10 +476,10 @@ def sweep(directory, frames, span):
         pairs = 0
         for frame in frames:
             try:
-                reference, ours = load_at(directory, frame, shift)
+                reference, ours = load_at(directory, frame, shift, region)
             except MissingDump:
                 continue
-            total += len(diff_offsets(reference, ours))
+            total += len(diff_offsets(reference, ours, region))
             pairs += 1
         if not pairs:
             continue
@@ -367,11 +488,11 @@ def sweep(directory, frames, span):
         if best is None or mean < best[0]:
             best = (mean, shift)
     if best is None:
-        raise HarnessError(f"no frame pair to sweep in {directory}")
+        raise HarnessError(f"no frame pair to sweep in {directory} ({region.name})")
     return results, best[1]
 
 
-def run_comparison(directory, frames, span=4):
+def run_comparison(directory, frames, span=4, region=WORK_RAM):
     """Measure the frame alignment, then compare at it: the whole pipeline.
 
     The order matters and is the whole reason the two are one function. Comparing
@@ -381,12 +502,58 @@ def run_comparison(directory, frames, span=4):
     and at shift 0 this reports 35 persistent addresses where the truth is 25.
     """
     if span <= 0:
-        return compare(directory, frames, 0)
-    results, shift = sweep(directory, frames, span)
-    report = compare(directory, frames, shift)
+        return compare(directory, frames, 0, region)
+    results, shift = sweep(directory, frames, span, region)
+    report = compare(directory, frames, shift, region)
     report.sweep = results
     report.shift_measured = True
     return report
+
+
+@dataclass
+class Memory:
+    """What a `--vdp` run found: one alignment, and a :class:`Report` per memory.
+
+    The shift is shared rather than measured per memory because the two images of a
+    frame are the same instant of the same machine: a CRAM read at a different frame
+    offset from the VRAM beside it would be a frame of the wrong moment, and CRAM is
+    128 B of mostly-still colour, which is nowhere near enough for a sweep of its
+    own to be trustworthy anyway.
+    """
+
+    directory: str
+    #: one report per :data:`VDP_REGIONS`, in that order
+    reports: list = field(default_factory=list)
+    shift: int = 0
+    shift_measured: bool = False
+    anchor: str = ""
+
+    @property
+    def agrees(self):
+        """Do both memories match, frame for frame at the comparison's shift?"""
+        return all(report.agrees for report in self.reports)
+
+
+def run_vdp(directory, frames, span=4):
+    """Compare VRAM and CRAM at one measured alignment: the `--vdp` pipeline.
+
+    The alignment comes from VRAM, which is the only one of the two with enough
+    moving in it for the minimum of :func:`sweep` to mean something. A memory with
+    no dumps at all is a harness failure rather than a region that agrees: a
+    comparison of nothing has to be unable to say `agree` (#534).
+    """
+    shift = 0
+    if span > 0:
+        _, shift = sweep(directory, frames, span, VRAM)
+    memory = Memory(directory=directory, shift=shift, shift_measured=span > 0)
+    for region in VDP_REGIONS:
+        try:
+            report = compare(directory, frames, shift, region)
+        except MissingDump as error:
+            raise HarnessError(f"{region.name} was never dumped here: {error}") from error
+        report.shift_measured = memory.shift_measured
+        memory.reports.append(report)
+    return memory
 
 
 @dataclass
@@ -508,10 +675,10 @@ def parse_meters(spec):
             value = int(part, 0)
         except ValueError:
             raise HarnessError(f"meter address {part!r} is not a number: give it as 0xFFFF2C") from None
-        if not RAM_BASE <= value <= RAM_BASE + RAM_SIZE - METER_LONG:
+        if not WORK_RAM.base <= value <= WORK_RAM.base + WORK_RAM.size - METER_LONG:
             raise HarnessError(
                 f"meter address 0x{value:06X} is outside the dumped region "
-                f"0x{RAM_BASE:06X}-0x{RAM_BASE + RAM_SIZE - 1:06X}"
+                f"0x{WORK_RAM.base:06X}-0x{WORK_RAM.base + WORK_RAM.size - 1:06X}"
             )
         found.add(value)
     if not found:
@@ -521,11 +688,11 @@ def parse_meters(spec):
 
 def read_long(image, address):
     """The big-endian long at a 68000 address inside a dump."""
-    offset = address - RAM_BASE
+    offset = address - WORK_RAM.base
     if offset < 0 or offset + METER_LONG > len(image):
         raise HarnessError(
             f"meter address 0x{address:06X} is not readable in a {len(image)}-byte image "
-            f"based at 0x{RAM_BASE:06X}"
+            f"based at 0x{WORK_RAM.base:06X}"
         )
     return int.from_bytes(image[offset : offset + METER_LONG], "big")
 
@@ -733,8 +900,12 @@ def print_meter(meter, stream=None):
         )
 
 
-def print_report(report, stream=None):
+def print_report(report, stream=None, result=True):
     """The human-facing report. The exit code is what scripts read.
+
+    ``result`` is off only for a `--vdp` run, where the two memories of one frame
+    are two reports and one verdict: printing a RESULT line per memory would let one
+    of them look like the answer while the other was still being read.
 
     ``stream`` is resolved on every call, not as a default argument: a default of
     ``sys.stdout`` is bound once at import time and then survives
@@ -747,7 +918,7 @@ def print_report(report, stream=None):
         print(text, file=stream)
 
     say(f"dir      {report.directory}")
-    say(f"region   0x{RAM_BASE:06X}-0x{RAM_BASE + RAM_SIZE - 1:06X}, {RAM_SIZE} B per frame")
+    say(f"memory   {report.region.describe()}")
     if report.anchor:
         say(f"point    both sides stopped before 0x{report.anchor} (frame N = arrival N there)")
     compared = report.compared
@@ -765,13 +936,16 @@ def print_report(report, stream=None):
         say(f"         {len(report.dropped)} frame(s) had no image on our side at this shift")
     say("")
     if report.per_frame:
-        say("frame        differ  addresses")
+        say(f"frame        differ  {report.region.plural}")
     for frame in compared:
         offsets = report.per_frame[frame]
-        say(f"{frame:7d} {len(offsets):9d}  {ranges(offsets)}")
+        say(f"{frame:7d} {len(offsets):9d}  {ranges(offsets, report.region)}")
     if report.sweep:
         say("")
-        say("alignment (mean differing bytes of %d, our frame number shifted):" % RAM_SIZE)
+        say(
+            "alignment (mean differing %s of %d, our frame number shifted):"
+            % (report.region.plural, report.region.size)
+        )
         for shift, mean, pairs in report.sweep:
             mark = " <- best" if shift == report.shift else ""
             say(f"  shift {shift:+d} {mean:9.1f}  over {pairs} frame pair(s){mark}")
@@ -791,31 +965,77 @@ def print_report(report, stream=None):
         every = len(compared)
         if report.differs_in_all:
             say(f"differs in all {every} of {every} frames - persistent divergence:")
-            reference, ours = load_at(report.directory, compared[-1], report.shift)
+            reference, ours = load_at(report.directory, compared[-1], report.shift, report.region)
             for offset in report.differs_in_all:
                 count = report.persistent[offset]
                 say(
-                    f"  0x{address(offset):06X}  ref={reference[offset]:02X}  "
-                    f"ours={ours[offset]:02X}  ({count} of {every} frames)"
+                    f"  {report.region.label(offset)}  ref={report.region.value(reference, offset)}  "
+                    f"ours={report.region.value(ours, offset)}  ({count} of {every} frames)"
                 )
         else:
             say(f"nothing differs in all {every} frame(s)")
         if report.phase:
-            say(f"differ in fewer frames - frame phase, {len(report.phase)} addresses: "
-                f"{ranges(report.phase)}")
-    say("")
+            say(f"differ in fewer frames - frame phase, {len(report.phase)} {report.region.plural}: "
+                f"{ranges(report.phase, report.region)}")
+    first = report.first_difference()
+    if first is not None:
+        frame, offset = first
+        reference, ours = load_at(report.directory, frame, report.shift, report.region)
+        say(
+            f"first    {report.region.label(offset)}  "
+            f"ref={report.region.value(reference, offset)}  "
+            f"ours={report.region.value(ours, offset)}  "
+            f"(frame {frame}, the lowest offset that differs in any frame compared)"
+        )
+        say("")
+    if not result:
+        return
     if report.agrees:
         say("RESULT: agree")
     else:
-        total = sum(len(v) for v in report.per_frame.values()) / len(report.per_frame)
-        say(
-            f"RESULT: disagree at shift {report.shift:+d}, "
-            f"{total:.1f} of {RAM_SIZE} bytes per frame on average, "
-            f"{len(report.differs_in_all)} addresses in every frame compared"
+        say(f"RESULT: {report.summary()}")
+
+
+def print_vdp(memory, stream=None):
+    """Both VDP memories at one alignment, under one verdict (#534).
+
+    Each memory gets its own table because a VRAM divergence and a CRAM divergence
+    are different bugs in different chips, and one RESULT line because a run that
+    matched on the palette and not on the pattern tables is a *disagreement*, not a
+    half-agreement.
+    """
+    stream = sys.stdout if stream is None else stream
+
+    def say(text):
+        print(text, file=stream)
+
+    for index, report in enumerate(memory.reports):
+        report.anchor = memory.anchor
+        print_report(report, stream=stream, result=False)
+        if index + 1 < len(memory.reports):
+            say("")
+    say("")
+    if memory.agrees:
+        names = " and ".join(report.region.name for report in memory.reports)
+        say(f"RESULT: agree - {names} match at every frame compared")
+        return
+    parts = []
+    for report in memory.reports:
+        if report.agrees:
+            parts.append(f"{report.region.name} agrees")
+            continue
+        mean = sum(len(v) for v in report.per_frame.values()) / len(report.per_frame)
+        region = report.region
+        unit = "bytes" if region.unit == 1 else region.plural
+        found = len(report.differs_in_all)
+        parts.append(
+            f"{region.name} {mean:.1f} of {region.size // region.unit} {unit} per frame, "
+            f"{found} {region.plural if found != 1 else region.noun} in every frame"
         )
+    say(f"RESULT: disagree at shift {memory.shift:+d} - {'; '.join(parts)}")
 
 
-def build(directory, frames, images):
+def build(directory, frames, images, region=WORK_RAM):
     """Write ``images[frame]`` as both the reference and our dump for that frame.
 
     Test scaffolding: the self-test needs canned dumps of the right size, and this
@@ -824,24 +1044,28 @@ def build(directory, frames, images):
     for frame in frames:
         data = images[frame]
         for prefix in (REF_PREFIX, OURS_PREFIX):
-            with open(os.path.join(directory, f"{prefix}{frame:05d}.bin"), "wb") as handle:
+            with open(os.path.join(directory, region.image_name(prefix, frame)), "wb") as handle:
                 handle.write(data)
+
+
+def mutate(directory, frame, side, offset, value, region=WORK_RAM):
+    """Flip one element of one dump on one side.
+
+    `value` is a byte or the `region.unit` bytes of a wide element, so a CRAM colour
+    can be planted whole rather than nibble by nibble.
+    """
+    path = os.path.join(directory, region.image_name(side, frame))
+    with open(path, "r+b") as handle:
+        handle.seek(offset)
+        handle.write(bytes([value]) if isinstance(value, int) else value)
 
 
 def mutate_long(directory, frame, side, addr, value):
     """Write one big-endian long of one dump on one side, for the meter's self-test."""
-    path = os.path.join(directory, f"{side}{frame:05d}.bin")
+    path = os.path.join(directory, WORK_RAM.image_name(side, frame))
     with open(path, "r+b") as handle:
-        handle.seek(addr - RAM_BASE)
+        handle.seek(addr - WORK_RAM.base)
         handle.write(int(value).to_bytes(METER_LONG, "big"))
-
-
-def mutate(directory, frame, side, offset, value):
-    """Flip one byte of one dump on one side."""
-    path = os.path.join(directory, f"{side}{frame:05d}.bin")
-    with open(path, "r+b") as handle:
-        handle.seek(offset)
-        handle.write(bytes([value]) if isinstance(value, int) else value)
 
 
 def churned_images(count, seed=0x5250):
@@ -860,7 +1084,7 @@ def churned_images(count, seed=0x5250):
         state = (state * 1103515245 + 12345) & 0xFFFFFFFF
         return (state >> 16) & 0xFF
 
-    base = bytearray(noise() for _ in range(RAM_SIZE))
+    base = bytearray(noise() for _ in range(WORK_RAM.size))
     images = {}
     for frame in range(count):
         body = bytearray(base)
@@ -894,7 +1118,7 @@ def selftest():
         check("identical dumps name no divergence", not report.differs_in_all)
 
         print("selftest: a pair that differs in one frame")
-        flip = 0xFFFDF0 - RAM_BASE
+        flip = 0xFFFDF0 - WORK_RAM.base
         mutate(work, 12, OURS_PREFIX, flip, images[12][flip] ^ 0xFF)
         report = compare(work, frames)
         with contextlib.redirect_stdout(io.StringIO()):
@@ -962,7 +1186,7 @@ def selftest():
         # A one-byte change to every one of our images, which is only visible once
         # the shift is applied, is the case a comparator has to survive.
         # Our image for reference frame `f` is r{f+1} here, and it holds base[f].
-        stuck = 0xFFB000 - RAM_BASE
+        stuck = 0xFFB000 - WORK_RAM.base
         for frame in shift_frames:
             if not os.path.exists(os.path.join(align, f"{OURS_PREFIX}{frame + 1:05d}.bin")):
                 continue
@@ -986,7 +1210,7 @@ def selftest():
         # ways this harness fails worst: going blind, and inventing a divergence out
         # of ordinary frame phase.
         anchor = "584"
-        planted = 0xFFE100 - RAM_BASE
+        planted = 0xFFE100 - WORK_RAM.base
         at_anchor = os.path.join(work, "anchored")
         os.mkdir(at_anchor)
         build(at_anchor, frames, images)
@@ -1213,7 +1437,7 @@ def selftest():
         # file calls fatal in its own inputs, so it is an exit status rather than a pass.
         blank = os.path.join(work, "meter-blank")
         os.mkdir(blank)
-        build(blank, meter_frames, {frame: bytes(RAM_SIZE) for frame in meter_frames})
+        build(blank, meter_frames, {frame: bytes(WORK_RAM.size) for frame in meter_frames})
         meter = run_meter(blank, [a1], meter_frames, span=0)
         check("a cursor nothing parked at is called what it is, not agreement",
               meter.unwritten, f"{meter.values[a1][47]}")
@@ -1233,6 +1457,135 @@ def selftest():
             status = main([ahead, "47-51", "--meter", "0x10"])
         check("a bad meter address is the harness failing, not an agreement",
               status == 2 and "outside the dumped" in err.getvalue(), f"status {status}")
+
+        print("selftest: the VDP memories (#534)")
+        # A frame of VDP memory is two more images per side - VRAM and CRAM - and
+        # two of the ways that can go wrong do not show up in a summary line. A
+        # CRAM image saved with the reference's default element size is 64 bytes
+        # instead of 128, which is half a palette and would compare its half
+        # against nothing; and a memory nobody dumped is an empty comparison, which
+        # reports `agree` if anything is allowed to report about it. Both are
+        # failures of the harness, not results, and the checks below are the ones
+        # that keep them that way.
+        vram_frames = [20, 21, 22, 23]
+        vram_at = churned_images(30, seed=0x5341)
+
+        def cram_images(frames):
+            """Canned CRAM: 64 colour words, one of them nonzero per frame.
+
+            Little endian, because that is the order `save/w` writes a word in, and
+            with a word moving every frame so a pair aligned one frame late is not
+            free to the sweep.
+            """
+            images = {}
+            for frame in frames:
+                words = [0] * (CRAM.size // CRAM.unit)
+                words[3] = 0x000E + (frame & 1)
+                images[frame] = b"".join(int(w).to_bytes(CRAM.unit, "little") for w in words)
+            return images
+
+        vdp_dir = os.path.join(work, "vdp")
+        os.mkdir(vdp_dir)
+        build(vdp_dir, vram_frames, vram_at, VRAM)
+        build(vdp_dir, vram_frames, cram_images(vram_frames), CRAM)
+
+        report = compare(vdp_dir, vram_frames, 0, VRAM)
+        check("matching VDP dumps compare as a pair", report.agrees and not report.differs_in_all)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            status = main([vdp_dir, "20-23", "--vdp", "--sweep", "0"])
+        check("a VDP comparison that matches exits 0", status == 0, f"status {status}")
+        check("and the report names both memories",
+              "VRAM" in out.getvalue() and "CRAM" in out.getvalue(), out.getvalue()[:200])
+
+        # VRAM first: a planted byte in every frame, which is the persistence test
+        # of #526 one address space over. It has to be found, and it has to be
+        # named by a VRAM offset rather than a work-RAM one, since the two dumps
+        # are 64 KiB of different hardware and a report that mixed them up would
+        # send someone to the wrong chip.
+        plant = 0x1A2F
+        for frame in vram_frames:
+            mutate(vdp_dir, frame, OURS_PREFIX, plant, vram_at[frame][plant] ^ 0xFF, VRAM)
+        report = compare(vdp_dir, vram_frames, 0, VRAM)
+        check("a VRAM difference planted in every frame is found",
+              report.differs_in_all == [plant], f"{report.differs_in_all}")
+        check("and the first differing byte of the memory is named",
+              report.first_difference() == (vram_frames[0], plant),
+              f"{report.first_difference()}")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_report(report)
+        check("and it is named as a VRAM offset, not as a work-RAM address",
+              "0x001A2F" in out.getvalue() and "0xFF1A2F" not in out.getvalue(),
+              out.getvalue()[-200:])
+        build(vdp_dir, vram_frames, vram_at, VRAM)
+
+        # Then CRAM: a planted colour has to come back as the colour that was
+        # planted. A palette differs a nibble at a time, so a report of two stray
+        # bytes is technically true and useless.
+        cram_plant = 7 * CRAM.unit
+        for frame in vram_frames:
+            mutate(vdp_dir, frame, OURS_PREFIX, cram_plant, b"\xEE\x0E", CRAM)  # colour 0x0EEE
+        report = compare(vdp_dir, vram_frames, 0, CRAM)
+        check("a CRAM colour planted in every frame is found at its word",
+              report.differs_in_all == [cram_plant], f"{report.differs_in_all}")
+        check("and CRAM's first difference is a colour too",
+              report.first_difference() == (vram_frames[0], cram_plant),
+              f"{report.first_difference()}")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_report(report)
+        check("and it is printed as a colour, not as two stray bytes",
+              "word 7  ref=0000  ours=0EEE" in out.getvalue(), out.getvalue()[-200:])
+
+        # The half-width CRAM dump, which is what `save "cram.bin" vdp:cram`
+        # produces rather than `save/w`: 64 values narrowed to a byte each. Both
+        # sides doing it by accident would agree perfectly for 64 bytes.
+        half = os.path.join(work, "vdp-half")
+        os.mkdir(half)
+        build(half, vram_frames, vram_at, VRAM)
+        build(half, vram_frames, cram_images(vram_frames), CRAM)
+        for frame in vram_frames:
+            for side in (REF_PREFIX, OURS_PREFIX):
+                with open(os.path.join(half, CRAM.image_name(side, frame)), "r+b") as handle:
+                    handle.truncate(CRAM.size // 2)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            status = main([half, "20-23", "--vdp", "--sweep", "0"])
+        check("a half-width CRAM dump fails the run rather than agreeing",
+              status == 2 and "expected 128" in err.getvalue(), f"status {status}")
+
+        no_cram = os.path.join(work, "vdp-no-cram")
+        os.mkdir(no_cram)
+        build(no_cram, vram_frames, vram_at, VRAM)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            status = main([no_cram, "20-23", "--vdp", "--sweep", "0"])
+        check("a VDP run with no CRAM dumps fails instead of agreeing",
+              status == 2 and "CRAM" in err.getvalue(), f"status {status}: {err.getvalue()[:80]}")
+
+        ram_only = os.path.join(work, "vdp-ram-only")
+        os.mkdir(ram_only)
+        build(ram_only, vram_frames, vram_at)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            status = main([ram_only, "20-23", "--vdp", "--sweep", "0"])
+        check("work-RAM dumps alone are not a VDP comparison", status == 2,
+              f"status {status}: {err.getvalue()[:80]}")
+
+        # Alignment, on the memory big enough for the sweep to have anything to
+        # work with: our images holding the previous frame. Read at the measured
+        # shift there is no divergence, and read where they were not taken there is
+        # a big one, which is the same trap #525 measured rather than assumed.
+        late = os.path.join(work, "vdp-late")
+        os.mkdir(late)
+        cram_at = cram_images([vram_frames[0] - 1] + vram_frames)
+        for frame in vram_frames:
+            for region, source in ((VRAM, vram_at), (CRAM, cram_at)):
+                with open(os.path.join(late, region.image_name(REF_PREFIX, frame)), "wb") as h:
+                    h.write(source[frame])
+                with open(os.path.join(late, region.image_name(OURS_PREFIX, frame)), "wb") as h:
+                    h.write(source[frame - 1])
+        memory = run_vdp(late, vram_frames, span=2)
+        check("a VDP dump one frame late is alignment, not divergence",
+              memory.shift == 1 and memory.agrees,
+              f"shift {memory.shift:+d}, {len(memory.reports)} region(s)")
+        check("and the same dumps read where they were not taken are not agreement",
+              not run_vdp(late, vram_frames, span=0).agrees)
 
         print("selftest: broken input is an error, not an agreement")
         truncated = os.path.join(work, "trunc")
@@ -1308,6 +1661,13 @@ def main(argv=None):
         "signed lead per frame. Use it at a --stop-at-pc anchor",
     )
     parser.add_argument(
+        "--vdp",
+        action="store_true",
+        help="compare the VDP's own memories rather than 68000 work RAM: the "
+        "bv/bc/rv/rc images `run-ref.sh --vdp` and `run-ours.sh --vdp` write, VRAM "
+        "and CRAM, at one shared frame alignment (#534)",
+    )
+    parser.add_argument(
         "--selftest",
         action="store_true",
         help="check this harness on canned dumps and exit (part of `just check`)",
@@ -1323,10 +1683,16 @@ def main(argv=None):
     # prints: the shift it aligned at, the anchor that says what the frame numbers
     # mean, and whether the two sides agree. Only the printing differs.
     try:
-        frames = frames_requested(",".join(args.frames), args.directory)
-        if args.meter:
+        wanted = ",".join(args.frames)
+        if args.vdp:
+            outcome = run_vdp(
+                args.directory, frames_requested(wanted, args.directory, region=VRAM), args.sweep
+            )
+        elif args.meter:
+            frames = frames_requested(wanted, args.directory)
             outcome = run_meter(args.directory, parse_meters(args.meter), frames, args.sweep)
         else:
+            frames = frames_requested(wanted, args.directory)
             outcome = run_comparison(args.directory, frames, args.sweep)
         outcome.anchor = args.anchor.strip().removeprefix("0x").upper()
         if outcome.shift:
@@ -1338,6 +1704,9 @@ def main(argv=None):
     except HarnessError as error:
         print(f"compare: {error}", file=sys.stderr)
         return 2
+    if args.vdp:
+        print_vdp(outcome)
+        return 0 if outcome.agrees else 1
     if args.meter:
         print_meter(outcome)
         if outcome.unwritten:
