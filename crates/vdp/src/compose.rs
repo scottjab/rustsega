@@ -872,9 +872,11 @@ mod tests {
         assert_eq!(row(&vdp, 0), vec![backdrop; 256]);
     }
 
-    /// The window replaces plane A over the columns R17 and R18 give it (genvdp.txt
+    /// The window replaces plane A over the columns R17 gives it (genvdp.txt
     /// section 13: "plane A cannot be displayed in any area where plane W is
-    /// located") and leaves the rest of plane A alone.
+    /// located") and leaves the rest of plane A alone. R18 = 0x00 keeps the
+    /// vertical band empty so the horizontal band shows alone - under the OR of
+    /// #289, R18 = 0x80 would take every column of the line.
     #[test]
     fn the_window_replaces_plane_a_where_it_shows() {
         let mut vdp = compose_vdp();
@@ -886,10 +888,10 @@ mod tests {
             put_entry(&mut vdp, WINDOW_BASE, cell, entry(SPRITE, 4, false));
         }
         solid(&mut vdp, 4, COLOUR);
-        // R17: window on the right of x = 8 x 16 = 128; R18: every line.
+        // R17: window on the right of x = 8 x 16 = 128; R18: no vertical band.
         vdp.write_register(3, WINDOW_REG);
         vdp.write_register(17, 0x80 | 8);
-        vdp.write_register(18, 0x80);
+        vdp.write_register(18, 0x00);
 
         sized(&mut vdp); // #371: the buffer is sized on the frame boundary
         vdp.render_line(0);

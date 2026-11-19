@@ -14,13 +14,28 @@
 //! the flip, the palette and the colour-0 transparency of genvdp.txt section 13
 //! are written once for the three name tables.
 //!
-//! TODO(#289): the four readings of genvdp.txt this file makes and its prose does
-//! not settle - the intersection of [`Vdp::window_line`] and
-//! [`Vdp::window_columns`], that the window has to be shown for the bug of
-//! [`Vdp::window_edge_bug`] to bite, that the bug moves a name table fetch and not
-//! the VSRAM word of the same column, and what [`Vdp::render_window_run`] reads
-//! past the end of its own table. Each is pinned by a test here so that a change
-//! of reading cannot be quiet.
+//! #289 verified the four readings of genvdp.txt that #92 left unsettled, and
+//! two of them changed. The window shows over a pixel when EITHER register's
+//! band reaches it, not only when both do: Sega's manual (Genesis Software
+//! Manual v2.0, 1991-07-09, section 9 "Window") describes each band on its own
+//! and never qualifies one with the other ("The WINDOW DISPLAY POSITION is
+//! designated by REG. #17 and #18", then the RIGT and DOWN halves without an
+//! intersection sentence anywhere), genvdp.txt says the OR out loud in its
+//! register entries ("This register will affect the window shown on the current
+//! line, if the current line does not fall into the vertical range specified by
+//! register $12", section 17 "$11"; "Having WVP set to zero and DOWN=1 is a
+//! legal setting; it means ... the entire screen is taken up by the window
+//! plane", "$12"; and the twin sentences for WHP=0 with RIGT=1 taking "the
+//! entire line"), and the three oldest accurate reference emulators read the
+//! pair the same way (BlastEm `read_map_scroll`, Genesis Plus GX `render_line`,
+//! Exodus `PerformVRAMRenderOperation` all take the window where the horizontal
+//! band OR the vertical band covers the pixel). The intersection #92 implemented
+//! makes both of genvdp's "legal setting" sentences false, and a full-width
+//! status bar is programmed under it the other way round: the horizontal band
+//! empty (WHP=0 with RIGT clear), not the whole line (WHP=0 with RIGT set).
+//! The bug of [`Vdp::window_edge_bug`] therefore bites on the lines the window
+//! shows *partially* on - the lines the vertical band keeps out, where a plane
+//! A column follows the window - and not on the lines it shows fully on.
 //!
 use crate::Vdp;
 use crate::WIDTH_H40;
@@ -70,16 +85,21 @@ impl Vdp {
         usize::from(self.window_v_position()) * self.cell_height()
     }
 
-    /// The screen columns of a line the window is shown on that the window covers:
+    /// The screen columns the window's horizontal band covers, on every line:
     /// "When RIGT=0, the window is shown from column zero to the column specified
     /// by the WHP field ... When RIGHT=1, the window is shown from the column
     /// specified in the WHP field up to the last column in the display" (genvdp.txt
-    /// section 17 "$11").
+    /// section 17 "$11"). Empty when WHP = 0 with RIGT clear - the band is what
+    /// "Setting the WHP field to zero disables the window" is about.
     ///
     /// The two settings the section singles out fall out of it rather than needing
     /// a case of their own: WHP = 0 with RIGT clear is `0..0`, "no window", and WHP
     /// = 0 with RIGT set is the whole line, "it means the window is shown from
     /// column zero up to the last column in the display".
+    ///
+    /// This band reaches its columns on every line of the display, the lines
+    /// [`Vdp::window_line`] keeps out included; the vertical band is the OR's other
+    /// half, not a gate on this one (see [`Vdp::render_plane_a_line_with_window`]).
     #[inline]
     fn window_columns(&self) -> core::ops::Range<usize> {
         let split = self.window_split_x().min(WIDTH_H40);
@@ -90,25 +110,28 @@ impl Vdp {
         }
     }
 
-    /// True for the lines R18 puts inside the window: "When DOWN=0, the window is
-    /// shown from line zero to the line specified by the WVP field ... When DOWN=1,
-    /// the window is shown from the line specified in the WVP field up to the last
-    /// line in the display" (genvdp.txt section 17 "$12"), WVP counting eight lines
-    /// apiece so that WVP = 0 with DOWN clear is no window at all - "Setting the
-    /// WVP field to zero disables the window" - and WVP = 0 with DOWN set is every
-    /// line of the display.
+    /// True for the lines the window's vertical band reaches: "When DOWN=0, the
+    /// window is shown from line zero to the line specified by the WVP field ...
+    /// When DOWN=1, the window is shown from the line specified in the WVP field
+    /// up to the last line in the display" (genvdp.txt section 17 "$12"), WVP
+    /// counting eight lines apiece so that WVP = 0 with DOWN clear is an empty
+    /// band - the per-axis half of "Setting the WVP field to zero disables the
+    /// window" - and WVP = 0 with DOWN set is every line of the display: "it
+    /// means the window is shown from line zero up to the last line in the
+    /// display, meaning the entire screen is taken up by the window plane"
+    /// (genvdp.txt section 17 "$12"), stated without qualifying it with
+    /// register $11 at all.
     ///
-    /// This is the vertical half of an area, not an alternative to [`Vdp::window_columns`]:
-    /// section 13 says "Registers 17 and 18 define an area which the window is
-    /// restricted to", and "Setting the WVP field to zero disables the window" is
-    /// only true of an intersection. Two lines of the two register texts - "This
-    /// register will affect the window shown on the current line, if the current
-    /// line does not fall into the vertical range specified by register $12"
-    /// ("$11") and its twin in "$12" - read on their own would make the two
-    /// registers alternatives, which would both contradict the sentence above and
-    /// make the standard use of the pair, a full-width status bar down one side of
-    /// the screen, impossible. They are read here as saying that R17 is consulted
-    /// per line and only on the lines R18 is showing the window on.
+    /// On these lines the window covers the whole line, whatever R17 says; on the
+    /// lines this keeps out only the horizontal band of [`Vdp::window_columns`]
+    /// shows. The OR of the two bands is the composition of
+    /// [`Vdp::render_plane_a_line_with_window`], and the two sentences of genvdp.txt
+    /// that read as alternatives are its description: "This register will affect
+    /// the window shown on the current line, if the current line does not fall
+    /// into the vertical range specified by register $12" (section 17 "$11") and
+    /// "If the current scanline does not fall within the range specified by
+    /// register $12, then register $11 determines where the window is shown"
+    /// ("$12"). #92 read them backwards, as an intersection; #289 corrected that.
     #[inline]
     fn window_line(&self, line: usize) -> bool {
         let split = self.window_split_line();
@@ -126,20 +149,31 @@ impl Vdp {
     /// priority bit per pixel and does not have to know which of the two it came
     /// from.
     ///
-    /// Plane A is rendered first and the window painted over the columns R17 and
-    /// R18 give it, because the columns the window leaves alone are exactly the
-    /// plane A line of [`Vdp::render_plane_line`] - the window is scrolled by
-    /// neither hscroll nor vscroll, and the plane is not scrolled by the window.
+    /// The two bands compose as an OR, and the window shows where either reaches:
+    /// the lines [`Vdp::window_line`] covers are all window, and on every other
+    /// line the horizontal band of [`Vdp::window_columns`] still shows. Plane A is
+    /// rendered first and the window painted over its pixels, because the columns
+    /// the window leaves alone are exactly the plane A line of
+    /// [`Vdp::render_plane_line`] - the window is scrolled by neither hscroll nor
+    /// vscroll, and the plane is not scrolled by the window.
     pub fn render_plane_a_line_with_window(&self, line: u16, out: &mut [u8; WIDTH_H40]) {
         self.render_plane_line(Plane::A, line, out);
         let line = usize::from(line);
-        if !self.window_line(line) {
-            return;
-        }
         let columns = self.window_columns();
-        self.render_window_run(line, columns.clone(), out);
-        if !self.window_right() {
-            self.window_edge_bug(line, columns.end, out);
+        if self.window_line(line) {
+            // The vertical band reaches this line, and it reaches every column of
+            // it: "the entire screen is taken up by the window plane" (genvdp.txt
+            // section 17 "$12", quoted on [`Vdp::window_line`]).
+            self.render_window_run(line, 0..WIDTH_H40, out);
+        } else if !columns.is_empty() {
+            // Outside the vertical band the horizontal band still shows, on its
+            // own: "This register will affect the window shown on the current
+            // line, if the current line does not fall into the vertical range
+            // specified by register $12" (genvdp.txt section 17 "$11").
+            self.render_window_run(line, columns.clone(), out);
+            if !self.window_right() {
+                self.window_edge_bug(line, columns.end, out);
+            }
         }
     }
 
@@ -209,9 +243,12 @@ impl Vdp {
     ///
     /// `edge` is the window split of a window on the left, so 0 is "no window on the
     /// left" and [`WIDTH_H40`] is "no plane A column after the window"; either way
-    /// there is nothing to fetch wrong. Neither is the bug applied to a line the
-    /// window is not shown on - the section conditions it on the window "showing"
-    /// - nor to a window on the right, which has no plane A column after it.
+    /// there is nothing to fetch wrong. The bug also needs the window shown
+    /// *partially*, and only the caller can know whether it is: on a line the
+    /// vertical band of [`Vdp::window_line`] covers, the window covers every
+    /// column and no plane A column follows it, so the caller only asks for the
+    /// bug on the lines the horizontal band shows alone. Neither is the bug
+    /// applied to a window on the right, which has no plane A column after it.
     fn window_edge_bug(&self, line: usize, edge: usize, out: &mut [u8]) {
         if edge == 0 || edge >= WIDTH_H40 {
             return;
@@ -353,12 +390,12 @@ mod tests {
 
     /// genvdp.txt section 17 "$12": WVP counts units of eight lines, "2 = lines
     /// 0-$F", so with DOWN clear the window is lines 0..15 and line 16 is plane A
-    /// again. R17 = 0x80 is WHP = 0 with RIGT = 1, which that section calls the
-    /// whole width: "it means the window is shown from column zero up to the last
-    /// column in the display".
+    /// again. R17 = 0x00 keeps the horizontal band empty (WHP = 0 with RIGT clear)
+    /// so the window is exactly the vertical band - under the OR of #289, the
+    /// whole-line setting of R17 (0x80) would cover every line on its own.
     #[test]
     fn r18_0x02_is_the_window_for_the_first_16_lines() {
-        let vdp = window_vdp(0x80, 0x02);
+        let vdp = window_vdp(0x00, 0x02);
         let mut out = blank_line();
         for line in 0..16 {
             vdp.render_plane_a_line_with_window(line, &mut out);
@@ -372,16 +409,36 @@ mod tests {
         assert_eq!(
             out,
             plane_a_line(&vdp, 16),
-            "line 16 is the first line outside the area, so plane A shows again"
+            "line 16 is the first line outside the band, so plane A shows again"
         );
+    }
+
+    /// The other half of the same OR: with the horizontal band taking the whole
+    /// line (WHP = 0 with RIGT set, "the entire line is taken up by the window
+    /// plane" - genvdp.txt section 17 "$11"), every line is window, the lines the
+    /// vertical band keeps out included. This is the pin the #92 intersection
+    /// reading fails, and the sentence that refutes it.
+    #[test]
+    fn a_full_width_r17_band_covers_the_lines_r18_keeps_out() {
+        let vdp = window_vdp(0x80, 0x02);
+        let mut out = blank_line();
+        for line in [0, 16, 20, 200] {
+            vdp.render_plane_a_line_with_window(line, &mut out);
+            assert_eq!(
+                out, [WINDOW_COLOUR; WIDTH_H40],
+                "line {line} is window: the horizontal band alone takes the whole line"
+            );
+        }
     }
 
     /// The DOWN half of the same field: WVP = 2 with DOWN set is "the line
     /// specified in the WVP field up to the last line in the display", so lines
-    /// 0..15 stay plane A and line 16 is the window.
+    /// 0..15 stay plane A and line 16 is the window. R17 = 0x00 keeps the
+    /// horizontal band out of the way, as in
+    /// [`r18_0x02_is_the_window_for_the_first_16_lines`].
     #[test]
     fn r18_0x82_is_the_window_from_line_16_down() {
-        let vdp = window_vdp(0x80, 0x82);
+        let vdp = window_vdp(0x00, 0x82);
         let mut out = blank_line();
         for line in [0, 8, 15] {
             vdp.render_plane_a_line_with_window(line, &mut out);
@@ -401,11 +458,16 @@ mod tests {
     /// The RIGT half of genvdp.txt section 17 "$11": "When RIGT=0, the window is
     /// shown from column zero to the column specified by the WHP field ... if
     /// RIGT=0 and WHP=4, the window is displayed on columns zero up to (and
-    /// including) column seven", 16 pixels for a WHP of 2. R18 = 0x80 is DOWN with
-    /// WVP = 0, which that section says is every line of the display.
+    /// including) column seven", 16 pixels for a WHP of 2. R18 = 0x00 keeps the
+    /// vertical band empty (WVP = 0 with DOWN clear), so the band shows on its
+    /// own - the horizontal band reaches its columns on every line, on the lines
+    /// the vertical band keeps out included ("This register will affect the
+    /// window shown on the current line, if the current line does not fall into
+    /// the vertical range specified by register $12", genvdp.txt section 17
+    /// "$11").
     #[test]
     fn r17_0x02_is_the_window_for_the_first_32_pixels() {
-        let vdp = window_vdp(0x02, 0x80);
+        let vdp = window_vdp(0x02, 0x00);
         let mut out = blank_line();
         vdp.render_plane_a_line_with_window(0, &mut out);
         assert_window_line(&out, 0..32);
@@ -418,7 +480,7 @@ mod tests {
     /// specified in the WHP field up to the last column in the display".
     #[test]
     fn r17_0x82_leaves_the_first_32_pixels_to_plane_a() {
-        let vdp = window_vdp(0x82, 0x80);
+        let vdp = window_vdp(0x82, 0x00);
         let mut out = blank_line();
         vdp.render_plane_a_line_with_window(0, &mut out);
         assert_window_line(&out, 32..WIDTH_H40);
@@ -442,20 +504,20 @@ mod tests {
         }
     }
 
-    /// genvdp.txt section 13 "Window": "Registers 17 and 18 define an area which
-    /// the window is restricted to", and section 17 "$12": "Setting the WVP field
-    /// to zero disables the window". Both are read here as an intersection, so a
-    /// line R18 keeps out is plane A even where R17 covers it.
+    /// The #92 reading this file used to pin - that a line the vertical band
+    /// keeps out is plane A wherever the horizontal band reaches - is refuted:
+    /// the horizontal band shows on every line on its own. genvdp.txt section 17
+    /// "$11": "This register will affect the window shown on the current line, if
+    /// the current line does not fall into the vertical range specified by
+    /// register $12"; its "$12" twin says the same. The vertical band of R18 is
+    /// the other half of an OR, not a gate on R17, and the whole-line setting of
+    /// R17 shows a window on lines R18 keeps out.
     #[test]
-    fn a_line_outside_the_r18_area_is_plane_a_wherever_r17_reaches() {
+    fn a_line_outside_the_r18_band_still_shows_the_r17_band() {
         let vdp = window_vdp(0x02, 0x00);
         let mut out = blank_line();
         vdp.render_plane_a_line_with_window(0, &mut out);
-        assert_eq!(
-            out,
-            plane_a_line(&vdp, 0),
-            "R17 = 0x02 alone does not make a window: WVP = 0 disables it"
-        );
+        assert_window_line(&out, 0..32);
     }
 
     /// The window table is 32 cells per row in H32 (genvdp.txt section 13), so
@@ -519,7 +581,7 @@ mod tests {
     /// the window where it is.
     #[test]
     fn the_window_ignores_the_horizontal_scroll() {
-        let mut vdp = window_vdp(0x02, 0x80);
+        let mut vdp = window_vdp(0x02, 0x00);
         fill_columns(&mut vdp, PLANE_A_BASE);
         vdp.write_register(13, 0x3F);
         vdp.write_register(11, 0x00);
@@ -550,7 +612,7 @@ mod tests {
     /// that a vscroll moves it.
     #[test]
     fn the_window_ignores_the_vertical_scroll() {
-        let mut vdp = window_vdp(0x02, 0x80);
+        let mut vdp = window_vdp(0x02, 0x00);
         fill_rows(&mut vdp, PLANE_A_BASE);
         let mut before = blank_line();
         vdp.render_plane_a_line_with_window(0, &mut before);
@@ -599,7 +661,7 @@ mod tests {
     /// the remainder of the display is drawn correctly."
     #[test]
     fn the_plane_a_column_after_a_left_window_is_a_copy_of_the_next_one() {
-        let mut vdp = window_vdp(0x02, 0x80);
+        let mut vdp = window_vdp(0x02, 0x00);
         fill_columns(&mut vdp, PLANE_A_BASE);
         vdp.write_register(13, 0x3F);
         vdp.write_register(11, 0x00);
@@ -631,7 +693,7 @@ mod tests {
     /// attribute data for the current column are fetched correctly."
     #[test]
     fn the_window_edge_column_is_fetched_correctly_at_a_16_byte_hscroll() {
-        let mut vdp = window_vdp(0x02, 0x80);
+        let mut vdp = window_vdp(0x02, 0x00);
         fill_columns(&mut vdp, PLANE_A_BASE);
         vdp.write_register(13, 0x3F);
         vdp.write_register(11, 0x00);
@@ -650,7 +712,7 @@ mod tests {
     /// left side of the screen".
     #[test]
     fn a_right_hand_window_has_no_edge_bug() {
-        let mut vdp = window_vdp(0x82, 0x80);
+        let mut vdp = window_vdp(0x82, 0x00);
         fill_columns(&mut vdp, PLANE_A_BASE);
         vdp.write_register(13, 0x3F);
         vdp.write_register(11, 0x00);
@@ -667,13 +729,16 @@ mod tests {
         assert_eq!(&out[32..], &[WINDOW_COLOUR; WIDTH_H40 - 32]);
     }
 
-    /// And on a line the window is not shown on there is no window edge to fetch
-    /// across: the section conditions the bug on the window "showing", so a
-    /// disabled R18 leaves the whole line to plane A even with the R17 and hscroll
-    /// conditions of the bug met.
+    /// And the other side of that placement, which is the half the #92 reading
+    /// got backwards: the bug bites on a line the vertical band keeps out (the
+    /// window shows partially on the left there), while a line the vertical band
+    /// covers shows the window on every column and has no plane A column after
+    /// the window for the fetch to go wrong in. R18 = 0x02 makes lines 0..16 the
+    /// vertical band, so line 0 is all window and line 20 is the left band plus
+    /// the bugged column after it.
     #[test]
-    fn a_line_with_no_window_has_no_edge_bug() {
-        let mut vdp = window_vdp(0x02, 0x00);
+    fn a_line_the_r18_band_covers_has_a_full_window_and_no_edge_bug() {
+        let mut vdp = window_vdp(0x02, 0x02);
         fill_columns(&mut vdp, PLANE_A_BASE);
         vdp.write_register(13, 0x3F);
         vdp.write_register(11, 0x00);
@@ -681,7 +746,25 @@ mod tests {
 
         let mut out = blank_line();
         vdp.render_plane_a_line_with_window(0, &mut out);
-        assert_eq!(out, plane_a_line(&vdp, 0));
+        assert_eq!(
+            out, [WINDOW_COLOUR; WIDTH_H40],
+            "line 0 is inside the vertical band: every column is window, and no fetch goes wrong"
+        );
+
+        let mut out = blank_line();
+        vdp.render_plane_a_line_with_window(20, &mut out);
+        let plane = plane_a_line(&vdp, 20);
+        assert_eq!(
+            &out[0..32],
+            &[WINDOW_COLOUR; 32],
+            "the horizontal band shows on its own"
+        );
+        assert_eq!(
+            &out[32..48],
+            &plane[48..64],
+            "and the edge bug of the line the band keeps out is there"
+        );
+        assert_ne!(&out[32..48], &plane[32..48]);
     }
 
     // ---------------------------------------------------------------------
@@ -740,7 +823,7 @@ mod tests {
         let mut vdp = plane_vdp();
         vdp.write_register(3, WINDOW_REG);
         vdp.write_register(12, 0x06);
-        vdp.write_register(17, 0x80);
+        vdp.write_register(17, 0x00); // horizontal band empty, so the vertical band shows alone
         vdp.write_register(18, 0x80 | 1); // DOWN, from the second unit of the split
         for cell in 0..H32_CELLS * WINDOW_ROWS {
             put_entry(&mut vdp, WINDOW_BASE, cell, WINDOW_TILE);
