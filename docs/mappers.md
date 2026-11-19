@@ -189,8 +189,8 @@ a mapper, and that is what this PR opens.
 J-CART's bank numbers and its I2C (EEPROM) serial data line live in the **same
 registers** at `0xA13000`-`0xA141FF`: GPGX's `mapper_i2c_jcart_read8` ORs the SDA
 level into `jcart_read()`. This repository already owns that block for save data —
-`crate::cart::eeprom`, `docs/eeprom-games.md`, with #270 and #271 open on EEPROM
-mode 3 and the Acclaim 32 Mbit shift. Two owners for one register set is how a
+`crate::cart::eeprom`, `docs/eeprom-games.md`, with #270 and the Acclaim 32 Mbit
+read-window latch (#271) landed on EEPROM. Two owners for one register set is how a
 save gets silently corrupted, so J-CART is not implemented here; the follow-up
 issue has to decide ownership first.
 

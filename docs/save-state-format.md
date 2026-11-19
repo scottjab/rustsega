@@ -14,7 +14,7 @@ a header that says which format version it is and which game it belongs to.
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
 | 0 | 4 | magic | `b"RSGS"` |
-| 4 | 4 | format version | `u32`, little endian, currently `4` (`state::FORMAT_VERSION`) |
+| 4 | 4 | format version | `u32`, little endian, currently `5` (`state::FORMAT_VERSION`) |
 | 8 | 8 | ROM checksum | `u64`, little endian, [`state::rom_checksum`] of the loaded image |
 | 16 | 4 | payload length | `u32`, little endian — the number of bytes that follow offset 20 |
 | 20 | n | payload | the `postcard` encoding of the machine state |
@@ -110,7 +110,8 @@ In a state, because it is the machine:
 - the 64 KiB of work RAM and the 8 KiB of sound RAM, the bank shift register;
 - the I/O chip: three ports, their direction registers and whatever pad is
   attached with its `TH` counter where it was;
-- the cartridge's save RAM or serial EEPROM, mid-transfer state included, and the
+- the cartridge's save RAM or serial EEPROM, mid-transfer state included (the
+  Acclaim 32 Mbit board's read-window latch included, #271), and the
   bank registers of a mapped cart;
 - the bus's TMSS state, its Z80 reset and bus-request lines, its pending stall
   counters;

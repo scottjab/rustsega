@@ -48,7 +48,15 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// for the shape alone - a state that does not carry a gate resumes a frame with the
 /// rest of a 68k -> VDP transfer silently dropped, which is the same class of wrong
 /// as the mode-2 field that made 2 what it is.
-pub const FORMAT_VERSION: u32 = 4;
+///
+/// Version 5 is the Acclaim 32 Mbit board's read-window latch (#271): one enum
+/// field added to `cart::eeprom::Eeprom`, so a v4 payload's EEPROM bytes are the
+/// v5 reader's enum and a machine restored from one would come back with a
+/// window decoded out of the array bytes. The latch being in the wrong state is
+/// the same class of wrong as the two above - the ROM window shows, but a game
+/// that reads its EEPROM answer through the armed quadrant reads the image's
+/// bit 0 instead of the chip's line.
+pub const FORMAT_VERSION: u32 = 5;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 

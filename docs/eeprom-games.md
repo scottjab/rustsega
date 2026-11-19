@@ -68,9 +68,43 @@ Two differences from hardware follow from it and are worth knowing:
   do that, and byte writes - what the declared `$E8` window describes - are
   exact.
 - The 32 Mbit board's word write is not a line write at all on hardware:
-  `mapper_acclaim_32M_write16` is that cart's **bank shift**, which this
-  emulator does not do at all yet (see "Left out"). Byte writes drive the lines
-  as they should.
+  it is the board's read-window latch, which this emulator now does (see "The
+  32 Mbit board's read-window latch" below). Byte writes drive the lines as
+  they should.
+
+## The 32 Mbit board's read-window latch
+
+A word write to $200000-$2FFFFF on one of the Acclaim 32 Mbit carts does not
+move the lines. Both /LWR and /UWR asserted is the board's PAL - Genesis Plus
+GX's "custom LZ95A53", the custom mapper chip of the 670125 and 670127 boards -
+latching bit 0 of the written word into a one-bit read mux (GPGX's
+[`mapper_acclaim_32M_write16`](https://github.com/ekeeke/Genesis-Plus-GX/blob/master/core/cart_hw/eeprom_i2c.c),
+whose comment calls it "custom bankshifting"; no bank number is latched and ROM
+is never swapped for ROM). Bit 0 = 1 restores plain ROM reads over the whole
+quadrant, and that is the reset state - the PAL's only address inputs are A20
+and A21, so its window is the 1 MiB quadrant and nothing smaller, and /RES is
+one of its inputs (8BitWizard's teardown of the board,
+[spritesmind t=107](http://gendev.spritesmind.net/forum/viewtopic.php?t=107)).
+Bit 0 = 0 arms the chip: every byte the quadrant reads answers with the /SDA
+line level in bit 0 (GPGX's quadrant-wide `mapper_i2c_generic_read8`), which is
+how a game samples the answer without the ROM's output driving the line under
+it.
+
+The games' own wrappers agree, and they are where the shape is pinned: every
+EEPROM operation on these carts runs arm, bit-bang, restore. NBA Jam TE's
+wrapper is `move.w #0,(A0)` at $000ADA to arm, the byte-write bit-banger
+sampling `move.b (A1),Dn; andi.b #1,Dn`, then `move.w #1,(A0)` at $000AB2 to
+restore; NFL Quarterback Club has the same pair at $0142FA and $01428C, and
+QBC 96, Big Hurt and College Slam share the shape. In this emulator the latch
+is [`Eeprom::write_word`] on the same board as the lines, and
+[`Bus::write_rom_word`] hands the word there first because the two byte writes
+a word write usually decomposes into would drive lines the board does not
+drive.
+
+One correction this latch makes to what was here before: the pair at $200000-
+$200001 used to answer with the line in bit 0 whatever the board's window said,
+which corrupted bit 0 of every ROM read of $200001 while no operation was
+running. In the ROM window the ROM drives that bit, on hardware as here.
 
 ## The games
 
@@ -234,10 +268,19 @@ carts carry (GPGX's `i2c_database` has it on `mapper_i2c_jcart_init` with
 `EEPROM_24C65`), so when the J-CART mapper lands (#356) its serial row in
 `EEPROM_GAMES` is one line. Until then it has no save, because the board is the
 missing piece, not the chip.
-- **The 32 Mbit board's bank shift.** See "Word accesses are two byte accesses"
-  above: `mapper_acclaim_32M_write16` is a 64 KB bank shift on those carts, and
-  the shift itself is not implemented. `T-081276`, `T-81406` and `T-081586` get
-  their save, and do not get the shift.
+- **The 32 Mbit board's read-window latch.** Now implemented (see "The 32 Mbit
+  board's read-window latch" above); this entry is the correction of what this
+  list used to say. The earlier text called `mapper_acclaim_32M_write16` "a 64
+  KB bank shift", which is not what the board does: GPGX's handler latches a
+  one-bit read mux over the 1 MiB quadrant $200000-$2FFFFF (ROM, or the chip's
+  /SDA line in bit 0), and the 64 KB in the old phrase is the block size of
+  GPGX's memory map and of its separate `cart.hw.bankshift` flag - which is
+  reset-time re-mapping shared with the SSF2 carts, not a register on this
+  board. `T-081276`, `T-81406` and `T-081586` get their save and their latch.
+  What this emulator still does not mirror is a *short* image across
+  $300000-$3FFFFF the way GPGX's default map does (T-81406 is 3 MiB); if a cart
+  is ever shown to read its own mirror, that is a mirroring issue with a name,
+  not this latch.
 - **Timing.** Real I2C is clocked by software with two floated lines. This samples
   on the clock's rising edge, holds the acknowledge low for the ninth clock, and
   does nothing else: no clock stretching, no bus arbitration, no pull-up model,
