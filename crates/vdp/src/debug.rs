@@ -41,11 +41,6 @@ const SWATCH: usize = 8;
 /// The outline of the visible area of a plane view.
 const OUTLINE: u32 = 0xFFFF_FFFF;
 
-/// Bits 0-5 of a layer pixel: its CRAM index, bit 6 being
-/// [`planes::PRIORITY_SHIFT`]'s priority flag. The same mask
-/// [`crate::compose`] reads a layer buffer with.
-const LAYER_INDEX_MASK: u8 = (1 << planes::PRIORITY_SHIFT) - 1;
-
 /// An RGBA image a debug view produced: `width * height` pixels of
 /// `0xAABBGGRR`, row-major, stride `width`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,9 +191,12 @@ pub struct SpriteInfo {
 
 /// The CRAM word `index` as a pixel of the dump: the 6-bit index of a layer
 /// pixel, which is all of CRAM a name table entry can name
-/// (genvdp.txt section 9's 64 words).
+/// (genvdp.txt section 9's 64 words). Masking with
+/// [`planes::CRAM_INDEX_MASK`] also drops the priority flag a transparent
+/// pixel carries for #295: the view is colours, not intensities, and a pixel
+/// the cell draws nothing at reads as CRAM 0 either way.
 fn cram_pixel(vdp: &Vdp, index: u8) -> u32 {
-    let word = vdp.cram[usize::from(index & LAYER_INDEX_MASK)];
+    let word = vdp.cram[usize::from(index & planes::CRAM_INDEX_MASK)];
     color::color(word, Intensity::Normal)
 }
 
