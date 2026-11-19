@@ -257,9 +257,10 @@ not from the chip as it stands when the line is drawn:
   `render_line`, so `render_plane_line` and a `render_line` call for a line the
   beam never latched work as they always did.
 * The exact clock of the latch is INFERRED, with a TODO on `latch.rs` for the
-  scroll ROM of M6-06. Sprites are not in the snapshot at all: genvdp.txt's
-  sprite list is a VRAM walk of the moment, and the sprite attribute cache below
-  is chip state rather than line state.
+  scroll ROM of M6-06. The sprite list rides the same point one line early: the
+  search of line N's list runs at the latch point of line N - 1, and it keeps
+  what it read (below), so the sprite work of a line is decided by the one
+  moment, not spread across the line's draw.
 
 ### VDP sprite attribute cache
 
@@ -270,8 +271,14 @@ of every entry:
 * 80 lines of four bytes, the `y` word and the `size`/`link` word of one entry
   each (the window is Nemesis's, SpritesMind t=851 note 7: "The first 4 bytes,
   containing the vertical position, size, and link data, are cached internally
-  in the VDP"). The pattern and the `x` are not cached and are read from VRAM on
-  every fetch of the entry.
+  in the VDP"). The pattern and the `x` are not cached and are read from VRAM
+  once a line: Nemesis's timing notes (t=851 note 5) read "all the mapping data
+  for every sprite" of a scanline "during the previous line", and Mask of
+  Destiny's VRAM-bus captures (t=1291) watched one second-half entry read per
+  sprite slot of that line and none in the line that draws them. The sprite
+  search of `sprites.rs` does that read at the latch point (above) and keeps the
+  whole entry, so a pattern or an `x` written halfway across a line lands on the
+  line after the next, exactly as a whole entry does.
 * Every VRAM write of the chip goes through `Vdp::write_vram_byte`, and that is
   what feeds the cache: a write inside `[sat_base, sat_base + 640)` that lands on
   one of the first four bytes of an entry updates that entry's line. The three DMA
@@ -294,6 +301,20 @@ of every entry:
   holds all 80 entries in both widths - the shrink to 64 in 32-cell mode is only
   TascoDLX's unconfirmed guess of t=851 - and no source says what a link of
   80..=127 reads, so the model falls back to VRAM there (#94).
+* Two more are fenced by #318, with the citations on `Vdp::search_sprites`. The
+  clock of the search inside its line is unmeasured - Mask of Destiny, whose
+  captures pin the fetch slots of the line before, says of the scan itself that
+  it leaves him "without any solid reads as to when the VDP scans the cached copy
+  of the SAT" - so the model shares the latch point with the scroll tables and
+  the mode registers, and a SAT write in the first blanking window of a line is
+  in time for the next line's list until a sprite ROM says otherwise. And the
+  search runs on every line regardless of display enable, where hardware gives
+  sprite processing only the slots of lines the display is on for: Eke (t=851,
+  April 2011, verified on hardware) watched the first line after a display-off
+  stretch draw no sprites (Power Instinct), and Genesis Plus GX models the
+  partial case as a budget that shrinks with the cycles spent display-off
+  (Mickey Mania's 3d level, the Overdrive demo). A line-granular model has no
+  slot budget to shrink, so the fence holds until there is one to measure.
 
 ### VDP debug views
 

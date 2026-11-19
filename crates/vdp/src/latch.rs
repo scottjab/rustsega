@@ -42,11 +42,13 @@
 //! not part of [`LineState`] because a `LineState` is read by the line it was
 //! latched for, at the end of that line, and a sprite search is not read until the
 //! end of the line *after* the one it ran on - one box would be refilled by the next
-//! line's search before the line the first one belongs to was ever drawn. The cache
-//! of the table's first four bytes per entry, `crate::sprites::SpriteCache` (#103),
-//! stays chip state and keeps its semantics: the search reads it, keeps what it
-//! read, and still leaves the pattern and the x of an entry to the fetch of the line
-//! that draws them.
+//! line's search before the line the first one belongs to was ever drawn. The search
+//! reads all four fields of an entry - the y, the size and the link out of the
+//! `SpriteCache` of #103, the pattern and the x out of VRAM (Nemesis's timing notes,
+//! SpritesMind t=851 note 5: the mapping data of a scanline "is read during the
+//! previous line") - and keeps them, so the line that draws the sprite fetches
+//! nothing of it again. The cache stays chip state and keeps its semantics: the
+//! search reads it, and only a write to the table of the moment feeds it.
 //!
 //! TODO(#102): pin the latch point with a scroll test ROM (M6-06), including
 //! whether a write inside that first-blanking window reaches the line it is
@@ -118,7 +120,8 @@ impl Vdp {
     pub(crate) fn latch_line_state(&mut self) {
         // The sprite walk of the line after this one, at the same moment and for the
         // same reason as the three reads below: the sprite list of a line is
-        // evaluated during the line before (#311).
+        // evaluated during the line before (#311), its pattern and its x
+        // included (Nemesis, SpritesMind t=851 note 5).
         self.search_sprites();
 
         let display_line = usize::from(self.display_line(self.line));
@@ -529,12 +532,16 @@ mod tests {
         );
     }
 
-    /// The other side of the #103 split, which #311 leaves where it is: the pattern
-    /// is not part of the walk of the line before, it is fetched by the line that
-    /// draws the sprite. So a pattern written halfway across line 9 is on line 10,
-    /// one line earlier than an entry written at the same moment would be.
+    /// The pattern is fetched from VRAM once a line, by the search of the line
+    /// before: Nemesis's timing notes (SpritesMind t=851, note 5) - "for each
+    /// scanline, all the mapping data for every sprite, and most of the pattern
+    /// data, is read during the previous line" - and Mask of Destiny's bus captures
+    /// behind t=1291, which watch one second-half SAT entry read in each sprite slot
+    /// of the line before's active display and no re-read in the line that draws
+    /// them. So a pattern written halfway across line 9 misses line 10 exactly as a
+    /// whole entry written at the same moment does, and shows on line 11.
     #[test]
-    fn a_sprite_pattern_written_in_mid_line_shows_on_the_next_line() {
+    fn a_sprite_pattern_written_in_mid_line_shows_on_the_line_after_the_next() {
         let mut vdp = sprite_running();
         for row in 0..CELL_TILE_ROWS {
             fill_tile_row(&mut vdp, 2, row, 2);
@@ -551,8 +558,141 @@ mod tests {
         vdp.advance(MCLKS_PER_LINE);
         assert_eq!(
             row(&vdp, 10),
-            sprite_row(SPRITE_ENTRY + 1),
-            "the pattern of line 10 is read by line 10"
+            sprite_row(SPRITE_ENTRY),
+            "line 10 draws the pattern its search read"
         );
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(
+            row(&vdp, 11),
+            sprite_row(SPRITE_ENTRY + 1),
+            "line 11 walks the table again, and finds the new pattern"
+        );
+    }
+
+    /// The x word sits in the same fetched-from-VRAM half of the entry as the
+    /// pattern (t=851 note 7: "containing the block mapping for the sprite, and the
+    /// horizontal position"), so it moves with it: a word 3 written halfway across
+    /// line 9 is drawn where line 9's search read it, and moves on line 11.
+    #[test]
+    fn a_sprite_x_written_in_mid_line_moves_on_the_line_after_the_next() {
+        let mut vdp = sprite_running();
+        sprite_on_line(&mut vdp, 10);
+
+        vdp.advance(9 * MCLKS_PER_LINE);
+        vdp.advance(HBLANK_CLEAR_MCLK_H32 + 100);
+        // Word 3 of entry 0, the x: screen x 40 instead of the 20 the entry was
+        // written with.
+        put_word(&mut vdp, SPRITE_BASE + 6, 128 + 40);
+
+        vdp.advance(MCLKS_PER_LINE - vdp.line_mclk);
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(
+            row(&vdp, 10),
+            sprite_row(SPRITE_ENTRY),
+            "line 10 draws the x its search read"
+        );
+
+        vdp.advance(MCLKS_PER_LINE);
+        let moved = {
+            let mut r = backdrop_row();
+            r[40..48].fill(pixel_of(SPRITE_ENTRY));
+            r
+        };
+        assert_eq!(row(&vdp, 11), moved, "line 11 draws the new x");
+    }
+
+    /// The R5 rule of #103 and #313 end to end, at the granularity a line-based
+    /// renderer has: CastleVania Bloodlines "changes the sprite table in the middle
+    /// of the screen (giving the sprites new X coordinate and tile number)"
+    /// (plutiedev's sprite notes), and what that gets is "half the data from the old
+    /// table and half the data from the new table" - the y, the size and the link
+    /// from the cache the move never refills, the pattern and the x from the table
+    /// the search of the line reads. The search runs once a line, so a move halfway
+    /// across line 9 leaves line 10 on the old table and puts line 11 on the new
+    /// one, both drawing the y of the old table that the cache still holds.
+    #[test]
+    fn an_r5_move_between_searches_switches_the_pattern_with_the_table() {
+        // The second table: R5 = 0x7A is 0xF400 in H32, clear of the 640 bytes at
+        // 0xF000. Written while R5 still names the first table, so its bytes land
+        // outside the cache window and refill nothing.
+        const TABLE_B: usize = 0xF400;
+        let mut vdp = sprite_running();
+        for row in 0..CELL_TILE_ROWS {
+            fill_tile_row(&mut vdp, 1, row, 1);
+            fill_tile_row(&mut vdp, 2, row, 2);
+        }
+        // The sprite of the first table, two cells tall so that the y the cache
+        // keeps covers line 11 as well as line 10 after the move.
+        put_sprite_at(
+            &mut vdp,
+            SPRITE_BASE,
+            0,
+            10 + 128,
+            128 + 20,
+            (1, 2),
+            0,
+            SPRITE_PATTERN,
+        );
+        // The entry under the same index of the second table: the same position,
+        // the second tile.
+        put_sprite_at(
+            &mut vdp,
+            TABLE_B,
+            0,
+            11 + 128,
+            128 + 20,
+            (1, 2),
+            0,
+            (3 << 13) | 2,
+        );
+
+        vdp.advance(9 * MCLKS_PER_LINE);
+        vdp.advance(HBLANK_CLEAR_MCLK_H32 + 100);
+        vdp.write_register(5, 0x7A);
+
+        vdp.advance(MCLKS_PER_LINE - vdp.line_mclk);
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(
+            row(&vdp, 10),
+            sprite_row(SPRITE_ENTRY),
+            "line 10 was searched before the move"
+        );
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(
+            row(&vdp, 11),
+            sprite_row(SPRITE_ENTRY + 1),
+            "line 11 is searched on the new table, at the y the cache kept"
+        );
+    }
+
+    /// The search runs past the last line of the picture, which is what the
+    /// "effectively renders 225 lines, not 224" overlap is (SpritesMind t=1291,
+    /// quoted on #100) and what Eke's note of t=851 (April 2011, verified on
+    /// hardware) describes - "VBLANK flag is cleared at the start of the last line,
+    /// not line 0, so sprites attribute + pattern data are processed on that line
+    /// to be displayed on next line (line 0)". Line 0 is searched by line 261, so a
+    /// sprite written once the frame has wrapped is not on line 0; it shows on
+    /// line 1.
+    #[test]
+    fn line_zero_is_searched_by_the_last_line_of_the_frame_before() {
+        let mut vdp = sprite_running();
+        vdp.advance(261 * MCLKS_PER_LINE);
+        assert_eq!((vdp.line, vdp.line_mclk), (261, 0));
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!((vdp.line, vdp.line_mclk), (0, 0), "the frame has wrapped");
+        sprite_on_line(&mut vdp, 0);
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(
+            row(&vdp, 0),
+            backdrop_row(),
+            "line 0 was searched by line 261, before the write"
+        );
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert_eq!(row(&vdp, 1), sprite_row(SPRITE_ENTRY));
     }
 }
