@@ -164,20 +164,24 @@ pub(crate) fn muted(value: i16, model: ChipModel) -> i32 {
 
 /// The channel 6 PCM sample `data` of `&2A` in the 14-bit domain the channel sums
 /// live in: unsigned, centred on 0x80, and spread over the six bits the 9-bit DAC
-/// of [`dac`] cannot see.
+/// of [`dac`] cannot see, with `dac_lsb` - `&2C` bit 3 - in the one of those six
+/// positions the converter answers to.
 ///
-/// The arithmetic is `((data - 128) << 6)`, which leaves the 9-bit code
-/// `(data - 128) << 1` after [`DAC_SHIFT`]: `&2A` drives the top eight bits of the
-/// converter and the ninth is only reachable from the `&2C` test register, so a
-/// PCM sample only ever lands on the even codes (YM2608 application manual "3.
-/// Register descriptions", `&2A`; plutiedev, "DAC"; and the `(write_data ^ 0x80)
-/// << 1` of Nuked-OPN2's `OPN2_WriteReg`, read 12 Nov 2026, which is this same
-/// code).
+/// The arithmetic is `((data - 128) << 6) | (dac_lsb << 5)`, which leaves the
+/// 9-bit code `((data - 128) << 1) | dac_lsb` after [`DAC_SHIFT`]: `&2A` drives
+/// the top eight bits of the converter and the ninth is `&2C` bit 3 (YM2608
+/// application manual "3. Register descriptions", `&2A`, for the sample byte;
+/// the `chip->dacdata &= 0x1fe; chip->dacdata |= chip->mode_test_2c[3]` of
+/// Nuked-OPN2's `OPN2_WriteReg`, the `m_dac_data = (m_dac_data & ~1) |
+/// bitfield(data, 3)` of ymfm's `ymfm_opn.cpp`, and `ch_val |= (reg_test_2c &
+/// 8) != 0` on the die in nukeykt/YM2608-LLE, all read 19 Nov 2026).
 ///
-/// So 0x80 is the centre and a sum of 0, 0xFF is 8128 - the code 254 - and 0x00 is
-/// -8192, which is the very bottom of the domain [`crate::channel`] clamps to.
-pub(crate) fn pcm_sample(data: u8) -> i16 {
-    (i16::from(data) - 128) << 6
+/// So 0x80 is the centre and a sum of 0, 0xFF is 8128 - the code 254 - and 0x00
+/// is -8192, which is the very bottom of the domain [`crate::channel`] clamps
+/// to; with the test bit up every byte lands one code along. What the test
+/// register does besides that bit is fenced (`crate::regs::REG_TEST_2C`).
+pub(crate) fn pcm_sample(data: u8, dac_lsb: bool) -> i16 {
+    ((i16::from(data) - 128) << 6) | (i16::from(dac_lsb) << 5)
 }
 
 /// The six channel sums of one step through their converters and added, per
@@ -401,17 +405,35 @@ mod tests {
 
     /// `&2A` to a channel sum: 0x80 is the centre and silence, and the code the
     /// 9-bit DAC of [`dac`] sees is `(data - 128) << 1` - every other code of the
-    /// converter, since the bottom one is `&2C`'s and not `&2A`'s (M5-11, #116).
+    /// converter, since the bottom one is `&2C` bit 3's and not `&2A`'s (M5-11, #116).
     #[test]
     fn pcm_sample_spreads_2a_across_the_dac() {
-        assert_eq!(pcm_sample(0x80), 0);
-        assert_eq!(pcm_sample(0xFF), 8128);
-        assert_eq!(pcm_sample(0x00), -8192);
+        assert_eq!(pcm_sample(0x80, false), 0);
+        assert_eq!(pcm_sample(0xFF, false), 8128);
+        assert_eq!(pcm_sample(0x00, false), -8192);
 
         for data in 0..=255u8 {
             assert_eq!(
-                dac(pcm_sample(data), ChipModel::Ym3438),
+                dac(pcm_sample(data, false), ChipModel::Ym3438),
                 (i32::from(data) - 128) * 2,
+                "{data:#04X}"
+            );
+        }
+    }
+
+    /// The ninth bit of that converter is `&2C` bit 3, not `&2A`: with the test
+    /// bit up every `&2A` byte lands one code along, on the odd codes (`&2C`,
+    /// and `crate::regs::REG_TEST_2C` for the sources and the fence).
+    #[test]
+    fn pcm_sample_lsb_is_2c_bit3() {
+        assert_eq!(pcm_sample(0x80, true), 32);
+        assert_eq!(pcm_sample(0xFF, true), 8160);
+        assert_eq!(pcm_sample(0x00, true), -8160);
+
+        for data in 0..=255u8 {
+            assert_eq!(
+                dac(pcm_sample(data, true), ChipModel::Ym3438),
+                (i32::from(data) - 128) * 2 + 1,
                 "{data:#04X}"
             );
         }

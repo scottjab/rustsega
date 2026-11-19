@@ -208,8 +208,8 @@ pub(crate) const RESET_B_BIT: u8 = 0x20;
 /// applies). Part I like [`REG_TIMER_A_LOW`] and [`REG_LFO`]: the DAC is one per
 /// chip, and part II does not decode this address at all.
 ///
-/// `&2C` bit 3, the PCM test bit that hardware wires to the bottom bit of the
-/// same converter, is not modelled.
+/// `&2C` bit 3 is the bottom bit of the same converter, and [`RegFile::dac_lsb`]
+/// is what answers for it; the rest of `&2C` is fenced (see [`REG_TEST_2C`]).
 pub(crate) const REG_DAC_DATA: u8 = 0x2A;
 
 /// Register `&2B`, the DAC control: bit 7 the enable that replaces the FM of
@@ -220,6 +220,49 @@ pub(crate) const REG_DAC_ENABLE: u8 = 0x2B;
 
 /// `&2B` bit 7: 1 puts [`REG_DAC_DATA`] in place of the FM of channel 6.
 pub(crate) const DAC_ENABLE_BIT: u8 = 0x80;
+
+/// Register `&2C`, the OPN2 test register. The OPNA register map has no `&2A`-
+/// `&2C` at all - its FM common registers run `$21` test, `$22` LFO, `$24`-`$27`
+/// timers, `$28` key on, `$29` SCH/IRQ enable, `$2D`-`$2F` prescaler (YM2608
+/// application manual 2-2-1) - so this one is the YM2612/YM3438's own. Part I
+/// like the rest of the globals.
+///
+/// Modelled: bit 3, the bottom bit of the same channel 6 PCM DAC converter
+/// [`RegFile::dac_data`] drives the top eight of ([`RegFile::dac_lsb`], and
+/// [`crate::output::pcm_sample`]).
+///
+/// Fenced, stored and decoded by nothing
+/// (`test_2c_bits_other_than_3_change_nothing`):
+///
+/// - bit 5 forces channel 6's converter to the `&2A` value regardless of
+///   [`DAC_ENABLE_BIT`]: `dac_sel = test_dac || (reg_dac_en && ch_ch6)` with
+///   `do_out = test_dac || ch_load[0]` on the die (nukeykt/YM2608-LLE
+///   `fmopna_impl.c`) and `|| test_dac` in Nuked-OPN2's `OPN2_ChOutput`. That is
+///   issue #588's to model, deliberately outside #339.
+/// - bit 7: #339 claimed an IRQ/STATUS disable showing up in `read_status`
+///   through BUSY, with BUSY surviving it. No reachable source says that:
+///   Nuked-OPN2's status read is unconditional (`chip->status = (chip->busy <<
+///   7) | ...`, stable back to its v1.0) and its bit 7 gates `eg_custom_timer`
+///   and the test output pin instead (`OPN2_ReadTestPin`), ymfm decodes nothing
+///   of `&2C` but the DAC bit (`m_dac_data = (m_dac_data & ~1) |
+///   bitfield(data, 3)`), and the die LLE drives only its `o_test_d` output pin
+///   with bit 7 (`o_test_d = (reg_test_2c & 128) == 0`).
+///   `test_2c_bit7_leaves_read_status_alone` pins BUSY and the timer flags
+///   working with bit 7 set. Needs hardware evidence before anything models it.
+/// - bit 6 is an envelope-generator timer force on the die
+///   (`timer_bit = ... || (!input.test && (reg_test_2c & 64))`, with Nuked's
+///   `eg_custom_timer = !mode_test_2c[7] && mode_test_2c[6]` the same test under
+///   its `&21` gate), bit 4 selects what the `&21`-driven test read of the
+///   status port returns, and bits 2-0 are not even latched on the die: the
+///   `&2C` write is `chip->reg_test_2c[0] = chip->data_bus1 & 0xf8;`
+///   (nukeykt/YM2608-LLE `fmopna_impl.c`). #339 described bits 0 and 1 as
+///   holding the MO and RO output pins to ground in test mode; the die does not
+///   store them, and Nuked-OPN2 reads them nowhere, so TODO(#339) until
+///   something sources a sound-visible effect.
+///
+/// Sources read 19 Nov 2026. Nuked-OPN2's handling of this register is identical
+/// in every version back to its v1.0.
+pub(crate) const REG_TEST_2C: u8 = 0x2C;
 
 /// Shift from `&27`'s bits 7-6, the channel 3 mode of M5-09 (#114), to their value.
 pub(crate) const CH3_MODE_SHIFT: u8 = 6;
@@ -438,6 +481,13 @@ impl RegFile {
     /// (YM2608 application manual `&2A`).
     pub(crate) fn dac_data(&self) -> u8 {
         self.read(PART_I, REG_DAC_DATA)
+    }
+
+    /// `&2C` bit 3, the test bit wired to the bottom of the same 9-bit converter
+    /// [`RegFile::dac_data`] drives the top eight of (`&2C`; see [`REG_TEST_2C`]
+    /// for what else that register holds and why nothing else of it decodes).
+    pub(crate) fn dac_lsb(&self) -> bool {
+        self.read(PART_I, REG_TEST_2C) & 0x08 != 0
     }
 
     /// The routing of channel `channel`: [`PAN_LEFT`] and [`PAN_RIGHT`] as the

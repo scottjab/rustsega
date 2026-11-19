@@ -218,6 +218,10 @@ impl Ym2612 {
     ///
     /// Reading does not clear anything: only a `&27` write with its reset bits
     /// set clears the two timer flags, and BUSY comes down by itself.
+    ///
+    /// `&2C` bit 7, which #339 named as an IRQ/STATUS disable, decodes to nothing
+    /// here - the fence and the sources that refuted the claim are on
+    /// [`regs::REG_TEST_2C`].
     pub fn read_status(&self) -> u8 {
         let busy = if self.busy > 0 { STATUS_BUSY } else { 0 };
         let timer_b = if self.timers.flag_b() {
@@ -295,7 +299,8 @@ impl Ym2612 {
 
     /// The six channel sums the output stage reads this sample: the FM of each
     /// channel, except that `&2B` bit 7 puts the `&2A` sample in place of channel
-    /// 6's (YM2608 application manual `&2A` and `&2B`, M5-11 #116).
+    /// 6's, with `&2C` bit 3 riding in the bottom bit of the same converter
+    /// (YM2608 application manual `&2A` and `&2B`, M5-11 #116, `&2C`).
     ///
     /// Only the sum is replaced. The operators of channel 6 keep their phase
     /// counters and their envelopes, because the chip walks all 24 slots whatever
@@ -304,7 +309,7 @@ impl Ym2612 {
     /// that turns the DAC off again finds the FM of the channel where it left it.
     fn channel_sums(&self) -> [i16; CHANNELS] {
         let dac = self.regs.dac_enabled();
-        let sample = output::pcm_sample(self.regs.dac_data());
+        let sample = output::pcm_sample(self.regs.dac_data(), self.regs.dac_lsb());
         std::array::from_fn(|channel| {
             if dac && channel == DAC_CHANNEL {
                 sample
@@ -1794,6 +1799,9 @@ mod tests {
     const REG_DAC_ENABLE: u8 = 0x2B;
     /// `&2B` bit 7.
     const DAC_ON: u8 = 0x80;
+    /// Register `&2C`: the OPN2 test register. Only bit 3 decodes - `regs::REG_TEST_2C`
+    /// is the register doc that says what is modelled and what is fenced.
+    const REG_TEST_2C: u8 = 0x2C;
 
     /// `&B4`-`&B6` bit 7: this channel reaches the left output (`&B4`).
     const PAN_LEFT: u8 = 0x80;
@@ -2075,6 +2083,126 @@ mod tests {
         set_dac(&mut asic, 0xFF, true);
         write_reg(&mut asic, ADDR_2, DATA_2, 0xB6, PAN_RIGHT);
         assert_eq!(asic.clock(), (0, 254));
+    }
+
+    /// `&2C` bit 3 is the bottom bit of the same converter `&2A` drives the top
+    /// eight of, so the same `&2A` byte moves the pin by exactly one 9-bit LSB
+    /// when the test bit goes up: `chip->dacdata &= 0x1fe; chip->dacdata |=
+    /// chip->mode_test_2c[3];` (Nuked-OPN2's `OPN2_WriteReg`), `m_dac_data =
+    /// (m_dac_data & ~1) | bitfield(data, 3);` (ymfm's `ymfm_opn.cpp`), and
+    /// `ch_val |= (chip->reg_test_2c[1] & 8) != 0;` on the die
+    /// (nukeykt/YM2608-LLE `fmopna_impl.c`, all read 19 Nov 2026).
+    #[test]
+    fn test_2c_bit3_is_the_dac_lsb() {
+        for model in [ChipModel::Ym2612, ChipModel::Ym3438] {
+            for data in [0x00u8, 0x80, 0x81, 0xFF] {
+                let mut chip = Ym2612::new();
+                chip.set_model(model);
+                set_dac(&mut chip, data, true);
+
+                write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0x00);
+                let without = chip.clock();
+                write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0x08);
+                let with = chip.clock();
+
+                assert_eq!(
+                    with.0 - without.0,
+                    1,
+                    "{model:?}, `&2A` {data:#04X}: bit 3 is one converter LSB"
+                );
+                assert_eq!(with.1 - without.1, 1, "{model:?}, both sides");
+            }
+        }
+
+        // And the absolute codes, bottom and top of the sweep: `&2A` 0xFF is the
+        // code 254 with bit 3 clear - the value `dac_replaces_ch6` already pins -
+        // and 255 with it set, which is the only way the top code of the
+        // converter is reachable (`&2A`, `&2C`).
+        let mut chip = Ym2612::new();
+        set_dac(&mut chip, 0xFF, true);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0x00);
+        assert_eq!(chip.clock(), (5 * 4 + 254 + 4, 5 * 4 + 254 + 4));
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0x08);
+        assert_eq!(chip.clock(), (5 * 4 + 255 + 4, 5 * 4 + 255 + 4));
+
+        let mut asic = Ym2612::new();
+        asic.set_model(ChipModel::Ym3438);
+        set_dac(&mut asic, 0xFF, true);
+        write_reg(&mut asic, ADDR_1, DATA_1, REG_TEST_2C, 0x08);
+        assert_eq!(asic.clock(), (255, 255));
+    }
+
+    /// Every other bit of `&2C` is stored and decoded by nothing: that is the
+    /// fence #339 decided on. Bit 5 is the one the fence gives away - Nuked-OPN2's
+    /// `OPN2_ChOutput` (`|| test_dac`) and the die LLE's `dac_sel = test_dac ||
+    /// (reg_dac_en && ch_ch6)` force channel 6's converter to `&2A` with it set -
+    /// but that is #588's to model, and bit 7's claimed IRQ/STATUS disable has no
+    /// source behind it (see `regs::REG_TEST_2C` for the whole fence, and
+    /// `test_2c_bit7_leaves_read_status_alone` for the status half of it).
+    #[test]
+    fn test_2c_bits_other_than_3_change_nothing() {
+        let mut chip = Ym2612::new();
+        set_dac(&mut chip, 0x40, true);
+
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0x00);
+        let base = chip.clock();
+
+        // Each of the other bits alone, and every one of them but bit 3 at once
+        // (`0xF7` = 1111_0111): the pin does not move.
+        for bits in [0x01u8, 0x02, 0x04, 0x10, 0x20, 0x40, 0x80, 0xF7] {
+            write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, bits);
+            assert_eq!(
+                chip.clock(),
+                base,
+                "{bits:#04X} moves the pin under the fence"
+            );
+        }
+
+        // With bit 3 up, the rest of the byte still does nothing: `0xFF` over
+        // `0xF7` is the one LSB of `test_2c_bit3_is_the_dac_lsb` and nothing else.
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0xF7);
+        let without = chip.clock();
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0xFF);
+        let with = chip.clock();
+        assert_eq!(with.0 - without.0, 1);
+    }
+
+    /// `&2C` bit 7 decodes to nothing in the status byte. #339 claimed it disables
+    /// the IRQ/STATUS output - with BUSY surviving it - but no reachable source
+    /// says that: Nuked-OPN2's status read is unconditional (`chip->status =
+    /// (chip->busy << 7) | ...`) and its bit 7 gates `eg_custom_timer` and the
+    /// test output pin instead, ymfm decodes nothing of `&2C` but the DAC bit, and
+    /// the die LLE drives only its `o_test_d` pin with bit 7 (all read 19 Nov
+    /// 2026; see `regs::REG_TEST_2C`). So bit 7 stays fenced, and what this pins
+    /// is the fence rather than the claim: with bit 7 up, BUSY still sets and runs
+    /// down, and the timer overflow flags still reach `read_status`.
+    #[test]
+    fn test_2c_bit7_leaves_read_status_alone() {
+        let mut chip = Ym2612::new();
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0x80);
+        assert_eq!(
+            chip.regs.read(PART_I, REG_TEST_2C),
+            0x80,
+            "the byte is stored"
+        );
+
+        // BUSY is the write-busy counter of #325, not part of any IRQ/STATUS
+        // output a test bit could switch off: it sets on the data write and runs
+        // down over the same 32 internal cycles as on a chip that never wrote
+        // `&2C` (`busy_set_after_write_and_clears`).
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x30, 0x01);
+        assert!(bit(chip.read_status(), STATUS_BUSY));
+        chip.clock();
+        assert!(bit(chip.read_status(), STATUS_BUSY));
+        chip.clock();
+        assert!(!bit(chip.read_status(), STATUS_BUSY));
+
+        // And the timer overflow flags still reach the status byte with bit 7
+        // set, which is the half of the claim that would have been visible.
+        set_timer_a(&mut chip, 1000);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, LOAD_A | ENABLE_A);
+        clock_for(&mut chip, 24);
+        assert!(bit(chip.read_status(), STATUS_TIMER_A));
     }
 
     /// The routing a chip answers with before anything has written `&B4`-`&B6` is
