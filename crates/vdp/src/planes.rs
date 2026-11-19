@@ -298,16 +298,28 @@ impl Vdp {
     /// value is larger than the width of the playfield, the display wraps
     /// horizontally") and on the size of the value, but NOT on its direction: it
     /// says only that "the lower three bits of the scroll value provide a pixel
-    /// offset into each column comprised of one pattern". Subtracting the value,
-    /// so that a larger one moves the plane right, is what #90 works to and what
-    /// the tests here fix in. It is INFERRED, not documented.
+    /// offset into each column comprised of one pattern". Sega's own manual
+    /// settles the direction (Genesis Software Manual v2.0, 1991-07-09, section
+    /// 8 "Scrolling Screen", "Horizontal Scrolling": "Taking the DISPLAY SCREEN
+    /// as standard, the SCROLL direction will be as follows", over a diagram
+    /// that puts `- SCROLL QUANTITY` at the left end of the moving-direction
+    /// arrow and `+` at its right end): a larger scroll value moves the plane
+    /// content to the right, which is the subtraction above and what #90 works
+    /// to, pinned at one pixel by `hscroll_of_1_puts_plane_pixel_0_at_screen_x_1`.
+    /// Kabuto's VDP notes (plutiedev mirror, "Memory access pattern") agree in
+    /// prose: the tiles the VDP fetches to the left of the playfield are "so
+    /// there are additional pixels when scrolling the picture to the right".
     ///
     /// Vertical scroll: plane y is `(line + vscroll) & (height * cell_height - 1)`,
     /// where `vscroll` is [`Vdp::column_vscroll`] for the 16 pixel column the pixel
     /// is in, or [`Vdp::left_column_vscroll`] for the partial column at the left
     /// edge of the line. Adding the value, so that a larger one moves the plane up,
-    /// is what #91 works to: like the horizontal scroll its direction is INFERRED,
-    /// and unlike it the value comes from VSRAM 10 bits at a time - 11 in interlace
+    /// is what #91 works to, and the direction is settled by the same section's
+    /// "V Scroll" (same manual: "Taking the DISPLAY SCREEN as standard, the
+    /// scrolling direction will be as follows", over a diagram that pairs
+    /// `+ SCROLL QUANTITY` with the upward moving-direction arrow), pinned at one
+    /// line by `vscroll_of_1_shows_plane_line_1_on_line_0`. Unlike the horizontal
+    /// value it comes from VSRAM 10 bits at a time - 11 in interlace
     /// mode 2 - instead of from a VRAM table. A 2-cell column can name any plane
     /// row, so `row_base` and `cell_row` belong to the run being fetched and not to
     /// the line, and one line can change plane row at every [`CELL_COLUMN`] pixels.
@@ -1037,6 +1049,64 @@ mod tests {
         assert_eq!(same, out, "only the low 10 bits of the entry are read");
     }
 
+    /// Cell (0,0) naming tile 1, whose top row is the eight colours 1..=8 left
+    /// to right: an asymmetric pattern, so which pixel lands on which screen
+    /// pixel says which direction the scroll moved the plane in.
+    fn plane_a_row_of_eight_colours() -> Vdp {
+        let mut vdp = scroll_vdp(0b00);
+        put_entry(&mut vdp, PLANE_A_BASE, 0, 1);
+        put_tile_row(&mut vdp, 1, 0, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        vdp
+    }
+
+    /// A hscroll of 1 moves the plane content one pixel to the right, and the
+    /// line is drawn with the value *latched* for it. Sega's Genesis Software
+    /// Manual v2.0 (1991-07-09), section 8 "Scrolling Screen", "Horizontal
+    /// Scrolling", is the citation for #288: "Taking the DISPLAY SCREEN as
+    /// standard, the SCROLL direction will be as follows" over a diagram whose
+    /// moving-direction arrow has `- SCROLL QUANTITY` at its left end and `+` at
+    /// its right end - so a larger scroll value moves the plane content right,
+    /// and the subtraction `plane_x = x - hscroll` is that sense. genvdp.txt
+    /// section 13 gives only the magnitude and the wrap of the value.
+    ///
+    /// The plane is [`plane_a_row_of_eight_colours`]: with no scroll its pixel 0
+    /// (colour 1) sits at screen x 0. With hscroll 1 it sits at screen x 1 and
+    /// the wrapped far end of the plane (transparent here) sits at screen x 0.
+    /// The value the line is drawn with is the one latched at the start of its
+    /// active display (#102), so the table is rewritten after the latch with a
+    /// scroll of 5: screen x 5 must show plane pixel 4 (colour 5), which both a
+    /// plane drawn with the written 5 (it would show plane pixel 0 there) and a
+    /// flipped sense (the pattern would run the other way) fail.
+    #[test]
+    fn hscroll_of_1_puts_plane_pixel_0_at_screen_x_1() {
+        let mut vdp = plane_a_row_of_eight_colours();
+        put_scroll(&mut vdp, 0, 1, 0);
+
+        // The beam reads the line's scroll at its latch point; the write after
+        // the read is too late for this line.
+        vdp.latch_line_state();
+        put_scroll(&mut vdp, 0, 5, 0);
+
+        vdp.begin_line(0);
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        vdp.end_line();
+
+        assert_eq!(
+            out[0], 0,
+            "screen x 0 shows the wrapped far end of the plane, not its first pixel"
+        );
+        assert_eq!(
+            &out[1..9],
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+            "plane pixel 0 landed at screen x 1: a positive hscroll moves the content right"
+        );
+        assert_eq!(
+            out[5], 5,
+            "screen x 5 shows plane pixel 4: the line is drawn with the latched 1, not the written 5"
+        );
+    }
+
     /// Per-line mode (`11`) reads `base + line * 4`, so line 5 and line 6 move
     /// differently (genvdp.txt section 13 "Horizontal Scrolling", the `case 0x03`
     /// of its `get_scroll` pseudocode).
@@ -1190,8 +1260,8 @@ mod tests {
     /// 17 "$0B") and section 10 gives the value as "y = Vertical scroll factor
     /// (0-3FFh)": one value for the whole plane, `vsram[0]` for plane A. A value
     /// of 8 is one whole cell row, so line 0 shows what was on line 8 - plane y
-    /// `line + vscroll`, the direction #91 works to; like the horizontal one of
-    /// [`Vdp::render_plane_line`] it is INFERRED, not documented.
+    /// `line + vscroll`, the direction #91 works to, cited and pinned at the
+    /// single-line scale by `vscroll_of_1_shows_plane_line_1_on_line_0`.
     #[test]
     fn full_vscroll_of_8_shows_plane_row_8_on_line_0() {
         let mut vdp = plane_a_two_cell_rows();
@@ -1219,6 +1289,42 @@ mod tests {
             &out[0..8],
             &[3; 8],
             "line 1 is the row below it, so the scroll moved plane y and not the tile row"
+        );
+    }
+
+    /// A vscroll of 1 moves the plane content one line up: line 0 shows what
+    /// was plane line 1. Same citation as the horizontal pin
+    /// `hscroll_of_1_puts_plane_pixel_0_at_screen_x_1`, the other half of #288:
+    /// Sega's Genesis Software Manual v2.0 (1991-07-09), section 8 "Scrolling
+    /// Screen", "V Scroll" - "Taking the DISPLAY SCREEN as standard, the
+    /// scrolling direction will be as follows" over a diagram that pairs
+    /// `+ SCROLL QUANTITY` with the upward moving-direction arrow and `-` with
+    /// the downward one - so a larger vscroll moves the plane content up, and
+    /// the addition `plane_y = line + vscroll` is that sense. genvdp.txt section
+    /// 10 gives only the magnitude ("y = Vertical scroll factor (0-3FFh)").
+    ///
+    /// The plane is [`plane_a_row_gradient`], whose only filled cell row names a
+    /// tile whose pattern row `r` is colour `r + 1`, so the colour line 0 shows
+    /// says which plane line it was fetched from.
+    #[test]
+    fn vscroll_of_1_shows_plane_line_1_on_line_0() {
+        let mut vdp = plane_a_row_gradient();
+
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[1; 8],
+            "with no vscroll line 0 still shows plane line 0"
+        );
+
+        vdp.vsram[0] = 1;
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[0..8],
+            &[2; 8],
+            "vscroll 1: line 0 shows plane line 1, a positive vscroll moves the content up"
         );
     }
 
