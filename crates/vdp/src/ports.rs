@@ -325,9 +325,10 @@ const fn vsram_read_index(addr: u16) -> usize {
 /// The CRAM word a read answers: the colour from CRAM, the rest from the port.
 ///
 /// "Unused bits are set using data from next available FIFO entry" (Genesis Plus
-/// GX's `vdp_68k_data_r_m5` case `0x08`). The read side has no FIFO of its own
-/// yet - that is the read prefetch of M4-21b (#100) - so `Vdp::fifo_last`, the
-/// word the port was last driven with, stands where that entry does.
+/// GX's `vdp_68k_data_r_m5` case `0x08`). The read side keeps no queue of its
+/// own here - `fifo` is the write FIFO, and #303 found no value the read
+/// buffer changes - so `Vdp::fifo_last`, the word the port was last driven
+/// with, stands where that entry does.
 const fn cram_read_word(stored: u16, port: u16) -> u16 {
     (stored & CRAM_COLOR_BITS) | (port & CRAM_UNUSED_BITS)
 }
@@ -514,10 +515,34 @@ impl Vdp {
     /// Like a write, the access happened whatever the code made of it, so the
     /// address register moves on by R15 and `pending` clears.
     ///
-    /// TODO(#303): real hardware prefetches the word when the read command
-    /// is set up, which is what makes reading the port right after a command
-    /// word return the old word and the VDP lock up if the command was a write.
-    /// There is no prefetch here, so no delay and no lock.
+    /// Hardware answers a read from a prefetch, not from the memories at the
+    /// moment of the read: the read setup joins the same command list as the
+    /// write FIFO, the fetch runs at an access slot behind the queued writes
+    /// ("reading from DATA port hangs until read command has been processed",
+    /// and takes longer when the FIFO was full - Eke, "VDP Internals",
+    /// SpritesMind t=1291), and the word lands in a one-word read buffer beside
+    /// the four-word write FIFO ("Internally, there must be a 4-word write
+    /// FIFO, which is completely separate from the buffered read data, and
+    /// there must be a 1-word read buffer", Nemesis's notes in his
+    /// `VDPFIFOTesting` source). BlastEm is built the same way:
+    /// `vdp_data_port_read` runs the VDP until its read fetch flag is set, then
+    /// returns the prefetched word. What the port is served, once the fetch it
+    /// waited for is done, is the word at the address, which is what this
+    /// answers by reading there: #303 found no value in any pinned sequence
+    /// that a read latch would change (the four cases of the ticket are
+    /// `vram_read_returns_the_word_the_data_port_put_there`,
+    /// `vram_reads_walk_the_address_register_by_r15`,
+    /// `a_write_between_reads_does_not_disturb_the_read_sequence` and
+    /// `a_new_command_word_re_latches_the_read`).
+    ///
+    /// What is not modelled here is timing, not values: the 68k should be held
+    /// while the fetch runs, behind a full FIFO like a write is, which is the
+    /// hold-versus-additive-stall question #489 carries at
+    /// `crates/genesis/src/bus.rs`. The corners where hardware answers by
+    /// racing the pre-cache - a read inside the fetch latency keeps the old
+    /// byte in its word, a data write with a read target set corrupts or
+    /// invalidates the read path, both seen as lock-ups in Nemesis's own tests
+    /// - are pinned by no source and not guessed at here.
     pub fn read_data(&mut self) -> u16 {
         self.pending = false;
 
@@ -840,6 +865,80 @@ mod tests {
         vdp.write_control(second);
         assert_eq!(vdp.read_data(), 0x1122);
         assert_eq!(vdp.read_data(), 0x3344);
+    }
+
+    /// A new command word re-latches the read: the next read answers the word
+    /// at the address the new setup named, not the next word of a sequence an
+    /// earlier setup was still walking.
+    ///
+    /// This is the prefetch shape of #303: on hardware the command word starts
+    /// a fresh fetch into the chip's one-word read buffer - BlastEm clears its
+    /// read-fetch flag on the completed command word and refetches
+    /// (`vdp_control_port_write`), and Nemesis's test ROM relies on read target
+    /// switching answering at the new target once its pre-cache has had a
+    /// moment (`TestReadTargetSwitching.asm`). What that fetch holds when the
+    /// port is read is the word at the new address, which is what reading there
+    /// answers; no value the old sequence had queued survives it.
+    #[test]
+    fn a_new_command_word_re_latches_the_read() {
+        let mut vdp = Vdp::new(false);
+        set_reg(&mut vdp, 15, 2);
+        vram_write_at(&mut vdp, 0x0100);
+        vdp.write_data(0x1111);
+        vdp.write_data(0x2222);
+        vdp.write_data(0x3333);
+
+        let (first, second) = vram_read_cmd(0x0100);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data(), 0x1111);
+
+        let (first, second) = vram_read_cmd(0x0104);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(
+            vdp.read_data(),
+            0x3333,
+            "the new setup answers at $0104, not the old sequence's $0102"
+        );
+    }
+
+    /// A data port write made while a read is set up is ignored (genvdp.txt
+    /// section 7), but the access happened: the address moves on by R15
+    /// (section 17, "every read or write to the data port"), and none of the
+    /// word the port was driven with reaches the read sequence - the next read
+    /// is the next word of the memory, not the write's data.
+    ///
+    /// Nemesis's `VDPFIFOWriteToInvalidTarget.asm` pins the hardware half of
+    /// this: the write lands in the FIFO and advances it even with no target
+    /// to write to. What the read answers after one is the memory's word.
+    #[test]
+    fn a_write_between_reads_does_not_disturb_the_read_sequence() {
+        let mut vdp = Vdp::new(false);
+        set_reg(&mut vdp, 15, 2);
+        vram_write_at(&mut vdp, 0x0100);
+        vdp.write_data(0x1111);
+        vdp.write_data(0x2222);
+        vdp.write_data(0x3333);
+
+        let (first, second) = vram_read_cmd(0x0100);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        assert_eq!(vdp.read_data(), 0x1111);
+
+        // Ignored: the read code still stands, so this write reaches nothing.
+        vdp.write_data(0xBEEF);
+        assert_eq!(
+            u16::from_be_bytes([vdp.vram[0x0102], vdp.vram[0x0103]]),
+            0x2222,
+            "the write went nowhere: $0102 keeps its setup word"
+        );
+
+        assert_eq!(
+            vdp.read_data(),
+            0x3333,
+            "the ignored write cost one address step ($0102 to $0104) and no data"
+        );
     }
 
     /// A CRAM read is the stored colour word back again (`----bbb0 ggg0 rrr0`,

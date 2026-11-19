@@ -169,9 +169,13 @@ pub struct Vdp {
     /// from. Not the FIFO: `fifo` holds the writes on their way to the memories,
     /// and this is the word the port itself is holding.
     ///
-    /// TODO(#303): the read prefetch, which on real hardware is a second,
-    /// read-side FIFO and is what makes a read straight after a command word
-    /// answer with the old word.
+    /// #303 measured the read prefetch the old TODO here stood for: the fetch a
+    /// read setup queues lands in a one-word read buffer and the port read
+    /// waits for it (Nemesis's `VDPFIFOTesting` notes; Eke on SpritesMind
+    /// t=1291; BlastEm's `vdp_data_port_read`), so what a read is served is the
+    /// word at the address - the word this answers by reading there at port
+    /// time. No latch of `fifo_last`'s own changes any pinned value; the
+    /// read-side hold on the 68k is timing, and #489's to charge.
     fifo_last: u16,
     /// The four-entry write FIFO between the data port and the memories
     /// (`fifo`, M4-21a #99): a data port write goes onto it, and an external
