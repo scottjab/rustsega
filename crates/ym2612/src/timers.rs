@@ -9,14 +9,31 @@
 //! timer only runs while its load bit of `&27` is set, and an overflow only
 //! raises its status flag while its enable bit of `&27` is set.
 //!
-//! Both are stepped in output samples, which is #107's timing model: one
-//! [`Timers::tick`] for timer A every sample and one for timer B every
-//! [`TIMER_B_DIVISOR`] of them. The widths, the reload values and the flag rules
-//! above come from the manual; the rates are the ticket's and none of them has
-//! been measured against hardware. A hardware timer A tick is 64 sample periods
-//! rather than the one modelled here, so absolute timer periods are 64x short,
-//! and [#325](https://github.com/scottjab/rustsega/issues/325) is where the
-//! measurements that fix that will land.
+//! Both are stepped in output samples: one [`Timers::tick`] for timer A every
+//! sample and one for timer B every [`TIMER_B_DIVISOR`] of them. The widths,
+//! the reload values and the flag rules above come from the manual. The rates
+//! are measured
+//! ([#325](https://github.com/scottjab/rustsega/issues/325)): on hardware one
+//! timer A tick is one output sample period, 144 chip clocks, 18.77 us at the
+//! 53267 Hz step. The YM3438 die shot in Nuked-OPN2 ticks timer A once per 24
+//! internal cycles of 6 chip clocks (github.com/nukeykt/Nuked-OPN2,
+//! `OPN2_DoTimerA`), ymfm counts `(1024 - TA)` steps of 24 operators x 6
+//! prescale clocks and MAME's `fm2612.cpp` sets the same prescaler
+//! (`OPNSetPres(OPN, 6*24, 6*24, 0)`), and plutiedev's "YM2612 registers"
+//! gives "($400 - TMRA) x 18.77us", which is 144 clocks at the Genesis rate.
+//! The YM2608 manual, the family documentation, says 72 clocks: "tA = 72 *
+//! (1024 - NA) / fM", resolution 9 us at 8 MHz, tA(MAX) = 9216 us. That is
+//! half the silicon's rate and is the one number in the family literature
+//! that disagrees with the die shot; it is a datasheet-vs-silicon
+//! discrepancy, the manual describes the family convention while the die shot
+//! is the chip itself, so the sample-rate tick stands and the 72-vs-144 gap
+//! needs no re-litigating.
+//!
+//! Timer B ticks once every 16 timer A ticks: the manual's timer B formula
+//! "tB = 1152 x (256 - NB) / fM", resolution 144 us at 8 MHz, is exactly 16
+//! x tA's 72 clocks, Nuked-OPN2 counts a sub-counter to 16 between ticks,
+//! ymfm and MAME both scale timer B by 16, and plutiedev's "($100 - TMRB) x
+//! 300.34us" is 16 x 18.77 us.
 
 use crate::regs;
 
@@ -30,8 +47,10 @@ use serde::{Deserialize, Serialize};
 /// 1024 (YM2608 application manual "3. Register descriptions", `&24` and `&25`).
 const TIMER_A_TOP: u16 = 1024;
 
-/// Samples per timer B tick: timer B runs at 1/16 the rate of timer A (#107).
-/// See the module note for how much of the timer rate is measured.
+/// Samples per timer B tick: timer B runs at 1/16 the rate of timer A, the
+/// 1152/72 ratio of the YM2608 manual's timer formulas and the 16-count
+/// sub-counter of the Nuked-OPN2 die shot (#107, measured in #325 - see the
+/// module note for the sources).
 const TIMER_B_DIVISOR: u8 = 16;
 
 /// The timer registers decoded, which is what the counter state machine reads.

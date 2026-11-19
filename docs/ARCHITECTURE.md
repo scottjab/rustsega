@@ -50,6 +50,11 @@ Rules:
 - Master clock: 53_693_175 Hz (53_203_424 Hz).
 - 68000: master / 7 (~7.67 MHz). Z80: master / 15 (~3.58 MHz).
 - YM2612: one output sample every 144 68k cycles (master / 7 / 144, ~53267 Hz).
+- YM2612 timers tick in the same samples: timer A once per output sample (18.77
+  us NTSC) and timer B once per 16 samples; BUSY holds 32 internal cycles (192
+  chip clocks, 25 us) after each data write. Measured against the die shot in
+  Nuked-OPN2 and the YM2608 manual's 1:16 ratio (#325); the crates/ym2612 module
+  note carries the citations.
 - PSG: master / 15 / 16 (~223722 Hz internal tick).
 - One scanline = 3420 master clocks. 262 lines per frame (313 PAL).
 - The scheduler in `genesis` runs line by line. Within a line it interleaves
