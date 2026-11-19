@@ -52,14 +52,24 @@ const PATTERN_WORD: usize = 2;
 const X_WORD: usize = 3;
 
 /// The bytes of an entry the VDP keeps for itself: its `Index + 0` and `Index + 2`
-/// words, the y and the size/link (#103). The other four bytes of an entry, the
-/// pattern and the x, are read from VRAM on every fetch.
+/// words, the y and the size/link (#103). Nemesis's timing notes (SpritesMind
+/// t=851, 2010, note 7): "Only the last 4 bytes of each 8-byte sprite attribute
+/// entry are read from VRAM, containing the block mapping for the sprite, and
+/// the horizontal position. The first 4 bytes, containing the vertical position,
+/// size, and link data, are cached internally in the VDP". The other four bytes
+/// of an entry, the pattern and the x, are read from VRAM on every fetch.
 const ENTRY_CACHE_BYTES: usize = 4;
 
 /// The cache lines of the table: its 80 entries of [`ENTRY_BYTES`] apiece, which
-/// is the 640 bytes of genvdp.txt section 15 and the `MAX_SPRITES_H40` sprites a
-/// walk of it may visit. The cache does not shrink in 32-cell mode, where only 64
-/// of them are ever reached.
+/// is the 640 bytes of genvdp.txt section 15 ("The table is 640 bytes in size")
+/// and the `MAX_SPRITES_H40` sprites a walk of it may visit. The cache does not
+/// shrink in 32-cell mode, where only 64 of them are ever reached: no source
+/// gives the cache a size of its own, and the one number in circulation -
+/// TascoDLX's "80 slots in H40 mode used to cache the sprite table, or 64 slots
+/// in H32 mode" (SpritesMind t=851, December 2010) - is a guess about how many
+/// VRAM reads a refill would cost, made two months before Nemesis's reply in
+/// the same thread established that the cache is never refilled from VRAM at
+/// all. See [`SpriteCache`] for the fence and the test that holds this in.
 const CACHE_ENTRIES: usize = 80;
 
 /// Bits 11-10 (`hs`) and 9-8 (`vs`) of the size word are the width and the height
@@ -217,14 +227,54 @@ fn sprite_of(vram: &[u8], entry: usize, y: u16, size: u16) -> Sprite {
 /// that clears VRAM, so a reset - which rebuilds the chip, `genesis::Bus` - leaves
 /// them agreeing again.
 ///
-/// **INFERRED**: the 80 lines, the four-byte window they cover and the fact that
-/// R5 refills none of them are the reading of genvdp.txt and Nemesis's notes that
-/// ticket #103 gives, and only the shape of the table they cache - 640 bytes of
-/// 8-byte entries - is quoted from section 15 at the top of this file. Nothing
-/// else was consulted, so all three are open to a measurement.
+/// The feed rule and the R5 rule are Nemesis's, from SpritesMind. His timing
+/// notes of t=851 (December 2010): the VDP "latches and stores the first 4 bytes
+/// of each sprite mapping in an internal cache as they are written to VRAM, but
+/// that cache is never invalidated and re-loaded from VRAM, which is why
+/// changing the sprite table address register results in the data from the old
+/// location being used". And asked what that cache does when R5 moves, in the
+/// "VDP Internals" thread of t=1291 (November 2012), he answers that the VDP
+/// "only ever updates the contents of the cache if it detects a VRAM write being
+/// made within the SAT cache 'window' based on the current location of the SAT
+/// as set by register 5. This means, you can change register 5, and the cache
+/// will continue to use the cached data from the old memory location.
+/// CastleVania Bloodlines relies on this." Mask of Destiny's VRAM-bus captures
+/// behind the same thread are the fetch side of the same rule: watching a whole
+/// frame of bus activity they never saw the first half of an entry read - the
+/// SAT reads of a line are only "the second half of sprite attribute table
+/// entries (i.e. the part that specifies horizontal position and which tile to
+/// use)". plutiedev's sprite notes state what that means to a game: "if you
+/// change the sprite address without writing new sprites, the cached values
+/// will be used and you'll end up with half the data from the old table and
+/// half the data from the new table."
 ///
-/// TODO(#103): pin the size of the cache, the width of the window and what a link
-/// past the 80 entries reads with the sprite ROM of M6-06.
+/// Two corners of the model stay unmeasured, and both are fenced rather than
+/// guessed:
+///
+/// - **Capacity.** The cache holds a line for each of the 80 entries of the
+///   table, in both widths. No source gives the cache a size of its own, and
+///   the 64 of 32-cell mode exists only as TascoDLX's guess quoted on
+///   [`CACHE_ENTRIES`]. The decision rule: an H32 write to entry 79 followed by
+///   a switch to H40 with no rewrite would show a shrink on screen, and the
+///   sprite ROM of M6-06 is what measures it. Written up on #313.
+/// - **Links past the table.** [`SpriteCache::line`] answers `None` past entry
+///   79 and the fetch falls back to VRAM for that entry's y and size.
+///   genvdp.txt bounds neither its 7-bit link field by the table nor says what
+///   such a fetch reads, and neither the t=1291 captures nor the t=851 notes
+///   cover it. Fenced for #94, and fixed in by the
+///   `a_link_past_the_table_reads_the_vram_the_link_names` test of this file.
+///
+/// The four bytes of the window are note 7 of the t=851 notes, quoted on
+/// [`ENTRY_CACHE_BYTES`]. That the window moves one *byte* at a time is the
+/// reading of the same mechanism - the writes the VDP watches are byte writes
+/// ("Within each 4 SC write cycle, 1 byte is written", Nemesis, t=851; "VRAM
+/// writes are 8-bit, so only half of the full 16-bit write would get through
+/// at that access slot", Mask of Destiny, t=1291) - but the cache's own
+/// granularity is not measured either, and the tests of this file fix the byte
+/// reading in so that a wider window fails loudly.
+///
+/// TODO(#313): the two fences above are written up there; neither moves until
+/// a sprite ROM measures it.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct SpriteCache {
@@ -247,8 +297,9 @@ impl SpriteCache {
 
     /// The cache line of entry `index`, or `None` for an index past the 80
     /// entries the cache holds. A link of 80..=127 therefore keeps reading VRAM,
-    /// the one corner of the walk this model does not cache; see the TODO on
-    /// [`SpriteList`] for what such an entry really reads.
+    /// the one corner of the walk this model does not cache; see the capacity
+    /// and links fences on [`SpriteCache`] and the TODO on [`SpriteList`] for
+    /// what such an entry really reads and why nothing answers it.
     pub(crate) fn line(&self, index: usize) -> Option<&[u8; ENTRY_CACHE_BYTES]> {
         self.lines.get(index)
     }
@@ -256,7 +307,10 @@ impl SpriteCache {
     /// The byte `byte` written to VRAM byte `address`, of a table based at `base`:
     /// [`Vdp::write_vram_byte`] calls this for every write the chip makes, so the
     /// cache follows the table the SAT is on now rather than any table this model
-    /// knows the name of.
+    /// knows the name of. That snoop is Nemesis's reading of the chip, SpritesMind
+    /// t=1291 (2012): the cache "only ever updates the contents of the cache if
+    /// it detects a VRAM write being made within the SAT cache 'window' based on
+    /// the current location of the SAT as set by register 5".
     pub(crate) fn write(&mut self, address: usize, byte: u8, base: usize) {
         // `checked_sub` because an address below `base` is simply not in the
         // table, and a `usize` subtraction of the kind would wrap instead.
@@ -392,7 +446,12 @@ impl SpriteLine {
 /// 640 bytes does not, is fetched at the address it names rather than stopped at:
 /// genvdp.txt neither bounds the field by the table nor says what the VDP reads
 /// past the table, and every limit it does give is a count of sprites rather than
-/// of addresses. TODO(M4-16 #94): what a link past the table really reads.
+/// of addresses. The sources #313 added to the cache - Nemesis's notes of t=851
+/// and Mask of Destiny's captures of t=1291 - say nothing about such a fetch
+/// either, so the VRAM fallback stays the model's reading, fixed in by the
+/// `a_link_past_the_table_reads_the_vram_the_link_names` test, and stays fenced
+/// for the sprite ROM to measure. TODO(M4-16 #94): what a link past the table
+/// really reads.
 pub(crate) struct SpriteList<'a> {
     /// The VRAM the table is read from: the pattern and the x of every entry.
     vram: &'a [u8],

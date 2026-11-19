@@ -268,17 +268,32 @@ attribute table, because a sprite fetch cannot wait on the bus for all eight byt
 of every entry:
 
 * 80 lines of four bytes, the `y` word and the `size`/`link` word of one entry
-  each. The pattern and the `x` are not cached and are read from VRAM on every
-  fetch of the entry.
+  each (the window is Nemesis's, SpritesMind t=851 note 7: "The first 4 bytes,
+  containing the vertical position, size, and link data, are cached internally
+  in the VDP"). The pattern and the `x` are not cached and are read from VRAM on
+  every fetch of the entry.
 * Every VRAM write of the chip goes through `Vdp::write_vram_byte`, and that is
   what feeds the cache: a write inside `[sat_base, sat_base + 640)` that lands on
   one of the first four bytes of an entry updates that entry's line. The three DMA
-  modes of `dma.rs` reach it the way the data port of `ports.rs` does.
+  modes of `dma.rs` reach it the way the data port of `ports.rs` does. The feed
+  is Nemesis's snoop (SpritesMind t=1291, 2012, answering Mask of Destiny's
+  VRAM-bus captures: the VDP "only ever updates the contents of the cache if it
+  detects a VRAM write being made within the SAT cache 'window' based on the
+  current location of the SAT as set by register 5"), and the updates are byte
+  sized, the width of the VRAM writes it watches.
 * Moving the SAT with R5 refills nothing. A table moved to under one that was
   never written is therefore drawn with the y, the size and the link of the old
-  one and the pattern and x of the new one, until the game rewrites the entries.
+  one and the pattern and x of the new one, until the game rewrites the entries
+  ("you can change register 5, and the cache will continue to use the cached
+  data from the old memory location. CastleVania Bloodlines relies on this",
+  the same thread).
 * It is chip state, not part of the line snapshot above: the chip takes no VRAM
   write while a line is being drawn.
+* Two corners are fenced, written up on #313 (#313's tests fix them in so a
+  change fails loudly): no source gives the cache a size of its own, so the model
+  holds all 80 entries in both widths - the shrink to 64 in 32-cell mode is only
+  TascoDLX's unconfirmed guess of t=851 - and no source says what a link of
+  80..=127 reads, so the model falls back to VRAM there (#94).
 
 ### VDP debug views
 
