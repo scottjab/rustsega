@@ -167,12 +167,12 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 /// ```text
 ///                     68000 memory test
 ///  400000-7FFFFF : FFFF FFFF (4E00 4E00)
-///  A00000-A0FFFF : F3ED F3F3 (4E00 4E00)
+///  /// A00000-A0FFFF : FFFF FFFF (4E00 4E00)
 ///  A00000-A03FFF : F3ED F3F3 (F3ED F3F3)
 ///  A04000-A05FFF : 0000 0000 (0000 0000)
 ///  A06000-A07EFF : FFFF FFFF (FFFF FFFF)
 ///  A10000-A1001F : A0A0 A0A0 (A0A0 A0A0)
-///  A11100        : FEFE FEFE (4F00 4F00)
+///  A11100        : FFFF FFFF (4F00 4F00)
 ///  A11100        : FEFE FEFE (4E00 4E00)
 ///  A11200        : FFFF FFFF (4E00 4E00)
 ///  C00000-C00003 : 1122 1122 (1122 1122)
@@ -211,6 +211,23 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 /// bit 0, so both read `FEFE` and the golden was re-recorded
 /// (`0xb8274a8ff209b032` -> `0x6bd9b2fb7eede3d2`). Re-check this block against a
 /// hardware capture of `memtest_68k` if one ever exists.
+///
+/// # The #260 movement
+///
+/// #260 moved two live cells of the report again, for a different reason. The
+/// memtest does a second probe of the sound side with the bus request still on
+/// and the reset line deliberately held (traced on the 68k side: a word 0 to
+/// `$A11200` lands between the RAM fill and the report, and the pass re-reads
+/// the fill and the bus request register). With the reset line folded into the
+/// grant (#260) the probes of that pass answer open bus instead of reading the
+/// fill back, and the bus request byte read answers "the Z80 running" - MAME's
+/// and Genesis Plus GX's answer while reset is asserted, with BlastEm keeping
+/// the looser busack-only gate as the recorded dissent on #260. The
+/// `$A00000-$A0FFFF` row and the first `$A11100` row therefore print `FFFF FFFF`
+/// where they used to print the fill and `FEFE FEFE`; the word row keeps `FEFE
+/// FEFE` from its post-release read. The golden was re-recorded
+/// (`0x6bd9b2fb7eede3d2` -> `0x4604981db74b07bf`), blessed by maintainer
+/// 2026-11-19 as part of #260.
 #[test]
 fn md_test_pack_memtest_68k_prints_its_memory_report() {
     check(
