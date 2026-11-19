@@ -388,8 +388,19 @@ impl PhaseGen {
     /// The increment is recomputed from the registers rather than cached, so a
     /// write to any of them takes effect on the very next sample.
     ///
-    /// INFERRED: nothing gates the counter on the key state. The envelope of
-    /// M5-05 (#109) is what decides whether an operator is heard, and an
+    /// `ssg_pg_reset` is the SSG-EG restart latch of each operator,
+    /// `[channel][slot]`, as [`crate::envelope::EnvelopeGen::ssg_pg_resets`]
+    /// reads it off the envelopes: while a `&90` mode 8 or 12 envelope of that
+    /// operator stands at or past the halfway point, the counter is held at 0
+    /// and does not count - Nuked-OPN2's ym3438.c spends its
+    /// `eg_ssg_pgrst_latch` through `pg_reset[slot]` by zeroing `pg_phase` and
+    /// masking `pg_inc` in `OPN2_PhaseGenerate`, which is what makes the
+    /// repeated saw of those modes start every swing at the same phase. The
+    /// `nkon && !okon` half of its `pg_reset` is the `&28` key-on edge, which
+    /// [`PhaseGen::key_on`] answers at the write (#337).
+    ///
+    /// INFERRED: nothing else gates the counter on the key state. The envelope
+    /// of M5-05 (#109) is what decides whether an operator is heard, and an
     /// operator that has never been keyed on only has a phase nothing can see.
     ///
     /// `pms` is each channel's `&B4` bits 2-0 and `pm_phase` the LFO's current PM
@@ -397,7 +408,12 @@ impl PhaseGen {
     /// increment ([`crate::lfo`] and [`increment`]). The LFO stops its work by
     /// holding `pm_phase` at 0 and a PMS of 0 offsets nothing, so a chip with no
     /// LFO ticks exactly as it did before either existed.
-    pub(crate) fn tick(&mut self, pms: &[u8; CHANNELS], pm_phase: u8) {
+    pub(crate) fn tick(
+        &mut self,
+        ssg_pg_reset: &[[bool; SLOTS]; CHANNELS],
+        pms: &[u8; CHANNELS],
+        pm_phase: u8,
+    ) {
         // Every frequency of the chip first, since reading one needs `self` and the
         // counters below are being moved. A normal channel has one F-Num for its four
         // operators and only channel 3 of the two special modes differs (#114).
@@ -409,7 +425,14 @@ impl PhaseGen {
                 let (fnum, block) = frequency[index][slot];
                 let pm = crate::lfo::pm_offset(fnum, pms[index], pm_phase);
                 let increment = increment(fnum, block, operator.dt, operator.mul, pm);
-                operator.phase = (operator.phase + increment) & PHASE_MASK;
+                // The SSG-EG restart latch: counter at 0, increment masked, for
+                // as long as the envelope stands at or past the halfway point
+                // (Nuked-OPN2's `OPN2_PhaseGenerate`).
+                operator.phase = if ssg_pg_reset[index][slot] {
+                    0
+                } else {
+                    (operator.phase + increment) & PHASE_MASK
+                };
             }
         }
     }
