@@ -94,14 +94,18 @@ pub(crate) const REG_LEVEL_RELEASE: u8 = 0x80;
 pub(crate) const REG_SSG_EG: u8 = 0x90;
 
 /// Register `&A0`, the first of the F-Num low group: `&A0` + channel, bits 7-0
-/// of the 11-bit F-Num. This is also the write that applies a channel's pending
-/// `&A4` (YM2608 application manual `&A0`).
+/// of the 11-bit F-Num. This is also the write that applies the chip's pending
+/// `&A4` - the latch is the chip's, so the next `&A0`-`&A2` write of any channel
+/// applies it (YM2608 application manual 2-4-1 "F-Number/Block", and #336).
 pub(crate) const REG_FNUM_LOW: u8 = 0xA0;
 
 /// Register `&A4`, the first of the block and F-Num high group: `&A4` +
-/// channel, block in bits 5-3 and F-Num 10-8 in bits 2-0. `&A8`-`&AE` are the
-/// channel 3 special mode of M5-09 (#114), not another channel (YM2608
-/// application manual `&A4`).
+/// channel, block in bits 5-3 and F-Num 10-8 in bits 2-0. The write only
+/// latches: there is one `&A4` register on the chip, shared by all six channels
+/// like the `&AC` of the channel 3 group, and the low write of any channel is
+/// what applies it (YM2608 application manual 2-4-1 "F-Number/Block", and
+/// #336). `&A8`-`&AE` are the channel 3 special mode of M5-09 (#114), not
+/// another channel.
 pub(crate) const REG_BLOCK_FNUM: u8 = 0xA4;
 
 /// Register `&A8`, the first of the channel 3 special-mode F-Num low group of

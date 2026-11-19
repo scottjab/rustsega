@@ -14,7 +14,7 @@ a header that says which format version it is and which game it belongs to.
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
 | 0 | 4 | magic | `b"RSGS"` |
-| 4 | 4 | format version | `u32`, little endian, currently `6` (`state::FORMAT_VERSION`) |
+| 4 | 4 | format version | `u32`, little endian, currently `7` (`state::FORMAT_VERSION`) |
 | 8 | 8 | ROM checksum | `u64`, little endian, [`state::rom_checksum`] of the loaded image |
 | 16 | 4 | payload length | `u32`, little endian — the number of bytes that follow offset 20 |
 | 20 | n | payload | the `postcard` encoding of the machine state |
@@ -219,6 +219,7 @@ The versions so far:
 | 4 | The serial EEPROM's mode 3: the 24C65's two-byte word address (#270) gave `Eeprom`'s state machine the two states that take the high and low address bytes. Rule 2 again: the variants live in a `serde` type the payload carries, and a state of the old encoding would decode a mode 3 transfer as something else. |
 | 5 | The Acclaim 32 Mbit board's read-window latch (#271): the one-bit `Eeprom::window` mux and the word write that arms it. A state that does not carry it resumes a cart with its quadrant's read window on the wrong half — ROM where the game had armed the serial answer, or the reverse. |
 | 6 | The J-CART register (#356): `Bus`'s `jcart` field, the TH line the register's writes move and its place in the slot's read order. Rule 2: a new field on `Bus` itself. |
+| 7 | The YM2612's `&A4` F-Num latch (#336): the `latched_fnum`/`latched_block` pair moved off each of the six `phase::Channel`s onto the one `phase::PhaseGen`, because the chip has one `&A4` register and the next `&A0`-`&A2` write of any channel applies it. Rule 2: the channel array's field list changes with the latch's home. A state saved while a driver held a latched `&A4` in flight loses the latch, and the next `&A0` write after a resume would apply block 0 instead of the driver's. |
 
 ## Out of scope
 

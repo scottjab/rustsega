@@ -200,10 +200,9 @@ pub(crate) struct Operator {
     pub(crate) phase: u32,
 }
 
-/// One channel: the F-Num and block its four operators share, the `&A4` latch
-/// waiting for the next `&A0` write, and the operators themselves. Channel 3 in a
-/// special mode is the exception to the shared half, and reads [`Special`] for
-/// three of its operators instead (M5-09, #114).
+/// One channel: the F-Num and block its four operators share, and the operators
+/// themselves. Channel 3 in a special mode is the exception to the shared half,
+/// and reads [`Special`] for three of its operators instead (M5-09, #114).
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub(crate) struct Channel {
@@ -211,10 +210,6 @@ pub(crate) struct Channel {
     pub(crate) fnum: u16,
     /// The block in force, 3 bits: `&A4` bits 5-3.
     pub(crate) block: u8,
-    /// `&A4` bits 2-0 as of the last `&A4` write, not yet applied.
-    latched_fnum: u16,
-    /// `&A4` bits 5-3 as of the last `&A4` write, not yet applied.
-    latched_block: u8,
     /// Indexed by the slot order of [`SLOT_S1`].
     pub(crate) operators: [Operator; SLOTS],
 }
@@ -226,8 +221,6 @@ impl Channel {
         Self {
             fnum: 0,
             block: 0,
-            latched_fnum: 0,
-            latched_block: 0,
             operators: [Operator {
                 dt: 0,
                 mul: 0,
@@ -304,16 +297,29 @@ pub(crate) struct PhaseGen {
     /// The `&A8`-`&AE` frequencies, in force for channel 3 while [`PhaseGen::mode`]
     /// is not [`regs::CH3_MODE_NORMAL`].
     ch3: Special,
+    /// `&A4` bits 2-0 as of the last `&A4` write of either part, not yet applied.
+    /// One latch for the whole chip, because the chip has one register there:
+    /// the next `&A0`-`&A2` write of ANY channel applies what it holds (YM2608
+    /// application manual 2-4-1 "F-Number/Block": "Please set data according to
+    /// the following procedures. (1) Data write of Block/F-Num2: $A4-$A6 (2)
+    /// Data write of F-Num1: $A0-$A2"; Nuked-OPN2's ym3438.c keeps the same one
+    /// `reg_a4` scalar), and [`Special::latched_fnum`] is the same thing one
+    /// group over.
+    latched_fnum: u16,
+    /// `&A4` bits 5-3, with [`PhaseGen::latched_fnum`].
+    latched_block: u8,
 }
 
 impl PhaseGen {
     /// A generator with every channel at F-Num 0, block 0 and every operator
-    /// off with its counter at 0.
+    /// off with its counter at 0, and the latch empty.
     pub(crate) fn new() -> Self {
         Self {
             channels: [Channel::new(); CHANNELS],
             mode: regs::CH3_MODE_NORMAL,
             ch3: Special::new(),
+            latched_fnum: 0,
+            latched_block: 0,
         }
     }
 
@@ -335,15 +341,15 @@ impl PhaseGen {
             operator.mul = value & 0x0F;
         } else if let Some(channel) = regs::channel_of_register(part, regs::REG_FNUM_LOW, register)
         {
+            // The one `&A4` latch applies to whichever channel the low write
+            // names, of either part (`PhaseGen::latched_fnum`).
+            let (latched_fnum, latched_block) = (self.latched_fnum, self.latched_block);
             let channel = &mut self.channels[channel];
-            channel.fnum = (channel.latched_fnum << 8) | u16::from(value);
-            channel.block = channel.latched_block;
-        } else if let Some(channel) =
-            regs::channel_of_register(part, regs::REG_BLOCK_FNUM, register)
-        {
-            let channel = &mut self.channels[channel];
-            channel.latched_fnum = u16::from(value & 0x07);
-            channel.latched_block = (value >> 3) & 0x07;
+            channel.fnum = (latched_fnum << 8) | u16::from(value);
+            channel.block = latched_block;
+        } else if regs::channel_of_register(part, regs::REG_BLOCK_FNUM, register).is_some() {
+            self.latched_fnum = u16::from(value & 0x07);
+            self.latched_block = (value >> 3) & 0x07;
         } else if part == regs::PART_I && register == regs::REG_CONTROL {
             self.mode = value >> regs::CH3_MODE_SHIFT;
         } else if let Some((slot, high)) = regs::ch3_frequency_of(part, register) {
