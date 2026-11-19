@@ -87,16 +87,22 @@ const DAC_CHANNEL: usize = CHANNELS - 1;
 ///
 /// [`Ym2612::clock`] is called once per sample, every 144 68k clocks, and the
 /// chip's own FM step is a sixth of that: 24 internal cycles per sample
-/// (docs/ARCHITECTURE.md, "Clocks and timing").
+/// (docs/ARCHITECTURE.md, "Clocks and timing"). The same 24-cycle sample frame
+/// is the one Nuked-OPN2's die-shot core walks, `chip->cycles = (cycles + 1) %
+/// 24`, which is the measured check of the division
+/// ([#325](https://github.com/scottjab/rustsega/issues/325)).
 const INTERNAL_CYCLES_PER_SAMPLE: u32 = 24;
 
 /// How long a write to a register holds [`STATUS_BUSY`], in internal cycles:
-/// 32 of them, which is 1.33 samples, so BUSY is still set one sample after the
-/// write and clear two samples after it.
+/// 32 of them, which is 192 chip clocks, 25.0 us, 1.33 samples, so BUSY is
+/// still set one sample after the write and clear two samples after it.
 ///
-/// INFERRED: the figure is the one #107 gives. It has not been checked against
-/// Nemesis's busy-flag measurements, and [#325](https://github.com/scottjab/rustsega/issues/325)
-/// is where that measurement is being collected.
+/// Measured in [#325](https://github.com/scottjab/rustsega/issues/325): the
+/// YM3438 die shot in Nuked-OPN2 holds BUSY with a 5-bit counter, `write_busy
+/// = (write_busy && !(write_busy_cnt >> 5)) || write_d_en`, so 32 internal
+/// cycles from each data write (github.com/nukeykt/Nuked-OPN2), and ymfm sets
+/// the same, `ymfm_set_busy_end(32 * clock_prescale())`. The OPN manuals
+/// describe the flag but give no duration.
 const BUSY_INTERNAL_CYCLES: u32 = 32;
 
 /// The YM2612: its four bus ports, its two register banks, its status byte, its
@@ -489,7 +495,11 @@ mod tests {
         );
 
         // BUSY is held for 32 internal cycles and a sample is 24 of them, so it
-        // survives one sample and is gone by the next.
+        // survives one sample and is gone by the next: 192 chip clocks, 25.0 us,
+        // 1.33 samples at the 53267 Hz step. The figure is measured, not
+        // inferred (#325): the YM3438 die shot in Nuked-OPN2 holds BUSY with a
+        // 5-bit counter, one that runs out at `write_busy_cnt >> 5`, and ymfm
+        // sets the same 32 x prescale, so the window is 24 < 32 <= 48 cycles.
         chip.clock();
         assert!(bit(chip.read_status(), STATUS_BUSY), "24 cycles < 32");
         chip.clock();
@@ -525,6 +535,65 @@ mod tests {
         );
         chip.clock();
         assert!(bit(chip.read_status(), STATUS_TIMER_B));
+    }
+
+    #[test]
+    fn timer_a_period_at_zero_is_1024_samples() {
+        // The sourced longest period: TA = 0 needs 1024 ticks, one per output
+        // sample, so 1024 samples, which is 1024 x 18.77 us = 19.2 ms at the
+        // 53267 Hz step. One tick per sample is what the YM3438 die shot in
+        // Nuked-OPN2 counts (once per 24 internal cycles of 6 chip clocks),
+        // what ymfm and MAME both count (24 x prescale = 144 clocks per tick)
+        // and what plutiedev's "($400 - TMRA) x 18.77us" adds up to; the
+        // YM2608 manual's tA(MAX) = 9216us is the same 1024 ticks at the
+        // family's 8 MHz convention (#325). The 64 sample periods per tick the
+        // ticket feared would make this 1.23 s, and this test would catch it.
+        let mut chip = Ym2612::new();
+        set_timer_a(&mut chip, 0);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, LOAD_A | ENABLE_A);
+
+        clock_for(&mut chip, 1023);
+        assert!(
+            !bit(chip.read_status(), STATUS_TIMER_A),
+            "1023 of the 1024 ticks timer A needs from 0"
+        );
+        chip.clock();
+        assert!(bit(chip.read_status(), STATUS_TIMER_A));
+    }
+
+    #[test]
+    fn timer_b_overflows_exactly_sixteen_timer_a_periods_later() {
+        // Both loaders set to a 2-tick period, TA = 1022 and TB = 254: timer A
+        // flags on sample 2, and timer B - whose tick is one every 16 of timer
+        // A's, the 1152/72 ratio of the YM2608 manual's timer formulas, the 16
+        // of Nuked-OPN2's timer B sub-counter and the 300.34/18.77 us of
+        // plutiedev's figures (#325) - flags exactly 16x later, on sample 32.
+        let mut chip = Ym2612::new();
+        set_timer_a(&mut chip, 1022);
+        set_timer_b(&mut chip, 254);
+        write_reg(
+            &mut chip,
+            ADDR_1,
+            DATA_1,
+            REG_CONTROL,
+            LOAD_A | LOAD_B | ENABLE_A | ENABLE_B,
+        );
+
+        clock_for(&mut chip, 1);
+        assert!(!bit(chip.read_status(), STATUS_TIMER_A), "1 of 2 ticks");
+        chip.clock();
+        assert!(bit(chip.read_status(), STATUS_TIMER_A));
+
+        clock_for(&mut chip, 29);
+        assert!(
+            !bit(chip.read_status(), STATUS_TIMER_B),
+            "sample 31 is 15 timer A periods in, one short of 16"
+        );
+        clock_for(&mut chip, 2);
+        assert!(
+            bit(chip.read_status(), STATUS_TIMER_B),
+            "sample 32 is exactly 16 x 2"
+        );
     }
 
     #[test]
