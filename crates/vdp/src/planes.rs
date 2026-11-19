@@ -9,7 +9,7 @@
 //! repeats either.
 
 use crate::pattern::{NameEntry, read_word, tile_row};
-use crate::{HScrollMode, InterlaceMode, Vdp, WIDTH_H40};
+use crate::{CRAM_WORDS, HScrollMode, InterlaceMode, Vdp, WIDTH_H40};
 
 /// Pixels across a plane cell: 8, in every mode.
 ///
@@ -41,6 +41,16 @@ pub(crate) const MAX_ENTRIES: usize = 4096;
 /// (#95) wants it. genvdp.txt section 14 moves a plane's pixels from `B`/`C`
 /// to `E'`/`F'` when the entry sets the flag.
 pub(crate) const PRIORITY_SHIFT: u32 = 6;
+
+/// Bits 5-0 of a layer pixel: its CRAM index, `palette * 16 + colour`
+/// (genvdp.txt section 9's 64 words). Bit 6 is [`PRIORITY_SHIFT`]'s priority
+/// flag, so a layer pixel becomes a CRAM index by masking this off - which is
+/// also how a pixel that draws nothing is told from one that does, for a
+/// pixel of colour 0 draws nothing (genvdp.txt section 12: "A pixel within a
+/// pattern that uses value zero isn't shown") whether or not its cell's flag
+/// is set. The compositor's transparency test and [`crate::debug`]'s plane
+/// view both read the index this way.
+pub(crate) const CRAM_INDEX_MASK: u8 = CRAM_WORDS as u8 - 1;
 
 /// Bits of a horizontal scroll table entry that the VDP reads: genvdp.txt
 /// section 13 "Horizontal Scrolling", "x = Horizontal scroll value (0-3FFh)"
@@ -283,11 +293,18 @@ impl Vdp {
     /// 448 lines to the beam's 224 and a cell row is 16 of them (#98).
     ///
     /// Colour 0 of any palette draws nothing (genvdp.txt section 12: "A pixel
-    /// within a pattern that uses value zero isn't shown"), and a pixel that
-    /// draws nothing is written as a whole zero byte: the transparent test the
-    /// compositor of M4-17 (#95) applies, `index & 0x0F == 0`, is then true of
-    /// it and of nothing else, and the stale priority bit of a transparent cell
-    /// cannot leak into the layer above.
+    /// within a pattern that uses value zero isn't shown"), so a pixel that
+    /// draws nothing is written without a CRAM index and the compositor's
+    /// transparency test [`crate::compose::shows`] cannot mistake it for an opaque
+    /// one. It keeps the priority flag of its cell all the same, because that
+    /// decision is not the only one the flag answers: genvdp.txt section 16
+    /// shows at normal intensity "all other graphics elements in the region
+    /// (usually 8x8) that the tile takes up, regardless of the tile containing
+    /// opaque pixels or not", and the SpritesMind "Shadow/Highlight" thread
+    /// 2692 names carrying the bit of a transparent pixel as the whole fix
+    /// ("I wasn't updating the background priority bit when the color was
+    /// transparent"). #295 is that lift; [`compose::background_level`] is the
+    /// read of it.
     ///
     /// Horizontal scroll: a pixel of the line comes from plane x
     /// `(x - hscroll) & (width * 8 - 1)` of this plane. `hscroll` is
@@ -429,8 +446,10 @@ impl Vdp {
     /// `offset`.
     ///
     /// A pixel of colour 0 draws nothing (genvdp.txt section 12: "A pixel within
-    /// a pattern that uses value zero isn't shown") and is written as a whole zero
-    /// byte; see [`Vdp::render_plane_line`] for why that is a byte and not a flag.
+    /// a pattern that uses value zero isn't shown") and is written without a
+    /// CRAM index; it keeps its cell's priority flag. See
+    /// [`Vdp::render_plane_line`] for why the flag survives where the index
+    /// does not.
     pub(crate) fn fill_cell_run(
         &self,
         base: usize,
@@ -450,7 +469,11 @@ impl Vdp {
         );
         let layer_base = (entry.palette << 4) | (u8::from(entry.priority) << PRIORITY_SHIFT);
         for (pixel, index) in pixels.iter_mut().zip(indices[offset..].iter().copied()) {
-            *pixel = if index == 0 { 0 } else { layer_base | index };
+            *pixel = if index == 0 {
+                u8::from(entry.priority) << PRIORITY_SHIFT
+            } else {
+                layer_base | index
+            };
         }
     }
 }
@@ -718,7 +741,37 @@ mod tests {
         assert_eq!(&out[0..8], &[cram_index(2, 5) | PRIORITY; 8]);
         assert_eq!(
             out[8], 0,
-            "a transparent pixel carries no priority either: it draws nothing"
+            "cell (1,0) is the empty entry: palette 0, priority clear, tile 0"
+        );
+    }
+
+    /// A pixel of colour 0 draws nothing (genvdp.txt section 12: "A pixel
+    /// within a pattern that uses value zero isn't shown"), so it carries no
+    /// CRAM index - but it keeps the priority flag of its cell, because the
+    /// intensity decision of genvdp.txt section 16 reads the planes' priority
+    /// off the layers "regardless of the tile containing opaque pixels or not"
+    /// (#295). The SpritesMind "Shadow/Highlight" thread 2692 names carrying
+    /// that bit as the whole fix: "I wasn't updating the background priority
+    /// bit when the color was transparent". The compositor reads transparency
+    /// off the index bits alone ([`crate::compose::shows`]), so the flag
+    /// cannot put the pixel in front of the mux.
+    #[test]
+    fn a_transparent_pixel_carries_its_cells_priority() {
+        let mut vdp = plane_vdp();
+        put_entry(&mut vdp, PLANE_A_BASE, 0, palette_entry(2, 1) | 0x8000);
+        // Tile 1 is never written, so every row of it is colour 0: the entry's
+        // only word that can reach the layer is its priority flag.
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+
+        assert_eq!(
+            &out[0..8],
+            &[PRIORITY; 8],
+            "no colour, and the cell's priority flag all the same"
+        );
+        assert_eq!(
+            out[8], 0,
+            "cell (1,0) is the empty entry, which has no flag to carry"
         );
     }
 

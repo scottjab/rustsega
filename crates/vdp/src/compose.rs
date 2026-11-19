@@ -24,23 +24,19 @@
 //! does not (M4-19 #97). Interlace mode 2 draws half a frame per field, into every
 //! other row of the frame buffer, which is [`Vdp::display_line`] (M4-20 #98).
 //!
-//! Two oddities of that section are outside the ticket and are not modelled: a
-//! sprite pixel of colour 14 of any palette line shows at normal intensity
-//! whatever its priority is (genvdp.txt's "bug rather than a feature", confirmed
-//! in the SpritesMind thread), and a high priority tile is said to lift the shadow
-//! of the whole 8x8 block it covers even where it is transparent - which the layer
-//! buffers of [`crate::planes`] cannot say, as a pixel they draw nothing at is a
-//! whole zero byte, priority and all. Both are for the M6 test-ROM triage.
+//! The intensity the planes set reaches every element of the position they
+//! cover, whatever shows there: a plane layer pixel carries its cell's priority
+//! flag whether or not its colour draws ([`crate::planes`], #295), so a high
+//! priority transparent tile lifts the whole 8x8 block it takes up - the
+//! backdrop, the other plane and any sprite under it - to normal (genvdp.txt
+//! section 16, the Ranger-X paragraph). A sprite pixel of colour 14 of palettes
+//! 0-2 is drawn at normal intensity whatever its own priority is, genvdp.txt's
+//! "bug rather than a feature"; the sprite operators and a sprite's own bit are
+//! [`compose_pixel`]'s.
 
 use crate::color::Intensity;
-use crate::planes::{self, Plane};
+use crate::planes::{self, CRAM_INDEX_MASK, Plane};
 use crate::{CRAM_WORDS, Vdp, WIDTH_H40};
-
-/// Bits 5-0 of a layer pixel: its CRAM index, `palette * 16 + colour`
-/// (genvdp.txt section 9's 64 words). Bit 6 is the priority flag of
-/// [`planes::PRIORITY_SHIFT`], so a layer pixel becomes a CRAM index by masking
-/// this off.
-const CRAM_INDEX_MASK: u8 = CRAM_WORDS as u8 - 1;
 
 /// The sprite pixel that is not a colour but a word about the pixel under it:
 /// palette 3 colour 14, which raises that pixel one step - the shadow of a plane
@@ -83,13 +79,16 @@ enum Layer {
     Sprite,
 }
 
-/// True for a layer pixel that draws: the three layer buffers write a pixel that
-/// shows nothing as a whole zero byte, so colour 0 of a palette (genvdp.txt
-/// section 12: "A pixel within a pattern that uses value zero isn't shown") and a
-/// pixel no layer covers are the same value, and both let the layer under through.
+/// True for a layer pixel that draws. A pixel that draws nothing is written
+/// without a CRAM index - colour 0 of any palette is not shown (genvdp.txt
+/// section 12: "A pixel within a pattern that uses value zero isn't shown")
+/// and a pixel no layer covers is zero outright - so the index bits of
+/// [`planes::CRAM_INDEX_MASK`] decide, and the priority flag a transparent
+/// plane pixel carries for genvdp.txt section 16's 8x8 lift (#295) cannot put
+/// it in front of the chain.
 #[inline]
 fn shows(pixel: u8) -> bool {
-    pixel != 0
+    pixel & CRAM_INDEX_MASK != 0
 }
 
 /// True for a layer pixel with the priority flag of [`planes::PRIORITY_SHIFT`]:
@@ -125,9 +124,18 @@ fn top_layer(plane_b: u8, plane_a: u8, sprite: u8) -> Layer {
 
 /// The intensity of the background of one position, which is the whole of the
 /// plane half of genvdp.txt section 16: "Background tiles are shown at half
-/// intensity, or at normal intensity if their priority bit is set", which the
-/// SpritesMind thread that settled the mode has as "if any layer is high priority,
-/// default to normal, otherwise default to shadowed".
+/// intensity, or at normal intensity if their priority bit is set".
+///
+/// The mode is read off the two plane layers before the colour mux, priority
+/// bit included where a pixel draws nothing: the hardware-verified
+/// implementation of the SpritesMind "Shadow/Highlight" thread 2692 computes
+/// it as `uint mode = a.priority || b.priority;` off the layer outputs, and
+/// names carrying the bit of a transparent pixel as the whole fix ("I wasn't
+/// updating the background priority bit when the color was transparent"). The
+/// layers now carry it ([`crate::planes`]), so this is that line, and the
+/// Ranger-X paragraph of genvdp.txt section 16 falls out of it: a column of
+/// high priority transparent plane A tiles has "the plane B tiles that scroll
+/// behind it ... shown at normal intensity".
 ///
 /// A [`Layer::Backdrop`] is under this too, and shadowed with the planes: "The
 /// backdrop is shown at half intensity". Only the planes speak: a sprite's own
@@ -185,6 +193,15 @@ fn compose_pixel(
     match (shadow_highlight, sprite & CRAM_INDEX_MASK) {
         (true, HIGHLIGHT_OPERATOR) => (top_layer(plane_b, plane_a, 0), raise(level)),
         (true, SHADOW_OPERATOR) => (top_layer(plane_b, plane_a, 0), Intensity::Shadow),
+        // Palette 3 colour 14 is the operator above; the other three palettes'
+        // colour 14 draws at normal whatever its priority: "Colors 0Eh, 1Eh,
+        // 2Eh, are always shown at normal intensity regardless of priority.
+        // I'd say this a bug rather than a feature" (genvdp.txt section 16).
+        // The thread confirms it is sprites-only ("Yes, it only affects
+        // sprites, BGs work normally") and lists them as `case 0x0e: case
+        // 0x1e: case 0x2e: mode = 1` in the same implementation the mode
+        // above is quoted from.
+        (true, index) if index & 0x0F == 14 => (Layer::Sprite, Intensity::Normal),
         _ => (
             Layer::Sprite,
             if high(sprite) {
@@ -1213,6 +1230,122 @@ mod tests {
         );
     }
 
+    /// A transparent tile still speaks for the whole 8x8 block it takes up:
+    /// genvdp.txt section 16, the Ranger-X case - "A column in plane A uses high
+    /// priority transparent tiles. The result is that any sprites passing within
+    /// that column, as well as the plane B tiles that scroll behind it, are all
+    /// shown at normal intensity." The SpritesMind "Shadow/Highlight" thread
+    /// 2692 names carrying the bit of a transparent pixel as the whole trick
+    /// ("I wasn't updating the background priority bit when the color was
+    /// transparent"), which is what [`crate::planes`] now writes and what the
+    /// mode decision reads before the mux.
+    #[test]
+    fn a_transparent_high_priority_tile_lifts_its_whole_8x8_block() {
+        let mut vdp = shadow_vdp();
+        shadow_background(&mut vdp, false);
+        // Cell (0,0) names tile 0, which nothing has written: every pixel of it
+        // is colour 0, and the only thing the cell can say is its priority.
+        put_entry(&mut vdp, PLANE_A_BASE, 0, entry(PLANE_A, 0, true));
+
+        vdp.render_line(0);
+
+        let lifted = pixel_at((PLANE_B << 4) | COLOUR, Intensity::Normal);
+        let shadowed = pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow);
+        let line = row(&vdp, 0);
+        assert!(
+            line[..8].iter().all(|&p| p == lifted),
+            "the transparent cell's priority lifts the plane B under it"
+        );
+        assert!(
+            line[8..].iter().all(|&p| p == shadowed),
+            "and only the cell's own 8x8 block, not the line"
+        );
+
+        // The block is 8x8: its last line is lifted with its first, and the cell
+        // row under it - the empty entry, priority clear - is not.
+        vdp.render_line(7);
+        assert!(
+            row(&vdp, 7)[..8].iter().all(|&p| p == lifted),
+            "row 7 is still inside the cell"
+        );
+        vdp.render_line(8);
+        assert!(
+            row(&vdp, 8)[..8].iter().all(|&p| p == shadowed),
+            "row 8 is the next cell row, which has no priority anywhere"
+        );
+    }
+
+    /// The same transparent tile with the bit clear leaves the shadow exactly as
+    /// it found it: the priority flag is the whole of the lift.
+    #[test]
+    fn a_transparent_low_priority_tile_leaves_the_block_shadowed() {
+        let mut vdp = shadow_vdp();
+        shadow_background(&mut vdp, false);
+        put_entry(&mut vdp, PLANE_A_BASE, 0, entry(PLANE_A, 0, false));
+
+        vdp.render_line(0);
+
+        let shadowed = pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow);
+        assert!(
+            row(&vdp, 0).iter().all(|&p| p == shadowed),
+            "a transparent tile without the bit neither lifts nor draws"
+        );
+    }
+
+    /// genvdp.txt section 16, Backdrop: "If a background tile has high priority,
+    /// then the corresponding 8x8 block of the backdrop color will be shown at
+    /// normal intensity. It does not matter if the background tile is fully
+    /// opaque or not" - so a transparent one lifts the backdrop of its block.
+    #[test]
+    fn a_transparent_high_priority_tile_lifts_the_backdrop_of_its_block() {
+        let mut vdp = shadow_vdp();
+        // No plane B and no plane A entries anywhere but cell (0,0), which names
+        // the unwritten tile 0: the block shows the backdrop and nothing else.
+        put_entry(&mut vdp, PLANE_A_BASE, 0, entry(PLANE_A, 0, true));
+
+        vdp.render_line(0);
+
+        let line = row(&vdp, 0);
+        let lifted = pixel_at(BACKDROP, Intensity::Normal);
+        let shadowed = pixel_at(BACKDROP, Intensity::Shadow);
+        assert!(
+            line[..8].iter().all(|&p| p == lifted),
+            "the backdrop of the block is normal, the tile being fully transparent"
+        );
+        assert!(
+            line[8..].iter().all(|&p| p == shadowed),
+            "and the rest of the line is still the shadowed backdrop"
+        );
+    }
+
+    /// The lift reaches the sprites a transparent column lets through: a low
+    /// priority sprite under a transparent high priority tile shows at normal,
+    /// where [`a_sprite_takes_its_intensity_from_its_own_priority`] pins the
+    /// same sprite over an unlifted background at shadow. This is the sprite
+    /// half of the Ranger-X sentence quoted above.
+    #[test]
+    fn a_low_priority_sprite_under_a_transparent_high_priority_tile_is_normal() {
+        let mut vdp = shadow_vdp();
+        shadow_background(&mut vdp, false);
+        put_entry(&mut vdp, PLANE_A_BASE, 0, entry(PLANE_A, 0, true));
+        sprite_over(&mut vdp, COLOUR, false);
+
+        vdp.render_line(0);
+
+        let line = row(&vdp, 0);
+        let sprite = pixel_at((SPRITE << 4) | COLOUR, Intensity::Normal);
+        assert!(
+            line[..8].iter().all(|&p| p == sprite),
+            "the sprite's own bit is clear, but the transparent tile above it is not"
+        );
+        assert!(
+            line[8..]
+                .iter()
+                .all(|&p| p == pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow)),
+            "and the lift is the cell's, not the sprite's"
+        );
+    }
+
     /// A shadow operator over a shadowed background is that background still
     /// shadowed, and a highlight operator lifts it one step: "shadow + shadow =
     /// shadow" and "shadow + highlight = normal" (SpritesMind "Shadow/Highlight"
@@ -1338,6 +1471,44 @@ mod tests {
         }
     }
 
+    /// Sprite colour 14 of palettes 0, 1 and 2 is drawn at normal intensity
+    /// whatever its priority: "Colors 0Eh, 1Eh, 2Eh, are always shown at normal
+    /// intensity regardless of priority. I'd say this a bug rather than a
+    /// feature" (genvdp.txt section 16). The SpritesMind thread confirms it is
+    /// sprites-only ("Yes, it only affects sprites, BGs work normally") and its
+    /// implementation lists the three colours as `case 0x0e: case 0x1e:
+    /// case 0x2e: mode = 1`; palette 3 colour 14 is [`HIGHLIGHT_OPERATOR`] and
+    /// matched before this rule ever applies.
+    #[test]
+    fn a_sprite_colour_14_of_a_background_palette_shows_at_normal() {
+        for palette in [0u8, 2] {
+            for priority in [false, true] {
+                let mut vdp = shadow_vdp();
+                shadow_background(&mut vdp, false);
+                let index = (palette << 4) | HIGHLIGHT;
+                vdp.cram[usize::from(index)] = 0x0EEE;
+                solid(&mut vdp, SPRITE_TILE, HIGHLIGHT);
+                put_sprite(&mut vdp, 0, 0, 0, entry(palette, SPRITE_TILE, priority));
+
+                vdp.render_line(0);
+
+                let line = row(&vdp, 0);
+                assert!(
+                    line[..8]
+                        .iter()
+                        .all(|&p| p == color(0x0EEE, Intensity::Normal)),
+                    "palette {palette} colour 14, priority {priority}: normal whatever the mode says"
+                );
+                assert!(
+                    line[8..]
+                        .iter()
+                        .all(|&p| p == pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow)),
+                    "and the colour does not lift the planes behind it"
+                );
+            }
+        }
+    }
+
     /// R12 bit 3 clear: the two operator entries of the sprite palette are
     /// colours like any other, drawn where the sprite draws them.
     #[test]
@@ -1357,6 +1528,43 @@ mod tests {
                 "CRAM entry {index:#04x} of a display with no shadow/highlight is its own colour"
             );
         }
+    }
+
+    /// genvdp.txt section 13 "Window": "In terms of priority and intensity
+    /// calculation for shadow / hilight mode, plane W is treated _exactly_ the
+    /// same as plane A", so a transparent high priority window cell lifts its
+    /// block the way [`a_transparent_high_priority_tile_lifts_its_whole_8x8_block`]
+    /// watches a plane A one do. The fetch is the one all three name tables
+    /// share; this pins the window half of it end to end.
+    #[test]
+    fn a_transparent_high_priority_window_cell_lifts_its_block() {
+        let mut vdp = shadow_vdp();
+        solid(&mut vdp, 1, COLOUR);
+        for cell in 0..PLANE_COLUMNS * PLANE_ROWS {
+            put_entry(&mut vdp, PLANE_B_BASE, cell, entry(PLANE_B, 1, false));
+        }
+        for cell in 0..WINDOW_CELLS_H32 * PLANE_ROWS {
+            put_entry(&mut vdp, WINDOW_BASE, cell, entry(0, 0, true));
+        }
+        // R17: window on the right of x = 8 x 16 = 128; R18: no vertical band.
+        vdp.write_register(3, WINDOW_REG);
+        vdp.write_register(17, 0x80 | 8);
+        vdp.write_register(18, 0x00);
+
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
+        vdp.render_line(0);
+
+        let line = row(&vdp, 0);
+        let shadowed = pixel_at((PLANE_B << 4) | COLOUR, Intensity::Shadow);
+        let lifted = pixel_at((PLANE_B << 4) | COLOUR, Intensity::Normal);
+        assert!(
+            line[..128].iter().all(|&p| p == shadowed),
+            "left of the window only plane B is opaque, and nothing lifts it"
+        );
+        assert!(
+            line[128..].iter().all(|&p| p == lifted),
+            "the window's transparent cells carry the bit all the same"
+        );
     }
 
     // ---------------------------------------------------------------------
