@@ -48,38 +48,79 @@ pub(crate) const PIXELS_H40: u32 = 420;
 
 /// The H40 line as runs of `(pixels, master clocks each)`.
 ///
-/// The 420 pixels of an H40 line are not all the same width in time. "Two
-/// internal pixel clocks: MCLK/10 (slow) and MCLK/8 (fast)", and across the
-/// HSYNC region "HSYNC uses the pattern 1 fast, 7 slow, 2 medium, 7 slow", the
-/// medium being MCLK/9 ("Megadrive VDP H40 timing", nesdev forum thread 20410).
-/// One pass of that pattern is 17 pixels of 8 + 70 + 18 + 70 = 166 master
-/// clocks, so two of them are the 332-clock HSYNC block of
-/// "((30+13+320+14+9)*8)+332=3420" ("VDP FIFO and DMA questions", SpritesMind
-/// gendev thread 3221), and the remaining 386 pixels of the line run on 8.
+/// The 420 pixels of an H40 line are not all the same width in time. "There are
+/// two pixel clock frequencies used in MD : MCLK / 10 (slow pixels) and MCLK /
+/// 8 (fast pixels)", and in H40 the VDP runs on the external pixel clock,
+/// "EDCLK ... which uses fast pixel timing outside HSYNC and pattern of 1 fast,
+/// 7 slow, 2 medium, 7 slow during HSYNC. Medium pixels last 9 x MCLK cycles"
+/// (TmEE's MD video timings, posted in person to both "Megadrive VDP H40
+/// timing", nesdev forum thread 20410, and "VDP FIFO and DMA questions",
+/// SpritesMind gendev thread 3221). One pass of that pattern is 17 pixels of
+/// 8 + 70 + 18 + 70 = 166 master clocks, so two of them are the 332-clock sync
+/// block of TmEE's own arithmetic, "8+8+(4*9)+((4*7)*10)=16+36+280=332", and
+/// the remaining 386 pixels of the line run on 8:
+/// "((30+13+320+14+9)*8)+332=3420".
 ///
-/// Read as a per-line total that is 2 + 386 = 388 pixels at 8 clocks, 4 at 9 and
-/// 28 at 10, for 3104 + 36 + 280 = 3420 clocks over 420 pixels: nesdev 20410's
-/// own table ("H320: slow 28, medium 4, fast 388"). The ticket this clock was
-/// written from says "most pixels 8 mclk, the HSYNC region uses 10 mclk pixels"
-/// and so misses the MCLK/9 step; without those four pixels of nine the line is
-/// 3416 clocks and does not close on [`MCLKS_PER_LINE`] at all.
+/// Read as a per-line total that is 2 + 386 = 388 pixels at 8 clocks, 4 at 9
+/// and 28 at 10, for 3104 + 36 + 280 = 3420 clocks over 420 pixels: TmEE's
+/// bucket table (thread 3221, "VDP pixels and MCLK cycles per full line") gives
+/// H320 as slow 28, medium 4, fast 388 - a table that is his alone, not
+/// nesdev 20410's, whose excerpt of the same doc carries the pattern sentence
+/// but not the table. The ticket this clock was written from says "most pixels
+/// 8 mclk, the HSYNC region uses 10 mclk pixels" and so misses the MCLK/9
+/// step; without those four pixels of nine the line is 3416 clocks and does
+/// not close on [`MCLKS_PER_LINE`] at all, and at 10 clocks each it is 3424.
+///
+/// The pattern describes EDCLK, and H40 *is* EDCLK on real hardware: R12 bit 7
+/// "switches the VDP to use the EDCLK signal to drive the serial clock" (Mask
+/// of Destiny, SpritesMind gendev thread 1291) and "When running in H40 mode,
+/// SC is equivalent to EDCLK" (Nemesis, thread 851), so the pattern is what
+/// a console clocks an H40 line with. TmEE's H256 column (342 slow pixels,
+/// 3420 cycles) is the H32 clock this module keeps as [`MCLKS_PER_PIXEL_H32`];
+/// his H320F column is the internal-clock H40, all 8s over 3360 clocks, which
+/// is the configuration games do not run.
 ///
 /// # Phase
 ///
-/// That the slow block *starts* the line is INFERRED. t=3221 gives the line
-/// composition as "HSYNC 34, left blanking 30, left border 13, active 320, right
-/// border 14, right blanking 9", listing HSYNC first, and the scope measurement
-/// agrees: "in H40 mode the VDP slows down its clock for a number of cycles
-/// during HBlank (32 pixel clocks according to my oscilloscope tests) - starting
-/// 24 pixels after the right edge" (plutiedev, "SEGA Mega Drive / Genesis
-/// hardware notes", kabuto mirror). The right edge of the 320-pixel window is
-/// pixel 397 of this line, and 397 + 24 is 421 - one past the end of the line,
-/// which is pixel 1: the first of the slow runs, straight after the single fast
-/// pixel that opens the pattern.
+/// The slow block sits at the head of the line, wrapping the line boundary,
+/// and four independent readings agree:
 ///
-/// TODO(#300): confirm on hardware where in the line the slow block sits, and
-/// where its four MCLK/9 pixels fall. The counts are firm, being what makes the
-/// line 3420 clocks; the phase is what is inferred.
+/// * The line composition lists HSYNC first: "HSYNC 34, left blanking 30, left
+///   border 13, active 320, right border 14, right blanking 9" (TmEE, thread
+///   3221), and his sync-period pixel strings draw the block as
+///   `8aaaaaaa99aaaaaaa8aaaaaaa99aaaaaaa` - the pattern twice, each pass
+///   opening on a fast pixel (`8` fast, `a` slow, `9` medium).
+/// * kabuto's oscilloscope: "in H40 mode the VDP slows down its clock for a
+///   number of cycles during HBlank (32 pixel clocks according to my
+///   oscilloscope tests) - starting 24 pixels after the right edge (or 10
+///   after the last rendered pixel), so doesn't affect visible pixels. It's
+///   just the actual hsync/colour-burst area that seems to be affected"
+///   (plutiedev, "SEGA Mega Drive / Genesis hardware notes", kabuto mirror).
+///   Counted from the right edge of the 320-pixel window (after pixel 396),
+///   24 border-and-blanking pixels land on position 420, the first pixel of
+///   the line, and the 32 slow clocks are the block's 28 slow plus 4 medium
+///   pixels - the two fast ones of the pattern sit inside that span.
+/// * TascoDLX's FIFO-gap arithmetic puts HSYNC inside the wrap between the
+///   lines' last free slot and the next line's first: "the largest gap is
+///   actually 26 slots, and half of that is during H-sync with the overall
+///   slower clock" (SpritesMind gendev thread 851).
+/// * Mask of Destiny's SC capture: "SC slows down while !HSYNC is low in
+///   40-cell mode ... mostly MCLK/5 during this period with a few cycles of
+///   MCLK/4" (thread 1291) - mostly 10-clock pixels with a few 8s, the
+///   pattern's own proportions.
+///
+/// No source puts the block anywhere else in the line. The two single fast
+/// pixels of the pattern are below the scope's resolution: kabuto's start
+/// position is ±1 pixel, exactly the width of the fast pixel that opens the
+/// block, and he flags the open-drain HSYNC's soft edge as uncertainty in the
+/// same breath. What no source pins is the anchor - which HV-counter reading
+/// master clock 0, and so pixel 0, falls on relative to the sync edge. That is
+/// #301's residue too, and the decisive experiment is the one written up
+/// there: an HV-counter latch (R0 M3) at a known point of the line against a
+/// vsync-anchored scope trace. The block's position and its four medium
+/// pixels are cited above - the mediums sit at pixels 8, 9, 25 and 26, the
+/// third and fourth characters of each pass - so TODO(#300) narrows to that
+/// one anchor.
 const H40_CLOCK_RUNS: [(u32, u32); 9] = [
     (1, 8),
     (7, 10),
@@ -527,8 +568,9 @@ mod tests {
 
     /// The mix of pixel widths #100 asks for: "most pixels 8 mclk, the HSYNC
     /// region uses 10 mclk pixels". The 10 is right and the ticket is short a
-    /// bucket - nesdev 20410 measures 388 of 8, 4 of 9 and 28 of 10, and the line
-    /// does not reach [`MCLKS_PER_LINE`] without the four of nine.
+    /// bucket - TmEE's bucket table (SpritesMind gendev thread 3221) measures
+    /// 388 of 8, 4 of 9 and 28 of 10, and the line does not reach
+    /// [`MCLKS_PER_LINE`] without the four of nine.
     #[test]
     fn the_h40_line_is_388_pixels_of_eight_four_of_nine_and_twenty_eight_of_ten() {
         let mut widths = [0u32; 11];
@@ -543,6 +585,80 @@ mod tests {
             widths[8] + widths[9] + widths[10],
             PIXELS_H40,
             "and nothing else in the line"
+        );
+    }
+
+    /// The sync block is the pattern twice, opening the line, pixel for pixel.
+    /// TmEE's sync-period string is `8aaaaaaa99aaaaaaa8aaaaaaa99aaaaaaa` (8
+    /// fast, a slow, 9 medium; SpritesMind gendev thread 3221), the composition
+    /// lists "HSYNC 34" first, kabuto's scope puts the slowdown "24 pixels after
+    /// the right edge" - the first pixel of the line - and Mask of Destiny's SC
+    /// capture sees "mostly MCLK/5 ... with a few cycles of MCLK/4" while
+    /// !HSYNC is low. Pinned literally, so that rearranging the runs has to
+    /// confront the pattern rather than just the arithmetic.
+    #[test]
+    fn the_sync_block_is_the_pattern_twice_at_the_head_of_the_line() {
+        // One character per pixel of the 34-pixel block, straight from the
+        // source string.
+        let pattern = "8aaaaaaa99aaaaaaa8aaaaaaa99aaaaaaa";
+        assert_eq!(pattern.len(), 34);
+        for (pixel, c) in pattern.chars().enumerate() {
+            let width = pixel_to_mclk(pixel as u32 + 1, true) - pixel_to_mclk(pixel as u32, true);
+            let expected = match c {
+                '8' => 8,
+                '9' => 9,
+                'a' => 10,
+                _ => unreachable!("only 8, 9 and a are in the pattern"),
+            };
+            assert_eq!(width, expected, "pixel {pixel} is a '{c}' pixel");
+        }
+        // And everything after the block is fast.
+        for pixel in 34..PIXELS_H40 {
+            assert_eq!(
+                pixel_to_mclk(pixel + 1, true) - pixel_to_mclk(pixel, true),
+                8,
+                "pixel {pixel} is outside the sync block and runs at 8"
+            );
+        }
+    }
+
+    /// TmEE's own arithmetic pins the block width and the line total, and his
+    /// bucket table pins the four medium pixels: "8+8+(4*9)+((4*7)*10) =
+    /// 16+36+280=332" then "((30+13+320+14+9)*8)+332=3420", with H320 reading
+    /// slow 28, medium 4, fast 388 (SpritesMind gendev thread 3221, "VDP pixels
+    /// and MCLK cycles per full line"). The mediums sit where the pattern puts
+    /// them - the third and fourth characters of each pass, pixels 8, 9, 25 and
+    /// 26 - and no other split closes the line: at 10 clocks each the block is
+    /// 336 and the line 3424, four past [`MCLKS_PER_LINE`].
+    #[test]
+    fn tmees_arithmetic_pins_the_block_and_its_four_medium_pixels() {
+        let block = 8 + 8 + (4 * 9) + ((4 * 7) * 10);
+        assert_eq!(block, 332);
+        assert_eq!((30 + 13 + 320 + 14 + 9) * 8 + block, MCLKS_PER_LINE);
+        assert_eq!(
+            pixel_to_mclk(34, true),
+            332,
+            "the block is the first 332 clocks"
+        );
+
+        let mediums: Vec<u32> = (0..PIXELS_H40)
+            .filter(|&p| {
+                let width = pixel_to_mclk(p + 1, true) - pixel_to_mclk(p, true);
+                width == 9
+            })
+            .collect();
+        assert_eq!(mediums, [8, 9, 25, 26]);
+
+        // The no-medium alternative (nesdev 20410's "30 are 10 master clocks
+        // long and the other 390 are 8") also totals 3420 - 390*8 + 30*10 - so
+        // the closure alone does not decide the split; TmEE's measured pattern
+        // does. What closure alone does decide is medium-as-10:
+        let mediums_as_ten = 2 * 8 + 28 * 10 + 4 * 10;
+        assert_eq!(mediums_as_ten, 336);
+        assert_eq!(
+            (PIXELS_H40 - 34) * 8 + mediums_as_ten,
+            3424,
+            "four clocks past the line, and MCLKS_PER_LINE has no give"
         );
     }
 
