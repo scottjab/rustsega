@@ -32,10 +32,11 @@
 //! triangle on one side and the four one-shot holds on the other. The output of
 //! [`Envelope::output`] may then be the mirror of the envelope's own attenuation
 //! about [`SSG_HALF`], which is why the channel reads its envelope there and not
-//! the field. What is not modelled is the phase-generator reset the chip asks
-//! for at the same moment in the two non-holding modes - Nuked-OPN2's
-//! `eg_ssg_pgrst_latch` - because the envelopes cannot reach the phase generator
-//! from here; the follow-up issue filed with this PR covers it.
+//! the field. In the two modes that restart, 8 and 12, the same halfway point
+//! also resets the phase generator of the operator, so the saw they draw is
+//! phase-coherent from one swing to the next: [`EnvelopeGen::ssg_pg_resets`] is
+//! that request, handed to [`crate::phase::PhaseGen::tick`] by
+//! [`crate::Ym2612::clock`] (#337).
 
 use crate::phase::{self, CHANNELS, PhaseGen, SLOTS};
 use crate::regs::{
@@ -451,7 +452,9 @@ impl Envelope {
     /// rows that restart are its `eg_ssg_repeat_latch`, `(ssg_eg & 0x01) == 0`,
     /// and the mirror is its `direction ^= 1` and `direction = 1`. A repeat is a
     /// key on of the envelope, so the key state gates the lot: a released
-    /// envelope has no attack to go back to.
+    /// envelope has no attack to go back to. The two rows that restart are also
+    /// where the phase-generator reset of [`EnvelopeGen::ssg_pg_resets`] comes
+    /// from - Nuked derives both from the same halfway condition.
     fn ssg_restarting(&mut self) -> bool {
         if !self.ssg_enabled() || !self.key_on || self.att < SSG_HALF {
             return false;
@@ -461,6 +464,26 @@ impl Envelope {
             self.ssg_direction = if hold { true } else { !self.ssg_direction };
         }
         !hold
+    }
+
+    /// The SSG-EG phase-generator reset of the two `&90` restart modes, the
+    /// `eg_ssg_pgrst_latch` of Nuked-OPN2's ym3438.c
+    /// (https://github.com/nukeykt/Nuked-OPN2): with the SSG-EG enabled and
+    /// both the alternate and the hold bit clear - modes 8 and 12, the ones
+    /// whose envelope goes back to its attack at [`SSG_HALF`] - a level at or
+    /// past [`SSG_HALF`] asks for the operator's phase generator to be reset.
+    /// `OPN2_EnvelopeSSGEG` recomputes the latch every pass from the level the
+    /// ADSR step is about to consume, `eg_ssg_pgrst_latch[slot] = 1` for
+    /// `(ssg_eg & 0x03) == 0x00` under the enable bit and `eg_level & 0x200`,
+    /// and `OPN2_EnvelopeADSR` spends it as
+    /// `pg_reset[slot] = (nkon && !okon) || eg_ssg_pgrst_latch[slot]`, where
+    /// the `nkon && !okon` half is the key-on reset [`PhaseGen`] already does
+    /// at the `&28` write. `OPN2_PhaseGenerate` answers by zeroing the phase
+    /// and masking the increment for as long as the reset stands, which is why
+    /// a mode 8 or 12 saw starts every swing where it started the last one
+    /// (#337).
+    fn ssg_pg_reset(&self) -> bool {
+        self.ssg_enabled() && self.ssg_eg & (SSG_ALTERNATE | SSG_HOLD) == 0 && self.att >= SSG_HALF
     }
 
     /// The two `&90` modes that hold at full level rather than going silent: the
@@ -673,6 +696,25 @@ impl EnvelopeGen {
     /// [`phase::SLOT_S1`] and friends.
     pub(crate) fn envelope(&self, channel: usize, slot: usize) -> &Envelope {
         &self.envelopes[channel][slot]
+    }
+
+    /// The 24 SSG-EG phase-generator resets, `[channel][slot]`: each
+    /// operator's [`Envelope::ssg_pg_reset`], the `eg_ssg_pgrst_latch` of
+    /// Nuked-OPN2's ym3438.c, sampled off the envelopes as they stand. The
+    /// level does not move between envelope updates, so what the chip walks its
+    /// slots against - a latch recomputed every pass from the current level -
+    /// is the same signal read here every sample. [`crate::Ym2612::clock`]
+    /// hands it to [`PhaseGen::tick`], which holds a pinned counter at 0
+    /// instead of counting, in the same pass the envelope restart runs in
+    /// (#337).
+    pub(crate) fn ssg_pg_resets(&self) -> [[bool; SLOTS]; CHANNELS] {
+        let mut resets = [[false; SLOTS]; CHANNELS];
+        for (channel, resets) in resets.iter_mut().enumerate() {
+            for (slot, reset) in resets.iter_mut().enumerate() {
+                *reset = self.envelopes[channel][slot].ssg_pg_reset();
+            }
+        }
+        resets
     }
 }
 
@@ -1357,5 +1399,30 @@ mod tests {
             eg.envelopes[0][SLOT_S4].ssg_eg, 0,
             "`&93` is the undecoded fourth channel of the group"
         );
+    }
+
+    #[test]
+    fn ssg_pg_reset_is_the_two_restart_modes_at_the_halfway_point() {
+        // Nuked-OPN2's `OPN2_EnvelopeSSGEG` sets `eg_ssg_pgrst_latch` for
+        // `(ssg_eg & 0x03) == 0` under the enable bit, while
+        // `eg_level & 0x200`: modes 8 and 12 at or past the halfway point and
+        // nothing else - not the hold and alternate modes, and not 0 or 4,
+        // whose low bits are clear but whose SSG-EG is off.
+        for mode in 0..=0x0F {
+            let mut envelope = Envelope::new();
+            envelope.ssg_eg = mode;
+            envelope.att = SSG_HALF;
+            let restart = mode & SSG_ENABLE != 0 && mode & (SSG_ALTERNATE | SSG_HOLD) == 0;
+            assert_eq!(
+                envelope.ssg_pg_reset(),
+                restart,
+                "mode {mode:#04x} at the halfway point"
+            );
+            envelope.att = SSG_HALF - 1;
+            assert!(
+                !envelope.ssg_pg_reset(),
+                "mode {mode:#04x} short of the halfway point"
+            );
+        }
     }
 }

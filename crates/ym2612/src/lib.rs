@@ -270,7 +270,15 @@ impl Ym2612 {
         self.timers.tick(&config);
         self.csm_step();
         self.lfo.tick();
-        self.phases.tick(self.lfo.pms(), self.lfo.pm_phase());
+        // The SSG-EG restart latch of #337, sampled off the envelopes as they
+        // stand: the level the envelope update of this sample is about to
+        // consume, which is the level Nuked-OPN2's `OPN2_EnvelopeSSGEG` latches
+        // on. Spending it inside the phase tick puts the reset in the same
+        // pass as the restart, where the die puts it
+        // ([`EnvelopeGen::ssg_pg_resets`]).
+        let ssg_pg_reset = self.envelopes.ssg_pg_resets();
+        self.phases
+            .tick(&ssg_pg_reset, self.lfo.pms(), self.lfo.pm_phase());
         self.envelopes.tick(&self.phases);
 
         for channel in 0..CHANNELS {
@@ -1002,6 +1010,159 @@ mod tests {
 
         clock_for(&mut chip, 3 * 32);
         assert!(level(&chip) > level_now, "the release is on its way up");
+    }
+
+    /// A one-operator SSG-EG voice on channel 0 operator 1: mul 1 at block 4
+    /// with F-Num 0x469, so the phase increment is a steady
+    /// `(0x469 << 4) >> 1` = 0x2348 a sample; attack and decay 1 at rate 48
+    /// (`&50` 23 and `&60` 23, one step an update at this key code) running
+    /// past D1L 15 (`&80` 0xF0) with decay 2 stopped (`&70` 0); and `&90` set
+    /// to `mode`. The LFO is off, so nothing but the key-on and the SSG-EG
+    /// restart can move the counter.
+    fn ssg_saw(mode: u8) -> Ym2612 {
+        let mut chip = Ym2612::new();
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x30, 0x01);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA4, 0x24);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA0, 0x69);
+        // 23 and not 24: at key code 18 (F-Num 0x469, block 4) the key scale
+        // adds 2, and 2*23 + 2 is the rate 48 whose update points all add one
+        // step - 24 would give rate 50, whose decay overshoots 0x200 in eights
+        // and turns round from 0x204 instead.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x50, 23);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x60, 23);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x70, 0x00);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x80, 0xF0);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x90, mode);
+        chip
+    }
+
+    /// The two restart modes of `&90`, 8 and 12, reset the phase generator
+    /// when the envelope turns round: the chip latches
+    /// `eg_ssg_pgrst_latch` for `(ssg_eg & 0x03) == 0` and spends it as
+    /// `pg_reset[slot] = (nkon && !okon) || eg_ssg_pgrst_latch[slot]`
+    /// (Nuked-OPN2's ym3438.c), so the saw of a mode 8 operator is
+    /// phase-coherent from one swing to the next instead of drifting by
+    /// whatever the increment has counted up to (#337).
+    #[test]
+    fn ssg_restart_modes_reset_the_phase_generator() {
+        for mode in [0x08, 0x0C] {
+            let mut chip = ssg_saw(mode);
+            write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1);
+
+            let state = |chip: &Ym2612| chip.envelopes.envelope(0, phase::SLOT_S1).state();
+            let level = |chip: &Ym2612| chip.envelopes.envelope(0, phase::SLOT_S1).level();
+            let phase = |chip: &Ym2612| operator(chip, 0, phase::SLOT_S1).phase;
+
+            // First swing: the attack from silence hands over to the decay,
+            // and the decay runs to the halfway point and turns round.
+            let mut guard = 0;
+            while state(&chip) != envelope::State::Decay {
+                chip.clock();
+                guard += 1;
+                assert!(guard < 2000, "the attack never reached decay");
+            }
+            guard = 0;
+            while state(&chip) != envelope::State::Attack {
+                chip.clock();
+                guard += 1;
+                assert!(guard < 3000, "the first swing never turned round");
+            }
+
+            // The restart update restarts the attack from the halfway point,
+            // and the phase is parked at 0 for it: the second swing counts
+            // from where the first did, not from wherever the decay had got
+            // to.
+            assert_eq!(
+                level(&chip),
+                0x1DF,
+                "the restart took the first attack step"
+            );
+            assert_eq!(phase(&chip), 0, "the restart pins the phase at 0");
+
+            // Recording the first samples of the new swing, to compare the
+            // next one against.
+            const STEPS: u32 = 64;
+            let mut first_swing = Vec::new();
+            for _ in 0..STEPS {
+                chip.clock();
+                first_swing.push(phase(&chip));
+            }
+
+            // Second swing: the restarted attack runs out, the decay climbs
+            // back to the halfway point, and the envelope turns round again.
+            let mut guard = 0;
+            while state(&chip) != envelope::State::Decay {
+                chip.clock();
+                guard += 1;
+                assert!(guard < 2000, "the restarted attack never reached decay");
+            }
+            guard = 0;
+            while state(&chip) != envelope::State::Attack {
+                chip.clock();
+                guard += 1;
+                assert!(guard < 3000, "the second swing never turned round");
+            }
+
+            assert_eq!(phase(&chip), 0, "the second swing pins the phase at 0 too");
+            let mut second_swing = Vec::new();
+            for _ in 0..STEPS {
+                chip.clock();
+                second_swing.push(phase(&chip));
+            }
+            assert_eq!(
+                first_swing, second_swing,
+                "the second saw starts where the first did"
+            );
+        }
+    }
+
+    /// The holding modes are not restart modes: mode 9 pins nothing, so the
+    /// phase counter free-runs through the swing, the halfway point and the
+    /// hold - `(ssg_eg & 0x03) == 0` is false with the hold bit set.
+    #[test]
+    fn ssg_hold_mode_does_not_reset_the_phase() {
+        let mut chip = ssg_saw(0x09);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1);
+
+        let level = |chip: &Ym2612| chip.envelopes.envelope(0, phase::SLOT_S1).level();
+        let phase = |chip: &Ym2612| operator(chip, 0, phase::SLOT_S1).phase;
+
+        // From the key-on on, sample n is n increments, through the whole
+        // swing and past the halfway point the restart modes reset at.
+        let inc = phase::increment(0x469, 4, 0, 1, 0);
+        assert_eq!(inc, 0x2348);
+        for n in 1..=1600u32 {
+            chip.clock();
+            assert_eq!(phase(&chip), (n * inc) & 0xF_FFFF, "sample {n} free-runs");
+        }
+        assert_eq!(level(&chip), envelope::SILENT, "mode 9 ended at its hold");
+    }
+
+    /// A plain envelope asks for no phase reset of its own: its decay walks
+    /// straight through the 0x200 point the SSG-EG restart modes pin at, on
+    /// its way to the sustain level, and the counter never notices. Only a
+    /// `&28` key-on resets it (`keyon_resets_phase`).
+    #[test]
+    fn plain_envelope_does_not_reset_the_phase() {
+        let mut chip = ssg_saw(0x00);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_S1);
+
+        let level = |chip: &Ym2612| chip.envelopes.envelope(0, phase::SLOT_S1).level();
+        let phase = |chip: &Ym2612| operator(chip, 0, phase::SLOT_S1).phase;
+
+        // Rate 48 without the SSG-EG's x4: one step an update, from 0 to the
+        // D1L 15 sustain level at 31 << 5 = 992. The halfway point goes by
+        // around update 512, unremarked; the loop runs to the sustain state
+        // itself, so it covers the whole attack from silence as well.
+        let inc = phase::increment(0x469, 4, 0, 1, 0);
+        let mut n = 0;
+        while chip.envelopes.envelope(0, phase::SLOT_S1).state() != envelope::State::Sustain {
+            chip.clock();
+            n += 1;
+            assert!(n < 8000, "the plain envelope never reached its sustain");
+            assert_eq!(phase(&chip), (n * inc) & 0xF_FFFF, "sample {n} free-runs");
+        }
+        assert_eq!(level(&chip), 31 << 5, "and the envelope sustains at D1L 15");
     }
 
     /// Register `&B0`'s channel group, and the two frequency registers, named
