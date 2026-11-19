@@ -13,8 +13,12 @@
 //! SpritesMind gendev forum thread 1132 for the behaviour of the Sega
 //! 315-5313 integrated PSG - the part the Genesis carries - where it differs
 //! from a discrete SN76489AN, and to the SMS Power forums threads 17191 and
-//! 13704 for the hardware measurements behind the register write-phase rule
-//! on [`Channel::tick`] (pinned on #321).
+//! 13704 for the hardware measurements behind the register write-phase rules:
+//! tone writes leave the running counter alone ([`Channel::tick`], pinned on
+//! #321), noise writes reload the shift register and leave the shift divider
+//! alone ([`Sn76489::write_noise`], pinned on #323), and nothing ever moves
+//! channel 3's pin back onto its tone generator
+//! ([`Sn76489::noise_connected`], fenced on #323).
 
 // Serialising the chip state for save states (M6-07a, #126). Gated on the
 // crate's `serde` feature so `cargo build --no-default-features` keeps the core
@@ -218,6 +222,11 @@ impl Noise {
     /// Advance the divider by one /16 tick. It flips like a tone channel does,
     /// and the shift register moves on the flip to high only, so a divider
     /// period of N shifts the register once every 2N ticks (#106).
+    ///
+    /// No write path touches the divider: a noise register write reloads the
+    /// shift register only, and the rule and its fence are on
+    /// [`Sn76489::write_noise`]. The divider is its own counter, cleared only
+    /// by the power-on state, like [`Channel::counter`] is.
     fn tick(&mut self, period: u16) {
         if self.counter == 0 {
             self.counter = period - 1;
@@ -285,13 +294,23 @@ pub struct Sn76489 {
     /// channel 3's tone generator. Writing the shared channel 3 register
     /// connects it (SMS Power "SN76489", noise).
     ///
-    /// INFERRED: nothing in the ticket or the retrieved facts says what, if
-    /// anything, disconnects it again, so nothing does - a write that intends
-    /// channel 3's tone period is indistinguishable from one that intends the
-    /// noise control, and this model picks the noise generator for both. The
-    /// chip has one register and two consumers, so the alternative reading is
-    /// that both are mixed. TODO(#106): pin on hardware or on a PSG test ROM,
-    /// filed as #323.
+    /// INFERRED (#323): nothing retrieved says what, if anything, disconnects
+    /// it again, so nothing does - a write that intends channel 3's tone
+    /// period is indistinguishable from one that intends the noise control,
+    /// and the measurement on [`Sn76489::write_noise`] says the chip treats
+    /// every such write as a noise write (it resets the LFSR), so this model
+    /// picks the noise generator for both readings and for the life of the
+    /// chip; until the first such write the pin carries the tone generator.
+    /// The chip has one register and two consumers, so the alternative
+    /// readings are that both are mixed, that the noise generator is connected
+    /// from power-on (its power-on shift register value is unspecified, so
+    /// this model cannot even say what that would output), or that some write
+    /// sequence moves the pin back to the tone generator; nothing measured
+    /// pins any of them. TODO(#323): pin on hardware or on a PSG test ROM
+    /// that plays a channel 3 tone on a chip that has just used noise; a
+    /// capture that reconnects the tone changes this rule through a new
+    /// ticket. Pinned as-is by `channel3_stays_on_the_noise_generator` and
+    /// `channel3_carries_its_tone_generator_until_the_noise_write`.
     noise_connected: bool,
 }
 
@@ -413,10 +432,44 @@ impl Sn76489 {
     /// [`NOISE_RESET`] (#106). Only the low three bits are the register; bit 3
     /// of the nibble is not part of it.
     ///
-    /// INFERRED: neither the ticket nor the retrieved facts say whether a write
-    /// also restarts the shift divider, so the divider keeps running and only
-    /// the register is reloaded. TODO(#106): pin on hardware or on a PSG test
-    /// ROM, filed as #323.
+    /// The reset side effect is measured hardware: "LFSR is reset on each freq
+    /// write to the noise channel, reset value is top bit getting set while
+    /// all others are back to zero. Then depending on chip it takes 14 or 15
+    /// cycles for first output to appear. Tone2 won't have any effect here,
+    /// only writes to noise channel freq register matter" (TmEE, SMS Power
+    /// forums thread 17191, 17 Sep 2018, bench tests of a discrete SN76489AN
+    /// and the Sega VDP PSG - the reply answers exactly the question of
+    /// whether a tone 2 write matters when tone 2 clocks the LFSR, and it does
+    /// not). The SMS Power document states the same reset value: "When the
+    /// noise register is written to, the shift register is reset, such that
+    /// all bits are zero except for the highest bit". The "14 or 15 cycles"
+    /// are shifts: bit 0 first carries a 1 after 15 shifts of the 16-bit Sega
+    /// register (14 for the 15-bit TI one) from that reset value, which is
+    /// what [`NOISE_RESET`] gives.
+    ///
+    /// INFERRED (#323): what the write does to the shift *divider* - the
+    /// counter clocking the LFSR at the shift rate. The measurement names only
+    /// the LFSR reset, so the divider keeps running from its current position:
+    /// a write mid half period leaves the scheduled flip where it was, and a
+    /// shift-rate change governs from the next reload like a tone period
+    /// write does. Nothing measured pins a divider restart, and every
+    /// implementation checked leaves it running: "The only thing that happens
+    /// on a register write is that the noise generator resets its LFSR" (Maxim,
+    /// SMS Power forums thread 13704, 19 Apr 2012); MAME's sn76496 `write()`
+    /// case 6 updates the period value and resets `m_RNG` and never touches
+    /// `m_count[3]`; Genesis Plus GX's psg.c case 6 updates `freqInc[3]` and
+    /// resets the LFSR, though its own choice to also sync `freqCounter[3]`
+    /// to tone 2's when the write selects shift rate 3 is as unmeasured as
+    /// the question itself; the rejunity tt05-psg-sn76489 RTL (an SN76489
+    /// that taped out, decapped in the repo) has `restart_noise` reset only
+    /// the LFSR, the divider counter cleared only by chip reset, and the
+    /// shift rate select is a mux over that counter's bits. The datasheet is
+    /// silent on what a write does to a counter that is already counting,
+    /// as #321 found for the tone counters. TODO(#323): pin by clocking a
+    /// noise write at a known point of a shift period on hardware or a PSG
+    /// test ROM; a capture where the shift schedule moves on the write
+    /// changes this rule through a new ticket. Pinned as-is by
+    /// `noise_write_mid_shift_period_keeps_the_divider_running`.
     fn write_noise(&mut self, control: u8) {
         self.noise.control = control & NOISE_CONTROL_BITS;
         self.noise.lfsr = NOISE_RESET;
@@ -969,5 +1022,170 @@ mod tests {
         assert_eq!(psg.channel_output(3), -VOLUME_TABLE[0]);
         ticks_to_noise_shift(&mut psg);
         assert_eq!(psg.channel_output(3) > 0, psg.noise.lfsr & 1 != 0);
+    }
+
+    // The noise register write's side effects, pinned on #323.
+    //
+    // The measured half: the write resets the shift register, and only noise
+    // register writes do it. Measured on a discrete SN76489AN and the Sega VDP
+    // PSG: "LFSR is reset on each freq write to the noise channel, reset value
+    // is top bit getting set while all others are back to zero. Then depending
+    // on chip it takes 14 or 15 cycles for first output to appear. Tone2 won't
+    // have any effect here, only writes to noise channel freq register matter"
+    // (TmEE, SMS Power forums thread 17191, 17 Sep 2018, answering exactly
+    // this question - whether a tone 2 write matters when tone 2 clocks the
+    // LFSR).
+    //
+    // The inferred half, fenced on [`Sn76489::write_noise`]: the shift divider
+    // is not measured, the model keeps it running, and the tests below are
+    // written so every divider-restart reading fails loudly. Positions are
+    // traced from [`Noise::tick`] with the divider counter and flip bit at
+    // known values before the write.
+    #[test]
+    fn noise_write_mid_shift_period_keeps_the_divider_running() {
+        let mut psg = Sn76489::new();
+        psg.write(volume_latch(3, 0));
+        psg.write(noise_latch(0b010)); // periodic, rate 2: divider period 0x40
+        // The first tick flips the divider high and shifts (the power-on
+        // counter is 0), then 19 decrements leave the counter at 44 with the
+        // flip bit high: 45 ticks into a 128-tick shift interval.
+        for _ in 0..20 {
+            psg.clock();
+        }
+        assert_eq!(psg.noise.counter, 44);
+        assert!(psg.noise.high);
+
+        // Change both the noise mode and the shift rate (2 -> 0, period
+        // 0x40 -> 0x10) mid half period.
+        psg.write(noise_latch(0b100));
+
+        // The write leaves the divider where it was.
+        assert_eq!(
+            psg.noise.counter, 44,
+            "the write may not restart the counter"
+        );
+        assert!(
+            psg.noise.high,
+            "the write may not reset the divider flip bit"
+        );
+
+        // The pre-write counter schedules the low flip at tick 45 and the
+        // shift at tick 61, after which the new period 0x10 governs (32-tick
+        // shift interval). A restart on the write shifts at tick 32 if only
+        // the counter reloads (`period - 1` or `period` both land there,
+        // because the high-to-low flip does not shift) and at tick 16 if the
+        // flip bit resets too. No restart variant produces 61.
+        assert_eq!(
+            ticks_to_noise_shift(&mut psg),
+            61,
+            "reload-only: the write may not move the scheduled shift or add an earlier one"
+        );
+        assert_eq!(
+            ticks_to_noise_shift(&mut psg),
+            32,
+            "the new rate 0 governs after the write"
+        );
+    }
+
+    /// Tone 2 writes do not touch the noise generator even when tone 2 clocks
+    /// the LFSR (shift rate 3), measured: "Tone2 won't have any effect here,
+    /// only writes to noise channel freq register matter" (TmEE, SMS Power
+    /// forums thread 17191, 17 Sep 2018). The shift period still follows tone
+    /// 2 from the next reload (`rate3_follows_tone2`); what this pins is the
+    /// phase: the shift register and the divider come out of the write
+    /// exactly as they went in.
+    #[test]
+    fn tone2_write_keeps_the_noise_phase() {
+        let mut psg = Sn76489::new();
+        set_tone(&mut psg, 2, 8);
+        psg.write(noise_latch(0b011)); // rate 3: divider period follows tone 2
+        for _ in 0..13 {
+            psg.clock();
+        }
+        assert_ne!(
+            psg.noise.lfsr, NOISE_RESET,
+            "the shift register must have run"
+        );
+        assert_ne!(psg.noise.counter, 0, "the divider must be mid half period");
+
+        let (lfsr, counter, high) = (psg.noise.lfsr, psg.noise.counter, psg.noise.high);
+        set_tone(&mut psg, 2, 32);
+
+        assert_eq!(
+            psg.noise.lfsr, lfsr,
+            "a tone 2 write may not reset the shift register"
+        );
+        assert_eq!(
+            psg.noise.counter, counter,
+            "a tone 2 write may not restart the divider"
+        );
+        assert_eq!(
+            psg.noise.high, high,
+            "a tone 2 write may not flip the divider"
+        );
+    }
+
+    /// The one-way connection, pinned as INFERRED on #323 (see
+    /// [`Sn76489::noise_connected`]): after the first noise register write,
+    /// channel 3's pin carries the noise generator for the life of the chip,
+    /// through any further writes to the shared register - a second noise
+    /// write and a data byte under the channel 3 latch, the two writes a
+    /// tone-intending program would make. Tone generator 3 keeps running the
+    /// whole time (period 1, so its flip-flop alternates every tick), which
+    /// is what makes the window discriminate: the output must follow the
+    /// shift register's bit 0, not the tone flip-flop.
+    #[test]
+    fn channel3_stays_on_the_noise_generator() {
+        let mut psg = Sn76489::new();
+        psg.write(volume_latch(3, 0));
+        psg.write(noise_latch(0b001)); // periodic, rate 1; tone period nibble 1
+        psg.write(0x02); // data byte: tone period 0x21, noise control 0b010
+        psg.write(noise_latch(0b001)); // second noise write; the reset value governs below
+
+        let mut disagreements = 0;
+        for _ in 0..128 {
+            psg.clock();
+            let noise = psg.noise.bit();
+            assert_eq!(
+                psg.channel_output(3),
+                psg.channels[3].level(noise),
+                "channel 3 must carry the noise generator, not the tone flip-flop"
+            );
+            if noise != psg.channels[3].high {
+                disagreements += 1;
+            }
+        }
+        assert!(
+            disagreements > 0,
+            "tone and noise agreed for the whole window; the test lost its discriminating power"
+        );
+    }
+
+    /// The other half of the one-way model: until the first noise register
+    /// write, channel 3's pin carries its own tone generator. The tone period
+    /// register is power-on 0, which behaves like period 1 (SpritesMind
+    /// thread 1132, see [`Channel::tick`]), so the output alternates every
+    /// tick; the power-on shift register (which its write would reload, and
+    /// whose bit 0 stays low for its first 15 shifts) would hold the line low
+    /// for hundreds of ticks instead.
+    #[test]
+    fn channel3_carries_its_tone_generator_until_the_noise_write() {
+        let mut psg = Sn76489::new();
+        psg.write(volume_latch(3, 0));
+
+        let mut flips = 0;
+        let mut previous = psg.channel_output(3);
+        for _ in 0..16 {
+            psg.clock();
+            let output = psg.channel_output(3);
+            if output != previous {
+                flips += 1;
+            }
+            previous = output;
+        }
+        assert_eq!(
+            flips, 16,
+            "before any noise write, channel 3 alternates on its tone generator"
+        );
     }
 }
