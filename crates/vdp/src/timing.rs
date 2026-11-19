@@ -309,6 +309,15 @@ impl Vdp {
             // line - see [`Vdp::vint_mclk`].
             self.in_vblank = true;
             self.frame_ready = true;
+            // The end of the frame, for masking mode 2: every sprite walk of the
+            // frame's own active display is behind it (the last one ran at the
+            // latch of the second-to-last line it drew), and the walks that feed
+            // the next frame's lists are all in the blanking that follows. So the
+            // bit clears here and not on line 0: a walk in the blanking parses
+            // for the next frame, and Nemesis's "reset at the end of the frame"
+            // (genvdp.txt section 15, "Sprite masking, mode 2") is the end of the
+            // frame the parsing belongs to. See [`Vdp::mask2_seen_x1`].
+            self.mask2_seen_x1 = false;
             // The frame is over, so the frame buffer's height is sized for the
             // picture it just drew rather than for the next one: see
             // [`Vdp::size_frame_buffer`]. The stride is not sized here, because a

@@ -37,8 +37,9 @@
 //! and the masking a sprite at X = 0 does to the sprites behind it are all here as
 //! of M4-16 (#94), and the 8x16 cells and doubled y origin of interlace mode 2 of
 //! M4-20 (#98) are: [`Vdp::cell_height`] and [`ORIGIN_MODE2`]. Not here is the
-//! priority resolution against the planes, which is M4-17 (#95), nor the X = 1
-//! masking mode 2 of genvdp.txt section 15, which is #292.
+//! priority resolution against the planes, which is M4-17 (#95). Masking mode 2,
+//! the X = 1 of genvdp.txt section 15, is here as of M4-16b (#292):
+//! [`Vdp::mask2_seen_x1`].
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -639,6 +640,14 @@ impl Vdp {
         let mut index = 0u8;
         loop {
             let sprite = sprite_at(&self.vram, &self.sprite_cache, base, usize::from(index));
+            // "This 'mode' is enabled when the VDP first parses a sprite with an X
+            // coordinate of one" (genvdp.txt section 15, "Sprite masking, mode
+            // 2"): this walk is the parse, one line ahead of the drawing, so the
+            // bit is on by the time any line this sprite is on is drawn. See
+            // [`Vdp::mask2_seen_x1`] for the bit and its frame boundary.
+            if sprite.x == 1 {
+                self.mask2_seen_x1 = true;
+            }
             let link = sprite.link;
             searched.push(sprite);
             if link == 0 || searched.count >= limit {
@@ -746,8 +755,24 @@ impl Vdp {
     /// That the mask only bites once a sprite of a non-zero X has been found on the
     /// line before it, or once the line before has run out of dots, is INFERRED from
     /// Nemesis's masking test - genvdp.txt does not cover it, and there is no test
-    /// ROM for it until M6-06. Masking mode 2, the X = 1 of genvdp.txt, is not
-    /// implemented either: it has its own issue, #292.
+    /// ROM for it until M6-06.
+    ///
+    /// Masking mode 2, the X = 1 of genvdp.txt section 15, rides on the same walk:
+    /// "If a sprite has an X coordinate of one, the former rule is invalid. Low
+    /// priority sprites will only be masked if a sprite with an X coordinate of
+    /// zero _also_ has a sprite with an X coordinate of one on the _same_ line",
+    /// while [`Vdp::mask2_seen_x1`] says which frames that sentence of Nemesis's
+    /// source governs. On a frame where no X = 1 has been parsed, mode 1 above is
+    /// the whole rule; on a frame where one has, an X = 0 masks only when an X = 1
+    /// is on the same line - its own line, the row of the walk it would hide - and
+    /// masks nothing on a line that has no X = 1, however well mode 1 would have
+    /// armed it. The list order of the two sprites does not matter, so the X = 1
+    /// question is answered by a pass over the line's sprites before the walk
+    /// starts; both sprites of a mask pair are off the display (screen x -128 and
+    /// -127), so which of them the pass starts from never shows. The parse of the
+    /// line's own X = 1 sprites happens here too, for the lines the beam never
+    /// searched - [`Vdp::search_sprites`] has already set the bit for the rest, and
+    /// an OR of the same sprites cannot disagree with it.
     ///
     /// Collision is d5 of the status register, "Set when any sprites have
     /// non-transparent pixels overlapping one another" (section 6), and it is
@@ -770,11 +795,34 @@ impl Vdp {
             (MAX_SPRITES_LINE_H32, MAX_DOTS_LINE_H32)
         };
         let prev_line_dot_overflow = self.prev_line_dot_overflow;
+        let mode2_seen_x1 = self.mask2_seen_x1;
         let origin_y = self.sprite_y_origin();
         let cell_rows = self.cell_height();
+        // Is an X = 1 sprite on this line? Mode 2 asks it of the sprites the line
+        // draws - row-covering, up to the line's own sprite limit - and of them
+        // alone, so an X = 1 parsed anywhere else in the frame enables the mode
+        // ([`Vdp::mask2_seen_x1`]) without arming this line's mask. The order of
+        // the walk cannot answer it, because an X = 0 may come first, so the line
+        // is read once before it is drawn. In the searched path this is a slice
+        // pass; the live chain of an un-searched line is walked a second time,
+        // which is the path of a `render_line` called directly and costs nothing
+        // that the pipeline pays.
+        let x1_on_line = self.line_sprites().take(max_sprites).any(|sprite| {
+            sprite.x == 1 && {
+                let row = i32::from(line) - (i32::from(sprite.y) - origin_y);
+                let height = (usize::from(sprite.height_cells) * cell_rows) as i32;
+                row >= 0 && row < height
+            }
+        });
         let mut walk = LineWalk::default();
+        // The X = 1 sprites this walk parses, for the bit below: on a searched
+        // line [`Vdp::search_sprites`] set it one line ago, and this re-derives
+        // the same answer; on a line drawn straight from the live chain this is
+        // the parse.
+        let mut parsed_x1 = false;
 
         for sprite in self.line_sprites() {
+            parsed_x1 |= sprite.x == 1;
             // The sprite occupies the lines `y - origin_y` to `y - origin_y` plus
             // its own height, and `row` is which row of that it is drawing. `line`
             // is a line of the picture, so in interlace mode 2 a sprite is twice
@@ -788,7 +836,18 @@ impl Vdp {
                 break;
             };
             if sprite.x == 0 {
-                walk.mask(prev_line_dot_overflow);
+                if x1_on_line {
+                    // Mode 2, the line having both of its sprites: the X = 0 is
+                    // the mask and hides everything after it, as in mode 1 and
+                    // however mode 1 would or would not have armed it.
+                    walk.masked = true;
+                } else if !mode2_seen_x1 {
+                    // Mode 1, no X = 1 parsed this frame.
+                    walk.mask(prev_line_dot_overflow);
+                }
+                // Mode 2 without an X = 1 on the line: "the former rule is
+                // invalid", so the mask arms on nothing - not on a non-zero X
+                // in front of it and not on the dot overflow of the line before.
             } else {
                 walk.x_nonzero = true;
             }
@@ -797,6 +856,9 @@ impl Vdp {
             }
         }
 
+        // The parse of the un-searched lines lands here; see [`Vdp::mask2_seen_x1`]
+        // for the bit and [`Vdp::search_sprites`] for the parse the pipeline runs.
+        self.mask2_seen_x1 |= parsed_x1;
         self.sprite_overflow |= walk.overflow;
         self.sprite_collision |= walk.collision;
         self.prev_line_dot_overflow = walk.dot_overflow;
@@ -2005,6 +2067,149 @@ mod tests {
         assert!(
             vdp.sprite_overflow,
             "the mask is the 21st sprite of the line, and is counted as one"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Sprite masking, mode 2: the X = 1 of genvdp.txt section 15 (M4-16b
+    // #292). The mode is a per-frame bit, set when the VDP parses an X = 1
+    // sprite and cleared at the frame boundary; while it is on, an X = 0
+    // sprite masks only when an X = 1 is on the same line.
+    // ---------------------------------------------------------------------
+
+    /// The end of the frame, the way `timing` draws it: the beam steps off the
+    /// last line of the active display onto the VBlank line, where
+    /// `start_line` raises [`Vdp::frame_ready`]. That line start is the frame
+    /// boundary the per-frame bit of masking mode 2 clears on.
+    fn cross_frame_boundary(vdp: &mut Vdp) {
+        use crate::hv::MCLKS_PER_LINE;
+        vdp.set_position(vdp.active_height() as u16 - 1, MCLKS_PER_LINE - 1);
+        vdp.advance(1);
+    }
+
+    /// genvdp.txt section 15 "Sprite masking, mode 2": "Low priority sprites
+    /// will only be masked if a sprite with an X coordinate of zero _also_ has
+    /// a sprite with an X coordinate of one on the _same_ line" - the list
+    /// order of the two does not matter, so here the X = 0 comes first. The
+    /// sprites the mask hides are everything after the X = 0, exactly as in
+    /// mode 1; the X = 1 sprite itself is off the display at screen x -127 and
+    /// draws nothing to see either way.
+    #[test]
+    fn an_x_of_one_and_an_x_of_zero_on_the_same_line_mask_the_sprites_after_them() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 2, 2);
+        put_sprite(&mut vdp, 0, 128, 0, (1, 1), 1, 0);
+        put_sprite(&mut vdp, 1, 128, 1, (1, 1), 2, 0);
+        put_sprite(&mut vdp, 2, 128, 128, (1, 1), 0, 2);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            &line[0..8],
+            &[0; 8],
+            "the x = 0 mask is armed by the x = 1 of its own line"
+        );
+    }
+
+    /// The other half of the same rule: an X = 1 is not a mask, and with no
+    /// X = 0 on the line there is nothing to arm. The X = 1 sprite is screen
+    /// x -127, invisible, so the test is that the sprites around it draw.
+    #[test]
+    fn an_x_of_one_on_a_line_without_an_x_of_zero_masks_nothing() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 1);
+        solid_tile(&mut vdp, 2, 2);
+        put_sprite(&mut vdp, 0, 128, 200, (1, 1), 1, 1);
+        put_sprite(&mut vdp, 1, 128, 1, (1, 1), 2, 0);
+        put_sprite(&mut vdp, 2, 128, 128, (1, 1), 0, 2);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[72..80], &[1; 8], "the sprite in front draws");
+        assert_eq!(
+            &line[0..8],
+            &[2; 8],
+            "and the x = 1 is not a mask: the sprite behind it draws too"
+        );
+    }
+
+    /// "If a sprite has an X coordinate of one, the former rule is invalid":
+    /// once the frame has parsed an X = 1 sprite, an X = 0 with no X = 1 on
+    /// its own line masks nothing, even armed the way mode 1 arms it - here
+    /// with a sprite of a non-zero X in front of it. The X = 1 of line 5 is
+    /// the frame's parse; line 0 has none.
+    #[test]
+    fn a_mask_at_x_zero_hides_nothing_on_a_line_without_an_x_of_one_once_the_mode_is_on() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 1);
+        solid_tile(&mut vdp, 3, 3);
+        put_sprite(&mut vdp, 0, 133, 1, (1, 1), 1, 0);
+        put_sprite(&mut vdp, 1, 128, 200, (1, 1), 2, 1);
+        put_sprite(&mut vdp, 2, 128, 0, (1, 1), 3, 2);
+        put_sprite(&mut vdp, 3, 128, 128, (1, 1), 0, 3);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(5, &mut line);
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[72..80], &[1; 8], "the sprite in front still draws");
+        assert_eq!(
+            &line[0..8],
+            &[3; 8],
+            "and the mode 2 line masks nothing without an x = 1 on it"
+        );
+    }
+
+    /// "It is reset at the end of the frame": the frame after one that parsed
+    /// an X = 1 masks in mode 1 again. The list is the mode 2 one of the last
+    /// test; crossing the frame boundary clears the bit, and the same line 0
+    /// that mode 2 left drawing behind its mask is masked now.
+    #[test]
+    fn the_masking_mode_clears_at_the_frame_boundary_so_mode_1_masks_again() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 1);
+        solid_tile(&mut vdp, 3, 3);
+        put_sprite(&mut vdp, 0, 133, 1, (1, 1), 1, 0);
+        put_sprite(&mut vdp, 1, 128, 200, (1, 1), 2, 1);
+        put_sprite(&mut vdp, 2, 128, 0, (1, 1), 3, 2);
+        put_sprite(&mut vdp, 3, 128, 128, (1, 1), 0, 3);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(5, &mut line);
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            &line[0..8],
+            &[3; 8],
+            "with the mode on, the x = 0 of a line without an x = 1 masks nothing"
+        );
+
+        cross_frame_boundary(&mut vdp);
+
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(
+            &line[0..8],
+            &[0; 8],
+            "and the next frame masks in mode 1 again"
+        );
+    }
+
+    /// The x = 1 sprite of a game that does not use the mode keeps being a
+    /// sprite of its line (#292's out-of-scope note): it draws nothing, being
+    /// at screen x -127, but it is still parsed, still spends its slot, and
+    /// still counts against the line's limit - which is what the 21st sprite
+    /// here proves, the same test [`a_mask_counts_toward_the_sprite_limit_of_the_line`]
+    /// makes of a mask.
+    #[test]
+    fn an_x_of_one_sprite_is_still_a_sprite_of_its_line() {
+        let mut vdp = sprite_vdp();
+        in_h40(&mut vdp);
+        put_line(&mut vdp, 128, 20, |i| 128 + 8 * i as u16);
+        put_sprite(&mut vdp, 20, 128, 1, (1, 1), 0, 0);
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert!(
+            vdp.sprite_overflow,
+            "the x = 1 sprite is the 21st sprite of the line, and is counted as one"
         );
     }
 
