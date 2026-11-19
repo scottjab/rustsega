@@ -20,12 +20,24 @@
 //! it as the beam goes past them, and [`Vdp::dma_68k_stall_mclk`] is how long the
 //! 68k is frozen while one runs - the number the bus glue of M3-16 (#77) waits.
 //!
-//! Not modelled: the read FIFO quirk that makes the first word of a
-//! 68k-to-VRAM transfer wrong on real hardware (#306), and the CRAM "dots" a
-//! write during active display leaves behind (out of scope for #101). The four
-//! bandwidth figures the slot costs below reproduce are the Sega Genesis
-//! Software Manual's own "DMA transfer capacity" table now: #305 read it off
-//! the scan and every cell matched.
+//! The words of a transfer reach memory in FIFO order behind whatever the
+//! port had already queued: Nemesis's `VDPFIFOTesting` sources have the DMA
+//! add its source words to the same four-entry write FIFO the data port
+//! feeds ("it will read a value from external memory using the DMA source
+//! address register and add it to the FIFO using the current command code
+//! and incremented command address registers", SpritesMind t=1291), so the
+//! queued writes land first and the transfer's first source word then lands
+//! at the transfer's own start address. Nothing is lost - that is what his
+//! `TestFIFOFullDMATransfer` expected result reads back, and the two pinning
+//! tests below carry it. `Vdp::start_running` is where the ordering is kept:
+//! the queue drains before the first transfer write. Not modelled: the
+//! queue's own slot cost inside the transfer window (on hardware the
+//! transfer waits for FIFO space behind the queued entries, so a transfer
+//! started non-empty freezes the 68k for their drain too - #563), and the
+//! CRAM "dots" a write during active display leaves behind (out of scope
+//! for #101). The four bandwidth figures the slot costs below reproduce are
+//! the Sega Genesis Software Manual's own "DMA transfer capacity" table
+//! now: #305 read it off the scan and every cell matched.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -276,9 +288,17 @@ impl Vdp {
 
     /// Take over the DMA in flight with `running`.
     ///
-    /// Whatever the port has queued reaches memory first: a DMA writes the same
-    /// memories through the same rules of M4-02 (#80) and must not overtake the
-    /// writes that were made before its own command word. And a DMA started
+    /// Whatever the port has queued reaches memory first: the DMA feeds the
+    /// same write FIFO the data port does ("it will read a value from external
+    /// memory using the DMA source address register and add it to the FIFO
+    /// using the current command code and incremented command address
+    /// registers", Nemesis on SpritesMind t=1291), so a transfer started
+    /// non-empty writes the queue out first and its own first source word then
+    /// lands at the transfer's own start address, nothing lost - his
+    /// `TestFIFOFullDMATransfer` reads back exactly that, and the pinning
+    /// tests in this file carry it. Draining here, before the first transfer
+    /// write, is the order; what it does not charge is the queue's own slot
+    /// cost inside the transfer window, which is #563. And a DMA started
     /// while one is running replaces it - a corner nothing documents, because
     /// hardware has the 68k frozen for a transfer and tells it to keep off the
     /// data port for the other two (status bit 1), so nobody is supposed to get
@@ -673,6 +693,168 @@ mod tests {
             "the words of 0x000100 in VRAM order, at the address of the command"
         );
         assert_eq!(bus.reads, [0x000100, 0x000102, 0x000104, 0x000106]);
+    }
+
+    /// The beam on the active display and DMA allowed at once: the one state
+    /// where a data port write is still on the queue when the next 68k
+    /// instruction runs, which is the state Nemesis's full-FIFO transfer test
+    /// sets up (his "Wait for the FIFO to be empty" / "Make sure the FIFO is
+    /// full" loop around `TestFIFOFullDMATransfer`).
+    fn active_display_dma(vdp: &mut Vdp) {
+        vdp.write_register(1, 0x50);
+        vdp.advance(200);
+        assert!(
+            !vdp.in_hblank && !vdp.in_vblank,
+            "the beam is not on the active display"
+        );
+    }
+
+    /// Nemesis's "DMA Transfer to VRAM inc=2" (`TestDMATransferToVRAM.asm`):
+    /// the FIFO empty when the command word lands, and his read-back of the
+    /// region is the word in front of the destination unchanged, then the
+    /// seven source words in order. The first word that lands in the
+    /// destination is the first source word, at the transfer's own start
+    /// address; the "stale word first, first source word lost" reading that
+    /// #101 deferred on is not what his sources measure.
+    #[test]
+    fn an_empty_fifo_starts_the_transfer_at_its_first_source_word() {
+        let mut vdp = Vdp::new(false);
+        dma_from(&mut vdp, 0x000200, 7); // R15 = 2, the step every set-up here uses
+        // The region around the destination, laid by port writes with the
+        // display off - so every write lands the moment it is made and the
+        // queue drains at once (`Fifo`, "a write with the display off drains
+        // at once"). Distinct values, so "unchanged" asserts something.
+        let (hi, lo) = vram_write_cmd(0x0FFE);
+        vdp.write_control(hi);
+        vdp.write_control(lo);
+        for word in 0..16u16 {
+            vdp.write_data(0x0200 + word);
+        }
+        assert!(vdp.fifo_empty(), "the display is off, so nothing queues");
+
+        start_dma(&mut vdp, vram_write_cmd(0x1000));
+        let mut bus = FakeBus::laid_at(
+            0x000200,
+            &[0x1122, 0x3344, 0x5566, 0x7788, 0x99AA, 0xBBCC, 0xDDEE],
+        );
+        vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
+
+        assert_eq!(
+            &vdp.vram[0x0FFE..0x1010],
+            [
+                0x02, 0x00, // the word in front of the destination: prior content
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+                0x02, 0x08, // the word behind the transfer: prior content
+            ],
+            "his expected result: the source words from the start address, nothing stale ahead"
+        );
+    }
+
+    /// Nemesis's "FIFO Full Before DMA Transfer" (`TestFIFOFullDMATransfer.asm`):
+    /// four queued port writes for 0x8000..0x8006 when the command word lands,
+    /// the transfer's destination 0x8002 one word in. His expected result reads
+    /// back $1234 - the first queued word, at its own address - and then the
+    /// seven source words from 0x8002 on: the queue lands before the transfer,
+    /// in FIFO order, and no source word is lost. The transfer does not
+    /// overtake the writes made before its command word (`Vdp::start_running`).
+    #[test]
+    fn a_transfer_behind_a_full_fifo_writes_the_queue_first_and_loses_nothing() {
+        let mut vdp = Vdp::new(false);
+        dma_from(&mut vdp, 0x000300, 7);
+        active_display_dma(&mut vdp);
+
+        // Nemesis's prior content: 16 zeros at 0x8000, drained before the
+        // interesting writes, like his "Wait for the FIFO to be empty" loop.
+        let (hi, lo) = vram_write_cmd(0x8000);
+        vdp.write_control(hi);
+        vdp.write_control(lo);
+        for _ in 0..16 {
+            vdp.write_data(0x0000);
+        }
+        for _ in 0..6 {
+            if vdp.fifo_empty() {
+                break;
+            }
+            vdp.advance(MCLKS_PER_LINE);
+        }
+        assert!(
+            vdp.fifo_empty(),
+            "the prior content drained like his loop waits for"
+        );
+
+        // The four stale writes, all four still queued when the command word
+        // comes: what his `btst #0` gate checks before starting the transfer.
+        vdp.write_control(hi);
+        vdp.write_control(lo);
+        for word in [0x1234u16, 0x5678, 0x9ABC, 0xDEF0] {
+            vdp.write_data(word);
+        }
+        assert!(
+            vdp.fifo_full(),
+            "the four writes queue behind the active display's slots"
+        );
+
+        start_dma(&mut vdp, vram_write_cmd(0x8002));
+        let mut bus = FakeBus::laid_at(
+            0x000300,
+            &[0x1122, 0x3344, 0x5566, 0x7788, 0x99AA, 0xBBCC, 0xDDEE],
+        );
+        vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
+
+        assert_eq!(
+            &vdp.vram[0x8000..0x8010],
+            [
+                0x12, 0x34, // the queued word, at its own address
+                0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            ],
+            "his expected result: the queue first, then the transfer's own words from 0x8002"
+        );
+        assert!(
+            vdp.vram[0x8010..0x8020].iter().all(|&byte| byte == 0),
+            "his prior zeros behind the transfer, untouched by any of it"
+        );
+    }
+
+    /// And the queue is not dropped either: Nemesis fills his FIFO from
+    /// `TestDMATransferUsingFIFO.asm` ("This test demonstrates that a DMA
+    /// transfer operation moves its data through the FIFO") and reads the
+    /// queued words back out. Here two queued writes for another region
+    /// survive a transfer started behind them, and land at their own
+    /// addresses, which is what his result block shows for the words it reads.
+    #[test]
+    fn a_transfer_started_behind_queued_writes_drops_neither_side() {
+        let mut vdp = Vdp::new(false);
+        dma_from(&mut vdp, 0x000400, 3);
+        active_display_dma(&mut vdp);
+
+        // Two writes queued for CRAM, a region the transfer does not touch.
+        let (hi, lo) = cram_write_cmd(0x0004);
+        vdp.write_control(hi);
+        vdp.write_control(lo);
+        vdp.write_data(0x0CAFE);
+        vdp.write_data(0x0BEEF);
+        assert!(
+            !vdp.fifo_empty(),
+            "the two writes queue behind the active display"
+        );
+
+        start_dma(&mut vdp, vram_write_cmd(0x2000));
+        let mut bus = FakeBus::laid_at(0x000400, &[0x1111, 0x2222, 0x3333]);
+        vdp.run_dma(&mut bus);
+        run_dma_to_end(&mut vdp);
+
+        assert_eq!(
+            &vdp.cram[2..4],
+            [0x0AEE, 0x0EEE],
+            "the queued CRAM words landed at their own addresses (----bbb0 ggg0 rrr0)"
+        );
+        assert_eq!(
+            &vdp.vram[0x2000..0x2006],
+            [0x11, 0x11, 0x22, 0x22, 0x33, 0x33],
+            "and the transfer's words landed at theirs"
+        );
     }
 
     #[test]

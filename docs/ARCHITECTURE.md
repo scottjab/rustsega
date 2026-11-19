@@ -196,6 +196,17 @@ The VDP write FIFO (`crates/vdp/src/fifo.rs`, M4-21a #99) is what makes
 * A DMA write goes straight to memory rather than onto the FIFO, because a
   68k-to-VDP transfer is thousands of writes and the FIFO is four deep. It
   still costs slots, and they are the same slots: see "VDP DMA timing".
+  In *order*, though, a transfer is a FIFO citizen: the DMA feeds the same
+  write FIFO the data port does ("it will read a value from external memory
+  using the DMA source address register and add it to the FIFO using the
+  current command code and incremented command address registers", Nemesis on
+  SpritesMind t=1291), so a transfer started while the port still has queued
+  writes lets them land first, and its first source word then lands at the
+  transfer's own start address with nothing lost - that is Nemesis's
+  `TestFIFOFullDMATransfer` expected result, pinned by the dma.rs tests of
+  #306, and `Vdp::start_running` keeps the order by draining the queue before
+  the first transfer write. What is not modelled is the queue's own slot cost
+  inside the transfer window (#563).
 
 ### VDP DMA timing
 
