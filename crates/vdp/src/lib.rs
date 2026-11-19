@@ -520,9 +520,17 @@ impl Vdp {
         self.line_reg(regs::R0) & (1 << 1) != 0
     }
 
-    /// R0 bit 2: palette select, which of the two CRAM halves a shadow or
-    /// highlight pixel uses. Software is told to leave it set (plutiedev
-    /// "$80xx"; genvdp.txt section 16 "Shadow / Hilight mode").
+    /// R0 bit 2 (palette select): when it is clear, the display generator takes
+    /// only bits 1, 5 and 9 of each CRAM word - "the LSB of each RGB component
+    /// is the only bit used" - and the palette drops from 512 colours to the 8
+    /// colours of those LSBs (genvdp.txt section 17 "$00", d2; #282). Software
+    /// is told to leave it set (plutiedev "$80xx"); a chip out of reset has it
+    /// clear, so the palette is reduced until a program writes R0.
+    ///
+    /// Which level a set LSB becomes is [`crate::color::REDUCED_LSB_LEVEL`], and
+    /// the two conversion paths that honour the bit are [`Vdp::cram_pixels`] and
+    /// [`Vdp::backdrop_pixel`]. Read through [`Vdp::line_reg`] like every
+    /// register getter of the renderer.
     #[inline]
     pub fn palette_select(&self) -> bool {
         self.line_reg(regs::R0) & (1 << 2) != 0
