@@ -334,6 +334,12 @@ impl Ym2612 {
     /// envelope, plus the LFO's AM attenuation for this channel when this
     /// operator's `&60` bit 7 asks for it (M5-08, #113, and [`crate::lfo`]).
     ///
+    /// In CSM mode the chip adds no total level to channel 3's four operators:
+    /// the key-on merged it into the envelope, and the output-stage adder is
+    /// skipped - Nuked-OPN2's `OPN2_EnvelopeGenerate` guards `level +=
+    /// chip->eg_tl[0] << 3` with `!(mode_csm && channel == 2)` (`&27`, `&40`,
+    /// #335).
+    ///
     /// The AM joins outside [`crate::envelope::Envelope::output`] and is clamped
     /// at silence again. The chip adds it before the total level and clamps once;
     /// the two come to the same number, since an envelope already at silence
@@ -341,8 +347,10 @@ impl Ym2612 {
     /// the LFO exists (`&60`, `&40`).
     fn attenuation(&self, channel: usize, slot: usize) -> u16 {
         let envelope = self.envelopes.envelope(channel, slot);
+        let total_level =
+            !(channel == phase::CHANNEL3 && self.regs.ch3_mode() == regs::CH3_MODE_CSM);
         let am = self.lfo.amplitude(channel, envelope.am_enable());
-        (envelope.output() + u16::from(am)).min(envelope::SILENT)
+        (envelope.output(total_level) + u16::from(am)).min(envelope::SILENT)
     }
 }
 
@@ -885,10 +893,10 @@ mod tests {
                 "slot offset {offset:#X}"
             );
             assert_eq!(envelope.level(), 0, "an attack of rate 62 is instant");
-            assert_eq!(envelope.output(), u16::from(total_level) << 3);
+            assert_eq!(envelope.output(true), u16::from(total_level) << 3);
         }
         assert_eq!(
-            chip.envelopes.envelope(3, phase::SLOT_S1).output(),
+            chip.envelopes.envelope(3, phase::SLOT_S1).output(true),
             0,
             "the `&43` write went nowhere, so part II's operator 1 is at full level"
         );
@@ -1454,6 +1462,107 @@ mod tests {
                 [envelope::State::Release; 4],
                 "mode {:02b} is not a CSM mode",
                 mode >> 6
+            );
+        }
+    }
+
+    /// The CSM key-on folds `&40`'s total level into channel 3's envelopes, and
+    /// nothing adds it again on the way out while CSM mode holds: the pulse that
+    /// keys the four operators on merges the total level into the envelope's own
+    /// attenuation, so what a CSM note reaches is decided at the key-on, not by
+    /// an output-stage adder. Nuked-OPN2, read off the die, is the source: its
+    /// `OPN2_EnvelopeADSR` does `if (chip->eg_kon_csm[slot]) nextlevel |=
+    /// chip->eg_tl[1] << 3` and its `OPN2_EnvelopeGenerate` skips `level +=
+    /// chip->eg_tl[0] << 3` while `mode_csm && channel == 2` (YM2608 application
+    /// manual `&27` and `&40`, #335).
+    #[test]
+    fn csm_key_on_folds_total_level_into_the_envelope() {
+        let mut chip = Ym2612::new();
+        set_timer_a(&mut chip, 1021);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, MODE_CSM | LOAD_A);
+        for slot in 0..4usize {
+            let offset = (slot * 4 + CHANNEL3) as u8;
+            // Total level 0x20 on every operator, an instant attack (`&50`: AR 31
+            // is rate 62 at key code 0, and an instant attack zeroes the
+            // attenuation at the key-on itself), releasing at RR 0.
+            write_reg(&mut chip, ADDR_1, DATA_1, 0x40 + offset, 0x20);
+            write_reg(&mut chip, ADDR_1, DATA_1, 0x50 + offset, 0x1F);
+            write_reg(&mut chip, ADDR_1, DATA_1, 0x80 + offset, 0x00);
+        }
+
+        // Timer A at 1021 overflows on the third sample, the sixth, the ninth:
+        // the ninth is one of them, and each pulse re-keys the four envelopes
+        // from their released state, so the fold lands `&40` into a level the
+        // attack had just brought to 0.
+        clock_for(&mut chip, 9);
+        for slot in 0..4usize {
+            let envelope = chip.envelopes.envelope(CHANNEL3, slot);
+            // The fold merged 0x20 << 3 = 0x100 into that zero, and the same
+            // sample's attack update took `attack_step(0x100, 8)` of it - the
+            // arithmetic shift floors, so 127. What it is not is 0: the total
+            // level is in the envelope itself.
+            assert_eq!(
+                envelope.level(),
+                0x7F,
+                "slot {slot}: the CSM key-on folded `&40` into the envelope"
+            );
+        }
+        // And the mix reads that folded level with no total level added again:
+        // in CSM mode the output stage adds nothing.
+        for slot in 0..4usize {
+            assert_eq!(
+                chip.attenuation(CHANNEL3, slot),
+                0x7F,
+                "slot {slot}: CSM adds no total level on the way out"
+            );
+        }
+    }
+
+    /// A total level written to a held channel 3 operator in CSM mode reaches
+    /// nothing: the output ignores `&40` in this mode, and with no CSM pulse to
+    /// fold it in, the note holds its full level under whatever `&40` says. The
+    /// same note in another mode would have moved the moment the register was
+    /// written (`&27`, `&40`, #335).
+    #[test]
+    fn csm_tl_write_waits_for_the_next_key_on() {
+        let mut chip = Ym2612::new();
+        set_timer_a(&mut chip, 1021);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, MODE_CSM | LOAD_A);
+        for slot in 0..4usize {
+            let offset = (slot * 4 + CHANNEL3) as u8;
+            write_reg(&mut chip, ADDR_1, DATA_1, 0x40 + offset, 0x20);
+            write_reg(&mut chip, ADDR_1, DATA_1, 0x50 + offset, 0x1F);
+            write_reg(&mut chip, ADDR_1, DATA_1, 0x80 + offset, 0x00);
+        }
+        // A real `&28` key on holds the four envelopes through the CSM pulses.
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_ALL | 2);
+        // A run of pulses, then no more: with the load bit off timer A freezes
+        // and nothing keys channel 3 again.
+        clock_for(&mut chip, 30);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, MODE_CSM);
+        // The held instant attacks have erased whatever the folds left, and with
+        // the total level heard only through folds there is nothing of `&40` in
+        // the output at all: full level.
+        clock_for(&mut chip, 90);
+        for slot in 0..4usize {
+            assert_eq!(
+                chip.attenuation(CHANNEL3, slot),
+                0,
+                "slot {slot}: a held note in CSM mode is at full level"
+            );
+        }
+        // Writing a louder total level mid-note changes nothing. There is no key
+        // on to fold it into the envelope, and the output is not adding it.
+        for slot in 0..4usize {
+            let offset = (slot * 4 + CHANNEL3) as u8;
+            write_reg(&mut chip, ADDR_1, DATA_1, 0x40 + offset, 0x30);
+        }
+        clock_for(&mut chip, 30);
+        for slot in 0..4usize {
+            assert_eq!(
+                chip.attenuation(CHANNEL3, slot),
+                0,
+                "slot {slot}: a `&40` write in CSM mode waits for the next key-on"
             );
         }
     }

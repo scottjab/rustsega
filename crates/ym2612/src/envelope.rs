@@ -19,6 +19,11 @@
 //! #113). So what [`Envelope::output`] gives is the operator's attenuation
 //! before the LFO adds to it.
 //!
+//! One rule of `&40` belongs to the key-on rather than the output: in CSM mode
+//! (`&27` bits 7-6 = 10) channel 3's total level is merged into the envelope at
+//! the timer A key-on and the output adds nothing - [`Envelope::
+//! fold_total_level`] carries the citation (#335).
+//!
 //! The SSG-EG of `&90` is here too (M5-10, #115). Enabled, it takes the
 //! envelope away from the four states above: the decay, sustain and release
 //! increments are four times as big up to half the range, and nothing at all
@@ -477,16 +482,42 @@ impl Envelope {
         self.ssg_enabled() && self.key_on && (self.ssg_direction != (self.ssg_eg & SSG_ATTACK != 0))
     }
 
-    /// What the operator contributes to the channel: its own attenuation plus
-    /// the total level of `&40` at 8 attenuation counts a step, clamped at
-    /// silence (YM2608 application manual `&40`).
+    /// What the operator contributes to the channel: its own attenuation plus,
+    /// unless `total_level` is false, the total level of `&40` at 8 attenuation
+    /// counts a step, clamped at silence (YM2608 application manual `&40`).
+    ///
+    /// `total_level` is false for the four operators of channel 3 in CSM mode:
+    /// there the chip adds no total level at the output - Nuked-OPN2's
+    /// `OPN2_EnvelopeGenerate` skips `level += chip->eg_tl[0] << 3` while
+    /// `mode_csm && channel == 2` - because a CSM key-on has already merged it
+    /// into the envelope itself ([`Envelope::fold_total_level`]).
     ///
     /// Read by the slot output of the channel mix of M5-07a (#111), which is why
     /// it is not `#[cfg(test)]`: the chip reads its own envelope here, it just
     /// cannot be made to read it back out. The amplitude modulation of M5-08
     /// (#113) is added on top there, not here.
-    pub(crate) fn output(&self) -> u16 {
-        (self.attenuation() + (u16::from(self.total_level) << 3)).min(SILENT)
+    pub(crate) fn output(&self, total_level: bool) -> u16 {
+        let mut level = self.attenuation();
+        if total_level {
+            level += u16::from(self.total_level) << 3;
+        }
+        level.min(SILENT)
+    }
+
+    /// The CSM key-on fold of the total level: merge `&40` into the envelope's
+    /// own attenuation. A CSM key-on - the timer A overflow pulse - does not
+    /// leave the total level for the output to add: it lands in the 10-bit
+    /// envelope level itself, which is why [`Envelope::output`] adds nothing on
+    /// the way out while CSM mode holds. Nuked-OPN2, read off the die, is the
+    /// source: `OPN2_EnvelopeADSR` does `if (chip->eg_kon_csm[slot]) nextlevel
+    /// |= chip->eg_tl[1] << 3`. The merge is an or, not an add - the register
+    /// bits are written - so a fold over a level already carrying those bits is
+    /// a no-op. The one-update read delay of the die's TL path (Nuked's
+    /// `eg_tl[1]`, the value one envelope update behind the register) is not
+    /// modelled: the fold reads the total level this register holds at the
+    /// pulse (YM2608 application manual `&27` and `&40`, #335).
+    fn fold_total_level(&mut self) {
+        self.att |= u16::from(self.total_level) << 3;
     }
 
     /// The envelope's own attenuation as the channel reads it: the level itself,
@@ -622,12 +653,18 @@ impl EnvelopeGen {
     /// and [`crate::phase::PhaseGen::key_state`]).
     ///
     /// The pulse says nothing to the phase counters: it is the envelope of channel
-    /// 3 that CSM strikes, and the counters keep counting through it.
+    /// 3 that CSM strikes, and the counters keep counting through it. And the
+    /// pulse is where `&40` gets in: the key-on folds the total level into the
+    /// envelope ([`Envelope::fold_total_level`]), which is why nothing adds it on
+    /// the way out while CSM mode holds.
     pub(crate) fn csm_key(&mut self, phases: &PhaseGen, on: bool) {
         for slot in 0..SLOTS {
             let keycode = phases.keycode(phase::CHANNEL3, slot);
             let held = on || phases.key_state(phase::CHANNEL3, slot);
             self.envelopes[phase::CHANNEL3][slot].set_key(held, keycode);
+            if on {
+                self.envelopes[phase::CHANNEL3][slot].fold_total_level();
+            }
         }
     }
 
@@ -946,20 +983,20 @@ mod tests {
         envelope.att = 0;
 
         envelope.total_level = 0;
-        assert_eq!(envelope.output(), 0);
+        assert_eq!(envelope.output(true), 0);
         envelope.total_level = 1;
-        assert_eq!(envelope.output(), 8);
+        assert_eq!(envelope.output(true), 8);
         envelope.total_level = 8;
-        assert_eq!(envelope.output(), 0x40);
+        assert_eq!(envelope.output(true), 0x40);
         envelope.total_level = 0x7F;
-        assert_eq!(envelope.output(), 0x3F8);
+        assert_eq!(envelope.output(true), 0x3F8);
 
         // The two add, and the sum is clamped at silence rather than wrapped.
         envelope.att = 0x100;
         envelope.total_level = 0x10;
-        assert_eq!(envelope.output(), 0x180);
+        assert_eq!(envelope.output(true), 0x180);
         envelope.att = SILENT;
-        assert_eq!(envelope.output(), SILENT);
+        assert_eq!(envelope.output(true), SILENT);
     }
 
     #[test]
@@ -1050,7 +1087,7 @@ mod tests {
                 let counter =
                     u16::try_from(1 + step % u32::from(COUNTER_MAX)).expect("12-bit counter");
                 envelope.update(counter, 0);
-                (envelope.att, envelope.output(), envelope.ssg_mirrored())
+                (envelope.att, envelope.output(true), envelope.ssg_mirrored())
             })
             .collect()
     }
@@ -1218,10 +1255,10 @@ mod tests {
         drive(&mut envelope, 1, 0);
         assert_eq!(envelope.att, SILENT, "and the envelope is off from there");
         assert_eq!(envelope.state, State::Release);
-        assert_eq!(envelope.output(), SILENT);
+        assert_eq!(envelope.output(true), SILENT);
 
         drive(&mut envelope, 4 * u32::from(COUNTER_MAX), 0);
-        assert_eq!(envelope.output(), SILENT, "and it holds there");
+        assert_eq!(envelope.output(true), SILENT, "and it holds there");
     }
 
     #[test]
@@ -1236,7 +1273,11 @@ mod tests {
         // point that switches the mirror on, as it is for the 9 above.
         drive(&mut envelope, 129, 0);
         assert_eq!(envelope.att, 0x200, "the swing stops at the halfway point");
-        assert_eq!(envelope.output(), 0, "which the mirror reads as full level");
+        assert_eq!(
+            envelope.output(true),
+            0,
+            "which the mirror reads as full level"
+        );
 
         drive(&mut envelope, 4 * u32::from(COUNTER_MAX), 0);
         assert_eq!(
@@ -1244,7 +1285,7 @@ mod tests {
             0x200,
             "the level stays at the halfway point"
         );
-        assert_eq!(envelope.output(), 0, "and so does the output");
+        assert_eq!(envelope.output(true), 0, "and so does the output");
     }
 
     #[test]
@@ -1254,15 +1295,15 @@ mod tests {
         // inverted 9 and so ends at silence (YM2608 application manual `&90`).
         let mut loud = ssg_at_full_level(SSG_ENABLE | SSG_ATTACK | SSG_HOLD);
         drive(&mut loud, 129, 0);
-        assert_eq!(loud.output(), 0, "13 holds at full level");
+        assert_eq!(loud.output(true), 0, "13 holds at full level");
         drive(&mut loud, 4 * u32::from(COUNTER_MAX), 0);
-        assert_eq!(loud.output(), 0, "and holds there");
+        assert_eq!(loud.output(true), 0, "and holds there");
 
         let mut silent = ssg_at_full_level(SSG_ENABLE | SSG_ATTACK | SSG_ALTERNATE | SSG_HOLD);
         drive(&mut silent, 129, 0);
-        assert_eq!(silent.output(), SILENT, "15 holds at silence");
+        assert_eq!(silent.output(true), SILENT, "15 holds at silence");
         drive(&mut silent, 4 * u32::from(COUNTER_MAX), 0);
-        assert_eq!(silent.output(), SILENT, "and holds there");
+        assert_eq!(silent.output(true), SILENT, "and holds there");
     }
 
     #[test]
@@ -1274,13 +1315,13 @@ mod tests {
         let mut envelope = ssg_at_full_level(SSG_ENABLE | SSG_ATTACK);
         for (att, out) in [(0, 0x200), (0x100, 0x100), (0x200, 0), (0x300, 0x300)] {
             envelope.att = att;
-            assert_eq!(envelope.output(), out, "mirrored {att:#04x}");
+            assert_eq!(envelope.output(true), out, "mirrored {att:#04x}");
         }
 
         // The total level still adds, and still clamps at silence.
         envelope.att = 0x200;
         envelope.total_level = 8;
-        assert_eq!(envelope.output(), 0x40);
+        assert_eq!(envelope.output(true), 0x40);
 
         // A key off forces the mirror off, and releases from where the mirror was
         // reading: Nuked applies `ssg_level` to the level itself on the key off,
@@ -1289,7 +1330,11 @@ mod tests {
         envelope.att = 0;
         envelope.set_key(false, 0);
         assert_eq!(envelope.att, 0x200, "released from the mirrored level");
-        assert_eq!(envelope.output(), 0x200, "and no longer through the mirror");
+        assert_eq!(
+            envelope.output(true),
+            0x200,
+            "and no longer through the mirror"
+        );
     }
 
     #[test]
