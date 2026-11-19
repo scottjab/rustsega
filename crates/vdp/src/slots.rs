@@ -21,13 +21,22 @@
 //! SpritesMind gendev thread 1291), which are also the Sega DMA bandwidth
 //! figures. With the display off an H40 line carries 198 transfers ([`OFF_TRANSFERS_H40`]).
 //!
-//! The *positions* of the free slots of an active line are in nothing this ticket
-//! could reach, so they are not invented here either: both active tables are
-//! counted out of plutiedev's per-line fetch pattern, reproduced on each table,
-//! one character per slot. They are marked INFERRED because that pattern is the
-//! only source for where in the line the gaps fall - even though counting its
-//! `~`s gives 18 slots for H40 and 16 for H32 out of lines of exactly 210 and 171
-//! slots, which is the evidence that the pattern is being read right. TODO(#301).
+//! The *positions* of the free slots of an active line are measured, not
+//! invented: both active tables are counted out of plutiedev's per-line fetch
+//! pattern, reproduced on each table, one character per slot, and that pattern
+//! is kabuto's transcription of Nemesis's logic-analyzer captures - the
+//! hand-drawn "Mega Drive VDP VRAM access timing - H40/H32 mode" diagrams of
+//! SpritesMind gendev thread 851 (host dead; Wayback snapshot 2024-05-04).
+//! Decoded against their grids, the diagrams draw the free slots at exactly the
+//! indices below, one refresh per fetch group at group offset 25
+//! ([`REFRESH_ACTIVE_H40`] / [`REFRESH_ACTIVE_H32`]), and the tail runs the
+//! pattern notates. jgenesis's independently published schedule
+//! (`jsgroth/jgenesis`, `genesis-components/src/vdp.rs`, "Adapted from ... t=851")
+//! is this same table at every index, shifted 8 slots by its own choice of
+//! origin, so the spacings have two readings that agree. What no source pins is
+//! the anchor: which HV-counter reading slot 0 - the H scroll fetch, master
+//! clock 0 here - falls on. That is #301's residue and only hardware answers
+//! it; the blank-line refresh spread below is still INFERRED.
 //!
 //! # The display-off line: measured, and deliberately not waited for (#302)
 //!
@@ -127,6 +136,25 @@ pub(crate) const REFRESH_OFF_H40: usize = 6;
 #[allow(dead_code)] // read by tests only: the display-off decision of #302
 pub(crate) const OFF_TRANSFERS_H40: usize = SLOTS_H40 - (2 * REFRESH_OFF_H40);
 
+/// The DRAM refresh slots of an *active* line, H40, as slot indices: one per
+/// fetch group, at group offset 25 - 38, 70, 102, 134, 166. Nemesis's measured
+/// timing diagram draws a refresh mark exactly there (SpritesMind thread 851,
+/// "Mega Drive VDP VRAM access timing - H40 mode"), and the position is what
+/// makes the documented FIFO-full stall arithmetic work: "Because of the
+/// refresh cycle, there's a gap of 16 access slots between external access
+/// slots. So, that's a maximum wait time of 4/MCLK * 4 * 16 = 4.77us"
+/// (TascoDLX, same thread). Nothing charges for these yet - the active-line
+/// schedule only names the free slots - so they are read by tests only, and a
+/// refresh-aware model of DMA or the FIFO would spend them (#305).
+#[allow(dead_code)] // read by tests only: nothing charges for active-line refresh yet
+const REFRESH_ACTIVE_H40: [u16; REFRESH_BLANK_H40] = [38, 70, 102, 134, 166];
+
+/// [`REFRESH_ACTIVE_H40`]'s H32 twin: the H32 diagram draws four of them, at 38,
+/// 70, 102, 134 (SpritesMind thread 851), which is Nemesis's "4 fixed refresh
+/// slots in H32 mode" (thread 1291). One group less, so one refresh less.
+#[allow(dead_code)] // read by tests only, as [`REFRESH_ACTIVE_H40`] is
+const REFRESH_ACTIVE_H32: [u16; REFRESH_BLANK_H32] = [38, 70, 102, 134];
+
 /// Every slot of an H40 line but the [`REFRESH_BLANK_H40`] the DRAM refresh
 /// takes: the 205 of [`BLANK_SLOTS_H40`], which is the schedule of a blank line.
 const BLANK_H40: [u16; BLANK_SLOTS_H40] = blank_line(SLOTS_H40, REFRESH_BLANK_H40);
@@ -137,12 +165,22 @@ const BLANK_H32: [u16; BLANK_SLOTS_H32] = blank_line(SLOTS_H32, REFRESH_BLANK_H3
 /// them, those being spread evenly over it.
 ///
 /// How many refresh slots a line has is [`REFRESH_BLANK_H40`] and
-/// [`REFRESH_BLANK_H32`]; where they are is in nothing this ticket could reach,
-/// so they go every `total / count` slots - and refresh is a property of the
-/// whole frame rather than of the beam, so any regular spread is as good an
-/// answer as another. What that buys and costs is measured against the counts,
-/// which do not depend on it: [`BLANK_SLOTS_H40`] and [`BLANK_SLOTS_H32`] come
-/// out of the length of this. INFERRED, TODO(#301).
+/// [`REFRESH_BLANK_H32`]; where they are, no source names a blank line outright
+/// and the nearest measurements disagree, so they go every `total / count`
+/// slots - and refresh is a property of the whole frame rather than of the
+/// beam, so any regular spread is as good an answer as another. The anchors:
+/// Nemesis's active-line diagrams draw the refresh one per fetch group at
+/// offset 25 ([`REFRESH_ACTIVE_H40`], [`REFRESH_ACTIVE_H32`]); kabuto says that
+/// with the display disabled "the VDP still does those refresh cycles and uses
+/// all other cycles as access slots"; Mask of Destiny measured six refreshes on
+/// a display-off H40 line, "one refresh slot every 32 slots starting at slot
+/// 37", which lands near those five places plus one at the tail slot the
+/// active line keeps free, and read 204 write slots off that where this table
+/// keeps the documented 205 (SpritesMind thread 1291 page 3). The count
+/// conflict is #305's to settle, and landing either correction moves every
+/// blank-line DMA deadline and FIFO wait. What that buys and costs is measured
+/// against the counts, which do not depend on it: [`BLANK_SLOTS_H40`] and
+/// [`BLANK_SLOTS_H32`] come out of the length of this. INFERRED, TODO(#301).
 const fn blank_line<const N: usize>(total: usize, count: usize) -> [u16; N] {
     let mut slots = [0u16; N];
     let mut out = 0;
@@ -174,8 +212,9 @@ const fn is_refresh(slot: usize, total: usize, count: usize) -> bool {
 /// fetch pattern leaves unassigned.
 ///
 /// The pattern, one character per access slot, from plutiedev's hardware notes
-/// (kabuto mirror; `H`=HSYNC, `s`=scroll, `A`/`B`=plane A/B, `a`/`b`=sprite,
-/// `S`/`r`=the rest of the fetch machine, `~`=nothing):
+/// (kabuto mirror), whose legend is `H`=H scroll fetch, `A`/`B`=plane A/B
+/// name-table reads, `a`/`b`=plane A/B pixel rows, `S`=sprite tile/x, `s`=sprite
+/// pixel data, `r`=DRAM refresh, `~`=68k access slot:
 ///
 /// ```text
 /// Hssss AsaaBsbb ((A~aaBSbb)*3 AraaBSbb)*5 ~~ s*23 ~ s*11
@@ -183,13 +222,23 @@ const fn is_refresh(slot: usize, total: usize, count: usize) -> bool {
 ///
 /// Counting out the `~`s along those 210 characters gives the 18 slots below:
 /// three between the fetch groups of each of five groups, the `~~` pair at 173
-/// and 174 where the groups end, and one at 198 out in the scroll fetches. The
-/// gaps run in eights and sixteens of a slot because a fetch group is eight slots
-/// wide with one gap in it.
+/// and 174 where the groups end, and one at 198 out in the tail. The gaps run
+/// in eights and sixteens of a slot because a fetch group is eight slots wide
+/// with one gap in it.
 ///
-/// INFERRED - see the module note and TODO(#301). What is confirmed of this line
-/// is the count, 18, and the 32-pixel largest gap across its fetch groups, which
-/// [`gap_is_the_documented_fifo_full_stall`] measures.
+/// CONFIRMED, no longer only a reading of the notation: Nemesis's measured
+/// timing diagram ("Mega Drive VDP VRAM access timing - H40 mode", SpritesMind
+/// thread 851, the capture kabuto's pattern transcribes) draws exactly these
+/// positions, and `the_diagram_pins_the_active_line_positions` checks the
+/// match. The tail `s` runs are sprite pixel data for the next line - "all the
+/// mapping data for every sprite, and most of the pattern data, is read during
+/// the previous line" (Nemesis, same thread) - so they keep the blanking busy
+/// and make two gaps wider than the documented FIFO-full stall without
+/// contradicting it, which `the_tail_and_wrap_gaps_of_an_active_h40_line_exceed_the_documented_stall`
+/// measures. What is confirmed of this line besides the positions is the count,
+/// 18, and the 32-pixel largest gap across its fetch groups, which
+/// [`gap_is_the_documented_fifo_full_stall`] measures. The anchor - which
+/// HV-counter reading slot 0 falls on - is still hardware's, TODO(#301).
 const ACTIVE_H40: [u16; 18] = [
     14, 22, 30, 46, 54, 62, 78, 86, 94, 110, 118, 126, 142, 150, 158, 173, 174, 198,
 ];
@@ -202,11 +251,13 @@ const ACTIVE_H40: [u16; 18] = [
 /// ```
 ///
 /// which is 171 characters - [`SLOTS_H32`] - of which 16 are `~`. It is the H40
-/// line with a fetch group less, and the tail of the line spread over two scroll
-/// runs instead of one.
+/// line with a fetch group less, and the tail spread over two sprite-pixel runs
+/// instead of one.
 ///
-/// INFERRED as [`ACTIVE_H40`] is; there the documented 32-pixel gap covers the
-/// whole line, the tail of scroll fetches included.
+/// CONFIRMED as [`ACTIVE_H40`] is: the H32 diagram of SpritesMind thread 851
+/// draws the tail pair at 141 and 142, the lone one at 156 and the last at 170,
+/// which is this table. There the documented 32-pixel gap covers the whole
+/// line, the tail of sprite fetches included.
 const ACTIVE_H32: [u16; 16] = [
     14, 22, 30, 46, 54, 62, 78, 86, 94, 110, 118, 126, 141, 142, 156, 170,
 ];
@@ -256,8 +307,8 @@ impl Vdp {
     ///
     /// * the table is a property of the *line*, not of the point the beam has
     ///   reached. An active line has [`ACTIVE_H40`] free slots for the whole of
-    ///   itself - the scroll fetches out in its blanking are fetches like any
-    ///   other - which is why the table quotes 18 bytes a line for a transfer
+    ///   itself - the tail sprite fetches out in its blanking are fetches like
+    ///   any other - which is why the table quotes 18 bytes a line for a transfer
     ///   with the display on and 205 with it off. Choosing on `in_hblank` the way
     ///   the port does would hand an active line's blanking slots to a DMA as
     ///   well and turn 18 into 46;
@@ -468,7 +519,7 @@ mod tests {
 
     /// The widest gap between neighbouring free slots of an active line, over the
     /// fetch groups: the table without its last entry, which sits out in the tail
-    /// of scroll fetches that both patterns end with.
+    /// of sprite fetches that both patterns end with.
     fn widest_active_gap(h40: bool) -> u32 {
         let active: &[u16] = if h40 {
             &ACTIVE_H40[..ACTIVE_H40.len() - 1]
@@ -683,5 +734,116 @@ mod tests {
         assert_eq!(slot_mclk(usize::from(ACTIVE_H32[0]), false), 280);
         assert_eq!(beam(true, 0).mclk_to_slots(1), 272);
         assert_eq!(beam(false, 0).mclk_to_slots(1), 280);
+    }
+
+    /// The active tables' positions are not just self-consistent arithmetic: they
+    /// are the positions Nemesis's measured timing diagram draws. The diagram is
+    /// the logic-analyzer capture behind both the fetch pattern and this module
+    /// (SpritesMind thread 851, "Mega Drive VDP VRAM access timing - H40/H32
+    /// mode"), and decoded against its grid it draws the three free slots of each
+    /// fetch group at group offsets 1, 9 and 17, the tail pair at 173 and 174
+    /// with the lone one at 198 in H40, and 141, 142, 156 and 170 in H32. Pinned
+    /// literally, so that regenerating the tables has to confront the diagram.
+    #[test]
+    fn the_diagram_pins_the_active_line_positions() {
+        assert_eq!(
+            ACTIVE_H40,
+            [
+                14, 22, 30, 46, 54, 62, 78, 86, 94, 110, 118, 126, 142, 150, 158, 173, 174, 198
+            ]
+        );
+        assert_eq!(
+            ACTIVE_H32,
+            [
+                14, 22, 30, 46, 54, 62, 78, 86, 94, 110, 118, 126, 141, 142, 156, 170
+            ]
+        );
+    }
+
+    /// The refresh cycles of an active line fall one per fetch group, at group
+    /// offset 25: 38 and every 32 slots after it, one less in H32 for want of a
+    /// fifth group. That is where Nemesis's diagrams draw the refresh mark
+    /// (SpritesMind thread 851), and it is what makes the documented FIFO-full
+    /// stall arithmetic work: "Because of the refresh cycle, there's a gap of 16
+    /// access slots between external access slots. So, that's a maximum wait time
+    /// of 4/MCLK * 4 * 16 = 4.77us" (TascoDLX, same thread). The 16-slot gap is
+    /// the one from the third `~` of a group to the first of the next, and the
+    /// refresh sits inside it - except at the group-to-tail transition, where the
+    /// gap to the tail pair is a slot shorter.
+    #[test]
+    fn active_line_refresh_slots_fall_one_per_fetch_group() {
+        assert_eq!(REFRESH_ACTIVE_H40, [38, 70, 102, 134, 166]);
+        assert_eq!(REFRESH_ACTIVE_H32, [38, 70, 102, 134]);
+
+        let containing_gap = |refresh: u16, active: &[u16], h40: bool| {
+            let before = active
+                .iter()
+                .rev()
+                .find(|&&s| s < refresh)
+                .expect("a free slot before every refresh slot");
+            let after = active
+                .iter()
+                .find(|&&s| s > refresh)
+                .expect("a free slot after every refresh slot");
+            slot_mclk(usize::from(*after), h40) - slot_mclk(usize::from(*before), h40)
+        };
+
+        for &refresh in &REFRESH_ACTIVE_H40[..4] {
+            assert_eq!(
+                containing_gap(refresh, &ACTIVE_H40, true),
+                256,
+                "refresh slot {refresh} sits inside a 32-pixel gap"
+            );
+        }
+        assert_eq!(
+            containing_gap(REFRESH_ACTIVE_H40[4], &ACTIVE_H40, true),
+            240,
+            "the last H40 refresh sits in the 15-slot gap to the tail pair"
+        );
+        for &refresh in &REFRESH_ACTIVE_H32[..3] {
+            assert_eq!(
+                containing_gap(refresh, &ACTIVE_H32, false),
+                320,
+                "refresh slot {refresh} sits inside a 32-pixel gap"
+            );
+        }
+        assert_eq!(
+            containing_gap(REFRESH_ACTIVE_H32[3], &ACTIVE_H32, false),
+            300,
+            "the last H32 refresh sits in the 15-slot gap to the tail pair"
+        );
+    }
+
+    /// The tail of an active H40 line really is two gaps wider than the
+    /// documented FIFO-full stall, and that contradicts nothing because the
+    /// stall figure is scoped to the active display: "the maximal wait time when
+    /// VDP Write FIFO is full is the maximal delay between 2 external access
+    /// slots, which, during active display, is exactly 32 pixels" (Eke,
+    /// SpritesMind thread 1291 page 1), and the freeze itself "only occurs
+    /// during the active display period" (genvdp.txt section 6). The wide gaps
+    /// are measured too, not just notated: "according to the new data, the
+    /// largest gap is actually 26 slots, and half of that is during H-sync with
+    /// the overall slower clock" (TascoDLX, thread 851) - the 26 slot periods
+    /// from the lone tail slot 198 around to the next line's 14, whose second
+    /// half crosses this model's slow line head. H32's tail gaps stay under its
+    /// active 32-pixel gap, so its widest gap is the documented one whole-line.
+    #[test]
+    fn the_tail_and_wrap_gaps_of_an_active_h40_line_exceed_the_documented_stall() {
+        assert_eq!(
+            slot_mclk(198, true) - slot_mclk(174, true),
+            384,
+            "24 fast-pixel slot periods over the blanking, 48 px"
+        );
+        assert_eq!(
+            MCLKS_PER_LINE - slot_mclk(198, true) + slot_mclk(14, true),
+            464,
+            "26 slot periods, the wrap TascoDLX names, across the slow head"
+        );
+        assert_eq!(slot_mclk(156, false) - slot_mclk(142, false), 280);
+        assert_eq!(
+            MCLKS_PER_LINE - slot_mclk(170, false) + slot_mclk(14, false),
+            300,
+            "H32's wrap stays under its 320-clock active gap"
+        );
     }
 }
