@@ -1634,4 +1634,132 @@ mod tests {
             "and display line 1 reads scroll entry 1, which does not"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // The two #441 carts: enabled display, loaded palette, sparse plane, and
+    // a frame that is mostly backdrop. The renderer was suspected of throwing
+    // their pixels away; both tests pin that it does not, for the exact
+    // register sets the carts hold at frame 1800 (the #441 register dump).
+    // ---------------------------------------------------------------------
+
+    /// The first three name entries of HardBall III's plane A table at frame
+    /// 1800, ascending by $19 per cell, and a tile row of theirs: two of every
+    /// four pixels set, which is the sparsity probe441c measured ("only 2-6
+    /// of 8 pixels set in the cells that do render").
+    const HARDBALL_ENTRIES: [u16; 3] = [0x0074, 0x008D, 0x00A6];
+    /// The sparse pixel row those tiles show where they render at all.
+    const SPARSE_ROW: [u8; 8] = [1, 2, 3, 4, 1, 2, 3, 4];
+
+    /// HardBall III's VDP at frame 1800 (#441 dump): plane A at R2 = 0x28 is
+    /// $A000, R16 = 0x01 makes it 64 cells by 32 rows, R12 = 0x81 is H40 with
+    /// no shadow and no interlace, and R17 = R18 = 0 leaves the window off,
+    /// although R3 = 0 points the window table at $0000 just the same.
+    fn hardball_vdp() -> Vdp {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(1, 0x74);
+        vdp.write_register(2, 0x28);
+        vdp.write_register(3, 0x00);
+        vdp.write_register(12, 0x81);
+        vdp.write_register(16, 0x01);
+        vdp.write_register(17, 0x00);
+        vdp.write_register(18, 0x00);
+        vdp
+    }
+
+    /// The 24 pixels of the three sparse cells: [`SPARSE_ROW`] three times.
+    const THREE_SPARSE_CELLS: [u8; 24] = [
+        1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4,
+    ];
+
+    /// Every pixel of plane A line `line` is the sparse row where its name
+    /// entry names one of the three tiles, and colour 0 - the transparency
+    /// that shows the backdrop - everywhere the tiles are blank, which is most
+    /// of the screen. Nothing the state describes is dropped.
+    #[test]
+    fn the_hardball_iii_plane_configuration_renders_its_sparse_tiles() {
+        let mut vdp = hardball_vdp();
+        assert_eq!(vdp.plane_a_base(), 0xA000);
+        assert_eq!(vdp.plane_width_cells(), 64);
+        assert!(vdp.h40());
+        for (cell, entry) in HARDBALL_ENTRIES.iter().enumerate() {
+            put_entry(&mut vdp, 0xA000, cell, *entry);
+        }
+        for entry in &HARDBALL_ENTRIES {
+            put_tile_row(&mut vdp, *entry, 0, &SPARSE_ROW);
+        }
+
+        // Line 0 is cell row 0, pattern row 0: the three cells carry the
+        // sparse pixels, and the 37 cells past them name tile 0, which is
+        // blank, so every pixel there is colour 0.
+        let mut out = [0u8; WIDTH_H40];
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(&out[..24], &THREE_SPARSE_CELLS);
+        assert!(
+            out[24..].iter().all(|&p| p == 0),
+            "blank tiles are colour 0, not dropped"
+        );
+
+        // Pattern row 1 of the same three tiles was never written, so line 1
+        // is colour 0 across the whole width.
+        let mut out = [0u8; WIDTH_H40];
+        vdp.render_plane_line(Plane::A, 1, &mut out);
+        assert!(out.iter().all(|&p| p == 0));
+
+        // The window registers are zero, so painting the window over the line
+        // changes nothing, however suspect the R3 = 0 window base looks.
+        let mut plain = [0u8; WIDTH_H40];
+        vdp.render_plane_line(Plane::A, 0, &mut plain);
+        let mut with_window = [0u8; WIDTH_H40];
+        vdp.render_plane_a_line_with_window(0, &mut with_window);
+        assert_eq!(plain, with_window);
+    }
+
+    /// Janou Touryuumon's VDP at frame 1800 (#441 dump): R2 = 0x00 puts plane
+    /// A's name table at VRAM $0000 itself - the configuration that looks
+    /// like a misread, and is not - R16 = 0x11 makes it 64 cells by 64 rows,
+    /// and the rest is the HardBall set: H40, window off.
+    #[test]
+    fn the_janou_touryuumon_plane_configuration_renders_from_base_zero() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(1, 0x64);
+        vdp.write_register(2, 0x00);
+        vdp.write_register(3, 0x00);
+        vdp.write_register(4, 0x01);
+        vdp.write_register(12, 0x81);
+        vdp.write_register(13, 0x07);
+        vdp.write_register(16, 0x11);
+        vdp.write_register(17, 0x00);
+        vdp.write_register(18, 0x00);
+        assert_eq!(vdp.plane_a_base(), 0x0000);
+        assert_eq!(vdp.plane_width_cells(), 64);
+        assert_eq!(vdp.plane_height_cells(), 64);
+
+        // The name entries are the first bytes of VRAM, on top of the hscroll
+        // table base and everything else that lives at zero in this cart.
+        for (cell, entry) in HARDBALL_ENTRIES.iter().enumerate() {
+            put_entry(&mut vdp, 0x0000, cell, *entry);
+        }
+        for entry in &HARDBALL_ENTRIES {
+            put_tile_row(&mut vdp, *entry, 0, &SPARSE_ROW);
+        }
+
+        let mut out = [0u8; WIDTH_H40];
+        vdp.render_plane_line(Plane::A, 0, &mut out);
+        assert_eq!(
+            &out[..24],
+            &THREE_SPARSE_CELLS,
+            "a name table at base $0000 is fetched from $0000"
+        );
+        // Tile 0's first pattern row lives at $0000 too, which here is the
+        // name table's own first two entries, so every cell naming tile 0
+        // draws those bytes as pixels: nibbles of 00 74 00 8D. This overlap
+        // is not a fetch mistake; it is what the cart asked for, and it is
+        // the one-colour-plus-backdrop band its real frame shows (#441).
+        let mut expected = [0u8; WIDTH_H40];
+        expected[..24].copy_from_slice(&THREE_SPARSE_CELLS);
+        for group in expected[24..].as_chunks_mut::<8>().0 {
+            group.copy_from_slice(&[0, 0, 7, 4, 0, 0, 8, 13]);
+        }
+        assert_eq!(out, expected);
+    }
 }
