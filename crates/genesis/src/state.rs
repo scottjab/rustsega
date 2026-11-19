@@ -56,7 +56,14 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// the same class of wrong as the two above - the ROM window shows, but a game
 /// that reads its EEPROM answer through the armed quadrant reads the image's
 /// bit 0 instead of the chip's line.
-pub const FORMAT_VERSION: u32 = 6;
+///
+/// Version 7 is the YM2612's `&A4` F-Num latch (#336): two fields moved off
+/// `phase::Channel` onto `phase::PhaseGen`, because the chip has one `&A4`
+/// register, not six. A v6 payload decodes the channel array into a reader whose
+/// channel no longer expects the fields and whose generator does, so a restored
+/// chip would run with its latch lost and the next `&A0` write applying block
+/// 0 rather than what the driver had latched.
+pub const FORMAT_VERSION: u32 = 7;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 

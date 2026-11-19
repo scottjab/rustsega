@@ -722,8 +722,9 @@ mod tests {
 
         // &A4 is block in bits 5-3 and F-Num 10-8 in bits 2-0. It goes to a
         // latch and nothing else: the pair reaches the phase generator with the
-        // next &A0 write (YM2608 application manual "3. Register descriptions",
-        // `&A0` and `&A4`).
+        // next &A0 write (YM2608 application manual, 2-4-1 "F-Number/Block":
+        // "Please set data according to the following procedures. (1) Data
+        // write of Block/F-Num2: $A4-$A6 (2) Data write of F-Num1: $A0-$A2").
         write_reg(&mut chip, ADDR_1, DATA_1, 0xA4, 0x24);
         let before = chip.phases.channel(0);
         assert_eq!(
@@ -742,12 +743,66 @@ mod tests {
         let again = chip.phases.channel(0);
         assert_eq!((again.fnum, again.block), (0x401, 4));
 
-        // The latch is per channel: writing the next channel of part I leaves the
-        // channel written above alone.
+        // The latch is the chip's, not the channel's: there is one &A4 register
+        // on the die, so the next &A0 of ANY channel applies what it holds. A
+        // driver that writes &A4 once and then steps &A0-&A2 gets the same
+        // block and F-Num high bits on every channel it touches - Nuked-OPN2's
+        // ym3438.c latches one `reg_a4` scalar the same way, and the &AC group
+        // of #114 is modelled the same way one latch wide.
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA4, 0x24);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA1, 0x10);
+        assert_eq!(
+            (chip.phases.channel(1).fnum, chip.phases.channel(1).block),
+            (0x410, 4),
+            "channel 1 takes channel 0's latched block and F-Num high bits"
+        );
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA2, 0x20);
+        assert_eq!(
+            (chip.phases.channel(2).fnum, chip.phases.channel(2).block),
+            (0x420, 4),
+            "so does channel 2"
+        );
+
+        // A part II &A0 applies the same single latch too: the six channels are
+        // one chip's registers, not two of anything. 0x2F is block 5 and
+        // F-Num 10-8 = 7.
+        write_reg(&mut chip, ADDR_2, DATA_2, 0xA4, 0x2F);
+        write_reg(&mut chip, ADDR_2, DATA_2, 0xA0, 0x07);
+        assert_eq!(
+            (chip.phases.channel(3).fnum, chip.phases.channel(3).block),
+            (0x707, 5),
+            "part II's &A0 applies the one latch"
+        );
+    }
+
+    #[test]
+    fn fresh_a4_before_every_a0_sets_each_channel() {
+        // The pattern every real driver hits: a fresh &A4 before each &A0, so
+        // each channel's F-Num is the pair just written even though the latch
+        // itself is the chip's. The per-channel *effect* falls out of the
+        // chip-global rule and must stay (YM2608 application manual 2-4-1:
+        // the two writes are one setting procedure).
+        let mut chip = Ym2612::new();
+
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA4, 0x24);
+        write_reg(&mut chip, ADDR_1, DATA_1, 0xA0, 0x69);
         write_reg(&mut chip, ADDR_1, DATA_1, 0xA5, 0x08);
         write_reg(&mut chip, ADDR_1, DATA_1, 0xA1, 0x10);
-        assert_eq!(chip.phases.channel(1).fnum, 0x010);
-        assert_eq!(chip.phases.channel(0).fnum, 0x401);
+        write_reg(&mut chip, ADDR_2, DATA_2, 0xA6, 0x0C);
+        write_reg(&mut chip, ADDR_2, DATA_2, 0xA2, 0xAB);
+
+        assert_eq!(
+            (chip.phases.channel(0).fnum, chip.phases.channel(0).block),
+            (0x469, 4)
+        );
+        assert_eq!(
+            (chip.phases.channel(1).fnum, chip.phases.channel(1).block),
+            (0x010, 1)
+        );
+        assert_eq!(
+            (chip.phases.channel(5).fnum, chip.phases.channel(5).block),
+            (0x4AB, 1)
+        );
     }
 
     #[test]

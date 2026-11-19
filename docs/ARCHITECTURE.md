@@ -357,6 +357,19 @@ impl Ym2612  { pub fn new() -> Self; pub fn write(&mut self, port: u8, value: u8
 resamples to the host rate (48 kHz default) with a band-limited resampler,
 and applies the Model 1 low-pass filter.
 
+One YM2612 register detail the write path has to model exactly: the `&A4`
+frequency latch is the chip's, not the channel's. `&A4`-`&A6` only latch the
+block and the top three F-Num bits, and the next `&A0`-`&A2` write of any
+channel - part I or part II - is what applies them, so a driver that writes
+`&A4` once and then steps `&A0`-`&A2` leaves every channel it touches on the
+same latched half (YM2608 application manual 2-4-1 "F-Number/Block": the
+setting procedure is "(1) Data write of Block/F-Num2: $A4-$A6 (2) Data write
+of F-Num1: $A0-$A2"; Nuked-OPN2's `ym3438.c` keeps the same one `reg_a4`
+scalar). Real drivers write `&A4` before every `&A0`, which is why the
+every-channel effect of the rule is rarely heard. The `&A8`-`&AE` group of
+channel 3 special mode (#114) is modelled the same way: one `&AC` latch for
+the whole group.
+
 ### genesis
 
 ```rust
