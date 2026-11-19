@@ -576,13 +576,6 @@ const KNOWN_FAILURES: &[(&str, &str)] = &[
     // their own `initial.d2` on any machine. Upstream data bug, #209; the
     // same two cases `shifts.rs` drops from `asl_b_file_passes`.
     ("ASL.b", "#209"),
-    // Clocks only — every CHK case's state matches, which is what the
-    // `Check::StateSkipExceptions` per-file test already proves. 4948 of the
-    // 8065 cases run (the rest are the exception cases) and all 4948 are 4 or 6
-    // clocks below the suite's `length`: a trapped CHK wants 38 + ea and a
-    // passing one wants 10 + ea, against this core's 34 + ea and 4 + ea.
-    // #241 carries the CHK clock law.
-    ("CHK", "#241"),
 ];
 
 /// The files that failed without an issue, and the issues whose files now pass.

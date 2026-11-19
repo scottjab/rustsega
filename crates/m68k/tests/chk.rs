@@ -1,21 +1,12 @@
 //! `CHK` in the pinned 680x0 suite (M1-27, #35).
 //!
 //! One test for `CHK.json.gz`, in the style of `status.rs`, checked with
-//! [`harness::Check::StateSkipExceptions`]. It is the one instruction file
-//! M1-31c (#41) left off cycle checking, and it is not because it was skipped:
-//! measured over the 4948 cases this test compares, `CHK`'s own work is
-//! 6 clocks when the comparison completes — `CHK.W D0,D0` is 10, `CHK.W (A0)` is
-//! 14, and every mode is exactly 6 over its operand's bus traffic — but a CHK
-//! that traps pays `4 + <ea> + 34` for some cases and `6 + <ea> + 34` for
-//! others, and what picks between the two is not the operand, the mode or the
-//! direction of the overflow. That split is issue #241; until it has an answer
-//! there is no rule to implement here, so enabling clocks would mean writing a
-//! rule that is wrong on part of the file. See the measurement in the #41 PR.
-//!
-//! The file runs `CHK.W Dn,<ea>` for
-//! every `Dn` and every addressing mode, so a large share of its cases end in the
-//! suite's exception handler on an odd address and the skip is doing real work
-//! here rather than hiding anything.
+//! [`harness::Check::StateAndCyclesSkipExceptions`] since #241: the trap clock
+//! law below made the file's 4948 ran cases deterministic, so clocks are now
+//! compared along with state. It is still not [`harness::Check::StateAndCycles`]
+//! because a large share of its cases end in the suite's exception handler on an
+//! odd address and the skip is doing real work here rather than hiding anything
+//! (the file runs all eighteen addressing modes).
 //!
 //! # What the file covers
 //!
@@ -38,6 +29,29 @@
 //!   alone unless the trap fired. `ops::arith::M68k::op_chk` works through the two
 //!   cases that separate that from `CMP` semantics and from touching nothing.
 //!
+//! # The clock law (`length` over all 4948 cases the suite dates)
+//!
+//! Let `ea` be the bound operand's access cost and the compare be the signed
+//! 16-bit one the manual describes (`Dn < 0 || Dn > <ea>`). Which of the two
+//! conditions fires the trap is what picks the trap length, and the instruction
+//! pays for whichever ran before the exception entry:
+//!
+//! | `Dn.w` vs bound (signed) | outcome | suite `length` | per case |
+//! |---|---|---|---|
+//! | `Dn > bound` | trap, high | `38 + ea` | 2409 |
+//! | `Dn < 0`, `Dn <= bound` | trap, sign only | `40 + ea` | 1863 |
+//! | `0 <= Dn <= bound` | in range | `10 + ea` | 676 |
+//!
+//! The 38 row covers the "both hold" cases too: a negative `Dn` that the bound
+//! compare would also have flagged traps at 38, not 40. Measured against every
+//! case in the file the rule above has zero mismatches, and it is not a fit to
+//! the data — it is Motorola's own bus timing, two rows in the per-instruction
+//! tables this repo cites as yacht.txt: `trap : Dn > Src` at `38(5/3) + ea` and
+//! `trap : Dn < 0` at `40(5/3) + ea` (no-trap `10(1/0) + ea`). The manual's
+//! exception-summary table rounds both trap rows to a single worst-case
+//! `40(4/3) + ea`, which is where the "one number" readings of CHK timing come
+//! from. The core models this in `ops::arith::M68k::op_chk`.
+//!
 //! The `CHK.L` block below each register's `CHK.W` (`0100 ddd 100 mmm rrr`) is a
 //! 68020 instruction; the 68000 has no case for it and it stays in the
 //! illegal-instruction path.
@@ -48,10 +62,11 @@ mod harness;
 
 /// `CHK.W Dn,<ea>`: `$4180` + `<ea>` for `D0`, walked for all eight `Dn` and all
 /// eighteen addressing modes (M68000UM "CHK — Check Data Register Against Upper
-/// Bound").
+/// Bound"). Cycles are compared too: the trap clock law of #241 covers every
+/// case the suite dates, so the trap paths are pinned like the rest.
 #[test]
 fn chk_file_passes() {
-    harness::assert_file_passes("CHK", harness::Check::StateSkipExceptions);
+    harness::assert_file_passes("CHK", harness::Check::StateAndCyclesSkipExceptions);
 }
 
 /// The file name above is what the suite ships, so a rename fails here with a

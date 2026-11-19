@@ -172,16 +172,14 @@ pub(crate) const EXCEPTION_ENTRY_CLOCKS: u64 = 34;
 /// already fetched its opcode before it faulted: those
 /// [`OPCODE_CLOCKS`](crate::cpu::OPCODE_CLOCKS) themselves.
 ///
-/// A handler returns them so the step totals the fetch it really spent, and the
-/// two numbers add up on the suite's only cycle-checked case of the kind,
-/// `80ef [DIVU (d16, A7), D0] 5745`: `length` 46 = 4 fetch + 8 for the
-/// `(d16,An)` read + 34 entry (#238). It is the only case of its kind under a
-/// cycle check: every other trapping case either sits in a file that is not
-/// cycle-checked (`CHK`, `TRAP`, `TRAPV`) or is left out by
-/// `harness::is_exception_case`. `CHK` is the second family that agrees with
-/// the split, at `4 + ea + 34` on all 3989 of its trapping cases (`Dn` 38,
-/// `(An)` 42, `-(An)` 44, `(xxx).l` 50), and #241 carries the 2-clock half of
-/// `CHK`'s population that no model here accounts for.
+/// A handler returns them so the step totals the fetch it really spent. The
+/// first suite case that forced this was `80ef [DIVU (d16, A7), D0] 5745`:
+/// `length` 46 = 4 fetch + 8 for the `(d16,An)` read + 34 entry (#238). Since
+/// #241 `CHK`'s traps are cycle-checked and return it on both trap paths, with
+/// the sign-only path one [`ALU_PASS_CLOCKS`] pass above it: the suite's 4 272
+/// trapping `CHK` cases sit at `38 + ea` when the signed bound compare fires
+/// the trap and `40 + ea` when only `Dn < 0` does — documented bus timing (see
+/// [`M68k::op_chk`] for the law and its citations), not a fit.
 ///
 /// Not for the traps that *are* the instruction: `TRAP`, `TRAPV` and an illegal
 /// opcode fault before any operand is read, and cost the entry's 34 with nothing
@@ -191,6 +189,8 @@ pub(crate) const EXCEPTION_ENTRY_CLOCKS: u64 = 34;
 /// skips), which is what keeps this 4 away from [`M68k::op_illegal`].
 ///
 /// [`M68k::op_illegal`]: crate::M68k::op_illegal
+/// [`M68k::op_chk`]: crate::ops::arith::M68k::op_chk
+/// [`ALU_PASS_CLOCKS`]: crate::ops::arith::ALU_PASS_CLOCKS
 pub(crate) const FAULTED_FETCH_CLOCKS: u32 = crate::cpu::OPCODE_CLOCKS;
 
 /// Bus accesses [`M68k`] performs during an exception entry: three writes for

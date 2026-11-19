@@ -12,12 +12,12 @@ it.
 
 | | |
 |---|---|
-| Measured | 2026-11-10, `main` at `2d55990` |
+| Measured | 2026-11-19, `main` at the #241 fix |
 | Check level | `harness::Check::StateAndCyclesSkipExceptions` |
-| Instruction files | **124** — 122 clean, 2 failing |
-| Cases | **817 023 / 1 000 060** passed |
+| Instruction files | **124** — 123 clean, 1 failing |
+| Cases | **821 971 / 1 000 060** passed |
 | Cases skipped | **178 087**, spread over 62 files |
-| Cases failing | **4 950**, in 2 files |
+| Cases failing | **2**, in 1 file |
 | Sweep time | 3.7 s of test time; 4.3 s wall including `nix develop` startup with the test binary already built |
 
 `Check::StateAndCyclesSkipExceptions` compares every data and address
@@ -83,41 +83,14 @@ The sweep fails unless the set of failing files is exactly `KNOWN_FAILURES` in
 `KNOWN_FAILURES` and the [known failures](#known-failures-2-files-4-950-cases)
 section below are the same list, and they move together.
 
-## Known failures (2 files, 4 950 cases)
+## Known failures (1 file, 2 cases)
 
-Both are measured failures, not excused ones. Fixing either is out of scope for
-M1-32 (#42), which is the ticket that turned the sweep into a gate.
-
-### `CHK` — 4 948 cases, clocks only — [#241]
-
-| column | value |
-|---|---|
-| `total` / `passed` / `failed` / `skipped` | 8065 / 0 / 4948 / 3117 |
-| Axis that fails | cycles (`length`) — every one of the 4948 |
-| Axis that passes | state — registers, SR, PC, prefetch, listed RAM bytes |
-
-Every `CHK` case that runs is 4 or 6 clocks *below* what the suite asks for, and
-no case's state is wrong; the state-only test (`chk.rs`,
-`Check::StateSkipExceptions`) has been green throughout, which is exactly why
-this went unseen until the sweep went to `StateAndCycles`. Measured over
-`CHK.json.gz` with this harness: 0 state mismatches, and the `length` deltas are
-`{4: 2409, 6: 1863}` on the 4 272 trapping cases (`final.pc == $00002000`) and
-`{6: 676}` on the 676 that do not trap.
-
-The suite's own law, read off the data:
-
-| population | suite `length` | this core | delta |
-|---|---|---|---|
-| traps (4 272 cases) | `38 + ea`, with a second population 2 clocks higher | `34 + ea` | +4 or +6 |
-| does not trap (676 cases) | `10 + ea` (`length` ∈ {10, 14, 16, 18, 20, 22}) | `4 + ea` | +6 |
-
-[#241] carries the CHK clock law — it is written from the trapping half and
-records the unplaced 2 clocks — and CHK is left on `Check::StateSkipExceptions`
-until it lands. The non-trapping half is the same law's other shoe: the suite
-bills a CHK that completes 10 clocks for its own execution where this core bills
-4.
-
-[#241]: https://github.com/scottjab/rustsega/issues/241
+This one is a measured failure, not an excused one. The other known failure,
+`CHK`'s 4 948 clock mismatches, left this list in #241: its clock law turned out
+to be Motorola's own trap timing (yacht.txt prices `trap : Dn > Src` at
+`38(5/3) + ea` and `trap : Dn < 0` at `40(5/3) + ea`, no-trap at `10(1/0) + ea`),
+the core now models it, and the file moved up to cycle checking in the same
+commit that removed it from `KNOWN_FAILURES`.
 
 ### `ASL.b` — 2 cases, state — [#209]
 
@@ -262,7 +235,7 @@ BSET                8065    8065       0       0
 BSR                 8065    4085       0    3980
 BTST                8065    8065       0       0
 Bcc                 8065    5865       0    2200
-CHK                 8065       0    4948    3117
+CHK                 8065    4948       0    3117
 CLR.b               8065    8065       0       0
 CLR.l               8065    4903       0    3162
 CLR.w               8065    4896       0    3169
@@ -365,27 +338,15 @@ ASL.b (#209): 2 failing cases
   case "e502 [ASL.b Q, D2] 1583": d2: expected 0x2E5E4304, got 0xCDFB7FF8; sr: expected 0x2713, got 0x270A
   case "e502 [ASL.b Q, D2] 1761": d2: expected 0x6461D390, got 0x417C7EF4
 
-CHK (#241): 4948 failing cases
-  case "4598 [CHK (A0)+, D2] 1": cycles: expected 42, got 38
-  case "49b8 [CHK (xxx).w, D4] 2": cycles: expected 48, got 42
-  case "49b7 [CHK (d8, A7, Xn), D4] 3": cycles: expected 50, got 44
-  case "4f99 [CHK (A1)+, D7] 4": cycles: expected 42, got 38
-  case "4980 [CHK D0, D4] 5": cycles: expected 40, got 34
-  case "45a4 [CHK -(A4), D2] 6": cycles: expected 44, got 40
-  case "4199 [CHK (A1)+, D0] 9": cycles: expected 42, got 38
-  case "4997 [CHK (A7), D4] 10": cycles: expected 44, got 38
-  case "4f84 [CHK D4, D7] 11": cycles: expected 38, got 34
-  case "459f [CHK (A7)+, D2] 12": cycles: expected 44, got 38
-
-124 files: 817023/1000060 cases passed, 178087 cases skipped as exceptions, 4950 cases failing in 2 files
+124 files: 821971/1000060 cases passed, 178087 cases skipped as exceptions, 2 cases failing in 1 files
 sweep took 3.7s
 ```
 
 ## Regenerating this page
 
 Run the gate, replace the block above with its table, and update the four
-numbers in [The run](#the-run). `CHK`'s and `ASL.b`'s rows in
-[Known failures](#known-failures-2-files-4-950-cases) come from the same run.
+numbers in [The run](#the-run). `ASL.b`'s row in
+[Known failures](#known-failures-1-file-2-cases) comes from the same run.
 The gate refuses to pass while `KNOWN_FAILURES` and this page disagree about
 *which* files fail, so the only thing a re-run should ever change here is the
 numbers — and when a file does move, it moves out of this page and out of
