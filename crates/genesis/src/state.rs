@@ -48,7 +48,7 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// for the shape alone - a state that does not carry a gate resumes a frame with the
 /// rest of a 68k -> VDP transfer silently dropped, which is the same class of wrong
 /// as the mode-2 field that made 2 what it is.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 
@@ -258,5 +258,24 @@ mod tests {
     fn a_short_header_is_bad_magic() {
         assert_eq!(payload_of(b"RSG", &[]), Err(StateError::BadMagic));
         assert_eq!(payload_of(&[], &[]), Err(StateError::BadMagic));
+    }
+
+    /// A state of another version is refused with its version in the error
+    /// rather than decoded as this version's payload: the fields one build
+    /// writes after the header are not the fields another build wrote there,
+    /// and the version is the only thing that says so. Both directions, the
+    /// older one being the shape the versions before this one wrote.
+    #[test]
+    fn a_foreign_version_is_refused_not_misparsed() {
+        let state = container(rom_checksum(b"rom"), b"payload");
+        for version in [FORMAT_VERSION + 1, FORMAT_VERSION - 1] {
+            let mut foreign = state.clone();
+            foreign[4..8].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                payload_of(&foreign, b"rom"),
+                Err(StateError::UnsupportedVersion(version)),
+                "version {version}"
+            );
+        }
     }
 }

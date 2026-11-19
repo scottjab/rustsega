@@ -141,11 +141,13 @@ fn header_written_and_checked() {
     );
     assert_eq!(
         u32::from_le_bytes(state[4..8].try_into().expect("4 bytes of version")),
-        3,
-        "format version 3, which is what the scheduler carrying the two freeze gates of a \
-         68k -> VDP transfer is (#517) on top of the woven mode-2 field that made it 2 \
-         (#457); the number is pinned rather than read from `state::FORMAT_VERSION` because \
-         bumping it has to be a decision, not an accident"
+        4,
+        "format version 4, which is the EEPROM chip carrying one of three addressing \
+         modes instead of a mode-1 flag, the 24C65's two-byte word address of #270, \
+         on top of the scheduler's two freeze gates that made it 3 (#517) and the \
+         woven mode-2 field that made it 2 (#457); the number is pinned rather than \
+         read from `state::FORMAT_VERSION` because bumping it has to be a decision, \
+         not an accident"
     );
     let checksum = u64::from_le_bytes(state[8..16].try_into().expect("8 bytes of checksum"));
     assert_eq!(

@@ -85,7 +85,7 @@ the serials, the boards and the chip types; `H` = the cart's own header in
 `test-roms/` and the local ROM directory; `D` = the manufacturer's datasheet,
 cited in the chip table.
 
-All 21 of these are in `EEPROM_GAMES`. Genesis Plus GX's names for them are the
+All 23 of these are in `EEPROM_GAMES`. Genesis Plus GX's names for them are the
 names in its own table; a good number are Japanese and European releases whose
 English titles vary, so the serial is the thing to trust and the emulator matches
 on that.
@@ -108,6 +108,8 @@ on that.
 | John Madden Football 93 | `T-50446` | X24C01 | 128 B | 4 | 1 | Ea | serial only (G) |
 | John Madden Football 93 (Champ. Ed.) | `T-50516` | X24C01 | 128 B | 4 | 1 | Ea | serial only (G) |
 | Bill Walsh College Football | `T-50606` | X24C01 | 128 B | 4 | 1 | Ea | serial only (G) |
+| Frank Thomas Big Hurt Baseball | `T-81476` | AT24C65 | 8 KB | 64 | 3 | Acclaim32M | declares (G,H) |
+| College Slam | `T-81576` | AT24C65 | 8 KB | 64 | 3 | Acclaim32M | declares (G,H) |
 | NBA Jam (J) | `T-81033` | X24C02 | 256 B | 4 | 2 | Acclaim16M | declares (G) |
 | NBA Jam (UE) | `T-081326` | X24C02 | 256 B | 4 | 2 | Acclaim16M | declares (G) |
 | NFL Quarterback Club | `T-081276` | AT24C02 | 256 B | 8 | 2 | Acclaim32M | declares (G) |
@@ -129,7 +131,23 @@ Mode is what the first byte of a transfer means. Mode 1 puts the word address
 *in* it - seven bits of address and the read/write flag - which is what a Xicor
 1 Kbit part with no device address does; mode 2 puts a device address there
 (`1010` and the chip's own address pins) with a whole word-address byte behind
-it. The numbers are Xicor's `T7`-`T9` and timing `T15` for the X24C01 and
+it; mode 3 puts a device address there with the word address behind it as **two**
+bytes, high half first, of which the array answers to only the low ones - the
+Atmel AT24C65 datasheet (doc2631, "Byte Write": "a write operation requires two
+8-bit data word addresses following the device address word") and Genesis Plus
+GX's `i2c_specs` for the 24C32 through the 24C512, all of which take
+`address_bits` 16. A bit of those two bytes above the array is don't-care: the
+24C65 answers to 13 of the 16 and ignores the top three of the high byte, which
+is the `size_mask` half of GPGX's triple - its `GET_WORD_ADR_HIGH` never latches
+a bit above it, and MAME's `i2cmem` masks the composed address with the array
+size - and on the wire that means a high address byte with garbage on top is the
+same address as without it. A mode-3 part's device pins name the chip on the
+board instead and nothing of the address rides on them; the pins standing in for
+the top of the word address is mode 2's trick, for the 24C04-16 only. The two
+address bytes are a write's as much as a read's, and every byte of the sequence -
+device, high, low, data - takes its own acknowledge.
+
+The numbers are Xicor's `T7`-`T9` and timing `T15` for the X24C01 and
 chapters 5-7 of Atmel's `doc0180` for the AT24C01-16 family, and they are the
 `{address_bits, size_mask, pagewrite_mask}` triples of Genesis Plus GX's
 `i2c_specs[]` to the byte.
@@ -143,6 +161,7 @@ chapters 5-7 of Atmel's `doc0180` for the AT24C01-16 family, and they are the
 | `At24c04` | 512 B | 16 | 2 | Atmel doc0180: 4 Kbit, page 16; `i2c_specs` `{8, 0x1FF, 0x0F}` |
 | `At24c08` | 1 KB | 16 | 2 | Atmel doc0180: 8 Kbit, page 16; `i2c_specs` `{8, 0x3FF, 0x0F}` |
 | `At24c16` | 2 KB | 16 | 2 | Atmel doc0180: 16 Kbit, page 16; `i2c_specs` `{8, 0x7FF, 0x0F}` |
+| `At24c65` | 8 KB | 64 | 3 | Atmel AT24C65 datasheet, doc2631 (the archived copy at web.archive.org, 2003-05-21, is encrypted; the two-address-byte protocol is the one GPGX and MAME's `i2cmem` both encode); `i2c_specs` `{16, 0x1FFF, 0x3F}` |
 
 The page is what a write wraps inside: the low `log2(page)` bits of the word
 address count up and the rest of the address stays where it was - Xicor's `T15`
@@ -152,7 +171,9 @@ tests it on the X24C01's four and the AT24C02's eight. The three address pins of
 a mode-2 device byte are the top of the word address on a chip big enough to
 need them (Atmel doc0180, and `i2c_specs`' 9-bit mask for the 24C04), which is
 what `Chip::select` is and what the second half of
-`write_then_read_byte_mode2` checks.
+`write_then_read_byte_mode2` checks; a mode-3 part's word address needs no help
+from its pins, and `write_then_read_byte_mode3` walks the whole of it, the
+two-byte composition, the don't-care top bits and the 64-byte page.
 
 ### Where the sources disagree
 
@@ -207,14 +228,12 @@ what `Chip::select` is and what the second half of
   `jcart_read()`). It needs the J-CART mapper to exist first, and to agree with
   it about those registers. That is worth its own ticket, and the row above is
   here - in this file, not in `eeprom::Board`, which has only the four boards the
-  emulator decodes - so the bit positions are written down once.
-- **Mode 3.** Genesis Plus GX's `i2c_specs` for the 24C32 up to the 24C512 - and
-  for the 24C65 of `T-81476` (Frank Thomas Big Hurt Baseball), `T-81576`
-  (College Slam) and `T-120146` - take `address_bits` 16: a device byte, then a
-  word address in *two* bytes, with the device pins standing in for the top bits
-  when the array is smaller than the addressing. `Chip` and the state machine
-  have one word-address byte and no shape for that, so those carts are out. It is
-  a small extension to `accept`/`select` when a cart needs it.
+  emulator decodes - so the bit positions are written down once. The chip of the third of these,
+`T-120146`, is now in the emulator: it is the same mode 3 AT24C65 the two EA
+carts carry (GPGX's `i2c_database` has it on `mapper_i2c_jcart_init` with
+`EEPROM_24C65`), so when the J-CART mapper lands (#356) its serial row in
+`EEPROM_GAMES` is one line. Until then it has no save, because the board is the
+missing piece, not the chip.
 - **The 32 Mbit board's bank shift.** See "Word accesses are two byte accesses"
   above: `mapper_acclaim_32M_write16` is a 64 KB bank shift on those carts, and
   the shift itself is not implemented. `T-081276`, `T-81406` and `T-081586` get
