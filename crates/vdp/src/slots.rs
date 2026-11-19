@@ -19,7 +19,10 @@
 //! The *counts* are documented. A blank line has 205 external slots in H40 and
 //! 167 in H32 - "H32: 167+4=171, H40: 205+5=210" (Nemesis, "VDP Internals",
 //! SpritesMind gendev thread 1291), which are also the Sega DMA bandwidth
-//! figures. With the display off an H40 line carries 198 transfers ([`OFF_TRANSFERS_H40`]).
+//! figures: the "DMA transfer capacity" table of the Sega Genesis Software
+//! Manual quotes 205 and 167 for the blanking column of a 68k to VRAM transfer
+//! (read off the scan on #305; transcribed in genvdp.txt "Transfer capacity").
+//! With the display off an H40 line carries 198 transfers ([`OFF_TRANSFERS_H40`]).
 //!
 //! The *positions* of the free slots of an active line are measured, not
 //! invented: both active tables are counted out of plutiedev's per-line fetch
@@ -93,12 +96,13 @@
 //!
 //! The DMA line is the one to look at next, and it is not this decision: with the
 //! display off [`Vdp::dma_slot_table`] hands a transfer [`BLANK_SLOTS_H40`] = 205
-//! slots, which is the Sega bandwidth table's own display-off figure, while
-//! SpritesMind measures 198 transfers on such a line. A DMA that takes its whole
-//! allowance is therefore modelling something 3.5% wider than hardware carries -
-//! a demand shape this port argument does not speak to. #305 is open on the DMA
-//! table (against the Sega manual) and is where that belongs; #101 shipped the DMA
-//! timing itself and did not have the display-off measurement to compare to.
+//! slots, which is the Sega bandwidth table's own blanking figure, while
+//! SpritesMind measures 204 write slots / 198 read transfers on such a line. A
+//! DMA that takes its whole allowance is therefore modelling something wider
+//! than hardware carries - a demand shape this port argument does not speak
+//! to. #305 fenced that conflict rather than landing either side; #101 shipped
+//! the DMA timing itself and did not have the display-off measurement to
+//! compare to.
 
 use crate::Vdp;
 use crate::hv::{MCLKS_PER_LINE, pixel_to_mclk};
@@ -177,10 +181,12 @@ const BLANK_H32: [u16; BLANK_SLOTS_H32] = blank_line(SLOTS_H32, REFRESH_BLANK_H3
 /// 37", which lands near those five places plus one at the tail slot the
 /// active line keeps free, and read 204 write slots off that where this table
 /// keeps the documented 205 (SpritesMind thread 1291 page 3). The count
-/// conflict is #305's to settle, and landing either correction moves every
-/// blank-line DMA deadline and FIFO wait. What that buys and costs is measured
-/// against the counts, which do not depend on it: [`BLANK_SLOTS_H40`] and
-/// [`BLANK_SLOTS_H32`] come out of the length of this. INFERRED, TODO(#301).
+/// conflict - manual 205, measurement 204, H32 positions unknown - was fenced
+/// on #305 rather than landed either way: no source settles it and landing
+/// either correction moves every blank-line DMA deadline and FIFO wait. What
+/// hardware must measure is on the ticket. What that buys and costs is
+/// measured against the counts, which do not depend on it:
+/// [`BLANK_SLOTS_H40`] and [`BLANK_SLOTS_H32`] come out of the length of this. INFERRED, TODO(#301).
 const fn blank_line<const N: usize>(total: usize, count: usize) -> [u16; N] {
     let mut slots = [0u16; N];
     let mut out = 0;
@@ -283,7 +289,8 @@ impl Vdp {
     ///   slot of the line but the [`REFRESH_BLANK_H40`] and
     ///   [`REFRESH_BLANK_H32`] that DRAM refresh takes - the 205 and 167 of
     ///   [`BLANK_SLOTS_H40`] and [`BLANK_SLOTS_H32`]. Where the refresh slots
-    ///   fall is INFERRED (see [`blank_line`]); that they are 5 and 4 is not.
+    ///   fall is INFERRED (see [`blank_line`]); that they are 5 and 4 is not,
+    ///   and that the counts are 205 and 167 is the Sega manual's own table.
     ///
     /// With the display off this is not consulted at all: nothing is being
     /// fetched, so the memories are free for the port the moment a write is made,
@@ -314,16 +321,23 @@ impl Vdp {
     ///   well and turn 18 into 46;
     /// * a fill pays one slot of every line and moves nothing: 17 and 15 active,
     ///   204 and 166 blank, one short of the transfer in all four columns.
-    ///   Nothing says where in the line that slot goes, so it is the first one
-    ///   and the four counts come out right. INFERRED, TODO(#101): the fill and
-    ///   copy figures are what #101 was given rather than something a page was
-    ///   found for, and #305 is checking them against the Sega manual.
+    ///   The counts are the manual's own: "VRAM FILL ... 17 Bytes" active H40
+    ///   and "204 Bytes" blank (Sega Genesis Software Manual, "DMA transfer
+    ///   capacity", read off the scan on #305), and the copy row is there too
+    ///   at 9/102 and 8/83, half a transfer's, rounded down. What no page says
+    ///   is where in the line the fill's lost slot goes, so it is the first one
+    ///   and the four counts come out right: the position is INFERRED, the
+    ///   counts are CONFIRMED as of #305.
     ///
     /// A line with the display off is a blank one here: nothing is being fetched
-    /// so [`BLANK_H40`] is the schedule, which is the same reading
-    /// [`Vdp::fifo_clock`] makes. Hardware charges a little more for it -
-    /// [`OFF_TRANSFERS_H40`]'s 198 rather than 205 - and #302 is where that is
-    /// paid.
+    /// so [`BLANK_H40`] is the schedule. The manual's table has no display-off
+    /// column of its own; Charles MacDonald's gloss of it (genvdp.txt "Transfer
+    /// capacity") reads its "Blanking" as covering "when the display is
+    /// forcibly blanked via register #1", which is the reading this table
+    /// takes. Hardware charges a little more for it - [`OFF_TRANSFERS_H40`]
+    /// transfers rather than 205, and Mask of Destiny measured 6 refresh slots
+    /// on such a line where the documented 205 needs 5 - and the conflict is
+    /// fenced on #305, pending hardware.
     pub(crate) fn dma_slot_table(&self, fill: bool) -> &'static [u16] {
         let line = self.dma_line_slots(self.in_vblank || !self.display_enabled());
         if fill { &line[1..] } else { line }

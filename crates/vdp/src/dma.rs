@@ -23,8 +23,9 @@
 //! Not modelled: the read FIFO quirk that makes the first word of a
 //! 68k-to-VRAM transfer wrong on real hardware (#306), and the CRAM "dots" a
 //! write during active display leaves behind (out of scope for #101). The four
-//! bandwidth figures the slot costs below reproduce are ticket-stated rather
-//! than quoted from the Sega manual, and #305 is checking them.
+//! bandwidth figures the slot costs below reproduce are the Sega Genesis
+//! Software Manual's own "DMA transfer capacity" table now: #305 read it off
+//! the scan and every cell matched.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -106,7 +107,9 @@ const fn bytes_to_move(length: u16) -> u32 {
 /// Access slots a copied byte costs: one to read the source and one to write the
 /// destination. It is why the Sega DMA bandwidth table's copy figures are half a
 /// transfer's - 9 bytes on an active H40 line out of its 18 slots, and 102 of a
-/// blank line's 205.
+/// blank line's 205, rounding down as the manual's own "VRAM COPY" row does
+/// (Sega Genesis Software Manual, "DMA transfer capacity": 9/102 H40, 8/83
+/// H32).
 const COPY_SLOTS: u8 = 2;
 
 /// Access slots one unit of a DMA costs, a unit being a word of a 68k transfer
@@ -114,10 +117,15 @@ const COPY_SLOTS: u8 = 2;
 ///
 /// VRAM is byte wide, so its word is two writes and two slots (genvdp.txt
 /// section 8); CRAM and VSRAM are word wide and cost one (sections 9 and 10),
-/// which is the table's "the same slot counts but in words". A step of a fill is
+/// which is the manual's own note: "number of words (not byte) should apply"
+/// when CRAM or VSRAM is the destination of a MEMORY TO VRAM transfer (Sega
+/// Genesis Software Manual, "DMA transfer capacity"). A step of a fill is
 /// one byte, or one word of CRAM or VSRAM, and one slot; that a fill's line
 /// holds one slot *less* than a transfer's is not this function's business, it is
-/// [`Vdp::dma_slot_table`] that pays it.
+/// [`Vdp::dma_slot_table`] that pays it. That a CRAM or VSRAM *fill* costs one
+/// slot a word is analogy and not a citation: the manual's fill row is VRAM
+/// FILL only, its words note covers MEMORY TO VRAM only, and #305 left it
+/// assumed on that basis.
 const fn slots_per_unit(mode: DmaMode, target: DataTarget) -> u8 {
     match mode {
         DmaMode::Mc68kTransfer => match target {
@@ -1466,13 +1474,172 @@ mod tests {
         assert!(!vdp.dma_busy, "and two lines of them is enough");
     }
 
+    /// The manual's fill row as a line budget: "VRAM FILL ... H40CELL ... DURING
+    /// V BLANK 204 Bytes" (Sega Genesis Software Manual, "DMA transfer
+    /// capacity", read off the scan on #305). A fill pays one slot of every
+    /// blank H40 line to the machine, which is what puts it one byte short of
+    /// the transfer's 205, so 204 bytes of fill fit inside the line it starts
+    /// on.
+    #[test]
+    fn a_fill_of_204_bytes_in_h40_vblank_is_one_line() {
+        let mut vdp = h40_in_vblank();
+        dma_set_up(&mut vdp, FILL, 204, 1);
+        vdp.write_register(1, 0x50);
+        start_and_run(&mut vdp, vram_write_cmd(0x2000));
+        vdp.write_data(0xAB00);
+        assert!(vdp.dma_busy, "the fill is running");
+
+        vdp.advance(MCLKS_PER_LINE);
+
+        assert!(
+            !vdp.dma_busy,
+            "204 bytes x 1 slot is the blank H40 line's 204 fill slots exactly"
+        );
+        assert_eq!(
+            (vdp.reg(19), vdp.reg(20)),
+            (0, 0),
+            "the count is spent when the last slot is"
+        );
+    }
+
+    /// The other half of the same row: one byte more is 205 slots against 204,
+    /// so the fill runs into the next line.
+    #[test]
+    fn a_fill_of_205_bytes_does_not_fit_in_that_line() {
+        let mut vdp = h40_in_vblank();
+        dma_set_up(&mut vdp, FILL, 205, 1);
+        vdp.write_register(1, 0x50);
+        start_and_run(&mut vdp, vram_write_cmd(0x2000));
+        vdp.write_data(0xAB00);
+        assert!(vdp.dma_busy, "the fill is running");
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(vdp.dma_busy, "205 slots against 204: one byte short");
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(!vdp.dma_busy, "and the second line finishes it");
+    }
+
+    /// The manual's words note as a cost: "In the MEMORY TO VRAM, in the case
+    /// where CRAM and VSRAM are the dessinations, number of words (not byte)
+    /// should apply" (Sega Genesis Software Manual, "DMA transfer capacity";
+    /// the typo is the scan's). One slot a word ([`slots_per_unit`]) over the
+    /// 205 of a blank H40 line is 205 words, so a CRAM transfer of exactly that
+    /// fits inside the line it starts on. Every source word is 0x0EEE, the one
+    /// colour word the CRAM's write masking leaves alone, so the whole CRAM
+    /// reads back as it once the transfer has been through it, wrap and all.
+    #[test]
+    fn a_cram_transfer_of_205_words_in_h40_vblank_is_one_line() {
+        let mut vdp = h40_in_vblank();
+        vdp.write_register(1, 0x50);
+        dma_from(&mut vdp, 0x000100, 205);
+        start_dma(&mut vdp, cram_write_cmd(0x0000));
+
+        let source: Vec<u16> = vec![0x0EEE; 205];
+        let mut bus = FakeBus::laid_at(0x000100, &source);
+        vdp.run_dma(&mut bus);
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(
+            !vdp.dma_busy,
+            "205 words x 1 slot is the blank H40 line's 205 exactly"
+        );
+        assert!(
+            vdp.cram.iter().all(|&word| word == 0x0EEE),
+            "the whole CRAM is the transferred word"
+        );
+    }
+
+    /// One word more is 206 slots against 205, so the transfer runs into the
+    /// next line: the words note makes the unit of a CRAM transfer a word, not
+    /// the transfer free.
+    #[test]
+    fn a_cram_transfer_of_206_words_does_not_fit_in_that_line() {
+        let mut vdp = h40_in_vblank();
+        vdp.write_register(1, 0x50);
+        dma_from(&mut vdp, 0x000100, 206);
+        start_dma(&mut vdp, cram_write_cmd(0x0000));
+
+        let source: Vec<u16> = vec![0x0EEE; 206];
+        let mut bus = FakeBus::laid_at(0x000100, &source);
+        vdp.run_dma(&mut bus);
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(vdp.dma_busy, "206 slots against 205: one word short");
+        assert_eq!(vdp.cram[0], 0x0EEE, "words are landing while it runs");
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(!vdp.dma_busy, "and the second line finishes it");
+    }
+
+    /// The copy row of an active line: "VRAM COPY ... H40CELL DURING EFFECTIVE
+    /// SCREEN 9 Bytes" (Sega Genesis Software Manual, "DMA transfer capacity",
+    /// on #305). Two slots a copied byte ([`COPY_SLOTS`]) halves the 18 free
+    /// slots of an active H40 line, so 9 bytes fit inside the line exactly.
+    /// A copy moves byte lanes, from `source ^ 1` to `addr ^ 1` (genvdp.txt
+    /// section 11), so the source is planted lane-swapped and the ninth byte
+    /// of the sequence lands at 0x0209.
+    #[test]
+    fn a_copy_of_9_bytes_over_the_active_h40_display_is_one_line() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(12, 0x81);
+        dma_set_up(&mut vdp, COPY, 9, 1);
+        vdp.write_register(1, 0x50);
+        copy_source(&mut vdp, 0x0100);
+        vdp.in_hblank = false;
+        vdp.in_vblank = false;
+        for offset in 0u16..10 {
+            vdp.vram[usize::from((0x0100 + offset) ^ 1)] = offset as u8 + 1;
+        }
+        start_and_run(&mut vdp, copy_write_cmd(0x0200));
+        assert!(vdp.dma_busy, "the copy is running");
+
+        vdp.advance(MCLKS_PER_LINE);
+
+        assert!(
+            !vdp.dma_busy,
+            "9 bytes x 2 slots is the active H40 line's 18 exactly"
+        );
+        for byte in 1u16..=9 {
+            assert_eq!(
+                vdp.vram[usize::from((0x0200 + byte - 1) ^ 1)],
+                byte as u8,
+                "byte {byte} of the sequence, at its lane-swapped slot"
+            );
+        }
+    }
+
+    /// One byte more is 20 slots against 18: the copy runs into the next line.
+    #[test]
+    fn a_copy_of_10_bytes_does_not_fit_in_that_line() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(12, 0x81);
+        dma_set_up(&mut vdp, COPY, 10, 1);
+        vdp.write_register(1, 0x50);
+        copy_source(&mut vdp, 0x0100);
+        vdp.in_hblank = false;
+        vdp.in_vblank = false;
+        for offset in 0u16..11 {
+            vdp.vram[usize::from((0x0100 + offset) ^ 1)] = offset as u8 + 1;
+        }
+        start_and_run(&mut vdp, copy_write_cmd(0x0200));
+        assert!(vdp.dma_busy, "the copy is running");
+
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(vdp.dma_busy, "20 slots against 18: one byte short");
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(!vdp.dma_busy, "and the second line finishes it");
+        assert_eq!(vdp.vram[0x0208], 10, "the tenth byte, on the next line");
+    }
+
     /// The slot budget of a line is the Sega DMA bandwidth table read in slots
-    /// rather than in bytes: 18 of them on an active H40 line and 205 on a blank
-    /// one, 16 and 167 in H32, and one less in every column for a fill - 17,
-    /// 204, 15 and 166. With a unit costing 2 slots for a VRAM word and a
-    /// copied byte and 1 for a CRAM or VSRAM word ([`slots_per_unit`]), those
-    /// are the table's 18 / 205, 17 / 204, 9 / 102 and 16 / 167, 15 / 166,
-    /// 8 / 83.
+    /// rather than in bytes, and every cell of it has a page now: the Sega
+    /// Genesis Software Manual's "DMA transfer capacity" table (read off the
+    /// scan on #305, and transcribed cell for cell in genvdp.txt "Transfer
+    /// capacity") quotes MEMORY TO VRAM 18/205 H40 and 16/167 H32, VRAM FILL
+    /// 17/204 and 15/166, VRAM COPY 9/102 and 8/83, bytes for VRAM and words
+    /// for a CRAM or VSRAM destination. With a unit costing 2 slots for a VRAM
+    /// word and a copied byte and 1 for a CRAM or VSRAM word
+    /// ([`slots_per_unit`]), those are exactly the numbers the four tables
+    /// make: 18 / 205, 17 / 204, 9 / 102 and 16 / 167, 15 / 166, 8 / 83.
     #[test]
     fn the_dma_line_budget_is_the_bandwidth_table() {
         let mut active = Vdp::new(false);
@@ -1518,8 +1685,11 @@ mod tests {
 
     /// Two slots for the VRAM word of a 68k transfer, because VRAM is byte wide
     /// (genvdp.txt section 8), and two for a copied byte, because a copy reads
-    /// as well as writes. One for a CRAM or VSRAM word, which are word wide
-    /// (sections 9 and 10), and one for a fill step.
+    /// as well as writes. One for a CRAM or VSRAM word - "number of words (not
+    /// byte) should apply" when they are the destination of a MEMORY TO VRAM
+    /// transfer (Sega Genesis Software Manual, "DMA transfer capacity") - and
+    /// one for a fill step, which for a CRAM or VSRAM fill the manual does not
+    /// state and is analogy with this row (#305).
     #[test]
     fn a_unit_costs_what_its_memory_costs() {
         assert_eq!(
