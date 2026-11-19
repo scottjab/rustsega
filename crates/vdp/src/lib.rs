@@ -252,6 +252,25 @@ pub struct Vdp {
     /// it has just drawn on every call, so the field only ever describes the line
     /// the beam was on last.
     prev_line_dot_overflow: bool,
+    /// Masking mode 2 of genvdp.txt section 15: a sprite with an X coordinate of
+    /// one has been parsed since the frame boundary, so "the former rule is
+    /// invalid" - the mode 1 mask of an X = 0 sprite only bites on a line that
+    /// also has an X = 1 on it ("Low priority sprites will only be masked if a
+    /// sprite with an X coordinate of zero _also_ has a sprite with an X
+    /// coordinate of one on the _same_ line"), and an X = 0 on a line without one
+    /// masks nothing.
+    ///
+    /// "This 'mode' is enabled when the VDP first parses a sprite with an X
+    /// coordinate of one. It is reset at the end of the frame" - the parse is
+    /// [`Vdp::search_sprites`]'s walk, one line ahead of the drawing, and the end
+    /// of the frame is the frame boundary [`crate::timing`] marks on the VBlank
+    /// line, where [`Vdp::frame_ready`] goes up. That is the moment every parse of
+    /// the frame's own sprites is behind it and the first parses of the next
+    /// frame's lists - the walk for the first line of its active display happens
+    /// in the blanking that follows - are still ahead of it. Galaxy Force II is
+    /// the only game known to use the mode (genvdp.txt section 15, Charles
+    /// MacDonald).
+    mask2_seen_x1: bool,
     /// Status bit 4 (ODD): this frame is the odd one of an interlace pair.
     ///
     /// "Set when the display is interlaced, and in the odd frame, otherwise it
@@ -396,6 +415,7 @@ impl Vdp {
             sprite_overflow: false,
             sprite_collision: false,
             prev_line_dot_overflow: false,
+            mask2_seen_x1: false,
             odd_frame: false,
             in_vblank: false,
             in_hblank: false,
