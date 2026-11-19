@@ -2120,4 +2120,236 @@ mod tests {
             "the pattern and x words of an entry are not cache material"
         );
     }
+
+    // The corners #313 was filed to pin. The feed rule and the R5 rule above are
+    // Nemesis's, measured or answered on SpritesMind (the citations are on
+    // [`SpriteCache`]); the capacity in 32-cell mode, the granularity of the
+    // window and the reads a link past the table reaches are not answered by any
+    // source, so each is fenced on [`SpriteCache`] and fixed in here, the way
+    // the INFERRED readings of #93 and #94 were: a model that moves them fails
+    // these tests loudly, and the sprite ROM is what gets to move them.
+
+    /// The window is the whole 640-byte table in both widths. genvdp.txt section
+    /// 15 fixes the table - "The table is 640 bytes in size" - and no source
+    /// shrinks the cache with it in 32-cell mode: TascoDLX's "80 slots in H40
+    /// mode used to cache the sprite table, or 64 slots in H32 mode"
+    /// (SpritesMind t=851, December 2010) was a guess about how many VRAM reads
+    /// a refill would cost, made two months before Nemesis's reply in the same
+    /// thread established that the cache is never refilled from VRAM at all, and
+    /// nothing since has measured the silicon. So the model keeps 80 lines in
+    /// both widths, and this test is what a shrink to 64 fails loudly.
+    #[test]
+    fn the_cache_window_covers_all_eighty_entries_in_32_cell_mode() {
+        let mut vdp = sprite_vdp();
+        // Entry 79, the last one the table holds. Its first four bytes are in
+        // the window, its last four are not.
+        put_sprite(&mut vdp, 79, 0x1234, 0x0ABC, (1, 1), 9, 0x7654);
+        assert_eq!(
+            vdp.sprite_cache.line(79).copied(),
+            Some([0x12, 0x34, 0x00, 0x09]),
+            "the last entry of the table is cached in 32-cell mode too"
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(80).copied(),
+            None,
+            "the cache ends where the table does"
+        );
+
+        // A byte just past the table is outside the window and wraps into no
+        // entry: 0xF000 + 640 is one past entry 79's last byte.
+        vdp.write_vram_byte(SPRITE_BASE + CACHE_ENTRIES * ENTRY_BYTES, 0xFF);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0x00, 0x00, 0x00, 0x00]),
+            "a write past the table enters no line at all"
+        );
+    }
+
+    /// The window moves a byte at a time. Nemesis's timing notes (SpritesMind
+    /// t=851, 2010) have the VDP "latch and store the first 4 bytes of each
+    /// sprite mapping ... as they are written to VRAM", and the writes it
+    /// watches are byte writes - "Within each 4 SC write cycle, 1 byte is
+    /// written" (Nemesis, t=851), "VRAM writes are 8-bit, so only half of the
+    /// full 16-bit write would get through at that access slot" (Mask of
+    /// Destiny, t=1291). No source states the cache's own granularity, so this
+    /// fixes the byte reading in: a window that latched whole words would move
+    /// byte 0's neighbour with it and fail here.
+    #[test]
+    fn a_write_into_the_window_updates_its_byte_alone() {
+        let mut vdp = sprite_vdp();
+        put_sprite(&mut vdp, 0, 0x1234, 0x0ABC, (2, 3), 9, 0x7654);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0x12, 0x34, 0x06, 0x09])
+        );
+
+        vdp.write_vram_byte(SPRITE_BASE, 0xAB);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0xAB, 0x34, 0x06, 0x09]),
+            "the low byte of the y word, alone"
+        );
+        vdp.write_vram_byte(SPRITE_BASE + 1, 0xCD);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0xAB, 0xCD, 0x06, 0x09]),
+            "the high byte of the y word, alone"
+        );
+        vdp.write_vram_byte(SPRITE_BASE + 3, 0x42);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0xAB, 0xCD, 0x06, 0x42]),
+            "the high byte of the size/link word, alone"
+        );
+
+        // Entry 1's bytes reach entry 1's line and no other.
+        put_word(&mut vdp, SPRITE_BASE + ENTRY_BYTES, 0xFFFF);
+        assert_eq!(
+            vdp.sprite_cache.line(1).copied(),
+            Some([0xFF, 0xFF, 0x00, 0x00])
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0xAB, 0xCD, 0x06, 0x42]),
+            "a write to the next entry leaves this one alone"
+        );
+    }
+
+    /// One byte of the y word, seen where it ends: the search and the draw both
+    /// take the y out of [`SpriteCache`] (#103), so a write to byte 1 alone moves
+    /// the sprite between lines. This is the render half of the granularity
+    /// reading the test above fixes in.
+    #[test]
+    fn one_byte_of_the_y_word_moves_the_sprite_between_lines() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 3);
+        put_sprite(&mut vdp, 0, 128, 128 + 10, (1, 1), 0, palette_tile(1, 1));
+
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[10..18], &[19; 8], "y = 0x0080 is the top line");
+
+        // Byte 1 of the y word, 0x80 -> 0x90: y is now 0x0090 = 144, sixteen
+        // lines down, and byte 0 of the word has not moved.
+        vdp.write_vram_byte(SPRITE_BASE + 1, 0x90);
+        let mut gone = blank_line();
+        vdp.render_sprite_line(0, &mut gone);
+        assert_eq!(gone, blank_line(), "the sprite has left the top line");
+
+        let mut moved = blank_line();
+        vdp.render_sprite_line(16, &mut moved);
+        assert_eq!(
+            &moved[10..18],
+            &[19; 8],
+            "and sits on line 16, where 0x0090 puts it"
+        );
+    }
+
+    /// The R5 rule, at the level of the cache itself. Nemesis, answering Mask of
+    /// Destiny's captures on SpritesMind t=1291, November 2012: "it only ever
+    /// updates the contents of the cache if it detects a VRAM write being made
+    /// within the SAT cache 'window' based on the current location of the SAT as
+    /// set by register 5. This means, you can change register 5, and the cache
+    /// will continue to use the cached data from the old memory location.
+    /// CastleVania Bloodlines relies on this." So: the move is a register write,
+    /// not a VRAM write, and refills nothing; a table written while another one
+    /// was the SAT never entered the cache; and a write after the move lands on
+    /// the base R5 names now. [`a_moved_sat_table_keeps_the_y_size_and_link_of_the_old_one`]
+    /// and [`a_rewrite_after_the_move_is_what_refreshes_the_cache`] are the same
+    /// rule as the renderer sees it.
+    #[test]
+    fn moving_r5_refills_nothing_and_a_write_lands_on_the_new_base() {
+        let mut vdp = sprite_vdp();
+        // The table R5 points at: two entries with bytes of their own.
+        put_sprite(&mut vdp, 0, 0x1111, 128, (1, 1), 1, 1);
+        put_sprite(&mut vdp, 1, 0x2222, 128, (1, 1), 0, 1);
+        // The table R5 is about to point at, written while the SAT is still
+        // 0xF000: these writes are outside the window, and must leave no trace.
+        put_sprite_at(&mut vdp, OTHER_SPRITE_BASE, 0, 0x3333, 128, (1, 1), 1, 1);
+        put_sprite_at(&mut vdp, OTHER_SPRITE_BASE, 1, 0x4444, 128, (1, 1), 0, 1);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0x11, 0x11, 0x00, 0x01])
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(1).copied(),
+            Some([0x22, 0x22, 0x00, 0x00])
+        );
+
+        vdp.write_register(5, OTHER_SPRITE_REG);
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0x11, 0x11, 0x00, 0x01]),
+            "the move refills nothing: 0xE000's entries were never cached"
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(1).copied(),
+            Some([0x22, 0x22, 0x00, 0x00])
+        );
+
+        // One byte of entry 1 of the new table, written now that 0xE000 is the
+        // SAT: it lands on line 1, against the new base, and alone.
+        vdp.write_vram_byte(OTHER_SPRITE_BASE + ENTRY_BYTES + 1, 0x55);
+        assert_eq!(
+            vdp.sprite_cache.line(1).copied(),
+            Some([0x22, 0x55, 0x00, 0x00]),
+            "the write is inside the window of the SAT as R5 names it now"
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(0).copied(),
+            Some([0x11, 0x11, 0x00, 0x01]),
+            "and entry 0 of the new table is untouched by it"
+        );
+    }
+
+    /// A link of 80..=127 names an entry the table does not have. genvdp.txt
+    /// section 15 neither bounds its 7-bit link field by the 640-byte table nor
+    /// says what such a fetch reads, and neither the captures of t=1291 nor
+    /// Nemesis's notes of t=851 cover it. The model answers `None` past entry 79
+    /// and falls back to VRAM for that entry's y and size - the reading #94
+    /// made before the cache existed, kept unchanged here so that a change of
+    /// mind fails loudly rather than silently. Fenced for #94, whose sprite ROM
+    /// is the thing that would measure it.
+    #[test]
+    fn a_link_past_the_table_reads_the_vram_the_link_names() {
+        let mut vdp = sprite_vdp();
+        solid_tile(&mut vdp, 1, 3);
+        // Entry 0 links to entry 85, forty bytes past the end of the table. Its
+        // bytes are written into VRAM there, and none of its first four can be
+        // in the window: 85 * 8 = 680 >= 640.
+        put_sprite(&mut vdp, 0, 128, 128 + 10, (1, 1), 85, palette_tile(1, 1));
+        put_sprite_at(
+            &mut vdp,
+            SPRITE_BASE,
+            85,
+            128,
+            128 + 20,
+            (1, 1),
+            0,
+            palette_tile(1, 1),
+        );
+        assert_eq!(
+            vdp.sprite_cache.line(85).copied(),
+            None,
+            "the cache has no line for an entry the table does not hold"
+        );
+
+        let sprite = sprite_at(&vdp.vram, &vdp.sprite_cache, SPRITE_BASE, 85);
+        assert_eq!(
+            (sprite.y, sprite.x, sprite.link),
+            (128, 148, 0),
+            "the whole entry comes back out of VRAM, cacheless"
+        );
+
+        // And the list draws it: entry 0 at x 10, then the entry the link
+        // names at x 20, read from the same VRAM.
+        let mut line = blank_line();
+        vdp.render_sprite_line(0, &mut line);
+        assert_eq!(&line[10..18], &[19; 8], "entry 0, the head of the list");
+        assert_eq!(
+            &line[20..28],
+            &[19; 8],
+            "entry 85, fetched from VRAM at the address the link names"
+        );
+    }
 }
