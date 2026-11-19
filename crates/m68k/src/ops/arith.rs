@@ -61,7 +61,7 @@
 use crate::bus::Bus;
 use crate::cpu::M68k;
 use crate::ea::{Ea, Size, sign_extend_word};
-use crate::exceptions::EXC_CHK;
+use crate::exceptions::{EXC_CHK, FAULTED_FETCH_CLOCKS};
 use crate::ops::field;
 use crate::sr::{SR_C, SR_N, SR_V, SR_X, SR_Z};
 
@@ -107,6 +107,30 @@ pub(crate) const fn tas_clocks(ea: Ea) -> u32 {
         _ => ALU_PASS_CLOCKS,
     }
 }
+
+/// The two clocks a CHK that traps on the sign alone spends over one that the
+/// bound compare fires: the sign test is the second thing the microcode looks
+/// at, and it is reached only when the subtraction did not already say "above
+/// the bound".
+///
+/// This is one ALU pass of [`ALU_PASS_CLOCKS`], and it is documented bus timing,
+/// not a fit: the per-instruction tables this repo cites as yacht.txt price
+/// `trap : Dn > Src` at `38(5/3) + ea` and `trap : Dn < 0` at `40(5/3) + ea`,
+/// and all 4948 cases of `CHK.json.gz` the suite dates split on exactly that
+/// line (M1-31b, #241). See [`M68k::op_chk`] for the law and its zero-mismatch
+/// check.
+///
+/// [`M68k::op_chk`]: crate::ops::arith::M68k::op_chk
+pub(crate) const CHK_SIGN_TRAP_CLOCKS: u32 = ALU_PASS_CLOCKS;
+
+/// The compare work a CHK that does *not* trap bills over its fetch, its
+/// operand read and the queue advance: the manual's `10(1/0) + ea` no-trap
+/// total leaves 6 once those are paid. A trapping CHK spends less of it — the
+/// sign-only trap pays 2 of these clocks ([`CHK_SIGN_TRAP_CLOCKS`]) and the
+/// high trap none — which is exactly why the three yacht.txt rows read
+/// `10(1/0)`, `40(5/3)` and `38(5/3)` (all 4948 dated cases of `CHK.json.gz`
+/// agree; M1-31b, #241).
+pub(crate) const CHK_IN_RANGE_CLOCKS: u32 = 3 * ALU_PASS_CLOCKS;
 
 /// Clocks the two-operand ALU instructions (`ADD`, `SUB` and their `#imm`/`Q`
 /// forms, and via [`crate::ops::logic`] `AND`, `OR` and `EOR`) pay on top of
@@ -846,7 +870,32 @@ impl M68k {
     /// * otherwise — the instruction finishes normally.
     ///
     /// The bound test is signed on both sides, so a negative `Dn` traps whatever
-    /// the bound is and never reaches the second comparison.
+    /// the bound is. `N` follows the sign whenever `Dn.w` is negative — a
+    /// negative `Dn` above a *negative* bound traps with `N = 1` even though its
+    /// difference is positive — but the *clocks* follow the bound compare: see
+    /// the clock law below.
+    ///
+    /// # Clocks
+    ///
+    /// Which condition fires the trap is also what picks the trap length, and
+    /// the instruction pays for the compare work that ran before the entry
+    /// (M68000UM-style per-instruction bus tables, the doc this repo cites as
+    /// yacht.txt: no-trap `10(1/0) + ea`, `trap : Dn > Src` at `38(5/3) + ea`,
+    /// `trap : Dn < 0` at `40(5/3) + ea`; `ea` itself is charged by the operand
+    /// read, the entry's 34 by [`M68k::exception`]):
+    ///
+    /// | `Dn.w` vs bound (signed) | outcome | clocks | return |
+    /// |---|---|---|---|
+    /// | `Dn > bound` | trap, high (covers negative `Dn` too) | `38 + ea` | [`FAULTED_FETCH_CLOCKS`] |
+    /// | `Dn < 0`, `Dn <= bound` | trap, sign only | `40 + ea` | [`FAULTED_FETCH_CLOCKS`] `+ 2` |
+    /// | `0 <= Dn <= bound` | in range | `10 + ea` | [`CHK_IN_RANGE_CLOCKS`] |
+    ///
+    /// All 4948 cases of `CHK.json.gz` the suite dates agree with this split
+    /// (`tests/chk.rs` compares them now), and the "both hold" cases sit on the
+    /// 38 row: it is the bound compare that decides the early trap.
+    ///
+    /// [`FAULTED_FETCH_CLOCKS`]: crate::exceptions::FAULTED_FETCH_CLOCKS
+    /// [`CHK_IN_RANGE_CLOCKS`]: crate::ops::arith::CHK_IN_RANGE_CLOCKS
     ///
     /// # Flags
     ///
@@ -866,9 +915,8 @@ impl M68k {
     /// "undefined" is therefore "the ALU result codes get dropped on the floor",
     /// and the third that survives is `N`.
     ///
-    /// Which of the two trap reasons fired is what `N` reports, and the negative
-    /// `Dn` test runs first: a negative `Dn` above a *negative* bound traps with
-    /// `N = 1` even though its difference is positive.
+    /// Which of the two trap reasons fired is what `N` reports: the negative
+    /// `Dn` cases always show `N = 1`.
     ///
     /// # The frame's PC
     ///
@@ -907,20 +955,32 @@ impl M68k {
 
         if signed_value < 0 {
             self.set_ccr(cleared | SR_N);
+            // A negative `Dn` the bound compare would also have flagged takes
+            // the same early trap the high path takes; only a negative `Dn` the
+            // bound compare passes needs the sign test's own 2 clocks first
+            // (yacht.txt's `trap : Dn < 0` row is 2 clocks over
+            // `trap : Dn > Src`). The entry's 34 is charged by
+            // [`M68k::exception`]; what it does not cover is the fetch and the
+            // compare work, and that is what these returns hand back.
             self.exception(bus, EXC_CHK, return_pc);
-            return 0;
+            return if signed_value > signed_bound {
+                FAULTED_FETCH_CLOCKS
+            } else {
+                FAULTED_FETCH_CLOCKS + CHK_SIGN_TRAP_CLOCKS
+            };
         }
         if signed_value > signed_bound {
             self.set_ccr(cleared);
             self.exception(bus, EXC_CHK, return_pc);
-            return 0;
+            return FAULTED_FETCH_CLOCKS;
         }
 
         // In range: `CHK` writes nothing back, so clearing the three flags is the
-        // whole rest of it.
+        // whole rest of it, plus the compare work the manual's `10(1/0) + ea`
+        // bills over fetch and operand.
         self.set_ccr(self.ccr() & !(SR_Z | SR_V | SR_C));
         self.advance_opcode(bus);
-        0
+        CHK_IN_RANGE_CLOCKS
     }
 
     /// `NEG`: `0100 0100 ss mmm rrr` — `0 - <ea> → <ea>` (M68000UM section 8,
@@ -2373,6 +2433,43 @@ mod tests {
         cpu.step(&mut bus);
         assert_eq!(cpu.pending_exception, Some(EXC_CHK));
         assert_eq!(cpu.a[0], MEM, "a plain (An) does not move");
+    }
+
+    /// The CHK trap clock law: 38 + ea when the signed bound compare fires the
+    /// trap, 40 + ea when only the sign test does, 10 + ea when nothing traps.
+    /// The split is the suite's own (all 4948 ran `CHK.json.gz` cases agree) and
+    /// it is documented bus timing, not a fit: Motorola's per-instruction bus
+    /// tables (the doc this repo cites as yacht.txt) price `trap : Dn > Src` at
+    /// `38(5/3) + ea` and `trap : Dn < 0` at `40(5/3) + ea`, one row each.
+    #[test]
+    fn chk_clock_law_38_vs_40_vs_10() {
+        // In range, `CHK.W D1,D0`: 10 clocks with nothing on the bus but the
+        // opcode's own fetch, the manual's `10(1/0) + ea` with ea = 0.
+        let (mut cpu, mut bus) = run(0x4181, &[0x4E71]);
+        cpu.d[0] = 2;
+        cpu.d[1] = 10;
+        assert_eq!(cpu.step(&mut bus), 10, "in range: 10 + ea");
+
+        // Over the bound (`5 > 3` signed), no sign involved: the bound compare
+        // fires the trap, `38(5/3) + ea`.
+        let (mut cpu, mut bus) = run(0x4181, &[0x4E71]);
+        cpu.d[0] = 5;
+        cpu.d[1] = 3;
+        assert_eq!(cpu.step(&mut bus), 38, "high trap: 38 + ea");
+
+        // Negative operand against a positive bound (`-1 <= 10` signed): the
+        // sign test fires alone, `40(5/3) + ea`.
+        let (mut cpu, mut bus) = run(0x4181, &[0x4E71]);
+        cpu.d[0] = 0xFFFF_FFFF;
+        cpu.d[1] = 10;
+        assert_eq!(cpu.step(&mut bus), 40, "sign-only trap: 40 + ea");
+
+        // Both conditions hold (`-1 > -10` signed as well as negative): the
+        // bound compare fires first, so this is the 38 row, not the 40 one.
+        let (mut cpu, mut bus) = run(0x4181, &[0x4E71]);
+        cpu.d[0] = 0xFFFF_FFFF;
+        cpu.d[1] = 0xFFFF_FFF6;
+        assert_eq!(cpu.step(&mut bus), 38, "both hold: the bound row, 38 + ea");
     }
 
     /// `TAS.B <ea>` (`$4AC0 | <ea>`) reads the byte, sets N and Z from **that
