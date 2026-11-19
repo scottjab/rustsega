@@ -1308,7 +1308,20 @@ impl Bus {
     /// Cartridge slot word write: both bytes, high byte first, for the reason
     /// [`Bus::read_rom_word`] gives - a 16-bit save stores both halves and a
     /// half-width one stores the half that is its own.
+    ///
+    /// One exception, and the board that asks for it: the Acclaim 32 Mbit
+    /// board's word write is its read-window latch and not a line write (see
+    /// [`crate::cart::eeprom::Eeprom::write_word`]), so when the chip consumes
+    /// the word the two byte writes below do not happen - with both /LWR and
+    /// /UWR asserted that board drives no line at all.
     fn write_rom_word(&mut self, addr: u32, value: u16) {
+        if self
+            .eeprom
+            .as_mut()
+            .is_some_and(|chip| chip.write_word(addr, value))
+        {
+            return;
+        }
         self.write_rom_byte(addr, (value >> 8) as u8);
         self.write_rom_byte(addr + 1, value as u8);
     }
@@ -4738,6 +4751,12 @@ mod tests {
         let mut bus = Bus::new(eeprom_rom(0x20_0000, "GM T-081276 00"), TEST_VERSION);
         assert_eq!(bus.sram().map(<[u8]>::len), Some(256), "the 24C02");
 
+        // The board's read-back rides on the window latch its word write
+        // arms, and the games arm it at the top of every EEPROM operation and
+        // restore it on the way out (NBA Jam TE's wrapper, `move.w #0,(A0)`
+        // at entry and `move.w #1,(A0)` at exit): walk the board the way a
+        // game does, latch first.
+        bus.write_word(0x20_0000, 0x0000);
         let mut lines = EepromLines::acclaim_32m();
         lines.start(&mut bus);
         assert!(lines.send(&mut bus, 0xA0), "the device address");
@@ -4754,6 +4773,48 @@ mod tests {
         assert!(lines.send(&mut bus, 0xA1), "and the same word, reading");
         assert_eq!(lines.recv(&mut bus, false), 0x5C);
         lines.stop(&mut bus);
+    }
+
+    /// On the bus, the latch is the word write and nothing else: it arms and
+    /// restores the quadrant's read window, it does not drive the two lines
+    /// the way a word write decomposed into byte writes would, and a word
+    /// write outside the quadrant is the ordinary two byte writes it always
+    /// was (Genesis Plus GX's `mapper_acclaim_32M_write16` against its
+    /// `mapper_i2c_generic_read8`).
+    #[test]
+    fn acclaim_32m_word_write_is_the_window_latch() {
+        let mut rom = eeprom_rom(0x20_0004, "GM T-081276 00");
+        rom[0x20_0002] = 0xA4;
+        let mut bus = Bus::new(rom, TEST_VERSION);
+        assert_eq!(bus.read_byte(0x20_0002), 0xA4, "the image byte, ROM window");
+
+        // Arm: bit 0 clear. The line is idle-high, so every byte in the
+        // quadrant now carries it in bit 0.
+        bus.write_word(0x20_0000, 0x0000);
+        assert_eq!(bus.read_byte(0x20_0002), 0xA5);
+        assert_eq!(bus.read_byte(0x20_0000), 0x01);
+
+        // And the word write drove no line: were it the two byte writes of a
+        // board without the latch, the odd half's $00 would have pulled /SDA
+        // down and this would read 0xA4 again.
+        bus.write_word(0x20_0000, 0x0002);
+        assert_eq!(bus.read_byte(0x20_0002), 0xA5, "still armed, lines high");
+
+        // A byte write to the pair moves a line and never the latch.
+        bus.write_byte(0x20_0001, 0x00);
+        assert_eq!(bus.read_byte(0x20_0002), 0xA4, "the line, low, in bit 0");
+        bus.write_byte(0x20_0001, 0x01);
+
+        // Restore: bit 0 set, and the quadrant is the image again.
+        bus.write_word(0x20_0000, 0x0001);
+        assert_eq!(bus.read_byte(0x20_0002), 0xA4);
+        assert_eq!(bus.read_byte(0x20_0000), 0x00);
+
+        // Outside the quadrant the word write is no latch: it decomposes as
+        // it always has, and the window it finds there stays where it was.
+        bus.write_word(0x20_0000, 0x0000);
+        bus.write_word(0x10_0000, 0x0000);
+        assert_eq!(bus.read_byte(0x20_0002), 0xA5, "still armed");
     }
 
     /// A cart that declares neither save has neither, and a cart that declares an

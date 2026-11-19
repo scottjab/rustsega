@@ -43,6 +43,14 @@ const CARTRIDGE_END: u32 = 0x3F_FFFF;
 /// Genesis Plus GX lists by serial (the Acclaim 32 Mbit and the EA carts) decode.
 const DEFAULT_BASE: u32 = 0x20_0000;
 
+/// The quadrant the Acclaim 32 Mbit board's PAL owns: $200000-$2FFFFF, the one
+/// range its only address inputs - A20 and A21, of the 670125/670127 board's
+/// custom chip (8BitWizard's teardown, spritesmind t=107) - can name, and the
+/// range Genesis Plus GX installs `mapper_acclaim_32M_write8`/`write16` over.
+/// Both its word-write latch ([`Eeprom::write_word`]) and its armed read
+/// window ([`Eeprom::read`]) live here and nowhere else.
+const ACCLAIM_WINDOW: std::ops::Range<u32> = 0x20_0000..0x30_0000;
+
 /// Which half of a 16-bit cart access reaches a line.
 ///
 /// The carts differ here and nowhere else: Sega's and EA's boards take the byte
@@ -278,6 +286,32 @@ impl EepromInfo {
     }
 }
 
+/// What the 32 Mbit board's own quadrant shows on a read: the image, or the
+/// chip.
+///
+/// The board's PAL (Genesis Plus GX's "custom LZ95A53", the custom mapper chip
+/// of the 670125/670127 boards) decodes only A20 and A21, so its whole read
+/// window is the 1 MiB quadrant $200000-$2FFFFF and the word write that both
+/// /LWR and /UWR assert latches one bit of it - bit 0 of the word - into this
+/// choice (Genesis Plus GX's `mapper_acclaim_32M_write16`). It is a read mux
+/// rather than a bank register: no bank number is latched and ROM is never
+/// swapped for ROM, which is why it lives on the EEPROM with the lines rather
+/// than in `super::mapper`, and `docs/eeprom-games.md` records why the
+/// "64 KB bank shift" the earlier text called it is not what the board does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum Window {
+    /// The ROM answers the quadrant: the reset state, and what a word write
+    /// with bit 0 set arms. The ROM's output drives bit 0 of the pair too, so
+    /// the chip's line is nowhere on the bus.
+    Rom,
+    /// The chip's data line is bit 0 of every byte the quadrant reads (Genesis
+    /// Plus GX's `mapper_i2c_generic_read8`), which is how a game samples /SDA
+    /// without the ROM fighting it: the game arms this at the top of every
+    /// EEPROM operation and restores [`Window::Rom`] on the way out (NBA Jam
+    /// TE's wrapper: `move.w #0,(A0)` at $000ADA, `move.w #1,(A0)` at $000AB2).
+    Serial,
+}
+
 /// Where the transfer has got to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum State {
@@ -349,6 +383,10 @@ pub struct Eeprom {
     select: u8,
     /// The word address the next byte is for.
     word: usize,
+    /// What the 32 Mbit board's quadrant shows on a read, [`Window::Rom`] on
+    /// every way in: the PAL's /RES input is what a reset reaches, and the
+    /// games' wrappers restore the ROM window after every operation.
+    window: Window,
 }
 
 impl Eeprom {
@@ -373,6 +411,7 @@ impl Eeprom {
             line: None,
             select: 0,
             word: 0,
+            window: Window::Rom,
         }
     }
 
@@ -400,8 +439,9 @@ impl Eeprom {
 
     /// Restart the chip: the lines come back to idle and the transfer in hand is
     /// abandoned, because a reset is the 68k stopping in the middle of walking
-    /// them. The array and its dirty flag are not touched, as for
-    /// [`super::sram::Sram::reset`].
+    /// them, and the 32 Mbit board's read window goes back to ROM, which is
+    /// where the PAL's /RES input puts it. The array and its dirty flag are not
+    /// touched, as for [`super::sram::Sram::reset`].
     pub fn reset(&mut self) {
         self.scl = true;
         self.sda = true;
@@ -410,6 +450,7 @@ impl Eeprom {
         self.state = State::Idle;
         self.bit = ACK;
         self.line = None;
+        self.window = Window::Rom;
     }
 
     /// A cart access at `addr` writing `value`: what the 68k put on the bus is
@@ -439,18 +480,48 @@ impl Eeprom {
         true
     }
 
+    /// The 32 Mbit board's word write: the read-window latch, and nothing else
+    /// ([`Window`]). Answers whether the board consumed the word, which is only
+    /// ever true for this one board and only inside its own quadrant
+    /// ([`ACCLAIM_WINDOW`]) - [`crate::Bus::write_rom_word`] hands the word
+    /// here first and skips its usual two byte writes when the board took it,
+    /// because with both /LWR and /UWR asserted this board drives no line at
+    /// all (Genesis Plus GX's `mapper_acclaim_32M_write16` against its
+    /// `mapper_acclaim_32M_write8`).
+    pub fn write_word(&mut self, addr: u32, value: u16) -> bool {
+        if self.info.board != Board::ACCLAIM_32M || !ACCLAIM_WINDOW.contains(&addr) {
+            return false;
+        }
+        self.window = if value & 1 == 0 {
+            Window::Serial
+        } else {
+            Window::Rom
+        };
+        true
+    }
+
     /// A cart access reading `addr`, of which `image` is what the cartridge slot
     /// answers there: the chip replaces the one bit of that byte its data line
     /// is on, and leaves every other address of the cart alone.
     ///
+    /// On the 32 Mbit board "the one bit" is not a matter of the pair but of
+    /// the whole quadrant, and only while the game's word write has armed the
+    /// serial window ([`Window::Serial`]); in the ROM window the image byte is
+    /// the whole answer, the ROM driving bit 0 of the pair included.
+    ///
     /// `None` when the chip holds nothing for this address, which is every
     /// address but the one its board reads back on.
     pub fn read(&self, addr: u32, image: u8) -> Option<u8> {
-        if !self.covers(addr) {
-            return None;
-        }
         let pin = self.info.board.sda_out;
-        if !pin.drives(addr) {
+        let answers = if self.info.board == Board::ACCLAIM_32M {
+            // The window latch, not the lane: the PAL drives D0 over its whole
+            // quadrant for any read, even and odd alike, which is what Genesis
+            // Plus GX's quadrant-wide `mapper_i2c_generic_read8` models.
+            ACCLAIM_WINDOW.contains(&addr) && self.window == Window::Serial
+        } else {
+            self.covers(addr) && pin.drives(addr)
+        };
+        if !answers {
             return None;
         }
         // Released, the line keeps the level the 68k left it at, which is what a
@@ -1169,10 +1240,137 @@ mod tests {
                 board,
                 chip: Chip::X24C01,
             });
+            // The 32 Mbit board's read-back rides on the window latch, and the
+            // games arm it at the top of every EEPROM operation (the word
+            // write #0 of the driver wrapper): walk the board the way a game
+            // does, latch first.
+            if board == Board::ACCLAIM_32M {
+                assert!(master.chip.write_word(DEFAULT_BASE, 0x0000));
+            }
             master.write(3, &[0x69]);
             assert_eq!(master.chip.contents()[3], 0x69, "{board:?} carried a write");
             assert_eq!(master.read(3, 1), vec![0x69], "{board:?} read back");
         }
+    }
+
+    /// The 32 Mbit board's word write is the board's read-window latch, not a
+    /// line write: bit 0 of the word selects what the quadrant reads show, the
+    /// ROM image (reset, and bit 0 = 1) or the chip's data line (bit 0 = 0),
+    /// and a byte write moves a line without touching the latch (Genesis Plus
+    /// GX's `mapper_acclaim_32M_write16`, and the games' own wrappers: NBA Jam
+    /// TE arms with `move.w #0,(A0)` at $000ADA and restores with
+    /// `move.w #1,(A0)` at $000AB2).
+    #[test]
+    fn acclaim_32m_word_write_latches_the_read_window() {
+        let mut chip = Eeprom::new(EepromInfo {
+            base: DEFAULT_BASE,
+            board: Board::ACCLAIM_32M,
+            chip: Chip::AT24C02,
+        });
+        // Reset is the ROM window: every read in the quadrant, the pair
+        // included, is the image's own byte.
+        assert_eq!(chip.read(0x20_0000, 0x40), None);
+        assert_eq!(chip.read(0x20_0001, 0x40), None);
+        assert_eq!(chip.read(0x20_0004, 0x80), None);
+
+        // A word write with bit 0 clear arms the serial window: the chip's
+        // line, idle-high until a byte write moves it, is bit 0 of every byte
+        // in the quadrant now.
+        assert!(chip.write_word(0x20_0000, 0x0000));
+        assert_eq!(chip.read(0x20_0004, 0x80), Some(0x81));
+        assert_eq!(chip.read(0x20_0000, 0x40), Some(0x41));
+        assert_eq!(chip.read(0x2F_FFFF, 0xFE), Some(0xFF));
+
+        // A byte write is still a line write, and it does not move the latch:
+        // driving /SDA low leaves the window armed with the line low.
+        assert!(chip.write(0x20_0001, 0x00), "the board's own line");
+        assert_eq!(chip.read(0x20_0004, 0x80), Some(0x80));
+
+        // A word write with bit 0 set restores the ROM window, whatever the
+        // lines are doing.
+        assert!(chip.write_word(0x20_0000, 0x0001));
+        assert_eq!(chip.read(0x20_0004, 0x80), None);
+        assert_eq!(chip.read(0x20_0001, 0x40), None);
+
+        // And a second latch write arms it again, which is what a game's next
+        // EEPROM operation does. The line is where the last byte write left
+        // it - nothing restores /SDA but the game.
+        assert!(chip.write_word(0x20_0000, 0x0000));
+        assert_eq!(chip.read(0x20_0004, 0x80), Some(0x80));
+    }
+
+    /// The latch is the board's, not the pair's: it answers across the whole
+    /// quadrant its PAL decodes - the only address inputs on the 670125/670127
+    /// board's custom chip are A20 and A21 (8BitWizard's teardown, spritesmind
+    /// t=107) - and the reset input of that chip is what puts the ROM window
+    /// back, which is what [`Eeprom::reset`] does.
+    #[test]
+    fn acclaim_32m_window_is_the_quadrant_and_reset_restores_rom() {
+        let mut chip = Eeprom::new(EepromInfo {
+            base: DEFAULT_BASE,
+            board: Board::ACCLAIM_32M,
+            chip: Chip::AT24C02,
+        });
+        assert!(
+            chip.write_word(0x2F_FFFE, 0x0000),
+            "the latch is quadrant-wide"
+        );
+        assert_eq!(chip.read(0x20_0000, 0x00), Some(0x01));
+        assert_eq!(chip.read(0x2F_FFFF, 0xFE), Some(0xFF));
+        // And outside the quadrant nothing answers, armed or not: the byte
+        // below is plain ROM, the bytes above are nothing the chip drives.
+        assert_eq!(chip.read(0x1F_FFFF, 0x00), None);
+        assert_eq!(chip.read(0x30_0000, 0x00), None);
+        assert_eq!(chip.read(0x3F_FFFF, 0x00), None);
+        assert!(
+            !chip.write_word(0x30_0000, 0x0000),
+            "the write window ends at $2FFFFF"
+        );
+
+        // Reset: /RES is an input of the PAL, and the window it arms comes up
+        // showing ROM.
+        chip.reset();
+        assert_eq!(chip.read(0x20_0000, 0x00), None);
+        assert_eq!(chip.read(0x2F_FFFF, 0xFE), None);
+    }
+
+    /// A word write drives no line on this board: with both /LWR and /UWR
+    /// asserted the PAL latches, and the two lines stay where the byte writes
+    /// left them. The word $0002 is the pin - its bit 0 says "stay armed", and
+    /// its two byte halves, driven as a word write is on a board without the
+    /// latch, would have put both lines low.
+    #[test]
+    fn acclaim_32m_word_write_drives_no_line() {
+        let mut chip = Eeprom::new(EepromInfo {
+            base: DEFAULT_BASE,
+            board: Board::ACCLAIM_32M,
+            chip: Chip::AT24C02,
+        });
+        assert!(chip.write_word(0x20_0000, 0x0000));
+        assert_eq!(
+            chip.read(0x20_0001, 0x00),
+            Some(0x01),
+            "the lines idle high"
+        );
+        assert!(chip.write_word(0x20_0000, 0x0002));
+        assert_eq!(
+            chip.read(0x20_0001, 0x00),
+            Some(0x01),
+            "still armed, and the lines did not move"
+        );
+    }
+
+    /// No other board has the latch: a word write is nothing to them, and
+    /// their pair answers as it always has.
+    #[test]
+    fn other_boards_have_no_window_latch() {
+        let mut chip = Eeprom::new(chip_on_sega(Chip::X24C01));
+        assert!(!chip.write_word(0x20_0000, 0x0000));
+        assert_eq!(
+            chip.read(0x20_0004, 0x80),
+            None,
+            "the quadrant is not a window"
+        );
     }
 
     /// The window a cart declares is where the two lines are, and a cart that
