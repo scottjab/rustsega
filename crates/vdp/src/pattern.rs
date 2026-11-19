@@ -11,6 +11,9 @@
 
 use crate::VRAM_SIZE;
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
 /// Every VRAM address is masked to this. genvdp.txt section 8: "The VDP is
 /// connected to 64K of video RAM" and "The address register wraps past address
 /// FFFFh", so a fetch that runs off the top of VRAM comes back at 0 rather than
@@ -30,6 +33,7 @@ const ROW_BYTES: usize = 4;
 /// n = Pattern name". [`NameEntry::decode`] is that layout, [`tile_row`] the
 /// pattern it names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct NameEntry {
     /// Bit 15: draw this cell's opaque pixels in front of plane A and the
     /// sprites (genvdp.txt section 14, where a plane's entries move from `B`/`C`
