@@ -56,7 +56,7 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// the same class of wrong as the two above - the ROM window shows, but a game
 /// that reads its EEPROM answer through the armed quadrant reads the image's
 /// bit 0 instead of the chip's line.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 

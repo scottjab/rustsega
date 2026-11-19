@@ -141,8 +141,8 @@ fn header_written_and_checked() {
     );
     assert_eq!(
         u32::from_le_bytes(state[4..8].try_into().expect("4 bytes of version")),
-        5,
-        "format version 5, which is the Acclaim 32 Mbit board's read-window latch \n         carrying one field in the EEPROM of #271, on top of the EEPROM chip \n         carrying one of three addressing modes instead of a mode-1 flag, the \n         24C65's two-byte word address that made it 4 (#270), the scheduler's two \n         freeze gates that made it 3 (#517) and the woven mode-2 field that made \n         it 2 (#457); the number is pinned rather than read from \n         `state::FORMAT_VERSION` because bumping it has to be a decision, \n         not an accident"
+        6,
+        "format version 6, which is the J-CART register carrying one field on the \n         bus of #356, on top of the Acclaim 32 Mbit board's read-window latch \n         carrying one field in the EEPROM of #271, on top of the EEPROM chip \n         carrying one of three addressing modes instead of a mode-1 flag, the \n         24C65's two-byte word address that made it 4 (#270), the scheduler's two \n         freeze gates that made it 3 (#517) and the woven mode-2 field that made \n         it 2 (#457); the number is pinned rather than read from \n         `state::FORMAT_VERSION` because bumping it has to be a decision, \n         not an accident"
     );
     let checksum = u64::from_le_bytes(state[8..16].try_into().expect("8 bytes of checksum"));
     assert_eq!(

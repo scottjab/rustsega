@@ -178,21 +178,50 @@ mapper problem**, and it is already filed as #354 (`frame_done` watchdog, 83 ROM
 and #355 (unimplemented m68k opcodes, 14 ROMs). It needs a diagnosis ticket, not
 a mapper, and that is what this PR opens.
 
-### 3. J-CART — deliberately not touched, and why
+### 3. J-CART — implemented (#356)
 
 | Game | Mapper type | Source |
 |---|---|---|
-| Micro Machines - Military (Europe) (J-Cart) | J-CART (bank + I2C) | name/tag; not implemented |
-| Micro Machines - Turbo Tournament 96 (Europe) (J-Cart), [Rev 1] | J-CART (bank + I2C) | name/tag; not implemented |
-| Cosmo Cop (Europe) (J-Cart), [Sega Zone] | J-CART (bank + I2C) | name/tag; not implemented |
+| Micro Machines - Military (Europe) (J-Cart) | J-CART (register + I2C) | `crates/genesis/src/cart/jcart.rs`; GPGX + BlastEm; measured |
+| Micro Machines - Turbo Tournament 96 (Europe) (J-Cart), [Rev 1] | J-CART (register + I2C) | measured |
+| Cosmo Cop (Europe) (J-Cart), [Sega Zone] | J-CART | no dump on this machine and no row in any reference's database; the detection admits it (a `Cosmo Cop` row) the day one arrives |
 
-J-CART's bank numbers and its I2C (EEPROM) serial data line live in the **same
-registers** at `0xA13000`-`0xA141FF`: GPGX's `mapper_i2c_jcart_read8` ORs the SDA
-level into `jcart_read()`. This repository already owns that block for save data —
-`crate::cart::eeprom`, `docs/eeprom-games.md`, with #270 and the Acclaim 32 Mbit
-read-window latch (#271) landed on EEPROM. Two owners for one register set is how a
-save gets silently corrupted, so J-CART is not implemented here; the follow-up
-issue has to decide ownership first.
+The register-ownership question this group was filed with is answered, and the
+answer retires the premise: **the J-CART has no bank registers at all.** The
+survey read GPGX's `mapper_i2c_jcart_read8` as "bank numbers and the EEPROM data
+line in one register"; what actually shares a register is the cart's two extra
+controller ports and the chip's data line, at `$380000-$3FFFFF` - not the
+`$A13000` block, which plutiedev's "$A130xx area usage" assigns to private use
+and the Sega mapper, with no J-CART in it. GPGX's `mapper_i2c_jcart_init`
+installs the EEPROM line writes over `$300000-$37FFFF` ("/LWR & /UWR are
+unused", both byte lanes) and the register over `$380000-$3FFFFF`; BlastEm's
+`jcart.c` agrees on the register shape, including the bit-14-tied-low line that
+its comment cites as the Micro Machines 2 fix. There is no plutiedev J-CART or
+mappers page to cite: the Wayback CDX listing of the site contains neither, so
+the survey's pointer to one was aspirational.
+
+The local set makes banking moot anyway: every J-CART-family dump on this
+machine is exactly 1 MiB, so `$380000-$3FFFFF` is past image end on all of
+them. And the carts boot without the board - the sweep's Boots rows were
+right - so the "freezes in its own copy-protection check" this page recorded
+was wrong too. What the board changes is what the register answers: on `main`
+the quadrant read open bus, whose bit 14 high is the level the games read as
+"no J-CART here", and every Micro Machines came up with its two-player-only
+menu. With the register decoded, the same carts put up the four-player menus
+(measured at 800 frames, menu text diff, all three Micro Machines dumps;
+`main` and this branch agree frame for frame up to the menu, so the divergence
+is the detection and nothing else). The cricket half of the family - Brian
+Lara Cricket, Brian Lara 96 / Shane Warne, serials `T-120106`/`T-120146` -
+ships without the ports (GPGX: "support for Brian Lara Cricket games without
+J-CART") and gets the EEPROM answer window instead; their boot hashes are
+unchanged, as expected for a save-side change.
+
+The chips were already here: GPGX gives the family 24C08, 24C16 and 24C65,
+all three of which #270 had, so the board - `Board::Codemasters`, whose bit
+positions this page's neighbour `docs/eeprom-games.md` had recorded since
+#270 - was the only new piece. The Easter egg counter (the two-thumbs-up
+screen) is not modelled: no implementing reference models it, GPGX and BlastEm
+both skip it, and the page that would document it does not exist.
 
 ### 4. Beyond 4 MiB — already covered, nothing to do
 
@@ -247,9 +276,10 @@ is [#433](https://github.com/scottjab/rustsega/issues/433).
 ## Follow-up issues opened from this survey
 
 - **#356 - cart: implement J-CART, and decide who owns the shared bank/EEPROM
-  registers.** The register-ownership question in group 3 has to be answered before
-  the mapper is written, because `crate::cart::eeprom` and #270/#271 already hold
-  part of the same address block.
+  registers.** Group 3, landed: the ownership question is answered at the top of
+  that group, and the answer retires the bank-register premise the ticket was
+  filed with. The register lives at `$380000-$3FFFFF`, not in the `$A130xx`
+  block, and the EEPROM line is one bit of its answer.
 - **#357 - genesis: diagnose the 2 MB and 4 MB Taiwan and China unlicensed carts
   that draw nothing (not a mapper).** Group 2, with the three measurements that
   ruled a mapper out and the shared-reset-vector clue, so the next person starts

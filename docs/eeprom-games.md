@@ -39,12 +39,21 @@ for line in the `mapper_i2c_*_init` functions at the end of that file, which set
 | `Ea` | D6 | D7 | D7 | the odd byte only |
 | `Acclaim16M` | D1 | D0 | **D1** | either byte |
 | `Acclaim32M` | D0 | D0 | D0 | **even byte for the clock, odd for the data** |
-| `Codemasters` (J-CART, not in the emulator) | D1 | D0 | **D7** | either byte |
+| `Codemasters` (J-CART, #356) | D1 | D0 | **D7** | either byte, over the whole quadrant `$300000-$37FFFF` |
 
 Genesis Plus GX routes byte writes to the odd byte on the Sega and EA boards and
 to either byte on the 16 Mbit board, which is the `Lane` field of `Pin`; the 32
 Mbit board splits them, `mapper_acclaim_32M_write8` taking `/SCL` from the even
-byte and `/SDA` from the odd one.
+byte and `/SDA` from the odd one; and the Codemasters board is its
+`mapper_i2c_jcart_init`, which installs the line writes over `$300000-$37ffff`
+with the comment "/LWR & /UWR are unused" and the answer over the next
+quadrant. The Codemasters board is the one whose lines are not a pair of
+addresses: the whole `$300000-$37FFFF` quadrant drives them and the answer
+comes back from `$380000-$3FFFFF`, where the J-CART register lives for the
+carts that have both - the register's odd byte is `D7`-for-`jcart_read`'s own
+bit 7 masked away *because* the line is wired there (`mapper_i2c_jcart_read8`'s
+`(eeprom_i2c_out() << 7) | (jcart_read(address) & 0x7f)`), which is the
+ownership rule `crates/genesis/src/cart/jcart.rs` states in code.
 
 **Word accesses are two byte accesses.** `Bus::read_rom_word` and
 `Bus::write_rom_word` go through `read_rom_byte`/`write_rom_byte` twice, by the
@@ -119,10 +128,11 @@ the serials, the boards and the chip types; `H` = the cart's own header in
 `test-roms/` and the local ROM directory; `D` = the manufacturer's datasheet,
 cited in the chip table.
 
-All 23 of these are in `EEPROM_GAMES`. Genesis Plus GX's names for them are the
+All 28 of these are in `EEPROM_GAMES`. Genesis Plus GX's names for them are the
 names in its own table; a good number are Japanese and European releases whose
 English titles vary, so the serial is the thing to trust and the emulator matches
-on that.
+on that - except the two zero-serial Micro Machines rows, which have no serial to
+match and are the checksum rows `zero_serial_override` holds.
 
 | Game | Serial | Chip | Size | Page | Mode | Board | Header |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -149,6 +159,11 @@ on that.
 | NFL Quarterback Club | `T-081276` | AT24C02 | 256 B | 8 | 2 | Acclaim32M | declares (G) |
 | NBA Jam TE | `T-81406` | AT24C04 | 512 B | 16 | 2 | Acclaim32M | declares (G) |
 | NFL Quarterback Club '96 | `T-081586` | AT24C16 | 2 KB | 16 | 2 | Acclaim32M | declares (G) |
+| Micro Machines 2 - Turbo Tournament | `T-120096` | AT24C16 | 2 KB | 16 | 2 | Codemasters | serial only (G) |
+| Brian Lara Cricket | `T-120106` | AT24C08 | 1 KB | 16 | 2 | Codemasters | serial only (G) |
+| Brian Lara Cricket 96 / Shane Warne Cricket | `T-120146` | AT24C65 | 8 KB | 64 | 3 | Codemasters | serial only (G) |
+| Micro Machines: Turbo Tournament 96 (zero-serial dumps) | *(no serial)* `chk $165E` | AT24C16 | 2 KB | 16 | 2 | Codemasters | checksum + boot longword (G) |
+| Micro Machines: Military (zero-serial dumps) | *(no serial)* `chk $168B` | AT24C08 | 1 KB | 16 | 2 | Codemasters | checksum + boot longword (G) |
 
 `known_game_serial_enables_eeprom` covers the three states that matter: a cart
 that only says `$E8` (Sega board, X24C01, what every Sega-board entry in the
@@ -158,6 +173,20 @@ chip, and a cart that says nothing at all and is in the table.
 `eeprom_override` matches a substring of the header serial on purpose: the header
 carries the `"GM "` software type and a `"-00"` revision either side of the part
 that names the cart.
+
+The Codemasters rows are the ones the header cannot name: none of the family
+declares `$E8` (every extra-memory field in it is spaces), and the two Micro
+Machines carts GPGX lists by checksum carry the literal serial `00000000`, so
+the serial list cannot hold them. `zero_serial_override` matches GPGX's pair -
+the header checksum, plus the image's first longword, which for these two carts
+is `$444e4c44` - and the longword is what makes the match safe: the original
+Micro Machines (Europe) revisions carry the same checksums over a different
+first longword and are ordinary carts, so GPGX's checksum half alone would
+catch carts that have nothing to do with the board. Its own `$165E`/
+`$fffffffc` row ("Pete Sampras Tennis (Prototype ?)") is not copied for
+exactly that reason. The Pete Sampras Tennis carts that GPGX lists by serial
+(`T-120066`, `T-123456`) have NO_EEPROM: they carry the J-CART register with
+no chip, and their serials live in `jcart.rs`'s table for the register alone.
 
 ## The chips
 
@@ -252,22 +281,17 @@ two-byte composition, the don't-care top bits and the 64-byte page.
 - **Codemasters J-CART** (`T-120106` Brian Lara Cricket, `T-120096` Micro Machines
   2 - Turbo Tournament, `T-120146` Brian Lara Cricket 96 / Shane Warne Cricket,
   and the checksum-matched Micro Machines Military and Micro Machines Turbo
-  Tournament 96). `Board::Codemasters` is in the board table and its bit
-  positions are written down above, because they are cheap to record and cost
-  something to rediscover, but no J-CART cart is decoded here and the
-  `EEPROM_GAMES` table has no entries for them. The reason is that the J-CART is
-  a bank-switching cart first and an EEPROM second: writes are at $300000-$37FFFF
-  and reads at $380000-$3FFFFF, with the bank numbers and the data line sharing
-  the same registers (`mapper_i2c_jcart_read8` ORs the line into
-  `jcart_read()`). It needs the J-CART mapper to exist first, and to agree with
-  it about those registers. That is worth its own ticket, and the row above is
-  here - in this file, not in `eeprom::Board`, which has only the four boards the
-  emulator decodes - so the bit positions are written down once. The chip of the third of these,
-`T-120146`, is now in the emulator: it is the same mode 3 AT24C65 the two EA
-carts carry (GPGX's `i2c_database` has it on `mapper_i2c_jcart_init` with
-`EEPROM_24C65`), so when the J-CART mapper lands (#356) its serial row in
-`EEPROM_GAMES` is one line. Until then it has no save, because the board is the
-missing piece, not the chip.
+  Tournament 96). Implemented since #356: the board rows are in the tables above
+  and the register half of the board is `crates/genesis/src/cart/jcart.rs`. What
+  this list used to say - "no J-CART cart is decoded here" - was true until the
+  J-CART mapper landed; the reason it gave ("a bank-switching cart first and an
+  EEPROM second ... with the bank numbers and the data line sharing the same
+  registers") was not: there are no bank registers on the board, the register is
+  the cart's two extra controller ports, and the shared byte is bit 7 of its odd
+  read answer, which the register owns everywhere except that one bit. The chip
+  of the third of these, `T-120146`, is the same mode 3 AT24C65 the two EA carts
+  carry, and its serial row in `EEPROM_GAMES` is the one line #270 said it would
+  be.
 - **The 32 Mbit board's read-window latch.** Now implemented (see "The 32 Mbit
   board's read-window latch" above); this entry is the correction of what this
   list used to say. The earlier text called `mapper_acclaim_32M_write16` "a 64

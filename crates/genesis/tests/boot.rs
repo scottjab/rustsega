@@ -770,3 +770,78 @@ fn global_gladiators_survives_a_reset() {
          repainted the chip it reset (#382)"
     );
 }
+
+// The J-CART carts (#356): the four the cartridge survey named. The board is
+// the Codemasters J-CART - the register at $380000-$3FFFFF and, behind it, the
+// serial EEPROM whose lines the quadrant below drives. These carts boot on
+// `main` too - what the board changes is what the register read answers: on
+// `main` the quadrant is open bus (bit 14 high, the level the game reads as
+// "no J-CART here"), and the games come up with their two-player-only menus;
+// decoded, the register's bit 14 is the PAL's tied-low line and the four-player
+// options appear (the measured menu diff is on the ticket). The assert here is
+// the boot itself, at 800 frames rather than the sweep's 300: these carts'
+// screens cycle - publisher logo, fade to black, title, menu - and the 300-frame
+// mark lands in a fade on every one of them, while 800 is inside the menu, which
+// is where the board's work is visible.
+//
+// Cosmo Cop is in the ticket's list of four but has no dump on this machine and
+// no row in any reference's database; the test stands ready for a dump.
+
+/// Micro Machines: Turbo Tournament 96, the cart whose J-CART register read
+/// GPGX's bit 14 fix is named after ("fixes Micro Machines 2").
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn micro_machines_turbo_tournament_96_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom(
+        "Micro Machines - Turbo Tournament 96 (Europe) (J-Cart)"
+    ));
+    let colours = colour_count(&path, 800, "jcart_mm_tt96.png");
+    assert!(
+        colours > BLANK,
+        "800 frames in, Turbo Tournament 96 is {colours} distinct colours"
+    );
+}
+
+/// Same cart, Rev 1, the second dump of the pair the local set carries.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn micro_machines_turbo_tournament_96_rev1_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom(
+        "Micro Machines - Turbo Tournament 96 (Europe) (Rev 1) (J-Cart)"
+    ));
+    let colours = colour_count(&path, 800, "jcart_mm_tt96_rev1.png");
+    assert!(
+        colours > BLANK,
+        "800 frames in, Turbo Tournament 96 (Rev 1) is {colours} distinct colours"
+    );
+}
+
+/// Micro Machines: Military, the zero-serial cart matched by checksum and boot
+/// longword rather than by serial.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn micro_machines_military_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom(
+        "Micro Machines - Military (Europe) (J-Cart)"
+    ));
+    let colours = colour_count(&path, 800, "jcart_mm_military.png");
+    assert!(
+        colours > BLANK,
+        "800 frames in, Micro Machines: Military is {colours} distinct colours"
+    );
+}
+
+/// Cosmo Cop, the ticket's fourth cart: a J-CART cart in `docs/mappers.md`'s
+/// survey and in no reference's database, with no dump on this machine. The
+/// prefix matches nothing today and `require_data!` skips for exactly that
+/// reason; when a dump lands, so does its row.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn cosmo_cop_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom("Cosmo Cop"));
+    let colours = colour_count(&path, 800, "jcart_cosmo_cop.png");
+    assert!(
+        colours > BLANK,
+        "800 frames in, Cosmo Cop is {colours} distinct colours"
+    );
+}

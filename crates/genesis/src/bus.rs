@@ -63,7 +63,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::audio::Audio;
-use crate::cart::{Eeprom, Mapper, Sram, eeprom, mapper, sram};
+use crate::cart::{Eeprom, Jcart, Mapper, Sram, eeprom, jcart, mapper, sram};
 use crate::config::version_is_pal;
 use crate::io::Io;
 use crate::z80_bus::{self, Z80Side};
@@ -604,6 +604,24 @@ pub struct Bus {
     /// Genesis Plus GX does in `mapper_sega_w` ("save current cartridge ROM bank
     /// mapped to $200000-$20ffff" to put back later).
     mapper: Mapper,
+    /// The J-CART register, from [`crate::cart::jcart::detect`] on [`Bus::rom`],
+    /// for the carts that carry the board: the two extra controller ports of
+    /// [`crate::cart::jcart`], answered at $380000-$3FFFFF.
+    ///
+    /// Not a region, like the two cart devices above it: the quadrant lives
+    /// inside [`Region::Rom`], and [`Bus::read_rom_byte`] and
+    /// [`Bus::write_rom_byte`] are the seams. The ownership rule of the one
+    /// byte two pieces of hardware answer is stated where it is applied:
+    /// **bit 7 of the odd byte is not this register's**. It is the wire the
+    /// cart's EEPROM data line rides on, and the register's answer is built
+    /// around it - GPGX's `mapper_i2c_jcart_read8` masks the port's own bit 7
+    /// and puts the line there, which is what makes the two owners lossless:
+    /// different bits. The EEPROM itself is [`Self::eeprom`] with
+    /// [`crate::cart::Board::CODEMASTERS`], whose write quadrant is
+    /// $300000-$37FFFF and whose own answer window is this same
+    /// $380000-$3FFFFF for the carts that have no register - and the decode
+    /// below is what keeps the two from ever answering the same read.
+    jcart: Option<Jcart>,
     /// 64 KiB of work RAM, mapped at 0xE00000 and mirrored every 0x10000.
     ///
     /// Saved as a sequence of its bytes: 64 KiB is past the thirty-two entries
@@ -814,11 +832,17 @@ impl Bus {
         // it in the system type, and both are in front of the code that turns a
         // file into a machine rather than next to it.
         let mapper = Mapper::detect(&rom);
+        // And so is the J-CART register, for the carts whose boards carry it:
+        // [`crate::cart::jcart::detect`] matches the serials and the two
+        // zero-serial Micro Machines carts the way Genesis Plus GX's database
+        // does.
+        let jcart = jcart::detect(&rom);
         Self {
             rom,
             sram,
             eeprom,
             mapper,
+            jcart,
             ram: Box::new([0; 0x10000]),
             version,
             io: Io::new(),
@@ -1203,7 +1227,15 @@ impl Bus {
     ///    [`crate::cart::sram::Sram::read`] answers `None` for every address the
     ///    save has no claim on, so the one call is the whole overlay and never a
     ///    scattered `if sram`.
-    /// 2. **the mapper**, between the overlay and the image, as a translation of
+    /// 2. **the J-CART register**, for the carts that carry the board: the
+    ///    quadrant $380000-$3FFFFF answers the register and not the image, with
+    ///    the EEPROM's data line in bit 7 of its odd byte - the shared byte the
+    ///    field docs on [`Bus::jcart`] own up to, and the overlay
+    ///    [`Bus::read_jcart_byte`] applies. The cricket carts have no register
+    ///    and skip this step, which is what leaves their chip's own answer -
+    ///    step 0's [`crate::cart::Board::CODEMASTERS`] window - as the quadrant's
+    ///    owner instead.
+    /// 3. **the mapper**, between the overlay and the image, as a translation of
     ///    `addr` to an offset in [`Bus::rom`] ([`crate::cart::mapper`], M3-12).
     ///    Below the overlay and not above it because `0xA130F1` bit 0 *is* the
     ///    switch that picks ROM or save RAM for this window, and a mapper only
@@ -1212,7 +1244,7 @@ impl Bus {
     ///    the bank and remembers which bank was underneath to put back. The
     ///    mapper answers `None` for a cart that has no mapper, and the address is
     ///    then its own offset - the plain image.
-    /// 3. **the image**, in address order. A read above its end is [`OPEN_BUS`].
+    /// 4. **the image**, in address order. A read above its end is [`OPEN_BUS`].
     ///    That is a decided question - [#435](https://github.com/scottjab/rustsega/issues/435)
     ///    is where it was decided - so the reasoning is written down here rather
     ///    than left to be re-derived the next time a cart draws black.
@@ -1252,6 +1284,17 @@ impl Bus {
         if let Some(value) = self.sram.as_ref().and_then(|save| save.read(addr)) {
             return value;
         }
+        // The J-CART register, for the carts that carry it: the whole quadrant
+        // answers the register and not the image (GPGX installs its handler
+        // over $380000-$3fffff), which is what makes this an overlay like the
+        // save RAM above rather than a bit of the answer below. Bit 7 of the
+        // odd byte is not the register's, and is the one wire it shares with
+        // [`Self::eeprom`]: the ownership rule, stated at the field and
+        // covered by `a_jcart_write_moves_th_and_leaves_the_lines_alone` and
+        // `an_eeprom_line_write_does_not_move_th` below.
+        if let Some(byte) = self.read_jcart_byte(addr) {
+            return byte;
+        }
         // The one place a cart's addresses are translated, and the only place the
         // mapper is consulted on the way to a byte: the overlay above has already
         // had its say and keeps its priority.
@@ -1264,6 +1307,24 @@ impl Bus {
             Some(value) => value,
             None => byte,
         }
+    }
+
+    /// The J-CART register's byte at `addr`, or `None` where the register has
+    /// no say: carts without one, and every address outside
+    /// [`jcart::WINDOW`]. The `sda` bit is the cart's EEPROM data line as the
+    /// chip holds it, or the released level - high - for the boards that
+    /// carry the register with no chip (GPGX's `eeprom_i2c_out` returns the
+    /// latched line, idle-high, for exactly those). This is the step that
+    /// keeps the two owners of the quadrant apart: a cart with the register
+    /// never reaches the EEPROM read below it, whose Codemasters answer
+    /// window is the same addresses - the chip's bit arrives through the
+    /// register instead, where the board wires it.
+    fn read_jcart_byte(&self, addr: u32) -> Option<u8> {
+        let cart = self.jcart.as_ref()?;
+        Jcart::covers(addr).then(|| {
+            let sda = self.eeprom.as_ref().map(Eeprom::sda_level).unwrap_or(true);
+            cart.read_byte(addr, sda)
+        })
     }
 
     /// Cartridge slot word read: the two bytes, high byte first (M68000UM, "Data
@@ -1290,10 +1351,21 @@ impl Bus {
     /// `addr` is inside it, and otherwise nothing at all - the image, like the
     /// mapper that will sit where [`Bus::read_rom_byte`] says, is read-only.
     fn write_rom_byte(&mut self, addr: u32, value: u8) {
+        // The J-CART register first: bit 0 of the byte is the TH line of the
+        // cart's two extra ports (GPGX's `jcart_write`), from either lane. For
+        // the cricket carts - register-less - this arm is absent and the write
+        // is dropped at the end, the way GPGX installs `m68k_unused_8_w` over
+        // their $380000-$3fffff.
+        if let Some(cart) = self.jcart.as_mut().filter(|_| Jcart::covers(addr)) {
+            cart.write(value);
+            return;
+        }
         // The serial EEPROM first: what the 68k wrote here is two lines of the
         // cart's board, and the chip has to see it whether or not the address is
         // one its save RAM overlay claims. The two are decoded from one header
         // field and never both exist, so nothing else about this order changes.
+        // On the Codemasters board this is the $300000-$37FFFF quadrant; on
+        // every other board it is the pair the cart declares.
         if let Some(chip) = self.eeprom.as_mut() {
             chip.write(addr, value);
         }
@@ -2263,6 +2335,13 @@ impl m68k::Bus for Bus {
         // asks for the same with `cart.hw.bankshift` on the carts that have the
         // mapper - "cartridge ROM mapping is reinitialized on /VRES".
         self.mapper.reset();
+        // And the J-CART register's TH line goes back high with them (Genesis
+        // Plus GX's `gamepad_reset`, "default state ... 0x40"). The EEPROM's
+        // lines and array are the chip's business and [`Eeprom::reset`] has
+        // already seen to them.
+        if let Some(cart) = self.jcart.as_mut() {
+            cart.reset();
+        }
     }
 }
 
@@ -4527,6 +4606,18 @@ mod tests {
         rom
     }
 
+    /// A J-CART-family cart the way the real dumps look: a serial, a checksum
+    /// and a boot longword, and **no** extra-memory record - the board's
+    /// windows are its own, which is exactly why the family is matched by the
+    /// table rather than by the header.
+    fn jcart_rom(serial: &str, checksum: u16, boot: u32) -> Vec<u8> {
+        let mut rom = vec![0u8; 0x10_0000];
+        rom[0x180..0x180 + serial.len()].copy_from_slice(serial.as_bytes());
+        rom[0x18E..0x190].copy_from_slice(&checksum.to_be_bytes());
+        rom[0..4].copy_from_slice(&boot.to_be_bytes());
+        rom
+    }
+
     /// A cart board's two lines, walked through the cart slot one access at a
     /// time: which address carries which line, at which bit, and which bit of the
     /// answer the chip drives. Every cart that declares a window declares the odd
@@ -4541,6 +4632,10 @@ mod tests {
         /// The byte last written to each half of the cart's pair, so that moving
         /// one line leaves the other where it was.
         written: [u8; 2],
+        /// The address the line is read back from, which is the data address
+        /// for every board but the Codemasters one, whose answer lives a
+        /// quadrant away.
+        out_addr: u32,
     }
 
     impl EepromLines {
@@ -4552,6 +4647,7 @@ mod tests {
                 sda,
                 out,
                 written: [0xFF; 2],
+                out_addr: sda_addr,
             }
         }
 
@@ -4570,6 +4666,15 @@ mod tests {
         /// the odd byte is the data.
         fn acclaim_32m() -> Self {
             Self::new(0x20_0000, 1, 0x20_0001, 1, 1)
+        }
+
+        /// The Codemasters J-CART board: both lines on either byte lane of the
+        /// write quadrant - this walks them from $300007 - and the answer read
+        /// back on bit 7 of the odd byte at the top of the next quadrant.
+        fn codemasters() -> Self {
+            let mut lines = Self::new(0x30_0007, 2, 0x30_0007, 1, 0x80);
+            lines.out_addr = 0x38_0001;
+            lines
         }
 
         fn scl(&mut self, bus: &mut Bus, level: bool) {
@@ -4604,7 +4709,7 @@ mod tests {
         fn clock(&mut self, bus: &mut Bus, level: bool) -> bool {
             self.sda(bus, level);
             self.scl(bus, true);
-            let answer = bus.read_byte(self.sda_addr) & self.out != 0;
+            let answer = bus.read_byte(self.out_addr) & self.out != 0;
             self.scl(bus, false);
             answer
         }
@@ -4815,6 +4920,192 @@ mod tests {
         bus.write_word(0x20_0000, 0x0000);
         bus.write_word(0x10_0000, 0x0000);
         assert_eq!(bus.read_byte(0x20_0002), 0xA5, "still armed");
+    }
+
+    /// The J-CART register answers the top quadrant for the carts that carry
+    /// it, both lanes, as a word and as bytes, and nothing outside it moves:
+    /// the register is $380000-$3FFFFF and nothing else (Genesis Plus GX's
+    /// `mapper_i2c_jcart_init`, "serial EEPROM (read) & J-CART (read/write)
+    /// mapped to $380000-$3fffff").
+    #[test]
+    fn the_jcart_register_answers_the_top_quadrant() {
+        let mut bus = Bus::new(
+            jcart_rom("GM T-120096-50", 0x7E50, 0xFFFF_FFFC),
+            TEST_VERSION,
+        );
+        // Port 2 in the even lane, bit 14 tied low; port 5 in the odd lane
+        // with TH in bit 6 and the line high since nothing has pulled it.
+        assert_eq!(bus.read_byte(0x38_0000), 0x3F);
+        assert_eq!(bus.read_byte(0x38_0001), 0xFF);
+        assert_eq!(bus.read_byte(0x3F_FFFE), 0x3F, "the whole quadrant");
+        assert_eq!(bus.read_byte(0x3F_FFFF), 0xFF);
+        // A word read is its two byte reads, which is GPGX's read16 answer:
+        // `(eeprom_i2c_out() << 7) | jcart_read(address)`.
+        assert_eq!(bus.read_word(0x38_0000), 0x3FFF);
+        // Below the quadrant nothing changed: the image, and open bus past it.
+        assert_eq!(bus.read_byte(0x37_FFFF), 0xFF, "open bus, the 1 MiB image");
+    }
+
+    /// The ticket's ownership test, one direction: a write to the J-CART
+    /// register moves TH, and the EEPROM's line is not disturbed by it - bit 7
+    /// stays released, and the chip took no byte.
+    #[test]
+    fn a_jcart_write_moves_th_and_leaves_the_lines_alone() {
+        let mut bus = Bus::new(
+            jcart_rom("GM T-120096-50", 0x7E50, 0xFFFF_FFFC),
+            TEST_VERSION,
+        );
+        assert_eq!(
+            bus.read_byte(0x38_0001),
+            0xFF,
+            "TH high, line released high"
+        );
+
+        // Bit 0 of the byte is TH, from either lane (GPGX's write8 answers
+        // both; BlastEm's only the odd one - a word write settles the same).
+        bus.write_byte(0x38_0001, 0x00);
+        assert_eq!(bus.read_byte(0x38_0001), 0xBF, "TH down, line still high");
+        bus.write_byte(0x38_0000, 0x01);
+        assert_eq!(bus.read_byte(0x38_0001), 0xFF, "TH up again, even lane");
+        // A word write is its two byte writes: the even half's bit 0 is word
+        // bit 8, the odd half's is word bit 0, and the odd half is written
+        // last - so the word settles at GPGX's `jcart_write` answer, bit 0 of
+        // the word, one transient aside (the documented behaviour of every
+        // Lane::Both board, `docs/eeprom-games.md`).
+        bus.write_word(0x38_0000, 0x0100);
+        assert_eq!(bus.read_byte(0x38_0001), 0xBF, "word bit 0 low: TH down");
+        bus.write_word(0x38_0000, 0x0000);
+        assert_eq!(bus.read_byte(0x38_0001), 0xBF, "word bit 0 is TH, and 0");
+        bus.write_word(0x38_0000, 0x0001);
+        assert_eq!(bus.read_byte(0x38_0001), 0xFF, "word bit 0 set, TH up");
+
+        // And the line never moved: bit 7 is high through every answer above,
+        // and the chip stored nothing.
+        assert!(!bus.take_dirty());
+    }
+
+    /// The ticket's ownership test, the other direction: an EEPROM clock/data
+    /// write drives the lines and does not move TH. Bit 6 of the register's
+    /// answer is where the register's state is, bit 7 where the chip's is, and
+    /// neither write touches the other's bit.
+    #[test]
+    fn an_eeprom_line_write_does_not_move_th() {
+        let mut bus = Bus::new(
+            jcart_rom("GM T-120096-50", 0x7E50, 0xFFFF_FFFC),
+            TEST_VERSION,
+        );
+        // TH down first, so the test cannot pass by a line write coincidentally
+        // restoring it.
+        bus.write_byte(0x38_0001, 0x00);
+        assert_eq!(bus.read_byte(0x38_0001), 0xBF);
+
+        // A start condition at $300001: D0 falls while D1 is up, and the chip
+        // is listening. The register sees the line in bit 7 and never TH.
+        let mut lines = EepromLines::codemasters();
+        lines.start(&mut bus);
+        assert_eq!(
+            bus.read_byte(0x38_0001),
+            0x3F,
+            "TH down, line low: two owners, two bits"
+        );
+
+        // A byte to the chip, and a stop: the line goes back up, TH stays down.
+        assert!(lines.send(&mut bus, 0xA0), "the chip acknowledges");
+        assert!(lines.send(&mut bus, 0x04), "and word 4");
+        assert!(lines.send(&mut bus, 0x5A), "and the byte for it");
+        lines.stop(&mut bus);
+        assert_eq!(bus.read_byte(0x38_0001), 0xBF, "TH never moved");
+        assert!(bus.take_dirty(), "the chip took the byte");
+        assert_eq!(bus.sram().unwrap()[4], 0x5A);
+    }
+
+    /// A full byte to the chip, walked through the board: the write quadrant
+    /// drives the lines from any address of itself - this one from $300007 -
+    /// and the answer is read back a quadrant up. This is the AT24C16 of
+    /// Micro Machines 2, mode 2 addressing, on the bus.
+    #[test]
+    fn codemasters_line_writes_are_window_wide() {
+        let mut bus = Bus::new(
+            jcart_rom("GM T-120096-50", 0x7E50, 0xFFFF_FFFC),
+            TEST_VERSION,
+        );
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(2048), "the AT24C16");
+
+        let mut lines = EepromLines::codemasters();
+        lines.start(&mut bus);
+        assert!(lines.send(&mut bus, 0xA0), "the device address");
+        assert!(lines.send(&mut bus, 0x03), "and word 3");
+        assert!(lines.send(&mut bus, 0xC3));
+        lines.stop(&mut bus);
+        assert_eq!(bus.sram().unwrap()[3], 0xC3);
+
+        // Reading it back, through the answer quadrant the same way.
+        lines.start(&mut bus);
+        assert!(lines.send(&mut bus, 0xA0));
+        assert!(lines.send(&mut bus, 0x03));
+        lines.stop(&mut bus);
+        lines.start(&mut bus);
+        assert!(lines.send(&mut bus, 0xA1), "and the same word, reading");
+        assert_eq!(lines.recv(&mut bus, false), 0xC3);
+        lines.stop(&mut bus);
+    }
+
+    /// The cricket carts - `T-120106` and `T-120146` - shipped without the
+    /// register (GPGX: "support for Brian Lara Cricket games without J-CART"):
+    /// their chip owns the answer quadrant alone, the even lane stays the
+    /// image's, and a write up there is dropped.
+    #[test]
+    fn the_cricket_cart_reads_its_chip_in_the_top_quadrant() {
+        let mut bus = Bus::new(
+            jcart_rom("GM T-120146-50", 0x9A5C, 0x00FF_FFFC),
+            TEST_VERSION,
+        );
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(8192), "the AT24C65");
+
+        // The line, released, in bit 7 of the odd byte; the even lane is the
+        // open bus past the image, untouched by any board bit.
+        assert_eq!(bus.read_byte(0x38_0001), 0xFF);
+        assert_eq!(bus.read_byte(0x38_0000), 0xFF);
+        let mut lines = EepromLines::codemasters();
+        lines.start(&mut bus);
+        assert_eq!(bus.read_byte(0x38_0001), 0x7F, "the line, low, in bit 7");
+        assert_eq!(bus.read_byte(0x38_0000), 0xFF, "no register on this cart");
+
+        // A write to the answer quadrant is nothing: no register to move, and
+        // the chip's write window is the quadrant below.
+        bus.write_byte(0x38_0001, 0x01);
+        bus.write_word(0x38_0000, 0xFFFF);
+        assert_eq!(bus.read_byte(0x38_0001), 0x7F, "unchanged by the writes");
+    }
+
+    /// The two zero-serial Micro Machines carts get the chip and the register
+    /// together: GPGX's checksum-plus-boot-longword match is what names them.
+    #[test]
+    fn an_mm_cart_gets_chip_and_ports_together() {
+        let mut bus = Bus::new(
+            jcart_rom("GM 00000000-00", 0x165E, 0x444E_4C44),
+            TEST_VERSION,
+        );
+        assert_eq!(bus.sram().map(<[u8]>::len), Some(2048));
+        assert_eq!(bus.read_byte(0x38_0000), 0x3F, "the register answers too");
+    }
+
+    /// The original Micro Machines (Europe) revisions, which share the zero
+    /// serial and the $165E checksum with Turbo Tournament 96, are ordinary
+    /// carts: the boot longword is the guard, and nothing of the board is
+    /// theirs.
+    #[test]
+    fn the_original_micro_machines_gets_neither() {
+        let mut bus = Bus::new(
+            jcart_rom("GM 00000000-00", 0x165E, 0xFFFF_FFFC),
+            TEST_VERSION,
+        );
+        assert_eq!(bus.sram(), None, "no chip");
+        assert_eq!(
+            bus.read_byte(0x38_0001),
+            0xFF,
+            "open bus past the image, as before any of this"
+        );
     }
 
     /// A cart that declares neither save has neither, and a cart that declares an
