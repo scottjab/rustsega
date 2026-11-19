@@ -26,6 +26,11 @@
 //! [`TMSS_SECURITY`]; a try before that freezes the CPU. The check is one line in
 //! each [`m68k::Bus`] dispatch arm, in front of the region's own functions, so that
 //! the ticket filling the VDP in cannot miss it - see [`Bus::vdp_access_denied`].
+//! The PSG's other 68k-side spelling, `0xA07F11` inside [`Region::Z80`], is the
+//! same port and sits behind the same gate from that region's own read/write
+//! (M3-10 #70, #262); the Z80's bank-window route into the VDP area arrives
+//! through the [`m68k::Bus`] dispatch, so the gate covers it without an arm of
+//! its own.
 //!
 //! ## Reading what is not there
 //!
@@ -937,13 +942,22 @@ impl Bus {
     /// counter, debug and **PSG** ports, the every-0x40 mirrors and the
     /// 0xC00020-0xC0003F hang-up corner. The PSG port at 0xC00011 locks because it
     /// lives in the VDP's port pair (plutiedev "Memory map") and is reached from here.
-    /// The Z80's own route to that port ([`SoundSide::Psg`], `0xA07F11`) is *not*
-    /// gated here, and that is a boundary rather than an oversight: it is the sound
-    /// side's path, #67 and #68 settled it without TMSS in it, and this bus only
-    /// freezes what the 68k asked for. Genesis Plus GX locks that route as well
-    /// (`zbank_memory_map` in `gen_tmss_w`), so
-    /// [#262](https://github.com/scottjab/rustsega/issues/262) is open on whether we
-    /// should.
+    /// GPGX locks those pages in *both* maps that can reach them: the 68k's own
+    /// `m68k.memory_map`, and the Z80's bank-window view `zbank_memory_map`, whose
+    /// unlocked handler `zbank_write_vdp` answers the PSG lane (case 0x10) with
+    /// `psg_write` - so the port is held, not the bus it is reached by. This is
+    /// asked for [`Region::Vdp`] from the [`m68k::Bus`] dispatch, and for the PSG's
+    /// spelling inside [`Region::Z80`] (`0xA07F11`, [`SoundSide::Psg`]) from the
+    /// window's own read/write, which are the functions already carrying that
+    /// area's other gate ([`Bus::z80_bus_granted`]); a Z80 bank-window access to
+    /// pages 0xC0-0xDF needs no arm of its own because it goes through the
+    /// [`m68k::Bus`] dispatch and this gate with it. GPGX's own 68k window is
+    /// stricter than this bus in every TMSS state - its `z80_write_byte` answers
+    /// the whole 0xA07F page with `m68k_lockup_w_8`, which is the M3-08 (#68)
+    /// settlement of [`SoundSide`] answering the PSG lane instead - but what no
+    /// reference does is let a TMSS-locked PSG write land on the chip, and
+    /// [#262](https://github.com/scottjab/rustsega/issues/262) is this gate
+    /// closing that hole.
     fn vdp_access_denied(&mut self) -> bool {
         if !self.vdp_locked() {
             return false;
@@ -1568,6 +1582,12 @@ impl Bus {
     /// asked, because the 68000 has spent the bus cycle either way: the access is
     /// slow because the device on the other end is 8-bit, not because the sound
     /// CPU happened to be holding it.
+    ///
+    /// The PSG lane is behind the TMSS gate as well as the bus gate: `0xA07F11` is
+    /// the port the 68k also owns at `0xC00011`, so [`Bus::vdp_access_denied`]
+    /// answers for it here and a locked read freezes the 68k like a locked write
+    /// (M3-10 #70, #262). Reads of the lane are [`OPEN_BUS`] either way - the PSG
+    /// is write-only - so the freeze is the only difference TMSS makes to a read.
     fn read_z80_byte(&mut self, addr: u32) -> u8 {
         self.stall_68k(Z80_AREA_WAIT_MCLK);
         if !self.z80_bus_granted() {
@@ -1580,7 +1600,9 @@ impl Bus {
             // the same way for all four.
             SoundSide::Ym => self.audio.ym_read_status(),
             // The bank register has no read handler in any reference, and the PSG is
-            // write-only.
+            // write-only. The PSG arm above is the TMSS gate: same port, same answer
+            // as 0xC00011 - see [`Bus::vdp_access_denied`].
+            SoundSide::Psg if self.vdp_access_denied() => OPEN_BUS,
             SoundSide::Bank | SoundSide::Psg | SoundSide::Nothing => OPEN_BUS,
         }
     }
@@ -1602,7 +1624,9 @@ impl Bus {
     /// Z80 bus byte write: the sound side's device, dropped entirely unless the 68k
     /// holds the Z80's bus. See [`Bus::z80_bus_granted`] and [`SoundSide`], and
     /// [`Bus::read_z80_byte`] for the wait state charged before the grant either
-    /// way.
+    /// way. The PSG lane is behind the TMSS gate on top of the bus gate, as at its
+    /// VDP-area spelling 0xC00011 - see [`Bus::vdp_access_denied`] for the sources
+    /// (M3-10 #70, #262).
     fn write_z80_byte(&mut self, addr: u32, value: u8) {
         self.stall_68k(Z80_AREA_WAIT_MCLK);
         if !self.z80_bus_granted() {
@@ -1612,6 +1636,7 @@ impl Bus {
             SoundSide::Ram => self.z80.ram[z80_bus::ram_index(addr as u16)] = value,
             SoundSide::Ym => self.audio.ym_write(z80_bus::ym_port(addr as u16), value),
             SoundSide::Bank => self.z80.shift_in(value),
+            SoundSide::Psg if self.vdp_access_denied() => {}
             SoundSide::Psg => self.audio.psg_write(value),
             SoundSide::Nothing => {}
         }
@@ -1933,7 +1958,9 @@ enum SoundSide {
     Bank,
     /// The PSG port: `0xA07F11` and its `0x13`/`0x15`/`0x17` mirrors, which are the
     /// port the Z80 sees at `0x7F11` and the 68k sees at `0xC00011`. One port, one chip,
-    /// three spellings - see [`z80_bus::is_psg_port`].
+    /// three spellings - see [`z80_bus::is_psg_port`]. The TMSS gate covers all three
+    /// spellings, so a 68k write through this window is refused and freezes while the
+    /// security string is missing, like its `0xC00011` spelling (M3-10 #70, #262).
     Psg,
     /// Anything else in the area: the gaps of the Z80 map, and the rest of the VDP
     /// window at `0xA07F00-0xA07FFF`.
@@ -3545,6 +3572,97 @@ mod tests {
             let _ = bus.read_word(addr & EVEN_LANE);
             assert!(!bus.locked_up, "{addr:#08x} is open once unlocked");
         }
+    }
+
+    /// The PSG has a second spelling on the 68k side, the Z80 window's `0xA07F11`
+    /// ([`SoundSide::Psg`]), and it is behind the TMSS gate with the VDP area's
+    /// `0xC00011`: one port, so one answer. Genesis Plus GX's `gen_tmss_w` locks
+    /// the VDP pages 0xC0-0xDF in *both* bus maps that can reach them while the
+    /// register does not read `"SEGA"` - the 68k's own `m68k.memory_map`, and the
+    /// Z80's bank-window view `zbank_memory_map`, whose unlocked handler
+    /// `zbank_write_vdp` answers the PSG lane (its case 0x10) with `psg_write` -
+    /// so a locked PSG write freezes whoever asked, whichever spelling they used.
+    #[test]
+    fn tmss_on_psg_write_via_z80_window_is_refused() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        request_the_z80_bus(&mut bus);
+        release_the_z80_reset(&mut bus);
+        assert!(!bus.locked_up(), "taking the bus alone freezes nothing");
+
+        // The write `psg_write_from_68k_at_a07f11` lands on an unlocked console:
+        // a data byte under the power-on latch, which moves channel 0's tone
+        // period the moment it arrives (SMS Power, "SN76489").
+        bus.write_byte(0xA07F11, 0x5A);
+        assert!(psg_untouched(&bus), "the locked PSG takes no write");
+        assert!(
+            bus.locked_up(),
+            "the write froze the 68k, as it would at 0xC00011"
+        );
+
+        // Reads refuse the same way: the PSG is write-only, so the answer is the
+        // [`OPEN_BUS`] it always gives, and the lock-up flag is what says the gate
+        // saw the access at all. A fresh machine, so this is the read's own doing.
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        request_the_z80_bus(&mut bus);
+        release_the_z80_reset(&mut bus);
+        assert_eq!(bus.read_byte(0xA07F11), OPEN_BUS);
+        assert!(bus.locked_up(), "the read froze the 68k too");
+    }
+
+    /// ... and the unlock opens this spelling with the rest: after `SEGA`, the
+    /// same two bytes land that a locked console refused, unchanged from
+    /// `psg_write_from_68k_at_a07f11` (M3-08 #68) - and without a freeze.
+    #[test]
+    fn tmss_unlock_opens_the_z80_window_psg() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        request_the_z80_bus(&mut bus);
+        release_the_z80_reset(&mut bus);
+        write_sega(&mut bus);
+        assert!(bus.tmss_unlocked, "setup: the string got through");
+
+        // The two bytes of `psg_write_from_68k_at_a07f11`: channel 0's volume
+        // latch, then its data byte (SMS Power, "SN76489").
+        bus.write_byte(0xA07F11, 0x9F);
+        bus.write_byte(0xA07F13, 0x13);
+        assert_eq!(bus.audio.psg.attenuation(0), 3, "the write lands");
+        assert!(!bus.locked_up(), "nothing froze: the port is open");
+    }
+
+    /// The gate covers the PSG lane and nothing else of the Z80 window: Genesis
+    /// Plus GX's `gen_tmss_w` maps 0xC0-0xDF to its lockup handlers and leaves the
+    /// rest of the maps alone, so the YM2612 at 0xA04000 (its `z80_write_byte`
+    /// case 2, which runs whether or not TMSS holds) and the even lane of the PSG
+    /// pair (no reference drives it at all, [`SoundSide::Nothing`]) keep the
+    /// answers they give on a console without a TMSS.
+    #[test]
+    fn tmss_lock_leaves_the_rest_of_the_z80_window_alone() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        request_the_z80_bus(&mut bus);
+        release_the_z80_reset(&mut bus);
+
+        // A YM2612 data-port write under the lock still reaches the chip, which
+        // the BUSY it sets proves (the same probe `z80_area_refused_while_reset_held`
+        // uses for the reset gate).
+        bus.write_byte(0xA04007, 0x00);
+        assert_eq!(
+            bus.read_byte(0xA04000) & YM_BUSY,
+            YM_BUSY,
+            "the YM2612 is not behind the TMSS gate"
+        );
+        assert!(!bus.locked_up(), "and it freezes nothing");
+
+        // The even lane of the PSG pair is not the port, so it is dropped as ever
+        // - without a lock-up, which is the one thing that would make it part of
+        // the gate.
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        request_the_z80_bus(&mut bus);
+        release_the_z80_reset(&mut bus);
+        bus.write_byte(0xA07F10, 0x5A);
+        assert!(
+            psg_untouched(&bus),
+            "the even lane reaches nothing, as ever"
+        );
+        assert!(!bus.locked_up(), "only the PSG lane itself freezes the 68k");
     }
 
     /// 0xA14101 bit 0 is "what sits behind the cartridge slot": 1 the cartridge, 0
