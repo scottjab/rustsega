@@ -28,7 +28,7 @@
 //! Which cart has which board and which chip, with where each number comes from
 //! and where the sources disagree, is `docs/eeprom-games.md`.
 
-use super::header::parse_header;
+use super::header::{RomHeader, parse_header};
 use serde::{Deserialize, Serialize};
 
 /// The extra-memory type byte of a cart whose save is a serial EEPROM
@@ -50,6 +50,13 @@ const DEFAULT_BASE: u32 = 0x20_0000;
 /// Both its word-write latch ([`Eeprom::write_word`]) and its armed read
 /// window ([`Eeprom::read`]) live here and nowhere else.
 const ACCLAIM_WINDOW: std::ops::Range<u32> = 0x20_0000..0x30_0000;
+
+/// Where the Codemasters J-CART board's lines are driven from: the whole
+/// quadrant $300000-$37FFFF, both lanes of every byte - Genesis Plus GX's
+/// `mapper_i2c_jcart_init`, which installs its EEPROM write handler over
+/// $300000-$37ffff with the comment "/LWR & /UWR are unused". The window is
+/// the board's, not a header's: no J-CART cart declares one.
+const CODEMASTERS_WRITE: std::ops::Range<u32> = 0x30_0000..0x38_0000;
 
 /// Which half of a 16-bit cart access reaches a line.
 ///
@@ -138,6 +145,24 @@ impl Board {
         scl: Pin::on(Lane::Even, 0),
         sda_in: Pin::on(Lane::Odd, 0),
         sda_out: Pin::on(Lane::Odd, 0),
+    };
+    /// Codemasters' J-CART board (SRJCV1-1/SRJCV1-2 with the EEPROM, Genesis
+    /// Plus GX's `mapper_i2c_jcart_init`: "SCL (in) -> D1, SDA (in) -> D0,
+    /// SDA (out) -> D7"). Both lines are driven by either byte lane -
+    /// "/LWR & /UWR are unused" - and the answer comes back on D7 of the odd
+    /// byte, because bit 7 of the J-CART register's read is where the board
+    /// wires the line (`mapper_i2c_jcart_read8`'s `(eeprom_i2c_out() << 7)`).
+    ///
+    /// This board is the one whose two lines do not live on a pair of
+    /// addresses: they are driven from the whole quadrant $300000-$37FFFF
+    /// ([`CODEMASTERS_WRITE`]) and read back from the next one,
+    /// $380000-$3FFFFF on the odd lane ([`super::jcart::WINDOW`], where the
+    /// J-CART register of [`super::jcart`] lives for the carts that have
+    /// both). [`EepromInfo::base`] says nothing about either and is not used.
+    pub const CODEMASTERS: Self = Self {
+        scl: Pin::on(Lane::Both, 1),
+        sda_in: Pin::on(Lane::Both, 0),
+        sda_out: Pin::on(Lane::Odd, 7),
     };
 }
 
@@ -239,10 +264,10 @@ impl Chip {
     /// low thirteen, the top three of the high byte being don't-care (Atmel
     /// AT24C65 datasheet, doc2631; Genesis Plus GX's `i2c_specs` row
     /// `{address_bits 16, size_mask 0x1FFF, pagewrite_mask 0x3F}`). The chip
-    /// of the three EA carts - T-81476 Frank Thomas Big Hurt Baseball and
-    /// T-81576 College Slam on the Acclaim 32 Mbit board, and T-120146 (Brian
-    /// Lara Cricket 96 / Shane Warne Cricket), whose board is the J-CART and
-    /// another ticket (#356).
+    /// of all three 8 KB carts: the two EA carts - T-81476 Frank Thomas Big
+    /// Hurt Baseball and T-81576 College Slam - on the Acclaim 32 Mbit board,
+    /// and T-120146 (Brian Lara Cricket 96 / Shane Warne Cricket) on the
+    /// Codemasters J-CART board.
     pub const AT24C65: Self = Self {
         size: 8192,
         mode: Mode::Mode3,
@@ -267,6 +292,12 @@ pub struct EepromInfo {
     /// A window whose two addresses are one address is not a length of one, and
     /// the chip's array is the size of the chip rather than of the window: the
     /// window says where the two lines are, not how much hangs off them.
+    ///
+    /// Not used by [`Board::CODEMASTERS`], whose lines are driven from the
+    /// whole quadrant $300000-$37FFFF and read back from $380000-$3FFFFF -
+    /// the board's own windows, which no cart of that family declares. Carts
+    /// detected by the table rather than by a header carry [`DEFAULT_BASE`]
+    /// here, which no code on that board reads.
     pub base: u32,
     pub board: Board,
     pub chip: Chip,
@@ -457,10 +488,12 @@ impl Eeprom {
     /// the two lines, and the chip answers it.
     ///
     /// Answers whether the access drove either line, which is `false` for every
-    /// address outside the chip's pair of addresses and for the half of that pair
-    /// a board puts neither line on.
+    /// address outside the chip's write window - the pair of addresses most
+    /// boards put the lines on, or the whole $300000-$37FFFF quadrant of
+    /// [`Board::CODEMASTERS`] - and for the half of that window a board puts
+    /// neither line on.
     pub fn write(&mut self, addr: u32, value: u8) -> bool {
-        if !self.covers(addr) {
+        if !self.in_write_window(addr) {
             return false;
         }
         let board = self.info.board;
@@ -518,6 +551,14 @@ impl Eeprom {
             // quadrant for any read, even and odd alike, which is what Genesis
             // Plus GX's quadrant-wide `mapper_i2c_generic_read8` models.
             ACCLAIM_WINDOW.contains(&addr) && self.window == Window::Serial
+        } else if self.info.board == Board::CODEMASTERS {
+            // The board's answer quadrant, odd lane only: GPGX's
+            // `mapper_i2c_generic_read8` answers `eeprom_i2c_out() <<
+            // sda_out_bit` for `address & 1` and nothing else. This is the
+            // window the cricket carts read their chip through - the carts
+            // that carry the J-CART register too have [`super::jcart`] answer
+            // this quadrant instead, with this line in its bit 7.
+            super::jcart::WINDOW.contains(&addr) && pin.drives(addr)
         } else {
             self.covers(addr) && pin.drives(addr)
         };
@@ -526,14 +567,32 @@ impl Eeprom {
         }
         // Released, the line keeps the level the 68k left it at, which is what a
         // cart reads back between the chip's own answers.
-        let level = self.line.unwrap_or(self.sda);
-        let bit = u8::from(level) << pin.bit;
+        let bit = u8::from(self.sda_level()) << pin.bit;
         Some((image & !(1 << pin.bit)) | bit)
+    }
+
+    /// Is `addr` inside the write window: the pair of addresses the lines live
+    /// on for every board but [`Board::CODEMASTERS`], whose lines the whole
+    /// $300000-$37FFFF quadrant drives ([`CODEMASTERS_WRITE`]).
+    fn in_write_window(&self, addr: u32) -> bool {
+        match self.info.board {
+            Board::CODEMASTERS => CODEMASTERS_WRITE.contains(&addr),
+            _ => self.covers(addr),
+        }
     }
 
     /// Is `addr` one of the two addresses the chip's lines live on?
     fn covers(&self, addr: u32) -> bool {
         (addr & !1) == self.info.base
+    }
+
+    /// The level of the data line right now: the chip's own answer while it is
+    /// holding the line, or the level the 68k last drove it to while it is
+    /// released. This is the bit the boards that read the line back hand the
+    /// caller, and the bit [`super::jcart`] puts in bit 7 of the J-CART
+    /// register's odd byte - the one wire the two modules share.
+    pub fn sda_level(&self) -> bool {
+        self.line.unwrap_or(self.sda)
     }
 
     /// One change of the two lines.
@@ -670,13 +729,11 @@ impl Eeprom {
 /// The carts whose EEPROM is not written in their own header, and so has to be
 /// written down here: serial, board, and chip.
 ///
-/// The list is Genesis Plus GX's `i2c_database` minus one group: the Codemasters
-/// J-CART carts, whose EEPROM shares its registers with the J-CART bank
-/// switching and is written at a different window from where it is read - which
-/// is also where the third 24C65 cart, `T-120146` (Brian Lara Cricket 96 /
-/// Shane Warne Cricket), waits: its chip is mode 3 now, but its board is the
-/// J-CART (#356). `docs/eeprom-games.md` has the whole table, the source for
-/// each row, and what is left over and why.
+/// The list is Genesis Plus GX's `i2c_database`: the serial rows are its rows
+/// verbatim, and the two zero-serial Micro Machines carts it matches by
+/// checksum and boot longword are [`zero_serial_override`].
+/// `docs/eeprom-games.md` has the whole table, the source for each row, and
+/// what is left over and why.
 pub const EEPROM_GAMES: &[(&str, Board, Chip)] = &[
     // Sega's boards, all X24C01.
     ("T-12046", Board::SEGA, Chip::X24C01), // Mega Man: The Wily Wars
@@ -730,7 +787,54 @@ pub const EEPROM_GAMES: &[(&str, Board, Chip)] = &[
         Chip::AT24C65, /* Frank Thomas Big Hurt Baseball */
     ),
     ("T-81576", Board::ACCLAIM_32M, Chip::AT24C65), // College Slam
+    // The Codemasters J-CART board, from `mapper_i2c_jcart_init`'s half of the
+    // database. The lines are driven at $300000-$37FFFF and read back at
+    // $380000-$3FFFFF, so `EepromInfo::base` is not this board's: the windows
+    // are [`Board::CODEMASTERS`]' own. The two Pete Sampras Tennis carts are
+    // on the same board with NO_EEPROM - ports, no chip - and have no row
+    // here; [`super::jcart`] lists their serials for the register alone.
+    (
+        "T-120096",
+        Board::CODEMASTERS,
+        Chip::AT24C16, /* Micro Machines 2 - Turbo Tournament */
+    ),
+    (
+        "T-120106",
+        Board::CODEMASTERS,
+        Chip::AT24C08, /* Brian Lara Cricket */
+    ),
+    (
+        "T-120146",
+        Board::CODEMASTERS,
+        Chip::AT24C65, /* Brian Lara Cricket 96 / Shane Warne Cricket */
+    ),
 ];
+
+/// The two zero-serial Micro Machines carts, matched the way Genesis Plus GX
+/// matches them ("additional check for Codemasters games"): the header's
+/// checksum, plus the image's first longword, which for these two carts is
+/// $444e4c44 while their serial field says `00000000`.
+///
+/// The longword is what makes the match safe: the original Micro Machines
+/// (Europe) revisions carry the same checksums ($165E and, on other dumps,
+/// $168B) over a different first longword and are ordinary carts, so GPGX's
+/// checksum half alone would catch carts that have nothing to do with this
+/// board. Its own `0x165E`/`$fffffffc` row ("Pete Sampras Tennis
+/// (Prototype ?)") is not copied for exactly that reason.
+fn zero_serial_override(header: &RomHeader, rom: &[u8]) -> Option<(Board, Chip)> {
+    const BOOT_MICRO_MACHINES: u32 = 0x444E_4C44;
+    let boot = u32::from_be_bytes(*rom.first_chunk::<4>()?);
+    if boot != BOOT_MICRO_MACHINES {
+        return None;
+    }
+    match header.checksum {
+        // `{"00000000", 0x444e4c44, 0x165E, mapper_i2c_jcart_init, EEPROM_24C16}`
+        0x165E => Some((Board::CODEMASTERS, Chip::AT24C16)), // Turbo Tournament 96
+        // `{"00000000", 0x444e4c44, 0x168B, mapper_i2c_jcart_init, EEPROM_24C08}`
+        0x168B => Some((Board::CODEMASTERS, Chip::AT24C08)), // Military
+        _ => None,
+    }
+}
 
 /// The board and chip of the cart `serial`, from [`EEPROM_GAMES`].
 ///
@@ -765,7 +869,7 @@ pub fn detect(rom: &[u8]) -> Option<EepromInfo> {
         return None;
     }
     let declared = EepromInfo::declared(&header.extra_memory);
-    let known = eeprom_override(&header.serial);
+    let known = eeprom_override(&header.serial).or_else(|| zero_serial_override(&header, rom));
     match (declared, known) {
         (Some(base), Some((board, chip))) => Some(EepromInfo { base, board, chip }),
         (Some(base), None) => Some(EepromInfo {
@@ -1474,6 +1578,100 @@ mod tests {
                 "{serial}"
             );
         }
+    }
+
+    /// The Codemasters J-CART board, from the `mapper_i2c_jcart_init` half of
+    /// the database: the three serials and their chips, in GPGX's order.
+    #[test]
+    fn codemasters_serials_pick_their_board_and_chip() {
+        for (serial, chip) in [
+            ("GM T-120096-50", Chip::AT24C16), // Micro Machines 2 - Turbo Tournament
+            ("GM T-120106-00", Chip::AT24C08), // Brian Lara Cricket
+            ("GM T-120146-50", Chip::AT24C65), // Brian Lara Cricket 96 / Shane Warne
+        ] {
+            let cart = rom(
+                serial,
+                // The family declares no extra memory: the board's windows are
+                // its own, and none of these carts says `$E8`.
+                &[b' '; 12],
+                0x10_0000,
+            );
+            assert_eq!(
+                detect(&cart).map(|info| (info.board, info.chip)),
+                Some((Board::CODEMASTERS, chip)),
+                "{serial}"
+            );
+            // And the board's windows, not a header pair: `base` says nothing
+            // on this board, whose lines the whole $300000-$37FFFF quadrant
+            // drives and whose answer lives at $380000-$3FFFFF.
+        }
+    }
+
+    /// The two zero-serial Micro Machines carts, matched by checksum and boot
+    /// longword together - and the original Micro Machines revisions, which
+    /// carry the same checksums, stay chipless because their boot longword is
+    /// different.
+    #[test]
+    fn zero_serial_machines_pick_their_chip_by_checksum_and_boot() {
+        let mut cart = rom("GM 00000000-00", &[b' '; 12], 0x10_0000);
+        cart[0..4].copy_from_slice(&0x444E_4C44u32.to_be_bytes());
+        cart[0x18E..0x190].copy_from_slice(&0x165Eu16.to_be_bytes());
+        assert_eq!(
+            detect(&cart).map(|info| (info.board, info.chip)),
+            Some((Board::CODEMASTERS, Chip::AT24C16)),
+            "Turbo Tournament 96"
+        );
+        cart[0x18E..0x190].copy_from_slice(&0x168Bu16.to_be_bytes());
+        assert_eq!(
+            detect(&cart).map(|info| (info.board, info.chip)),
+            Some((Board::CODEMASTERS, Chip::AT24C08)),
+            "Military"
+        );
+
+        // The collision, exactly as the local set carries it: the original
+        // Micro Machines (Europe) revisions, same serial and checksum, boot
+        // longword of an ordinary cart.
+        cart[0..4].copy_from_slice(&0xFFFF_FFFCu32.to_be_bytes());
+        assert_eq!(detect(&cart), None, "the boot longword is the guard");
+    }
+
+    /// The Codemasters board's lines do not live on a pair: the whole
+    /// $300000-$37FFFF quadrant drives them, either lane, and the answer comes
+    /// back only from the odd lane of $380000-$3FFFFF.
+    #[test]
+    fn codemasters_lines_live_on_the_board_quadrants() {
+        let mut chip = Eeprom::new(EepromInfo {
+            base: DEFAULT_BASE, // unused on this board
+            board: Board::CODEMASTERS,
+            chip: Chip::AT24C16,
+        });
+
+        // Write window: every address of the quadrant drives, either lane.
+        for addr in [0x30_0000, 0x30_0001, 0x30_0007, 0x37_FFFE, 0x37_FFFF] {
+            assert!(chip.write(addr, 0x03), "{addr:#010x} is in the window");
+        }
+        for addr in [0x2F_FFFF, 0x38_0000, 0x38_0001, 0x20_0001] {
+            assert!(!chip.write(addr, 0x03), "{addr:#010x} is not");
+        }
+
+        // Read window: the odd lane of the answer quadrant, bit 7, and
+        // nowhere else. Lines are idle-high here, so the answer's bit is set.
+        assert_eq!(chip.read(0x38_0001, 0x00), Some(0x80));
+        assert_eq!(chip.read(0x3F_FFFF, 0xFF), Some(0xFF));
+        assert_eq!(chip.read(0x38_0000, 0x00), None, "the even lane");
+        assert_eq!(chip.read(0x37_FFFF, 0x00), None, "the write quadrant");
+        assert_eq!(chip.read(0x20_0001, 0x00), None, "no pair anywhere");
+
+        // The line the register of `super::jcart` borrows for its bit 7, as
+        // the chip holds it or as the 68k left it.
+        assert!(chip.sda_level(), "idle-high with nothing driving");
+        assert!(chip.write(0x30_0001, 0x00), "SDA down, clock still up");
+        assert!(
+            !chip.sda_level(),
+            "pulled low, and the register would read 0"
+        );
+        chip.write(0x30_0001, 0x01);
+        assert!(chip.sda_level());
     }
 
     /// A cart has one save, which is why the two detectors can never both answer

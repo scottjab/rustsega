@@ -14,7 +14,7 @@ a header that says which format version it is and which game it belongs to.
 | Offset | Size | Field | Meaning |
 |---|---|---|---|
 | 0 | 4 | magic | `b"RSGS"` |
-| 4 | 4 | format version | `u32`, little endian, currently `5` (`state::FORMAT_VERSION`) |
+| 4 | 4 | format version | `u32`, little endian, currently `6` (`state::FORMAT_VERSION`) |
 | 8 | 8 | ROM checksum | `u64`, little endian, [`state::rom_checksum`] of the loaded image |
 | 16 | 4 | payload length | `u32`, little endian — the number of bytes that follow offset 20 |
 | 20 | n | payload | the `postcard` encoding of the machine state |
@@ -209,13 +209,16 @@ has no migration yet — that is out of scope of #127 and does not exist:
 3. Anything that changes what a byte of the payload means has to bump
    `FORMAT_VERSION` in the same commit, and update this page.
 
-The two versions so far:
+The versions so far:
 
 | Version | Payload |
 |---|---|
 | 1 | The frame buffer as its `width` and `height` and none of its pixels, in every mode (`vdp::frame_state`). |
 | 2 | The same, plus the lines of the field an interlace mode 2 frame does not draw — 224 KiB or more of pixels, for that mode only (#457). A version-1 mode-2 payload would decode a plausible-looking machine out of the wrong bytes rather than failing, which is why 1 is refused and not shimmed. |
 | 3 | The scheduler's two freeze gates, `Scheduler::m68k_frozen_until` and `Scheduler::z80_frozen_until` (#517): how far in front of the beam a 68k -> VDP transfer is still holding each chip. Rule 2 above is what forces the bump — two fields added to a `serde` type in the tuple change the encoding — and the freeze is what makes it more than bookkeeping: a state that does not carry a gate resumes the frame with the rest of a transfer dropped, the two chips let go lines before their bus time is paid for, and a cart that froze for 855 raster lines carries on drawing as if it had waited. |
+| 4 | The serial EEPROM's mode 3: the 24C65's two-byte word address (#270) gave `Eeprom`'s state machine the two states that take the high and low address bytes. Rule 2 again: the variants live in a `serde` type the payload carries, and a state of the old encoding would decode a mode 3 transfer as something else. |
+| 5 | The Acclaim 32 Mbit board's read-window latch (#271): the one-bit `Eeprom::window` mux and the word write that arms it. A state that does not carry it resumes a cart with its quadrant's read window on the wrong half — ROM where the game had armed the serial answer, or the reverse. |
+| 6 | The J-CART register (#356): `Bus`'s `jcart` field, the TH line the register's writes move and its place in the slot's read order. Rule 2: a new field on `Bus` itself. |
 
 ## Out of scope
 
