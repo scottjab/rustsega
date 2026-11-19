@@ -139,14 +139,21 @@ impl Board {
 pub struct Chip {
     /// Bytes of storage.
     pub size: usize,
-    /// Mode 1, the X24C01: the first byte of a write carries a 7-bit word
-    /// address and the read/write bit, and there is no second address byte
-    /// (Xicor/ICmicro X24C01, "Byte Write": "a start condition followed by a
-    /// seven bit word address and a write bit"). Mode 2, every 24Cxx: the first
-    /// byte is the device address - `1010`, three address bits, and the
-    /// read/write bit - and the word address follows as its own byte (Atmel
-    /// doc0180 and AT24C01D/02D, "Device Addressing").
-    pub mode1: bool,
+    /// What the first byte of a transfer means, and how many bytes of word
+    /// address follow it. Mode 1, the X24C01: the first byte of a write
+    /// carries a 7-bit word address and the read/write bit, and there is no
+    /// second address byte (Xicor/ICmicro X24C01, "Byte Write": "a start
+    /// condition followed by a seven bit word address and a write bit"). Mode
+    /// 2, every other one-address-byte 24Cxx: the first byte is the device
+    /// address - `1010`, three address bits, and the read/write bit - and the
+    /// word address follows as its own byte (Atmel doc0180 and
+    /// AT24C01D/02D, "Device Addressing"). Mode 3, the 24C32 and up: the
+    /// device address again, and the word address as two bytes, high half
+    /// first, of which the array answers to only the low ones (Atmel
+    /// AT24C65 datasheet, doc2631, "Byte Write": "a write operation requires
+    /// two 8-bit data word addresses following the device address word";
+    /// Genesis Plus GX's `i2c_specs` give these parts `address_bits` 16).
+    pub mode: Mode,
     /// Bytes a page write holds. A write that runs off the end of a page
     /// continues at the start of that page rather than crossing into the next
     /// one, and the bits above the page are not incremented at all (X24C01:
@@ -157,11 +164,23 @@ pub struct Chip {
     pub page: usize,
 }
 
+/// The three first-byte shapes [`Chip`] speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Mode {
+    /// The X24C01: the word address rides in the first byte with the
+    /// read/write bit.
+    Mode1,
+    /// A device address byte, then one word address byte.
+    Mode2,
+    /// A device address byte, then the word address as two bytes.
+    Mode3,
+}
+
 impl Chip {
     /// Xicor X24C01, 1 Kbit organized 128 x 8 with a 4-byte page.
     pub const X24C01: Self = Self {
         size: 128,
-        mode1: true,
+        mode: Mode::Mode1,
         page: 4,
     };
     /// Xicor X24C02, 2 Kbit: "Internally Organized 256 x 8" and "Four Byte Page
@@ -174,38 +193,52 @@ impl Chip {
     /// `docs/eeprom-games.md` records.
     pub const X24C02: Self = Self {
         size: 256,
-        mode1: false,
+        mode: Mode::Mode2,
         page: 4,
     };
     /// Atmel 24C01, 1 Kbit, mode 2 with an 8-byte page (doc0180).
     pub const AT24C01: Self = Self {
         size: 128,
-        mode1: false,
+        mode: Mode::Mode2,
         page: 8,
     };
     /// Atmel 24C02, 2 Kbit, mode 2 with an 8-byte page (doc0180).
     pub const AT24C02: Self = Self {
         size: 256,
-        mode1: false,
+        mode: Mode::Mode2,
         page: 8,
     };
     /// Atmel 24C04, 4 Kbit, mode 2 with a 16-byte page (doc0180).
     pub const AT24C04: Self = Self {
         size: 512,
-        mode1: false,
+        mode: Mode::Mode2,
         page: 16,
     };
     /// Atmel 24C08, 8 Kbit, mode 2 with a 16-byte page (doc0180).
     pub const AT24C08: Self = Self {
         size: 1024,
-        mode1: false,
+        mode: Mode::Mode2,
         page: 16,
     };
     /// Atmel 24C16, 16 Kbit, mode 2 with a 16-byte page (doc0180).
     pub const AT24C16: Self = Self {
         size: 2048,
-        mode1: false,
+        mode: Mode::Mode2,
         page: 16,
+    };
+    /// Atmel 24C65, 8 KB x 8 with a 64-byte page, and the mode 3 addressing:
+    /// the word address comes as two bytes of which the array answers to the
+    /// low thirteen, the top three of the high byte being don't-care (Atmel
+    /// AT24C65 datasheet, doc2631; Genesis Plus GX's `i2c_specs` row
+    /// `{address_bits 16, size_mask 0x1FFF, pagewrite_mask 0x3F}`). The chip
+    /// of the three EA carts - T-81476 Frank Thomas Big Hurt Baseball and
+    /// T-81576 College Slam on the Acclaim 32 Mbit board, and T-120146 (Brian
+    /// Lara Cricket 96 / Shane Warne Cricket), whose board is the J-CART and
+    /// another ticket (#356).
+    pub const AT24C65: Self = Self {
+        size: 8192,
+        mode: Mode::Mode3,
+        page: 64,
     };
 
     /// The mask a word address is kept inside.
@@ -253,11 +286,19 @@ enum State {
     Idle,
     /// Clocking in the first byte of a transfer, which is the word address and
     /// the read/write bit of a mode 1 chip and the device address of a mode 2
-    /// one.
+    /// or mode 3 one.
     Address,
     /// Mode 2 only: the device address is in and acknowledged, and the word
     /// address byte is next.
     Word,
+    /// Mode 3 only: the device address is in and acknowledged, and the word
+    /// address comes as two bytes, of which this is the high one (Atmel
+    /// AT24C65 datasheet, doc2631: "a write operation requires two 8-bit data
+    /// word addresses following the device address word").
+    WordHigh,
+    /// Mode 3 only: the high address byte is in and acknowledged, and the low
+    /// one is next.
+    WordLow,
     /// Taking data bytes for the word address in hand.
     Write,
     /// Sending data bytes for the word address in hand.
@@ -302,7 +343,9 @@ pub struct Eeprom {
     /// nothing at all on one with a single page (Atmel doc0180: "The next 3 bits
     /// are the A2, A1 and A0 device address bits ... These page addressing bits
     /// ... should be considered the most significant bits of the data word
-    /// address which follows").
+    /// address which follows"). A mode 3 part's pins name the chip on the board
+    /// instead and feed nothing into the address, whose whole two bytes follow
+    /// (doc2631; Genesis Plus GX never lets them in either).
     select: u8,
     /// The word address the next byte is for.
     word: usize,
@@ -506,12 +549,20 @@ impl Eeprom {
         match self.state {
             State::Address => {
                 let read = byte & 1 != 0;
-                if self.info.chip.mode1 {
-                    self.word = (byte >> 1) as usize & mask;
-                    self.state = if read { State::Read } else { State::Write };
-                } else {
-                    self.select = (byte >> 1) & 0b111;
-                    self.state = if read { State::Read } else { State::Word };
+                match self.info.chip.mode {
+                    Mode::Mode1 => {
+                        self.word = (byte >> 1) as usize & mask;
+                        self.state = if read { State::Read } else { State::Write };
+                    }
+                    Mode::Mode2 => {
+                        self.select = (byte >> 1) & 0b111;
+                        self.state = if read { State::Read } else { State::Word };
+                    }
+                    // The device bits name the chip, not a part of the
+                    // address: the whole word address follows in two bytes.
+                    Mode::Mode3 => {
+                        self.state = if read { State::Read } else { State::WordHigh };
+                    }
                 }
                 if read {
                     self.going = self.data[self.word];
@@ -519,6 +570,19 @@ impl Eeprom {
             }
             State::Word => {
                 self.word = (((self.select as usize) << 8) | byte as usize) & mask;
+                self.state = State::Write;
+            }
+            State::WordHigh => {
+                // The top bits above the array are don't-care - the 24C65
+                // answers to 13 of the 16 bits its two address bytes carry
+                // (doc2631, and Genesis Plus GX's `i2c_specs` size_mask - its
+                // GET_WORD_ADR_HIGH never latches a bit above it) - and the
+                // mask here is what ignores them.
+                self.word = (byte as usize) << 8;
+                self.state = State::WordLow;
+            }
+            State::WordLow => {
+                self.word = (self.word | byte as usize) & mask;
                 self.state = State::Write;
             }
             State::Write => {
@@ -535,12 +599,13 @@ impl Eeprom {
 /// The carts whose EEPROM is not written in their own header, and so has to be
 /// written down here: serial, board, and chip.
 ///
-/// The list is Genesis Plus GX's `i2c_database` minus two groups: the
-/// Codemasters J-CART carts, whose EEPROM shares its registers with the J-CART
-/// bank switching and is written at a different window from where it is read;
-/// and the 24C65 carts, which take their word address in two bytes rather than
-/// one. `docs/eeprom-games.md` has the whole table, the source for each row, and
-/// what is left over and why.
+/// The list is Genesis Plus GX's `i2c_database` minus one group: the Codemasters
+/// J-CART carts, whose EEPROM shares its registers with the J-CART bank
+/// switching and is written at a different window from where it is read - which
+/// is also where the third 24C65 cart, `T-120146` (Brian Lara Cricket 96 /
+/// Shane Warne Cricket), waits: its chip is mode 3 now, but its board is the
+/// J-CART (#356). `docs/eeprom-games.md` has the whole table, the source for
+/// each row, and what is left over and why.
 pub const EEPROM_GAMES: &[(&str, Board, Chip)] = &[
     // Sega's boards, all X24C01.
     ("T-12046", Board::SEGA, Chip::X24C01), // Mega Man: The Wily Wars
@@ -585,6 +650,15 @@ pub const EEPROM_GAMES: &[(&str, Board, Chip)] = &[
     ("T-081276", Board::ACCLAIM_32M, Chip::AT24C02), // NFL Quarterback Club
     ("T-81406", Board::ACCLAIM_32M, Chip::AT24C04),  // NBA Jam TE
     ("T-081586", Board::ACCLAIM_32M, Chip::AT24C16), // NFL Quarterback Club '96
+    // The two 24C65 carts, mode 3: Genesis Plus GX's i2c_database has both on
+    // mapper_i2c_acclaim_32M_init, and both declare the same window in their
+    // own headers as well ("RA" $E8 0x200000-0x200001).
+    (
+        "T-81476",
+        Board::ACCLAIM_32M,
+        Chip::AT24C65, /* Frank Thomas Big Hurt Baseball */
+    ),
+    ("T-81576", Board::ACCLAIM_32M, Chip::AT24C65), // College Slam
 ];
 
 /// The board and chip of the cart `serial`, from [`EEPROM_GAMES`].
@@ -755,16 +829,19 @@ mod tests {
         }
 
         /// Write `bytes` to `word`, and stop.
-        fn write(&mut self, word: u8, bytes: &[u8]) {
-            let first = if self.chip.info.chip.mode1 {
-                word << 1
+        fn write(&mut self, word: usize, bytes: &[u8]) {
+            let first = if self.chip.info.chip.mode == Mode::Mode1 {
+                (word << 1) as u8
             } else {
                 0xA0
             };
             self.start();
             assert!(self.send(first), "the chip acknowledges its address");
-            if !self.chip.info.chip.mode1 {
-                assert!(self.send(word));
+            if self.chip.info.chip.mode == Mode::Mode3 {
+                assert!(self.send((word >> 8) as u8), "the high address byte");
+            }
+            if self.chip.info.chip.mode != Mode::Mode1 {
+                assert!(self.send(word as u8), "the word address");
             }
             for byte in bytes {
                 assert!(self.send(*byte));
@@ -773,15 +850,17 @@ mod tests {
         }
 
         /// `count` bytes read from `word`.
-        fn read(&mut self, word: u8, count: usize) -> Vec<u8> {
+        fn read(&mut self, word: usize, count: usize) -> Vec<u8> {
+            let mode1 = self.chip.info.chip.mode == Mode::Mode1;
             self.start();
-            assert!(self.send(if self.chip.info.chip.mode1 {
-                (word << 1) | 1
-            } else {
-                0xA0
-            }));
-            if !self.chip.info.chip.mode1 {
-                assert!(self.send(word));
+            assert!(self.send(if mode1 { ((word << 1) | 1) as u8 } else { 0xA0 }));
+            if !mode1 {
+                // The address, then the device address again with the read
+                // bit behind a second start: a random read.
+                if self.chip.info.chip.mode == Mode::Mode3 {
+                    assert!(self.send((word >> 8) as u8), "the high address byte");
+                }
+                assert!(self.send(word as u8), "the word address");
                 self.stop();
                 self.start();
                 assert!(self.send(0xA1), "the chip acknowledges a reading");
@@ -876,6 +955,132 @@ mod tests {
         assert_eq!(master.chip.contents()[0], 0xFF, "and not the bottom page");
     }
 
+    /// Mode 3, the two-byte word address of the 24C65: a device byte, then the
+    /// word address as a high byte and a low byte, then (or before, for a read)
+    /// the data. The 24C65s of the three EA carts take their whole array this
+    /// way, and no part of it fits the one address byte the other modes carry.
+    #[test]
+    fn write_then_read_byte_mode3() {
+        let mut master = Master::new(chip_on_sega(Chip::AT24C65));
+
+        // A byte write at $1FFF, two address bytes and all.
+        master.start();
+        assert!(master.send(0xA0), "the chip acknowledges its address");
+        assert!(master.send(0x1F), "the high address byte");
+        assert!(master.send(0xFF), "the low address byte");
+        assert!(master.send(0x5A));
+        master.stop();
+        assert_eq!(master.chip.contents()[0x1FFF], 0x5A);
+
+        // A random read of it: the address loaded by a write-shaped sequence,
+        // then the device address again with the read bit.
+        master.start();
+        assert!(master.send(0xA0));
+        assert!(master.send(0x1F));
+        assert!(master.send(0xFF));
+        master.stop();
+        master.start();
+        assert!(master.send(0xA1), "the chip acknowledges a reading");
+        assert_eq!(master.recv(false), 0x5A);
+        master.stop();
+
+        // A sequential read across a 256-byte boundary mid-array, the place
+        // the two address bytes hand the count over: the low byte rolls from
+        // $FD through $FF to $00 and the high byte it sits on goes with it.
+        let array: Vec<u8> = (0..8192).map(|i| i as u8).collect();
+        master.chip.load(&array);
+        master.start();
+        assert!(master.send(0xA0));
+        assert!(master.send(0x00));
+        assert!(master.send(0xFD));
+        master.stop();
+        master.start();
+        assert!(master.send(0xA1));
+        assert_eq!(master.recv(true), 0xFD);
+        assert_eq!(master.recv(true), 0xFE);
+        assert_eq!(master.recv(true), 0xFF);
+        assert_eq!(master.recv(true), 0x00, "across the boundary");
+        assert_eq!(master.recv(false), 0x01);
+        master.stop();
+
+        // The top address bits are don't-care: the 24C65 uses 13 of the 16
+        // bits two address bytes carry, and a bit above the array is ignored
+        // rather than wrapped or made part of the address (Atmel AT24C65
+        // datasheet, doc2631; Genesis Plus GX's i2c_specs for the 24C65 are
+        // {address_bits 16, size_mask 0x1FFF}, and its GET_WORD_ADR_HIGH never
+        // latches a bit above size_mask). A high byte with the top three bits
+        // set is therefore the same address as without them.
+        master.start();
+        assert!(master.send(0xA0));
+        assert!(
+            master.send(0x9F),
+            "the same address as $1F, spelled with garbage above the array"
+        );
+        assert!(master.send(0xFF));
+        assert!(master.send(0x5A));
+        master.stop();
+        assert_eq!(master.chip.contents()[0x1FFF], 0x5A);
+        master.start();
+        assert!(master.send(0xA0));
+        assert!(master.send(0x1F));
+        assert!(master.send(0xFF));
+        assert!(master.send(0x2B));
+        master.stop();
+        assert_eq!(
+            master.chip.contents()[0x1FFF],
+            0x2B,
+            "the same $1FFF, overwritten"
+        );
+    }
+
+    /// The same four bytes on the wire, $A0 $1F $FF $5A, mean something else to
+    /// every addressing: on the X24C01 the first byte *is* the address and a
+    /// write bit, so $1F $FF $5A are data at $50; on a one-address-byte part
+    /// the word address is $1F, $FF is the data there, and $5A wraps with the
+    /// X24C02's four-byte page onto $1C, the page's first address; on the
+    /// 24C65 of the test above the bytes name $1FFF. A sequence is not an
+    /// address until the chip's mode says what to count.
+    #[test]
+    fn a_mode3_sequence_means_something_else_to_the_other_modes() {
+        let sequence = [0xA0, 0x1F, 0xFF, 0x5A];
+        let walk = |chip: Chip| {
+            let mut master = Master::new(chip_on_sega(chip));
+            master.start();
+            for byte in sequence {
+                assert!(master.send(byte), "the chip acknowledges {byte:#04x}");
+            }
+            master.stop();
+            master
+        };
+
+        // Mode 1: the first byte is a word address and a write bit.
+        let master = walk(Chip::X24C01);
+        assert_eq!(&master.chip.contents()[0x50..0x53], &[0x1F, 0xFF, 0x5A]);
+
+        // Mode 2: the first byte is the device address, the second the whole
+        // word address, and the rest data - with $1F the last byte of the
+        // X24C02's four-byte page, the second data byte wraps onto $1C (Atmel
+        // doc0180, "Page Write").
+        let master = walk(Chip::X24C02);
+        assert_eq!(master.chip.contents()[0x1F], 0xFF);
+        assert_eq!(
+            master.chip.contents()[0x1C],
+            0x5A,
+            "the second data byte wrapped with the page"
+        );
+
+        // Mode 3: the first byte is the device address and the next two the
+        // word address, so nothing lands until $1FFF itself.
+        let master = walk(Chip::AT24C65);
+        assert_eq!(master.chip.contents()[0x1FFF], 0x5A);
+        assert_eq!(
+            master.chip.contents()[0x1F],
+            0xFF,
+            "and the mode-2 addresses are empty"
+        );
+        assert_eq!(master.chip.contents()[0x1C], 0xFF);
+    }
+
     #[test]
     fn page_write_wraps_within_page() {
         // Five bytes behind one word address on the X24C01, whose page is four
@@ -897,6 +1102,28 @@ mod tests {
         assert_eq!(
             &master.chip.contents()[0..9],
             &[0xAF, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xFF]
+        );
+
+        // The 24C65's page is sixty-four bytes (Genesis Plus GX's i2c_specs
+        // give it pagewrite_mask $3F): sixty-five bytes behind one word
+        // address fill the page and wrap its last one back onto the first.
+        let mut master = Master::new(chip_on_sega(Chip::AT24C65));
+        let page: Vec<u8> = (0..65).map(|i| 0xB0 + i as u8).collect();
+        master.write(0, &page);
+        assert_eq!(
+            master.chip.contents()[0],
+            0xF0,
+            "the 65th byte wrapped onto the first"
+        );
+        assert_eq!(
+            master.chip.contents()[63],
+            0xEF,
+            "the 64th is the page's last"
+        );
+        assert_eq!(
+            master.chip.contents()[64],
+            0xFF,
+            "and the next page is untouched"
         );
     }
 
@@ -1034,6 +1261,21 @@ mod tests {
             detect(&ea).map(|info| (info.base, info.board, info.chip)),
             Some((0x20_0000, Board::EA, Chip::X24C01))
         );
+
+        // The two 24C65 carts declare $E8 over the pair *and* are in the list,
+        // which is what tells their Acclaim 32 Mbit board and their mode 3
+        // chip from the default a bare $E8 would get.
+        for (serial, chip) in [
+            ("GM T-81476 -00", Chip::AT24C65), // Frank Thomas Big Hurt Baseball
+            ("GM T-81576 -00", Chip::AT24C65), // College Slam
+        ] {
+            let cart = rom(serial, &extra_memory(0xE8, 0x20_0000, 0x20_0001), 0x1_0000);
+            assert_eq!(
+                detect(&cart).map(|info| (info.base, info.board, info.chip)),
+                Some((0x20_0000, Board::ACCLAIM_32M, chip)),
+                "{serial}"
+            );
+        }
     }
 
     /// A cart has one save, which is why the two detectors can never both answer
