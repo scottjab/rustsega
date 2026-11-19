@@ -9,10 +9,12 @@
 //! yet, so `clock` returns the raw sum of the four channels.
 //!
 //! Citations are to the SMS Power "SN76489" development document
-//! (<https://www.smspower.org/Development/SN76489>) by section name, and to the
+//! (<https://www.smspower.org/Development/SN76489>) by section name, to the
 //! SpritesMind gendev forum thread 1132 for the behaviour of the Sega
 //! 315-5313 integrated PSG - the part the Genesis carries - where it differs
-//! from a discrete SN76489AN.
+//! from a discrete SN76489AN, and to the SMS Power forums threads 17191 and
+//! 13704 for the hardware measurements behind the register write-phase rule
+//! on [`Channel::tick`] (pinned on #321).
 
 // Serialising the chip state for save states (M6-07a, #126). Gated on the
 // crate's `serde` feature so `cargo build --no-default-features` keeps the core
@@ -122,11 +124,30 @@ impl Channel {
     /// zero or one gives a constant +1 output, which is the discrete-chip
     /// behaviour and wrong here - do not "fix" this back to a constant level.
     ///
-    /// INFERRED: neither the ticket nor the SMS Power text says what a register
-    /// write does to a counter that is already running, so a write is treated as
-    /// changing the reload value only - it sets the length of the next half
-    /// period, not the phase of the current one. TODO(#105): pin this on
-    /// hardware or on a PSG test ROM, follow-up filed as #321.
+    /// A tone register write changes the reload value only: the half period in
+    /// progress runs to its scheduled end and the new period governs from the
+    /// next flip. The write path in [`Sn76489::write`] therefore leaves
+    /// `counter` alone. Pinned on #321, measured on hardware: "Volume and
+    /// frequency writes do not reset the phase of tone channels but frequency
+    /// writes will reset phase of noise channel ... All writes take effect
+    /// immediately" (TmEE, SMS Power forums thread 17191, 16 Sep 2018, bench
+    /// tests of a discrete SN76489 and the Sega VDP PSG, the two parts this
+    /// crate spans). The SMS Power document's author works from the same
+    /// model: "I view it as a register holding the reset value of the counter,
+    /// and a counter which ticks down, and when it gets to zero, it reloads
+    /// from the register and flips the output ... The only thing that happens
+    /// on a register write is that the noise generator resets its LFSR" (Maxim,
+    /// SMS Power forums thread 13704, 19 Apr 2012). The mainstream cores agree
+    /// (MAME's sn76496 `write()` updates only the period and never the counter;
+    /// Genesis Plus GX's psg.c likewise touches only the frequency increment),
+    /// which is evidence, not proof. The TI datasheet is silent: it describes
+    /// only the steady-state loop ("When the tone counter decrements to zero, a
+    /// borrow signal is produced. This borrow signal toggles the frequency
+    /// flip-flop and also reloads the tone counter", SN76489AN datasheet,
+    /// "OPERATION 1. TONE GENERATORS") and never says what a write does to a
+    /// counter that is already counting down. A hardware capture that
+    /// contradicts the pin changes the rule through a new ticket, not a quiet
+    /// edit here.
     fn tick(&mut self) {
         let period = self.tone.max(1);
         if self.counter == 0 {
@@ -335,6 +356,8 @@ impl Sn76489 {
     /// for the other half of the 10 bits, so the four bits of a latch byte are
     /// a complete period as far as the tone generator is concerned (SMS Power
     /// "SN76489", register writes, "tones update immediately after latch byte").
+    /// A tone write changes the reload value only; the running counter is left
+    /// alone, and the phase rule and its citations are on [`Channel::tick`].
     ///
     /// Channel 3's register is shared by its tone period and the noise control,
     /// so a write to it is a write to both: the chip has no way to tell them
@@ -472,13 +495,22 @@ mod tests {
     /// `ticks` ticks, counting the first tick against what the channel output
     /// before any of them.
     fn count_flips(psg: &mut Sn76489, channel: usize, ticks: usize) -> usize {
+        flip_positions(psg, channel, ticks).len()
+    }
+
+    /// The tick numbers, counted from 1 at the next `clock()`, at which the
+    /// output of `channel` changes sign over the next `ticks` ticks. Pinning
+    /// where the flips land, not just how many, is what catches a phase
+    /// regression: a model that resets the counter on a register write keeps
+    /// the same flip count over long runs but puts the flips elsewhere.
+    fn flip_positions(psg: &mut Sn76489, channel: usize, ticks: usize) -> Vec<usize> {
         let mut previous = psg.channel_output(channel);
-        let mut flips = 0;
-        for _ in 0..ticks {
+        let mut flips = Vec::new();
+        for tick in 1..=ticks {
             psg.clock();
             let output = psg.channel_output(channel);
             if output != previous {
-                flips += 1;
+                flips.push(tick);
             }
             previous = output;
         }
@@ -601,6 +633,82 @@ mod tests {
             flips <= 1,
             "the 512 period is not live: {flips} flips in 8 ticks"
         );
+    }
+
+    // The register write-phase rule, pinned on #321.
+    //
+    // A tone register write mid half period leaves the counter running and
+    // only changes the value the counter reloads at the flip, so the half
+    // period in progress ends on schedule and the new period governs from the
+    // next flip. Measured on a discrete SN76489 and the Sega VDP PSG: "Volume
+    // and frequency writes do not reset the phase of tone channels but
+    // frequency writes will reset phase of noise channel" (TmEE, SMS Power
+    // forums thread 17191, 16 Sep 2018, bench tests of both chips), the same
+    // model the SMS Power document's author works from (Maxim, SMS Power
+    // forums thread 13704, 19 Apr 2012), and the mainstream cores agree (see
+    // `Channel::tick`).
+    //
+    // The positions below are chosen so both readings of the rule the pin
+    // rejects fail loudly. Positions count from the tick after the write. With
+    // period 10 written after 3 ticks (counter 7, so the scheduled flip is 8
+    // ticks after the write) and a new period of 4: the reload-only model
+    // flips at 8, 12, 16, ...; a fresh-reload model that loaded `period - 1`
+    // at the write flips at 4 first; one that loaded `period` flips at 5
+    // first. No fresh-reload variant produces the reload-only schedule.
+    #[test]
+    fn tone_write_mid_half_period_keeps_the_running_counter() {
+        let mut psg = lone_channel(0, 0);
+        set_tone(&mut psg, 0, 10);
+        for _ in 0..3 {
+            psg.clock();
+        }
+        assert_eq!(psg.channels[0].counter, 7);
+        assert!(psg.channels[0].high);
+
+        set_tone(&mut psg, 0, 4);
+
+        // The write itself leaves the counter where it was.
+        assert_eq!(psg.channels[0].counter, 7);
+        assert_eq!(
+            flip_positions(&mut psg, 0, 30),
+            vec![8, 12, 16, 20, 24, 28],
+            "reload-only: the write may not move the scheduled flip or add an earlier one"
+        );
+    }
+
+    /// The latch byte alone is a complete write as far as the generator is
+    /// concerned (SMS Power: "tones update immediately after latch byte") and
+    /// obeys the same phase rule as the two-byte write.
+    #[test]
+    fn latch_byte_write_mid_half_period_keeps_the_running_counter() {
+        let mut psg = lone_channel(0, 0);
+        set_tone(&mut psg, 0, 10);
+        for _ in 0..3 {
+            psg.clock();
+        }
+        psg.write(0x80 | 4); // channel 0 tone, low nibble 4: period 10 -> 4
+        assert_eq!(psg.tone_period(0), 4);
+        assert_eq!(psg.channels[0].counter, 7);
+        assert_eq!(flip_positions(&mut psg, 0, 20), vec![8, 12, 16, 20]);
+    }
+
+    /// A volume write mid half period leaves the phase alone too (same
+    /// measurement: "Volume and frequency writes do not reset the phase of
+    /// tone channels") and changes the level on the byte that writes it.
+    #[test]
+    fn volume_write_mid_half_period_keeps_the_phase() {
+        let mut psg = lone_channel(0, 0);
+        set_tone(&mut psg, 0, 6);
+        for _ in 0..2 {
+            psg.clock();
+        }
+        assert_eq!(psg.channels[0].counter, 4);
+
+        psg.write(volume_latch(0, 5));
+
+        assert_eq!(psg.attenuation(0), 5);
+        assert_eq!(psg.channels[0].counter, 4);
+        assert_eq!(flip_positions(&mut psg, 0, 24), vec![5, 11, 17, 23]);
     }
 
     #[test]
