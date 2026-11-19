@@ -206,7 +206,7 @@ impl Vdp {
 #[cfg(test)]
 mod tests {
     use crate::Vdp;
-    use crate::color::{Intensity, color};
+    use crate::color::{Intensity, color, reduced_color_word};
     use crate::hv::MCLKS_PER_LINE;
     use crate::planes::testutil::{
         CELL_TILE_ROWS, PLANE_A_BASE, column_colour, fill_columns, fill_rows, fill_tile_row,
@@ -244,9 +244,13 @@ mod tests {
 
     /// The display-on [`scroll_vdp`] of these tests: H32, 32x32 playfields, the
     /// horizontal scroll table at the base [`scroll_vdp`] sets and full screen
-    /// scrolling in both axes unless a test says otherwise.
+    /// scrolling in both axes unless a test says otherwise. R0 bit 2 (palette
+    /// select) is set like a program's register init leaves it, which is what
+    /// the full-palette [`pixel_of`] expectations below assume; a test that
+    /// writes R0 itself has to keep the bit (or expect the reduced palette).
     fn running(mode: u8) -> Vdp {
         let mut vdp = scroll_vdp(mode);
+        vdp.write_register(0, 0x04);
         vdp.write_register(1, 0x40);
         fill_cram(&mut vdp);
         vdp
@@ -262,6 +266,15 @@ mod tests {
                 pixel_of(column_colour(plane_x / 8).into())
             })
             .collect()
+    }
+
+    /// A bare [`Vdp`] with the palette select bit set: what a program's register
+    /// init leaves the chip in, and what these tests' full-palette pixels assume
+    /// ([`fill_cram`] gives most entries colours only the bits above the LSB can
+    /// make). [`running`] sets the same bit in its own register init.
+    fn initialized(mut vdp: Vdp) -> Vdp {
+        vdp.write_register(0, 0x04);
+        vdp
     }
 
     /// The single colour a [`fill_rows`] plane A draws on picture line `line`
@@ -324,7 +337,7 @@ mod tests {
     /// written on.
     #[test]
     fn a_mode_register_write_in_mid_line_shows_on_the_next_line() {
-        let mut vdp = Vdp::new(false);
+        let mut vdp = initialized(Vdp::new(false));
         vdp.write_register(1, 0x40);
         fill_cram(&mut vdp);
 
@@ -379,7 +392,7 @@ mod tests {
 
         vdp.advance(10 * MCLKS_PER_LINE);
         vdp.advance(HBLANK_CLEAR_MCLK_H32 + 100);
-        vdp.write_register(0, 1 << 5);
+        vdp.write_register(0, 0x04 | (1 << 5));
 
         vdp.advance(MCLKS_PER_LINE - vdp.line_mclk);
         assert_eq!(
@@ -395,6 +408,42 @@ mod tests {
             "line 11 opens with the 8 backdrop pixels of LCB"
         );
         assert_eq!(&line[8..], &plane_columns(0)[8..]);
+    }
+
+    /// The palette select rides the same latch as every other register: R0 bit
+    /// 2 cleared halfway across line 10 leaves line 10 on the full palette and
+    /// line 11 on the reduced one, the shared latch rule of #102 that the R7
+    /// and LCB tests above pin for their own bits.
+    #[test]
+    fn a_palette_select_write_in_mid_line_shows_on_the_next_line() {
+        let mut vdp = running(0b00);
+        fill_columns(&mut vdp, PLANE_A_BASE);
+
+        vdp.advance(10 * MCLKS_PER_LINE);
+        vdp.advance(HBLANK_CLEAR_MCLK_H32 + 100);
+        assert_eq!((vdp.line, vdp.line_mclk), (10, HBLANK_CLEAR_MCLK_H32 + 100));
+        vdp.write_register(0, 0x00);
+
+        vdp.advance(MCLKS_PER_LINE - vdp.line_mclk);
+        assert_eq!(
+            row(&vdp, 10),
+            plane_columns(0),
+            "line 10 draws the full palette"
+        );
+
+        vdp.advance(MCLKS_PER_LINE);
+        // [`fill_columns`] colours the plane in palette 0 entries 1..=15, whose
+        // CRAM words carry their colour in the red field alone; reduced, only
+        // the red LSB of each entry survives, so the odd entries are the red
+        // corner and the even ones black.
+        let reduced = (0..256)
+            .map(|x| {
+                let plane_x = (x + 256) & 255;
+                let entry = usize::from(column_colour(plane_x / 8));
+                color(reduced_color_word(cram_word(entry)), Intensity::Normal)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(row(&vdp, 11), reduced, "line 11 is drawn reduced");
     }
 
     /// The SAT of the sprite tests below: R5 = `0x78` is 0xF000 in H32 (genvdp.txt

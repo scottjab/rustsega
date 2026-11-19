@@ -277,15 +277,28 @@ impl Vdp {
     /// lookups a line composites with, read once for that line and indexed
     /// `[cram_index][Intensity::index]`.
     ///
+    /// While R0 bit 2 (palette select, [`Vdp::palette_select`]) is clear the
+    /// words go through [`crate::color::reduced_color_word`] first: only bits 1,
+    /// 5 and 9 of a CRAM word are taken into account when the VDP generates
+    /// colour data, which is the eight colours of the LSBs (genvdp.txt section
+    /// 17 "$00"; #282). The read is of the latched R0 like every
+    /// register getter of the renderer, so a mid-line write of the bit shows on
+    /// the next line.
+    ///
     /// [`Vdp::backdrop_pixel`] is this at [`Vdp::backdrop_index`] and
     /// [`Intensity::Normal`]. Reading CRAM once a line rather than once a pixel is
     /// also what lets [`compose_row`] be a free function, so the row write borrows
     /// [`Vdp::frame_buffer`] alone and not the whole `Vdp`.
     fn cram_pixels(&self) -> [[u32; Intensity::ALL.len()]; CRAM_WORDS] {
+        let reduced = !self.palette_select();
         let mut pixels = [[0; Intensity::ALL.len()]; CRAM_WORDS];
         for (entry, colour) in pixels.iter_mut().zip(self.cram) {
             for (pixel, level) in entry.iter_mut().zip(Intensity::ALL) {
-                *pixel = self.color_lut.pixel(colour, level);
+                *pixel = if reduced {
+                    self.color_lut.reduced_pixel(colour, level)
+                } else {
+                    self.color_lut.pixel(colour, level)
+                };
             }
         }
         pixels
@@ -440,7 +453,7 @@ impl Vdp {
 mod tests {
     use super::*;
     use crate::WIDTH_H32;
-    use crate::color::color;
+    use crate::color::{Intensity, color};
     use crate::hv::MCLKS_PER_LINE;
     use crate::planes::testutil::{
         CELL_TILE_ROWS, PLANE_A_BASE, PLANE_B_BASE, PLANE_COLUMNS, PLANE_ROWS, fill_tile_row,
@@ -591,6 +604,7 @@ mod tests {
 
     fn compose_vdp() -> Vdp {
         let mut vdp = plane_vdp();
+        vdp.write_register(0, 0x04); // palette select: the full palette of #282
         vdp.write_register(1, 0x40);
         vdp.write_register(7, BACKDROP);
         vdp.write_register(5, SPRITE_REG);
@@ -710,6 +724,98 @@ mod tests {
             row(&vdp, 0),
             vec![red; 320],
             "and an H40 line is the 320 pixels of the mode it was drawn in"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // R0 bit 2 (palette select): the CRAM to 8 colours reduction of #282.
+    // ---------------------------------------------------------------------
+
+    /// R0 bit 2 set - the state every program leaves the chip in after its
+    /// register init - converts the full palette as before (genvdp.txt section
+    /// 17 "$00", d2, read with the bit set).
+    #[test]
+    fn r0_bit_2_set_renders_the_full_palette() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(0, 0x04);
+        vdp.write_register(7, 0x05);
+        sized(&mut vdp); // #371: the buffer is sized on the frame boundary
+
+        // A colour per channel, each of them a level only the bits above the
+        // LSB can make, and full white.
+        for (word, pixel) in [
+            (0x0004, 0xFF00_0057), // red 87
+            (0x0060, 0xFF00_7400), // green 116
+            (0x0200, 0xFF34_0000), // blue 52
+            (0x0EEE, 0xFFFF_FFFF),
+        ] {
+            vdp.cram[5] = word;
+            vdp.render_line(0);
+            assert_eq!(
+                row(&vdp, 0),
+                vec![pixel; 256],
+                "CRAM {word:#06x} with bit 2 set"
+            );
+        }
+    }
+
+    /// R0 bit 2 clear reduces CRAM to the eight colours of its LSBs: 0x000E and
+    /// 0x0002, which differ only in red bits that no longer count, are the same
+    /// pixel, and 0x0008 - red bit 3 only - is the black of the black-red pair
+    /// (genvdp.txt section 17 "$00": "only bits 1, 5, and 9 are taken into
+    /// account when the VDP generates color data from each word of CRAM").
+    #[test]
+    fn r0_bit_2_clear_renders_the_eight_colour_palette() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(7, 0x05);
+        sized(&mut vdp);
+
+        vdp.cram[5] = 0x000E;
+        vdp.render_line(0);
+        let red = row(&vdp, 0)[0];
+        assert_eq!(red, 0xFF00_00FF, "a set LSB is the full channel");
+
+        vdp.cram[5] = 0x0002;
+        vdp.render_line(0);
+        assert_eq!(
+            row(&vdp, 0),
+            vec![red; 256],
+            "0x000E and 0x0002 are the same reduced colour"
+        );
+
+        vdp.cram[5] = 0x0008;
+        vdp.render_line(0);
+        assert_eq!(
+            row(&vdp, 0),
+            vec![0xFF00_0000; 256],
+            "0x0008 has no LSB set, so it is black"
+        );
+    }
+
+    /// The reduction keys on bit 2 alone: R0 bit 0 - the display bit of
+    /// genvdp.txt section 17 "$00" this VDP does not model - neither reduces a
+    /// bit-2-set palette nor keeps a bit-2-clear one full.
+    #[test]
+    fn the_palette_select_keys_on_bit_2_alone() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(7, 0x05);
+        vdp.cram[5] = 0x0004; // red 87: only the bits above the LSB make it
+        sized(&mut vdp);
+
+        vdp.write_register(0, 0x04 | 0x01);
+        vdp.render_line(0);
+        assert_eq!(
+            row(&vdp, 0),
+            vec![0xFF00_0057; 256],
+            "bit 0 set next to bit 2 stays full colour"
+        );
+
+        vdp.write_register(0, 0x01);
+        vdp.render_line(0);
+        assert_eq!(
+            row(&vdp, 0),
+            vec![0xFF00_0000; 256],
+            "and bit 0 alone does not keep the palette full"
         );
     }
 
@@ -935,7 +1041,7 @@ mod tests {
             "before the blank is switched on, the sprite is what the column shows"
         );
 
-        vdp.write_register(0, 1 << 5);
+        vdp.write_register(0, 0x04 | (1 << 5));
         vdp.render_line(0);
         let line = row(&vdp, 0);
         let backdrop = pixel_of(BACKDROP);

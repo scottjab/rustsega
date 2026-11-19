@@ -101,9 +101,19 @@ impl Vdp {
     /// outside of the display area is always shown at normal intensity", and the
     /// pick between the two per pixel needs the plane priority data, so it is
     /// [`Vdp::render_line`] and its compositor that make it (M4-18, #96).
+    ///
+    /// R0 bit 2 (palette select) reaches the backdrop with the rest of CRAM: the
+    /// bit clear takes [`crate::color::reduced_color_word`] first, the same
+    /// reduction [`Vdp::cram_pixels`] gives every word of the line (#282). Read
+    /// through [`Vdp::palette_select`], so inside a drawn line it is the latched
+    /// R0 and outside it the live one, like every register getter of the crate.
     pub(crate) fn backdrop_pixel(&self) -> u32 {
         let colour = self.cram[usize::from(self.backdrop_index())];
-        self.color_lut.pixel(colour, Intensity::Normal)
+        if self.palette_select() {
+            self.color_lut.pixel(colour, Intensity::Normal)
+        } else {
+            self.color_lut.reduced_pixel(colour, Intensity::Normal)
+        }
     }
 }
 
@@ -122,10 +132,12 @@ mod tests {
 
     /// The backdrop is converted by the DAC levels of `color`, not by the
     /// three-bit replication the M4-06 stub used (M4-09, #87): `0x0002` is red
-    /// 52 (`0x34`), where the replication gave 36 (`0x24`).
+    /// 52 (`0x34`), where the replication gave 36 (`0x24`). R0 bit 2 (palette
+    /// select) is set, the state a program's register init leaves the chip in.
     #[test]
     fn backdrop_pixel_uses_the_colour_conversion() {
         let mut vdp = Vdp::new(false);
+        vdp.write_register(0, 0x04);
         vdp.write_register(7, 0x09);
         for (cram, want) in [
             (0x0002_u16, 0xFF00_0034_u32),
@@ -136,6 +148,24 @@ mod tests {
             vdp.cram[9] = cram;
             assert_eq!(vdp.backdrop_pixel(), want, "CRAM entry 9 = {cram:#06x}");
         }
+    }
+
+    /// The palette select of R0 bit 2 reaches the backdrop as much as any CRAM
+    /// word: with the bit clear, a backdrop whose LSBs are all clear is black
+    /// and one with the red LSB set is the red corner (#282).
+    #[test]
+    fn backdrop_pixel_reduces_with_the_palette_select_clear() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(7, 0x09);
+
+        vdp.cram[9] = 0x0004; // red 2: nothing an LSB can make
+        assert_eq!(vdp.backdrop_pixel(), 0xFF00_0000);
+
+        vdp.cram[9] = 0x0002;
+        assert_eq!(vdp.backdrop_pixel(), 0xFF00_00FF);
+
+        vdp.write_register(0, 0x04);
+        assert_eq!(vdp.backdrop_pixel(), 0xFF00_0034, "bit 2 set: red 52 again");
     }
 
     #[test]

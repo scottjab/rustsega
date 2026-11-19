@@ -85,6 +85,48 @@ pub const fn color_word(index: usize) -> u16 {
     r | g | b
 }
 
+/// The DAC level a set LSB of a channel becomes while R0 bit 2 has reduced the
+/// palette: the top level of the channel's 3-bit field.
+///
+/// TODO(#282): INFERRED, not documented. genvdp.txt section 17 "$00" says of
+/// this bit that "only bits 1, 5, and 9 are taken into account when the VDP
+/// generates color data from each word of CRAM" but never says which level a
+/// set one of them becomes. The SMS hardware this mode smells of is no help:
+/// SMS CRAM is 2 bits a channel and the SMS mode of the Genesis VDP puts out
+/// its own levels anyway (TmEE's measurements, SpritesMind t=2189: 0, 99, 162,
+/// 255, "there is some analog trickery going on or there's separate DACs used
+/// for SMS mode output"). Of the references only MAME implements the bit, and
+/// as DAC level 1 (`315_5313.cpp`, "strange palette mode"; the mask `clut &=
+/// 0x49` there leaves the LSB at the bottom of its channel) with the comment
+/// "correct?" - blastem, jgenesis, Genesis Plus GX, picodrive and Gens KMod
+/// ignore it. The ticket's own reading is the top level, and the tests below
+/// lock that in; the whole question lives in this one constant.
+pub const REDUCED_LSB_LEVEL: u16 = 7;
+
+/// The CRAM word the VDP shows for `cram` while R0 bit 2 is clear: each channel
+/// is its LSB alone, at [`REDUCED_LSB_LEVEL`] when set and black when clear.
+/// The other six bits of each field "are not taken into account when the VDP
+/// generates color data from each word of CRAM" (genvdp.txt section 17 "$00"),
+/// so words that differ outside bits 1, 5 and 9 reduce to the same colour.
+pub const fn reduced_color_word(cram: u16) -> u16 {
+    let red = if cram & (1 << 1) != 0 {
+        REDUCED_LSB_LEVEL << 1
+    } else {
+        0
+    };
+    let green = if cram & (1 << 5) != 0 {
+        REDUCED_LSB_LEVEL << 5
+    } else {
+        0
+    };
+    let blue = if cram & (1 << 9) != 0 {
+        REDUCED_LSB_LEVEL << 9
+    } else {
+        0
+    };
+    red | green | blue
+}
+
 /// A CRAM word as a frame-buffer pixel: `0xFF000000 | b << 16 | g << 8 | r`,
 /// the RGBA8888 order the web frontend hands to a canvas.
 ///
@@ -127,6 +169,16 @@ impl ColorLut {
     #[inline]
     pub fn pixel(&self, cram: u16, intensity: Intensity) -> u32 {
         self.table[intensity.index()][color_index(cram)]
+    }
+
+    /// The pixel a CRAM word produces at `intensity` while R0 bit 2 has reduced
+    /// the palette: the word through [`reduced_color_word`] first, then the same
+    /// table. Shadow and highlight intensities apply to the reduced colours as
+    /// to any other, being what the display does to a colour after the CRAM
+    /// readout made it (genvdp.txt section 16).
+    #[inline]
+    pub fn reduced_pixel(&self, cram: u16, intensity: Intensity) -> u32 {
+        self.pixel(reduced_color_word(cram), intensity)
     }
 }
 
@@ -237,6 +289,48 @@ mod tests {
                     "cram {cram:#06x} at {intensity:?}"
                 );
             }
+        }
+    }
+
+    /// R0 bit 2 clear: "only bits 1, 5, and 9 are taken into account when the
+    /// VDP generates color data from each word of CRAM" (genvdp.txt section 17
+    /// "$00"), so words that differ outside those bits reduce the same and a
+    /// word with no LSB set reduces to black.
+    #[test]
+    fn reduced_palette_counts_the_lsb_of_each_channel_only() {
+        // 0x000E is red 7 and 0x0002 is red 1: both carry bit 1 alone as their
+        // counted bit, the bits above it being of a field that no longer counts.
+        assert_eq!(reduced_color_word(0x000E), reduced_color_word(0x0002));
+        assert_eq!(reduced_color_word(0x00E0), reduced_color_word(0x0020));
+        assert_eq!(reduced_color_word(0x0E00), reduced_color_word(0x0200));
+        // 0x0008 is red bit 3 only: its LSB is clear, so it shows as black.
+        assert_eq!(reduced_color_word(0x0008), reduced_color_word(0x0000));
+        // While the LSBs themselves are what tell the words apart.
+        assert_ne!(reduced_color_word(0x0002), reduced_color_word(0x0020));
+        assert_ne!(reduced_color_word(0x0020), reduced_color_word(0x0200));
+        assert_ne!(reduced_color_word(0x0002), reduced_color_word(0x0000));
+    }
+
+    /// The eight combinations of bits 1, 5 and 9 are the eight corners of the
+    /// RGB cube: a set LSB is the full channel, a clear one black. Through the
+    /// LUT, which is the road the renderer takes.
+    #[test]
+    fn reduced_palette_gives_the_eight_corners_of_the_cube() {
+        let lut = ColorLut::new();
+        for lsb in 0..8u16 {
+            let red = (lsb & 1) * REDUCED_LSB_LEVEL;
+            let green = ((lsb >> 1) & 1) * REDUCED_LSB_LEVEL;
+            let blue = ((lsb >> 2) & 1) * REDUCED_LSB_LEVEL;
+            let word = (red << 1) | (green << 5) | (blue << 9);
+            let want = 0xFF00_0000
+                | (u32::from((lsb >> 2) & 1) * 0xFF) << 16
+                | (u32::from((lsb >> 1) & 1) * 0xFF) << 8
+                | (u32::from(lsb & 1) * 0xFF);
+            assert_eq!(
+                lut.reduced_pixel(word, Intensity::Normal),
+                want,
+                "LSBs {lsb:03b}",
+            );
         }
     }
 
