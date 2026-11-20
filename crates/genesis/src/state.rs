@@ -69,7 +69,12 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// a v7 payload was written). The same class of wrong as every bump above: a
 /// v7 payload reads into a struct that expects the field, and postcard fails
 /// or - worse - shifts the tail of the payload into it.
-pub const FORMAT_VERSION: u32 = 8;
+///
+/// Version 9 is the SVP's DSP (#433 stage 2): two fields added to the board
+/// struct the v8 payload carries - the DSP's IRAM and the `ssp1601::Ssp1601`
+/// core. A v8 payload would decode into a reader whose board expects both,
+/// so the state of the running DSP would be lost with the machine.
+pub const FORMAT_VERSION: u32 = 9;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 

@@ -15,9 +15,10 @@
 //!
 //! The IRAM window needs no board at all - it is the image read at its own
 //! offsets - which is why this module is only the two windows the image cannot
-//! answer. The DSP itself is not modelled yet (#433 stage 2): the registers
-//! answer with the DSP-side latches of [`Svp`] and nothing ever drives them
-//! from the other side, which is the "do-nothing DSP" of #433 stage 1.
+//! answer. The DSP itself is [`ssp16::Ssp1601`], clocked from the scheduler
+//! through [`Svp::run_dsp`]; the handshake latches are the two sides' shared
+//! state (the 68k's writes land here, the DSP's answer comes back through
+//! [`DspView::write_xst`]).
 //!
 //! ## Which carts carry the board
 //!
@@ -58,6 +59,9 @@ pub const REGISTER_WINDOW: std::ops::RangeInclusive<u32> = 0xA1_5000..=0xA1_5FFF
 
 /// Words of DRAM: 128 KiB of 16-bit memory.
 const DRAM_WORDS: usize = 0x1_0000;
+/// Words of DSP IRAM (svpdoc section 1: "2KB of IRAM"; section 3's program
+/// space maps it at word `0x000-0x3FF`).
+const IRAM_WORDS: usize = 0x400;
 /// Mask that names the word of [`DRAM_WINDOW`] an address lands on: the window
 /// is 64K words and the low address bits above the byte lane select it.
 const DRAM_WORD_MASK: u32 = DRAM_WORDS as u32 - 1;
@@ -86,8 +90,8 @@ const TITLE: &str = "Virtua Racing";
 pub struct Svp {
     /// The shared DRAM, 64K words. It is RAM, not chip state: a soft reset
     /// leaves it alone the way [`crate::cart::sram`] is left alone, and the
-    /// reference's `svp_reset` clears only the DSP's program mapping and core
-    /// state, which is #433 stage 2's business.
+    /// reference's `svp_reset` clears only the DSP's program mapping and
+    /// core state.
     #[serde(with = "crate::big_array")]
     dram: Box<[u16; DRAM_WORDS]>,
     /// XST: the command/result register the 68k sees at `0xA15000` and its
@@ -96,21 +100,18 @@ pub struct Svp {
     xst: u16,
     /// PM0: the handshake status (notaz *SVP doc* 2.2.1). Bit 0 is set when
     /// the SSP has written to XST, and clears when the 68k reads it; bit 1 is
-    /// set when the 68k writes XST, and clears when the SSP reads PM0. With
-    /// no DSP on the other side, bit 1 never clears - and bit 0 is set by
-    /// [`Svp::write_register_word`]'s fake answer.
+    /// set when the 68k writes XST, and clears when the SSP reads PM0.
     pm0: u16,
+    /// The DSP's IRAM: 2 KiB of program RAM the SSP can (re)load through its
+    /// external window (svpdoc section 3: "IRAM ... it can be changed through
+    /// external memory space"). It comes up zeroed the way the reference's
+    /// allocation does (`svp_init` memsets; `svp_reset` copies only the ROM
+    /// half of the program space), and survives a soft reset like the DRAM.
+    #[serde(with = "crate::big_array")]
+    iram: Box<[u16; IRAM_WORDS]>,
+    /// The SSP1601 core ([`ssp16::Ssp1601`]).
+    dsp: ssp16::Ssp1601,
 }
-
-/// What the game's driver writes into XST as a query, and what the board
-/// answers: the driver's `move.l #$00004F48, $A15000` puts the ASCII pair
-/// `OH` into the command register, and the DSP firmware - which spells
-/// `OHMP` at byte 0x810 of itself, the same bytes Picodrive's detection
-/// probes - answers the other half of the word. The reply is a measured
-/// inference, not a documented fact: see [`Svp::write_register_word`] for
-/// what it buys and what it was measured against.
-const HANDSHAKE_QUERY: u16 = 0x4F48; // "OH"
-const HANDSHAKE_REPLY: u16 = 0x4D50; // "MP"
 
 impl Svp {
     /// The board of the cart `rom`, if the image names itself an SVP cart.
@@ -136,7 +137,40 @@ impl Svp {
             dram: Box::new([0; DRAM_WORDS]),
             xst: 0,
             pm0: 0,
+            iram: Box::new([0; IRAM_WORDS]),
+            dsp: ssp16::Ssp1601::new(),
         }
+    }
+
+    /// Clock the DSP for up to `cycles` SSP cycles against `rom` (the game
+    /// image, which is the ROM half of the DSP's program space) and return
+    /// the cycles consumed. One SSP cycle per 68000 cycle (see
+    /// [`ssp16`]'s module docs).
+    pub(crate) fn run_dsp(&mut self, rom: &[u8], cycles: u32) -> u32 {
+        let Self {
+            dram,
+            xst,
+            pm0,
+            iram,
+            dsp,
+        } = self;
+        let mut view = DspView {
+            dram,
+            iram,
+            xst,
+            pm0,
+            rom,
+        };
+        dsp.run(&mut view, cycles)
+    }
+
+    /// What a soft reset does to the board: the DSP core goes back to its
+    /// entry point with ST and the PMC state clear. The DRAM, the IRAM and
+    /// the handshake latches survive, like the save RAM does - the
+    /// reference's `svp_reset` touches only the DSP's program mapping and
+    /// core state.
+    pub(crate) fn reset(&mut self) {
+        self.dsp.reset();
     }
 
     /// Is `addr` inside the DRAM window ([`DRAM_WINDOW`])?
@@ -252,33 +286,15 @@ impl Svp {
 
     /// Register page word write at `addr`. An XST lane takes the command.
     /// Writes set PM0 bit 1, the documented "68k has written" (notaz *SVP
-    /// doc* 2.2.1); bit 0 is the answer bit, set here by the same stroke -
-    /// and the answer itself is faked, because there is no DSP here yet
-    /// (#433 stage 2). Two fakes, both behind measurements on
-    /// `Virtua Racing (USA)`:
-    ///
-    /// * every command is answered the moment it is written, and `OH` is
-    ///   answered with `MP` ([`HANDSHAKE_QUERY`]/[`HANDSHAKE_REPLY`]). With
-    ///   neither, the game's boot self-test - send `SV`, poll PM0 bit 0,
-    ///   expect `OK` (the routine at 0x1C072 of the image) - reboots the
-    ///   machine into a black screen, and with the echo alone the attract
-    ///   loop parks waiting for XST to move off `OH`, which the open bus of
-    ///   `main` (a `FFFF` read) never blocked. Genesis Plus GX shipped the
-    ///   same idea as its 2008 "SVP faking: display 2D graphics in Virtua
-    ///   Racing" release; the full DSP of stage 2 is what replaces both.
-    /// * a write of `OH` answers `MP` rather than echoing, for the same
-    ///   reason at the next handshake out.
-    ///
-    /// Everything else in the page is dropped, like the reference's
-    /// `m68k_unused_16_w`.
+    /// doc* 2.2.1); the answer bit (bit 0) is the DSP's to set, by writing
+    /// its result to XST through [`DspView::write_xst`] once the SSP1601
+    /// program - clocked by the scheduler ([`Svp::run_dsp`]) - has handled
+    /// the command. Everything else in the page is dropped, like the
+    /// reference's `m68k_unused_16_w`.
     pub fn write_register_word(&mut self, addr: u32, value: u16) {
         if Self::is_xst(addr) {
-            self.xst = if value == HANDSHAKE_QUERY {
-                HANDSHAKE_REPLY
-            } else {
-                value
-            };
-            self.pm0 |= 3;
+            self.xst = value;
+            self.pm0 |= 2;
         }
     }
 
@@ -296,6 +312,102 @@ impl Svp {
 impl Default for Svp {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The board as the DSP sees it: the [`ssp16::SspMemory`] half of
+/// [`Svp`], borrowed field by field so [`Svp::run_dsp`] can hold it next to
+/// `&mut self.dsp`.
+struct DspView<'a> {
+    dram: &'a mut Box<[u16; DRAM_WORDS]>,
+    iram: &'a mut Box<[u16; IRAM_WORDS]>,
+    xst: &'a mut u16,
+    pm0: &'a mut u16,
+    rom: &'a [u8],
+}
+
+impl ssp16::SspMemory for DspView<'_> {
+    /// Program memory: IRAM words `0x000-0x3FF`, the game image above them
+    /// (svpdoc section 3's program-space table). The image is 16-bit
+    /// big-endian words, like every other word on this bus; a word past the
+    /// image reads open bus.
+    fn program(&mut self, addr: u16) -> u16 {
+        if usize::from(addr) < IRAM_WORDS {
+            self.iram[usize::from(addr)]
+        } else {
+            let offset = (usize::from(addr)) * 2;
+            match self.rom.get(offset..offset + 2) {
+                Some(bytes) => u16::from_be_bytes([bytes[0], bytes[1]]),
+                None => crate::bus::OPEN_BUS_WORD,
+            }
+        }
+    }
+
+    /// IRAM write through the external window (svpdoc section 3: the SVP
+    /// space at `0x390000-0x3907FF`, word `0x1C8000-0x1C83FF`; the core
+    /// hands the word already masked to the IRAM).
+    fn write_iram(&mut self, addr: u16, value: u16) {
+        self.iram[usize::from(addr)] = value;
+    }
+
+    /// DRAM word read: the core hands the full word address of the SVP
+    /// space (`0x180000-0x18FFFF`), of which the low 16 bits select the
+    /// word - the same decode the 68k-side overlay makes.
+    fn dram(&mut self, word_addr: u32) -> u16 {
+        self.dram[(word_addr & 0xFFFF) as usize]
+    }
+
+    /// DRAM word write, with the mode's `v` bit splitting the word into
+    /// nibbles and writing only the non-zero ones (svpdoc 2.2.7).
+    fn write_dram(&mut self, word_addr: u32, value: u16, overwrite: bool) {
+        let cell = &mut self.dram[(word_addr & 0xFFFF) as usize];
+        if overwrite {
+            for shift in [12u16, 8, 4, 0] {
+                let nibble = value & (0xF << shift);
+                if nibble != 0 {
+                    *cell = (*cell & !(0xF << shift)) | nibble;
+                }
+            }
+        } else {
+            *cell = value;
+        }
+    }
+
+    /// ROM word read (the game image), open bus past the end - the same
+    /// answer the 68k's own ROM window gives above the image (#435's
+    /// decision).
+    fn rom(&mut self, word_addr: u32) -> u16 {
+        let offset = word_addr as usize * 2;
+        match self.rom.get(offset..offset + 2) {
+            Some(bytes) => u16::from_be_bytes([bytes[0], bytes[1]]),
+            None => crate::bus::OPEN_BUS_WORD,
+        }
+    }
+
+    /// XST read: the raw latch.
+    fn xst(&mut self) -> u16 {
+        *self.xst
+    }
+
+    /// XST write: the latch takes the word and PM0 bit 0 sets - "set when
+    /// SSP160x has written something to XST" (svpdoc 2.2.1) - which is
+    /// what the 68k's `0xA15004` poll is waiting for.
+    fn write_xst(&mut self, value: u16) {
+        *self.xst = value;
+        *self.pm0 |= 1;
+    }
+
+    /// PM0 read: the SSP's side clears bit 1 - "cleared on PM0 read by
+    /// SSP160x" (svpdoc 2.2.1) - the 68k's "command taken" acknowledgement.
+    fn pm0(&mut self) -> u16 {
+        let pm0 = *self.pm0;
+        *self.pm0 &= !2;
+        pm0
+    }
+
+    /// PM0 write: the raw latch store.
+    fn write_pm0(&mut self, value: u16) {
+        *self.pm0 = value;
     }
 }
 
@@ -408,10 +520,10 @@ mod tests {
         assert_eq!(svp.read_register_word(0xA1_5000), 0x0042, "mirror write");
     }
 
-    /// PM0: a write to XST sets both handshake bits - bit 1 is the documented
-    /// "68k has written", bit 0 is the fake DSP answer of the stage-1 board
-    /// (see [`Svp::write_register_word`] for why it is faked). The read hands
-    /// both back and clears the answer bit on the way out, the one side
+    /// PM0: a write to XST sets the "68k has written" bit (bit 1, svpdoc
+    /// 2.2.1) and never the answer bit - bit 0 is the DSP's to set, by
+    /// writing its result to XST through the core ([`DspView::write_xst`]).
+    /// The 68k's read of PM0 clears bit 0 on the way out, the one side
     /// effect the 68k side has.
     #[test]
     fn pm0_reads_the_handshake_and_clears_the_answer_bit() {
@@ -419,15 +531,39 @@ mod tests {
         assert_eq!(svp.read_register_word(0xA1_5004), 0x0000);
 
         svp.write_register_word(0xA1_5000, 0x0001);
-        assert_eq!(svp.read_register_word(0xA1_5004), 0x0003);
-        // Every read of PM0 clears the answer bit, at either width; bit 1
-        // stays until the DSP side reads it, which never happens here.
+        assert_eq!(svp.read_register_word(0xA1_5004), 0x0002);
         assert_eq!(svp.read_register_byte(0xA1_5004), 0x00, "high lane");
         assert_eq!(svp.read_register_byte(0xA1_5005), 0x02, "low lane, bit 1");
 
-        // The next command sets it again: the handshake cycles.
-        svp.write_register_word(0xA1_5002, 0xFFFF);
+        // The DSP answers by writing XST through the core's memory view
+        // (the path the running SSP program takes): bit 0 sets, and the
+        // next 68k read hands it and clears it (svpdoc 2.2.1's answer
+        // cycle).
+        {
+            let Svp {
+                dram,
+                iram,
+                xst,
+                pm0,
+                dsp,
+            } = &mut svp;
+            let mut view = DspView {
+                dram,
+                iram,
+                xst,
+                pm0,
+                rom: &[],
+            };
+            ssp16::SspMemory::write_xst(&mut view, 0x0042);
+            let _ = dsp;
+        }
         assert_eq!(svp.read_register_word(0xA1_5004), 0x0003);
+        assert_eq!(svp.read_register_word(0xA1_5000), 0x0042, "the result");
+        assert_eq!(
+            svp.read_register_word(0xA1_5004),
+            0x0002,
+            "answered bit cleared"
+        );
     }
 
     /// The undecoded lanes of the page: `0xA15006` and `0xA15008` (the two

@@ -717,7 +717,7 @@ impl Ssp1601 {
             ptr.wrapping_add_signed(add)
         } else {
             let mask = ((1u16 << rpl) - 1) as u8;
-            ((ptr & !mask) | (ptr.wrapping_add_signed(add) & mask)) as u8
+            (ptr & !mask) | (ptr.wrapping_add_signed(add) & mask)
         }
     }
 

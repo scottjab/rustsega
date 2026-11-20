@@ -352,6 +352,11 @@ impl Scheduler {
                     MASTER_CLOCKS_PER_68K,
                     line_end,
                 );
+                // The SVP's DSP is clocked alongside the 68k it shares the
+                // cartridge with: one SSP cycle per 68k cycle stepped (see
+                // [`bus::Bus::svp_run_dsp`]). A cart without the board
+                // answers with nothing.
+                bus.svp_run_dsp(cycles);
                 // The bus waits are paid in the same master clocks the instruction
                 // was just charged in: the access is over, and it is the chip that
                 // is held.

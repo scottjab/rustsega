@@ -673,26 +673,29 @@ fn tom_clown_boots_to_non_blank_screen() {
 /// Virtua Racing, the one cart of the collection that carries the SVP: a Fujitsu
 /// SSP1601 DSP with its own program ROM and 2 KB of DRAM, which the 68k talks to
 /// through `0xA15000`-`0xA15009` and `0x300000`-`0x31FFFF` (notaz *SVP doc*
-/// section 3 "Memory map").
+/// section 3 "Memory map"). The board is emulated since #433: detection,
+/// the DRAM window, the status/control registers and the clocked SSP1601 core
+/// ([`cart::svp::svp16`]).
 ///
-/// Nothing in this tree models the SVP, so the cart waits on a DSP that never
-/// answers and the frame stays `#000000` however long it runs - `1 colours` in
-/// docs/compat.md, and the only two carts of the 2775 that never draw a pixel
-/// (#374). This test therefore **fails on `main` and is `#[ignore]`d** for that
-/// reason, not because the ROM is missing: it is the measurement the SVP work is
-/// judged on, and un-ignoring it is the acceptance criterion of #374.
+/// This test sat `#[ignore]`d from #374 ("fails on `main`, un-ignoring it is
+/// the acceptance criterion") until the DSP landed. Measured across the work:
+/// `headless run --frames 300 --colours` went 1 -> 8 distinct colours, and
+/// `--frames 1800 --max-colours --pad1 START@300,START@301` went 17 (the old
+/// open-bus fake) -> 41, with the title screen drawing its ranking table,
+/// road, cars and "PRESS START BUTTON" text.
 ///
-/// Run it with
+/// It still needs a commercial ROM, so it skips without one like the rest of
+/// the boot tests: run it with
 /// `cargo nextest run -p genesis --run-ignored only --test boot virtua_racing`.
 #[test]
-#[ignore = "needs a commercial ROM, and #374: the SVP is unemulated, so this fails on main"]
+#[ignore = "needs a commercial ROM; skips without one"]
 fn virtua_racing_boots_to_non_blank_screen() {
     let path = require_data!(testkit::find_commercial_rom("Virtua Racing (USA)"));
     let colours = colour_count(&path, 300, "virtua_racing_300.png");
     assert!(
         colours > BLANK,
-        "300 frames in, Virtua Racing is {} distinct colours: the cart is waiting on \
-         its SVP DSP, which nothing here models (#374)",
+        "300 frames in, Virtua Racing is {} distinct colours: the SVP DSP is \
+         emulated (#433), so a blank frame is a regression, not the named gap",
         colours
     );
 }
