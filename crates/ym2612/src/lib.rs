@@ -278,7 +278,36 @@ impl Ym2612 {
     /// The LFO steps first, so the phase modulation it applies to `&A0` and the
     /// amplitude modulation it applies to `&40` are the ones that belong to this
     /// sample rather than the one before (M5-08, #113, and `crate::lfo`).
+    ///
+    /// The idle fast path: a chip with no data write in it ([`BUSY_INTERNAL_CYCLES`]
+    /// outlasts a sample, so `busy == 0` says none for two), no timer running,
+    /// and all 24 envelopes at rest ([`Envelope::at_rest`]) sums to the same
+    /// silence every sample. The step still runs everything that keeps the
+    /// state exact for whatever ends the silence - the timers at their pinned
+    /// rates of #325, the CSM pulse they drive, the LFO wave, the phase
+    /// counters (which the model pins counting every sample, keyed or not)
+    /// and the envelope divider - and skips only the parts the at-rest
+    /// argument makes no-ops: the envelope updates (nothing at rest can move
+    /// without a write) and the per-operator sum (an operator at
+    /// [`envelope::SILENT`] attenuation outputs zero whatever its phase, so
+    /// the channel sums are 0 however the phases count). The pan and DAC
+    /// registers this sample reads again rather than remembers, so a write
+    /// that only moves the constant needs no special case.
     pub fn clock(&mut self) -> (i16, i16) {
+        if self.at_rest() {
+            let config = self.regs.timer_config();
+            self.timers.tick(&config);
+            self.csm_step();
+            self.lfo.tick();
+            let ssg_pg_reset = self.envelopes.ssg_pg_resets();
+            self.phases
+                .tick(&ssg_pg_reset, self.lfo.pms(), self.lfo.pm_phase());
+            self.envelopes.advance();
+            let sums = self.channel_sums();
+            let pan = std::array::from_fn(|channel| self.regs.pan(channel));
+            return output::mix(sums, pan, self.model);
+        }
+
         let config = self.regs.timer_config();
         self.timers.tick(&config);
         self.csm_step();
@@ -350,6 +379,16 @@ impl Ym2612 {
         }
         self.csm_key = csm;
         self.envelopes.csm_key(&self.phases, csm);
+    }
+
+    /// Whether the chip is idle in the sense of [`Ym2612::clock`]'s fast path:
+    /// no data write in the last two samples ([`BUSY_INTERNAL_CYCLES`] is more
+    /// than one sample of [`INTERNAL_CYCLES_PER_SAMPLE`]), neither timer running,
+    /// and every envelope at rest ([`Envelope::at_rest`]). CSM mode needs no
+    /// extra gate: its key pulse rides a timer A overflow, and an idle chip has
+    /// no timer running to overflow.
+    fn at_rest(&self) -> bool {
+        self.busy == 0 && !self.timers.any_running() && self.envelopes.all_at_rest()
     }
 
     /// What one operator is attenuated by as the channel mix reads it: its
@@ -2229,6 +2268,229 @@ mod tests {
 
         for (left, right) in samples(&mut chip, 64) {
             assert_eq!(left, right, "and the two sides are still the same mix");
+        }
+    }
+
+    /// The gate of the idle path opens and shuts on exactly the three things
+    /// that move a silent chip: BUSY after a write, a running timer, and a
+    /// keyed envelope. A data write holds it shut for two samples, BUSY being
+    /// 32 internal cycles and a sample 24 (`busy_set_after_write_and_clears`),
+    /// and a released note holds it shut until the release has run all the
+    /// way to the silence it clamps at, because [`Envelope::set_key`] starts a
+    /// re-struck note from wherever the attenuation stands.
+    #[test]
+    fn idle_gate_opens_only_on_a_silent_stopped_chip() {
+        let mut chip = Ym2612::new();
+        assert!(chip.at_rest(), "a chip nothing has touched is at rest");
+
+        write_reg(&mut chip, ADDR_1, DATA_1, 0x30, 0x01);
+        assert!(!chip.at_rest(), "a data write sets BUSY and shuts the gate");
+        chip.clock();
+        assert!(!chip.at_rest(), "BUSY survives the first sample");
+        chip.clock();
+        assert!(chip.at_rest(), "BUSY drained, the gate is open again");
+
+        // A keyed note: attack rate 62 is instant, so the note sounds at once
+        // and the release rate 15 below is the fastest way back to silence.
+        write_reg(&mut chip, ADDR_1, DATA_1, regs::REG_TOTAL_LEVEL, 20);
+        // Attack rate 31 is the 62 `effective_rate` calls instant (see the
+        // `MUTE`-style helpers of `crate::channel`'s tests).
+        write_reg(&mut chip, ADDR_1, DATA_1, regs::REG_KEY_SCALE_ATTACK, 0x1F);
+        write_reg(&mut chip, ADDR_1, DATA_1, regs::REG_LEVEL_RELEASE, 0x0F);
+        write_reg(&mut chip, ADDR_1, DATA_1, regs::REG_KEY_ON, KEY_ON_ALL);
+        assert!(!chip.at_rest(), "a keyed channel holds the gate shut");
+
+        write_reg(&mut chip, ADDR_1, DATA_1, regs::REG_KEY_ON, 0);
+        clock_for(&mut chip, 2);
+        assert!(
+            !chip.at_rest(),
+            "the gate stays shut while the release is still audible"
+        );
+        clock_for(&mut chip, 60_000);
+        assert!(chip.at_rest(), "a released note at silence opens the gate");
+
+        // A running timer, whichever of the two, and then a stopped one: the
+        // counters move per sample at the rates #325 pinned, so the gate has to
+        // follow the load bits of `&27` and not the silence.
+        set_timer_a(&mut chip, 0);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, LOAD_A | ENABLE_A);
+        clock_for(&mut chip, 1);
+        assert!(!chip.at_rest(), "timer A running holds the gate shut");
+        // The stop write is a data write, so BUSY alone holds the gate shut
+        // for the two samples after it (`busy_set_after_write_and_clears`);
+        // the clock count below has to say so as well.
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, 0);
+        clock_for(&mut chip, 2);
+        assert!(chip.at_rest(), "timer A stopped opens the gate again");
+
+        set_timer_b(&mut chip, 255);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, LOAD_B | ENABLE_B);
+        clock_for(&mut chip, 16);
+        assert!(!chip.at_rest(), "timer B running holds the gate shut");
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_CONTROL, 0);
+        clock_for(&mut chip, 2);
+        assert!(chip.at_rest(), "timer B stopped opens the gate again");
+
+        // The overflow flags the timers left behind do not hold the gate shut:
+        // they are status bits, and reading them is all a stopped timer does.
+        assert!(
+            bit(chip.read_status(), STATUS_TIMER_B),
+            "timer B overflowed on the way, and its flag is still set"
+        );
+        assert!(chip.at_rest());
+    }
+
+    /// The register script of the differential test below, one entry per sample
+    /// index: a note on channel 1 with a slow attack and the fastest release
+    /// there is (RR 15 is rate 31, about 50k samples of decay), the LFO on
+    /// throughout, timer B and then timer A with CSM, the DAC wiggled, SSG-EG
+    /// mode 8 on channel 3, and pan writes in the middle of silent stretches.
+    /// The long silent gaps between the events are what the idle path engages
+    /// in; everything else is what a wrong skip would be heard on.
+    fn idle_script(sample: u32, chip: &mut Ym2612) {
+        match sample {
+            // The LFO, at its middle rate, with the deepest AMS and PMS on
+            // channel 1 (`&22`, `&B4`). Everything keyed after this swings.
+            100 => write_reg(chip, ADDR_1, DATA_1, regs::REG_LFO, 0x0B),
+            110 => write_reg(chip, ADDR_1, DATA_1, regs::REG_AMS_PMS, 0x37),
+            // Channel 1's voice: block 4, fnum 0x211, TL 20, attack rate 16
+            // (slow, an ~8k-sample ramp the envelope divider drives), decay
+            // and sustain rates 31 (so the sustain level is reached), release
+            // rate 15 (the fastest there is, ~50k samples).
+            1_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_BLOCK_FNUM, 0x22),
+            1_001 => write_reg(chip, ADDR_1, DATA_1, regs::REG_FNUM_LOW, 0x11),
+            1_002 => write_reg(chip, ADDR_1, DATA_1, regs::REG_DT_MUL, 0x01),
+            1_003 => write_reg(chip, ADDR_1, DATA_1, regs::REG_TOTAL_LEVEL, 20),
+            1_004 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_SCALE_ATTACK, 0x10),
+            1_005 => write_reg(chip, ADDR_1, DATA_1, regs::REG_AM_DECAY_1, 0x1F),
+            1_006 => write_reg(chip, ADDR_1, DATA_1, regs::REG_DECAY_2, 0x1F),
+            1_007 => write_reg(chip, ADDR_1, DATA_1, regs::REG_LEVEL_RELEASE, 0x0F),
+            1_008 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, KEY_ON_ALL),
+            8_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, 0),
+            // The note has released to silence by ~52k; re-strike it out of a
+            // long idle stretch, with the LFO cycles further on.
+            55_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, KEY_ON_ALL),
+            70_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, 0),
+            // Timer B while the release is still running, then stopped again
+            // once it has overflowed (its flag stays set, and the differential
+            // reads it every 997 samples): the start has to give the timer a
+            // whole first period (`Timers::register_written` resets the
+            // divider), and the stop has to leave the flag readable.
+            72_000 => set_timer_b(chip, 10),
+            72_001 => write_reg(chip, ADDR_1, DATA_1, REG_CONTROL, LOAD_B | ENABLE_B),
+            120_000 => write_reg(chip, ADDR_1, DATA_1, REG_CONTROL, 0),
+            122_000 => write_reg(chip, ADDR_1, DATA_1, REG_CONTROL, RESET_A | RESET_B),
+            // Channel 3's voice on part II, then timer A in CSM mode: every
+            // overflow keys the four operators on and folds the total level
+            // into the envelope (`Ym2612::csm_step`).
+            130_000 => write_reg(chip, ADDR_2, DATA_2, regs::REG_BLOCK_FNUM, 0x22),
+            130_001 => write_reg(chip, ADDR_2, DATA_2, regs::REG_FNUM_LOW, 0x40),
+            130_002 => write_reg(chip, ADDR_2, DATA_2, regs::REG_DT_MUL, 0x01),
+            130_003 => write_reg(chip, ADDR_2, DATA_2, regs::REG_TOTAL_LEVEL, 40),
+            130_004 => write_reg(chip, ADDR_2, DATA_2, regs::REG_KEY_SCALE_ATTACK, 0x1F),
+            130_005 => write_reg(chip, ADDR_2, DATA_2, regs::REG_LEVEL_RELEASE, 0x0F),
+            131_000 => set_timer_a(chip, 1_020),
+            131_001 => {
+                // `&27` 10: CSM and frequency mode, with timer A loaded,
+                // running and enabled (`regs::CH3_MODE_CSM`, LOAD_A, ENABLE_A).
+                write_reg(chip, ADDR_1, DATA_1, REG_CONTROL, 0x85);
+            }
+            150_000 => write_reg(chip, ADDR_1, DATA_1, REG_CONTROL, RESET_A | RESET_B),
+            // The DAC on, wiggled every third sample over a keyed channel 1.
+            155_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, KEY_ON_ALL),
+            155_001 => write_reg(chip, ADDR_1, DATA_1, regs::REG_DAC_ENABLE, 0x80),
+            165_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_DAC_ENABLE, 0),
+            165_001 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, 0),
+            // SSG-EG mode 8 on channel 3, all four slots: the repeat-and-reset
+            // mode, keyed with an instant attack so the saw is loud, and
+            // released mid-swing so the key-off mirror fold has something in it.
+            170_000 => {
+                for slot in 0..4u8 {
+                    let offset = slot * 4 + 2;
+                    write_reg(chip, ADDR_1, DATA_1, regs::REG_SSG_EG + offset, 0x08);
+                }
+            }
+            170_001 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, KEY_ON_ALL | 2),
+            // The key-off of channel 2 names the channel: `&28` bits 2-0 are
+            // absolute, so a bare 0 would release channel 1 and leave the saw
+            // keyed on forever (`phase::key_on_channel`).
+            175_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, 2),
+            175_001 => {
+                for slot in 0..4u8 {
+                    let offset = slot * 4 + 2;
+                    write_reg(chip, ADDR_1, DATA_1, regs::REG_SSG_EG + offset, 0);
+                }
+            }
+            // Pan channel 3 to the left only, in the middle of the silent
+            // stretch that follows the release: the write lifts the chip out of
+            // idle for two BUSY samples, and the constant both paths then sit
+            // on moves.
+            225_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_AMS_PMS + 2, PAN_LEFT),
+            240_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_SCALE_ATTACK, 0x1F),
+            240_001 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, KEY_ON_ALL),
+            241_000 => write_reg(chip, ADDR_1, DATA_1, regs::REG_KEY_ON, 0),
+            // The DAC data, while it is enabled (155_001 to 165_000).
+            s if (155_002..165_000).contains(&s) && (s - 155_002) % 3 == 0 => {
+                let step = ((s - 155_002) / 3) as u8;
+                write_reg(
+                    chip,
+                    ADDR_1,
+                    DATA_1,
+                    regs::REG_DAC_DATA,
+                    0x40 + step % 4 * 0x20,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// The idle fast path of [`Ym2612::clock`] against the full one, sample for
+    /// sample over a minute-scale script.
+    ///
+    /// Both chips run [`idle_script`]; the reference additionally writes the
+    /// test register `&2C` with 0 before every sample. Only bit 3 of `&2C`
+    /// decodes (#339) and the script leaves it clear, so the extra write is
+    /// sound-inert - but a data write refills BUSY for 32 internal cycles and a
+    /// sample is 24 (`busy_set_after_write_and_clears`), so the reference is
+    /// never at `busy == 0` and never takes the idle path. Whatever the idle
+    /// path skipped that a later sample could see - an envelope counter, an LFO
+    /// swing, a timer divider, a phase counter no key-on resets - parts the two
+    /// outputs here.
+    #[test]
+    fn idle_samples_match_the_full_pipeline() {
+        let mut idle = Ym2612::new();
+        let mut reference = Ym2612::new();
+        reference.write(ADDR_1, REG_TEST_2C);
+
+        for sample in 0..255_000 {
+            idle_script(sample, &mut idle);
+            idle_script(sample, &mut reference);
+            // The busy-keeper write, with its register latched for it: a bare
+            // data write would land in whatever register the script latched
+            // last and rewrite the script itself.
+            reference.write(ADDR_1, REG_TEST_2C);
+            reference.write(DATA_1, 0);
+
+            assert_eq!(
+                idle.clock(),
+                reference.clock(),
+                "sample {sample} of the idle-versus-full run"
+            );
+            if sample % 997 == 0 {
+                let flags = STATUS_TIMER_A | STATUS_TIMER_B;
+                assert_eq!(
+                    idle.read_status() & flags,
+                    reference.read_status() & flags,
+                    "timer flags at sample {sample}"
+                );
+            }
+            if sample == 53_000 || sample == 230_000 {
+                assert!(
+                    idle.at_rest(),
+                    "samples {sample} sit in a silent stretch between events, \
+                     which is what makes the samples above a comparison of the two paths"
+                );
+            }
         }
     }
 }

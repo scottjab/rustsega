@@ -197,6 +197,15 @@ impl Timers {
         self.overflow_a
     }
 
+    /// Whether either load bit of `&27` stands: what [`Ym2612::clock`]'s idle
+    /// fast path must not run past. A running timer moves its counter every
+    /// sample (timer A) or every sixteenth (timer B) at the rates #325 pinned,
+    /// and raises its status flag at the overflow, so a stretch with one
+    /// running is not a stretch the sampling can skip.
+    pub(crate) fn any_running(&self) -> bool {
+        self.running_a || self.running_b
+    }
+
     /// One timer B tick, the 8-bit version of [`Timers::tick_a`].
     fn tick_b(&mut self, config: &TimerConfig) {
         match self.counter_b.checked_add(1) {
