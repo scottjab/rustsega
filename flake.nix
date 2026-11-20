@@ -235,6 +235,8 @@
             pkgs.git
             pkgs.ripgrep
             pkgs.jq
+            # For format-checking flake.nix and nix/*.nix (`just fmt-nix-check`).
+            pkgs.nixpkgs-fmt
             # For linting the shell scripts in scripts/ (`shellcheck scripts/*.sh`).
             pkgs.shellcheck
             # For linting the workflow files in .github/workflows/ (`just actionlint`),
@@ -404,59 +406,59 @@
           # an absent `ldd` would read here as "no shared library needed".
           ${if supportsStatic then "static" else null} =
             pkgs.runCommand "rustsega-static-check"
-            { nativeBuildInputs = [ pkgs.file pkgs.glibc.bin ]; } ''
-            bin=${self.packages.${system}.static}/bin/rustsega
+              { nativeBuildInputs = [ pkgs.file pkgs.glibc.bin ]; } ''
+              bin=${self.packages.${system}.static}/bin/rustsega
 
-            # The two failures this check exists for are the glibc build, which
-            # `file` calls "dynamically linked (uses shared libs)", and a musl
-            # build that lost `crt-static`, which it calls "interleaved". A
-            # correct one is "static-pie linked" here, and the phrasing of that
-            # varies between versions of `file`, so the word static has to be
-            # present and the words dynamically linked must not be.
-            info="$(file -L "$bin")"
-            echo "$info"
-            case "$info" in
-              *"dynamically linked"* | *interleaved*)
-                echo "expected $bin to be statically linked" >&2
-                exit 1
-                ;;
-              *static*) ;;
-              *)
-                echo "expected '$info' to say how the binary is linked" >&2
-                exit 1
-                ;;
-            esac
+              # The two failures this check exists for are the glibc build, which
+              # `file` calls "dynamically linked (uses shared libs)", and a musl
+              # build that lost `crt-static`, which it calls "interleaved". A
+              # correct one is "static-pie linked" here, and the phrasing of that
+              # varies between versions of `file`, so the word static has to be
+              # present and the words dynamically linked must not be.
+              info="$(file -L "$bin")"
+              echo "$info"
+              case "$info" in
+                *"dynamically linked"* | *interleaved*)
+                  echo "expected $bin to be statically linked" >&2
+                  exit 1
+                  ;;
+                *static*) ;;
+                *)
+                  echo "expected '$info' to say how the binary is linked" >&2
+                  exit 1
+                  ;;
+              esac
 
-            # And `ldd` agrees. A static binary gets "not a dynamic executable"
-            # or "statically linked" depending on the `ldd` in hand, and the first
-            # of those comes with exit status 1, so the status says nothing here;
-            # what matters is that no shared library is resolved for the binary,
-            # which is what an `=>` line would be.
-            dynamic="$(ldd "$bin" 2>&1 || true)"
-            echo "$dynamic"
-            case "$dynamic" in
-              *"=>"*)
-                echo "expected $bin to need no shared library, ldd said:" >&2
-                echo "$dynamic" >&2
-                exit 1
-                ;;
-            esac
+              # And `ldd` agrees. A static binary gets "not a dynamic executable"
+              # or "statically linked" depending on the `ldd` in hand, and the first
+              # of those comes with exit status 1, so the status says nothing here;
+              # what matters is that no shared library is resolved for the binary,
+              # which is what an `=>` line would be.
+              dynamic="$(ldd "$bin" 2>&1 || true)"
+              echo "$dynamic"
+              case "$dynamic" in
+                *"=>"*)
+                  echo "expected $bin to need no shared library, ldd said:" >&2
+                  echo "$dynamic" >&2
+                  exit 1
+                  ;;
+              esac
 
-            # The version comes from the workspace Cargo.toml, so this is what
-            # says the static binary is this workspace's server and not just any
-            # binary that happens to be static.
-            version="$("$bin" --version)"
-            echo "--version: $version"
-            case "$version" in
-              "rustsega ${workspaceVersion}") ;;
-              *)
-                echo "expected '--version' to print 'rustsega ${workspaceVersion}'" >&2
-                exit 1
-                ;;
-            esac
+              # The version comes from the workspace Cargo.toml, so this is what
+              # says the static binary is this workspace's server and not just any
+              # binary that happens to be static.
+              version="$("$bin" --version)"
+              echo "--version: $version"
+              case "$version" in
+                "rustsega ${workspaceVersion}") ;;
+                *)
+                  echo "expected '--version' to print 'rustsega ${workspaceVersion}'" >&2
+                  exit 1
+                  ;;
+              esac
 
-            touch $out
-          '';
+              touch $out
+            '';
         };
 
         formatter = pkgs.nixpkgs-fmt;

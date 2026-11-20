@@ -9,13 +9,22 @@ vdp-debug := "-p vdp --features debug-views"
 default: check
 
 # Everything a commit must pass.
-check: fmt-check actionlint clippy test wasm-core wasm-web ref-selftest
+check: fmt-check fmt-nix-check actionlint clippy test wasm-core wasm-web ref-selftest
 
 fmt:
     cargo fmt --all
+    nixpkgs-fmt flake.nix nix/*.nix
 
 fmt-check:
     cargo fmt --all --check
+
+# The nix files drift silently otherwise: CI runs `check` only, and before
+# #426 neither this nor the formatter package was in the tree.
+fmt-nix:
+    nixpkgs-fmt flake.nix nix/*.nix
+
+fmt-nix-check:
+    nixpkgs-fmt --check flake.nix nix/*.nix
 
 # The workflow files of .github (M8-07, #162). In `check` rather than only in the
 # release workflow, because nothing else reads them until a tag is pushed and by

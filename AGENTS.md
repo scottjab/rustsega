@@ -14,7 +14,7 @@ pip, npm, or apt. Everything you need is in the flake dev shell.
 
 ```sh
 nix develop -c <command>        # run one command in the dev shell
-nix develop -c just check       # the full check: fmt, clippy, tests, wasm build
+nix develop -c just check       # the full check: fmt, nix fmt, clippy, tests, wasm build
 ```
 
 If you need a tool that is missing, add it to `packages` in `flake.nix` in its
