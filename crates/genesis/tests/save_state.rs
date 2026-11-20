@@ -141,8 +141,18 @@ fn header_written_and_checked() {
     );
     assert_eq!(
         u32::from_le_bytes(state[4..8].try_into().expect("4 bytes of version")),
-        7,
-        "format version 7, which is the YM2612's `&A4` F-Num latch moving off the \n         per-channel fields of #336, on top of the J-CART register carrying one \n         field on the bus of #356, on top of the Acclaim 32 Mbit board's \n         read-window latch carrying one field in the EEPROM of #271, on top of \n         the EEPROM chip carrying one of three addressing modes instead of a \n         mode-1 flag, the 24C65's two-byte word address that made it 4 (#270), \n         the scheduler's two freeze gates that made it 3 (#517) and the woven \n         mode-2 field that made it 2 (#457); the number is pinned rather than \n         read from `state::FORMAT_VERSION` because bumping it has to be a \n         decision, not an accident"
+        8,
+        "format version 8, which is the SVP board carrying one field on the bus \
+         of #433, on top of the YM2612's `&A4` F-Num latch moving off the \
+         per-channel fields of #336 that made it 7, on top of the J-CART register carrying one \
+         field on the bus of #356, on top of the Acclaim 32 Mbit board's \
+         read-window latch carrying one field in the EEPROM of #271 that made it 5, on top of \
+         the EEPROM chip carrying one of three addressing modes instead of a \
+         mode-1 flag, the 24C65's two-byte word address that made it 4 (#270), \
+         the scheduler's two freeze gates that made it 3 (#517) and the woven \
+         mode-2 field that made it 2 (#457); the number is pinned rather than \
+         read from `state::FORMAT_VERSION` because bumping it has to be a \
+         decision, not an accident"
     );
     let checksum = u64::from_le_bytes(state[8..16].try_into().expect("8 bytes of checksum"));
     assert_eq!(

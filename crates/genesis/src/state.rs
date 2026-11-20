@@ -63,7 +63,13 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// channel no longer expects the fields and whose generator does, so a restored
 /// chip would run with its latch lost and the next `&A0` write applying block
 /// 0 rather than what the driver had latched.
-pub const FORMAT_VERSION: u32 = 7;
+///
+/// Version 8 is the SVP board (#433): an `Option<cart::svp::Svp>` field added to
+/// [`Bus`], after the J-CART field that made 6 (a field that was not there when
+/// a v7 payload was written). The same class of wrong as every bump above: a
+/// v7 payload reads into a struct that expects the field, and postcard fails
+/// or - worse - shifts the tail of the payload into it.
+pub const FORMAT_VERSION: u32 = 8;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 
