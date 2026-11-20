@@ -772,6 +772,66 @@ mod tests {
         }
     }
 
+    /// The unmaskable family: no exception except the interrupt consults the
+    /// SR interrupt mask. M68000UM 6.2.5 is the citation - "For the reset and
+    /// interrupt exceptions, the interrupt priority mask is also updated
+    /// appropriately" is the only mention of the mask in the entry sequence -
+    /// so illegal, the line emulators and the instruction traps are taken
+    /// whatever the mask holds. Dyna Brothers 2 runs its whole main loop on
+    /// this: `ORI.W #$700,SR` and then a 1111-format service call whose
+    /// handler must be entered with the mask still at 7 (#494).
+    ///
+    /// The strongest state pins it: user mode with the mask left at 7 by the
+    /// supervisor that set it, so S = 0 when the exception is taken and the
+    /// entry has to swap to the SSP to push the frame and still deliver. The
+    /// trap-based members (`CHK`, `TRAPV`, zero divide) share `exception` with
+    /// these four, so one call site covers them by construction.
+    #[test]
+    fn the_unmaskable_family_is_taken_under_interrupt_mask_seven() {
+        let sr = USER | SR_INT_MASK;
+        for (opcode, vector, slot, pushed_pc, name) in [
+            (0xFF1Fu16, EXC_LINE_F, 0x0000_002Cu32, PROGRAM, "line F"),
+            (0xA004u16, EXC_LINE_A, 0x0000_0028u32, PROGRAM, "line A"),
+            (0x4AFCu16, EXC_ILLEGAL, 0x0000_0010u32, PROGRAM, "ILLEGAL"),
+            (
+                0x4E40u16,
+                TRAP_VECTOR_BASE,
+                0x0000_0080u32,
+                PROGRAM + 2,
+                "TRAP #0",
+            ),
+        ] {
+            let (mut cpu, mut bus) = cpu_at(opcode, sr);
+            let before = cpu.cycles;
+
+            cpu.step(&mut bus);
+
+            assert_eq!(
+                cpu.pending_exception,
+                Some(vector),
+                "{name} (${opcode:04X}) is taken under SR mask 7"
+            );
+            assert!(cpu.is_supervisor(), "{name}: the entry set S");
+            assert_eq!(
+                cpu.int_mask(),
+                7,
+                "{name}: the mask the entry found is the mask it leaves"
+            );
+            assert_frame(&cpu, &bus, STACK - 6, sr, pushed_pc);
+            assert_eq!(cpu.pc, HANDLER, "{name}: the handler is entered");
+            assert_eq!(
+                bus.reads(),
+                vec![slot, slot + 2, HANDLER, HANDLER + 2],
+                "{name} fetches its handler long from ${slot:08X}"
+            );
+            assert_eq!(
+                cpu.cycles - before,
+                EXCEPTION_ENTRY_CLOCKS,
+                "{name} costs the usual 34 clocks"
+            );
+        }
+    }
+
     #[test]
     fn privilege_violation_helper() {
         // Called directly, as the privileged-instruction tickets will use it.

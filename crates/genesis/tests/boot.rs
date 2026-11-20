@@ -1084,3 +1084,29 @@ fn twinkle_tale_boots_to_non_blank_screen() {
         "1800 frames in, Twinkle Tale is {colours} distinct colours"
     );
 }
+
+/// Dyna Brothers 2 (#494) was the last of the #440 ten to lose its park. The
+/// park description ("loops with all interrupts masked on a 1111-format
+/// service call whose handler is never entered") was measured on the pre-#482
+/// baseline, where an F-line opcode raised vector 3 and landed on this cart's
+/// `$0C` stub; since #482 routes line opcodes to vectors 10/11, the cart's
+/// own `$2C` handler at `$668` runs and the service calls fire - under SR
+/// mask 7, which is legal, because the interrupt mask gates only the
+/// interrupt exception (M68000UM 6.2.5). The mask-gate hypothesis on #494 was
+/// checked and falsified before this test was written; the test exists to
+/// keep the cart's boots-on evidence next to the family's.
+///
+/// Measured on the #482 baseline: 11 colours at 600 frames, 28 at 1200
+/// (39 peak), still animating at 2400; the `$C00004` bit-3 poll in a trace
+/// tail is a wait-for-vblank in the game loop, not a park. 1200 judges it
+/// comfortably past a title splash.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn dyna_brothers_2_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom("Dyna Brothers 2 (Japan).md"));
+    let colours = colour_count(&path, 1200, "line_dyna_brothers_2.png");
+    assert!(
+        colours > BLANK,
+        "1200 frames in, Dyna Brothers 2 is {colours} distinct colours"
+    );
+}
