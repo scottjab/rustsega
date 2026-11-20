@@ -66,9 +66,10 @@ nix build                                    # -> ./result/bin/rustsega
 nix run . -- --rom-dir ~/games/roms/genesis  # build it, and serve the ROM library
 ```
 
-One derivation, and no network: trunk builds the frontend, then the server is
-compiled with the result embedded in it. What `./result` holds is therefore the
-whole app, and it needs nothing else on disk to serve it. `nix flake check`
+Trunk runs once: the frontend dist is its own derivation, and the server is
+compiled with the result embedded in it - the same dist store path that the
+static build embeds (#424). What `./result` holds is therefore the whole app,
+and it needs nothing else on disk to serve it. `nix flake check`
 builds that binary and runs a smoke test against it; inside `nix develop`,
 `just build` does the same two steps without Nix being in charge of them.
 

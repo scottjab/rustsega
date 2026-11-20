@@ -492,10 +492,12 @@ frame buffer) and what that means after a load, is
   a Genesis ROM is dense binary that barely shrinks (#417). The download is cached
   `private`, so compressing it was work repeated per client rather than once. What
   is left still compresses, the wasm and the ROM listing included.
-- `nix build` produces the single binary (frontend built in the same
-  derivation). `nix build .#static`, which `just build-static` runs, produces the
-  same binary for `x86_64-unknown-linux-musl`, fully static (M8-05b, #159), so it
-  runs on a Linux box with no nix on it.
+- `nix build` produces the single binary. The frontend dist is its own
+  derivation, built once by trunk and embedded by both it and the static build
+  (#424): the wasm runs in the browser, so nothing in it depends on the
+  server's C library or target. `nix build .#static`, which `just build-static`
+  runs, produces the same binary for `x86_64-unknown-linux-musl`, fully static
+  (M8-05b, #159), so it runs on a Linux box with no nix on it.
 - `nixosModules.default`, and the same module as `nixosModules.rustsega`, is the
   NixOS module of #161: `services.rustsega` with `enable`, `package`, `bind`,
   `port`, `romDir`, `openFirewall` and `logLevel`, each one handed to the server
