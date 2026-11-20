@@ -352,6 +352,31 @@ ASL.b (#209): 2 failing cases
 sweep took 3.7s
 ```
 
+## The decode table against the official opcode map
+
+[`decode_agrees_with_the_official_opcode_map`](../m68k/tests/opcode_map.rs) is
+the whole-table audit (#477): the same 680x0 pin, fetched a second time for its
+`map/` dir only (`just fetch 680x0-map`, landing at
+`test-roms/680x0-map/map/68000.official.json`), maps **all 65 536** 16-bit
+opcode words to their officially-defined operation, and the test walks every
+entry through [`decode`](../m68k/src/decode.rs). Where the suite can only
+exercise opcodes it has cases for, this map is the machine-readable statement
+of which opcodes exist, so a decode-table hole or an over-broad illegal route
+shows up here even with no case to catch it.
+
+The audit's verdict is recorded in the test's module docs; the shape of it:
+every defined entry decodes to its operation token's `Op` family (compared by
+family, not by condition, because the map does not record Bcc/Scc/DBcc
+conditions and folds `ADDI`/`ADDQ`/`CMPM`/`MOVEQ` into their base mnemonics),
+and every `"None"` entry either raises the illegal-instruction exception
+(`Illegal`/`Undefined`/`LineA`/`LineF`), or sits in one of two pinned lists:
+the 204 still-`Unimplemented` slots (#621) and 453 over-broad decodes where
+rustsega executes a word the map leaves undefined (#618 OR/AND EA classes,
+#619 MOVEM store to PC-relative, #620 static `BTST` into an immediate). Those
+pins are counted, so a fix that lands with its issue makes the count go stale
+and the test fails until the pin comes off — the `KNOWN_FAILURES` pattern,
+applied to opcodes instead of files.
+
 ## Regenerating this page
 
 Run the gate, replace the block above with its table, and update the four

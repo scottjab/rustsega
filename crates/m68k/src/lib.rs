@@ -38,6 +38,9 @@ pub mod testbus;
 pub use address_error::{ADDRESS_ERROR_FRAME_SIZE, EXC_ADDRESS_ERROR};
 pub use bus::{ADDR_MASK, Bus};
 pub use cpu::{M68k, RESET_CYCLES};
+// The decode table's verdict for a 16-bit word, for the opcode-map cross-check
+// (#477) and anyone auditing the table from outside the crate.
+pub use decode::{Op, decode};
 pub use disasm::disassemble;
 pub use ea::{Ea, Size};
 pub use exceptions::{
