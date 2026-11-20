@@ -1547,6 +1547,112 @@ mod tests {
         assert!(held > 0, "and the 68000 comes back when the transfer ends");
     }
 
+    /// A level 6 interrupt that fires while a transfer freeze holds the 68000 is
+    /// delivered on the first instruction after the freeze lifts - not lost, and
+    /// not while the transfer still has the bus (#555). Run against the pre-#518
+    /// additive model this fails: the stalled clock is charged past the latch
+    /// line and the handler runs at the over-charge's mercy rather than at the
+    /// gate's, which is the shape #489 found and #517 replaced with the gate.
+    ///
+    /// This is the spot #555 suspected: a freeze that swallowed the line-6 window
+    /// would park a game waiting on its VBlank routine forever. It does not have
+    /// to be guessed at - the wires are all documented. The VDP latches the
+    /// vertical interrupt when the beam crosses its point on the VBlank line
+    /// whether or not a CPU is listening (genvdp.txt section 6, the flag is the
+    /// chip's own), the pending flag is held until the acknowledge (section 6:
+    /// "reading the control port does not clear this bit"), the 68000 freezes
+    /// whole for a 68k -> VDP transfer (section 11, and #517's gate is what makes
+    /// that true on the beam), and the CPU samples its interrupt pin between
+    /// instructions, so delivery waits for the gate (M68000UM section 6,
+    /// "Interrupt Processing"). The freeze the ticket measured - a VRAM fill
+    /// gating the 68000 across the VBlank line - latched the flag under the
+    /// freeze and delivered it right after it.
+    ///
+    /// The setup walks [`machine`]'s parked beam to a few lines short of the
+    /// frame's VBlank line, starts a transfer whose freeze covers that line's
+    /// interrupt point, and arms IE0 on the way so the latch has a listener when
+    /// it is checked. The handler is one `ADDQ.L #1,D1` and `RTE` (M68000UM
+    /// Table 6-2: level 6 autovector at `$78`), so a handler run is a count in D1
+    /// and an empty pending flag is the acknowledge.
+    #[test]
+    fn a_vint_latched_inside_a_freeze_is_delivered_when_the_freeze_lifts() {
+        // [`rom_image`]'s loop, plus what taking an interrupt needs: `ANDI.W
+        // #$F8FF,SR` drops the reset mask without leaving supervisor state
+        // (M68000UM section 2 "ANDI to SR": bit 13, the S the exception pushed
+        // back on the RTE, must survive), the
+        // handler is one `ADDQ.L #1,D1` and `RTE` (Table 6-2: level 6
+        // autovector at `$78`), and a handler run is a count in D1.
+        let mut rom = vec![0_u8; 0x80];
+        rom[0x00..0x04].copy_from_slice(&0x00FF_0000_u32.to_be_bytes());
+        rom[0x04..0x08].copy_from_slice(&0x0000_0010_u32.to_be_bytes());
+        rom[0x10..0x12].copy_from_slice(&0x027C_u16.to_be_bytes()); // ANDI.W #$F8FF,SR
+        rom[0x12..0x14].copy_from_slice(&0xF8FF_u16.to_be_bytes());
+        rom[0x14..0x16].copy_from_slice(&0x5280_u16.to_be_bytes()); // ADDQ.L #1,D0
+        rom[0x16..0x18].copy_from_slice(&0x60FC_u16.to_be_bytes()); // BRA.B -4
+        rom[0x18..0x1A].copy_from_slice(&0x5281_u16.to_be_bytes()); // ADDQ.L #1,D1
+        rom[0x1A..0x1C].copy_from_slice(&0x4E73_u16.to_be_bytes()); // RTE
+        rom[0x78..0x7C].copy_from_slice(&0x0000_0018_u32.to_be_bytes());
+
+        let mut bus = Bus::new(rom, VERSION);
+        bus.vdp.start_in_vblank();
+        bus.z80.ram[0..3].copy_from_slice(&[0x3C, 0x18, 0xFD]);
+        release_z80_reset(&mut bus);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        let mut z80 = Z80::new();
+        z80.reset();
+        let mut s = Scheduler::new(Region::Usa);
+
+        // [`machine`]'s beam parks on the VBlank line with its own interrupt
+        // spent - the first interrupt of the run is the next frame's - so walk
+        // to a few lines short of that next VBlank line and start the transfer
+        // there, where its freeze covers the interrupt point of the line.
+        while s.line != 256 {
+            s.run_line(&mut cpu, &mut z80, &mut bus);
+        }
+        // [`start_dma`]'s R1 leaves IE0 clear, so arm it at once: display on,
+        // vertical interrupts enabled, DMA allowed. The display being on is what
+        // the walk of [`vdp::Vdp::dma_68k_stall_mclk`] reads the slot tables by,
+        // so arming before the freeze is first spent is what keeps its deadline
+        // the one the transfer really runs on. (genvdp.txt section 6 "Status
+        // Register" and section 11 "DMA"; plutiedev "$81xx" for the bits.)
+        start_dma(&mut bus, 1024);
+        set_reg(&mut bus, 1, 0x74);
+
+        // The freeze is up, and the beam has crossed the interrupt point of the
+        // VBlank line it was pointed at.
+        run_lines(&mut s, &mut cpu, &mut z80, &mut bus, 8);
+        assert!(
+            s.m68k_clock < s.m68k_frozen_until,
+            "the transfer's freeze is up"
+        );
+        assert_eq!(
+            bus.vdp.pending_irq(),
+            Some(6),
+            "the vertical interrupt latched during the freeze"
+        );
+        assert_eq!(cpu.ipl, 6, "and it is on the pin, waiting for the gate");
+        assert_eq!(cpu.d[1], 0, "the handler has not run: the 68000 is frozen");
+        assert!(
+            matches!(cpu.pc, x if x == CODE || x == CODE + 2 || x == CODE + 4 || x == CODE + 6),
+            "and the 68000 has not left its loop"
+        );
+
+        // Past the gate: the first instruction boundary samples the pin and takes
+        // the level 6, whose acknowledge clears the flag.
+        run_lines(&mut s, &mut cpu, &mut z80, &mut bus, 40);
+        assert_eq!(
+            bus.vdp.pending_irq(),
+            None,
+            "delivered means acknowledged: the flag is down"
+        );
+        assert_eq!(cpu.d[1], 1, "the handler ran exactly once");
+        assert!(
+            matches!(cpu.pc, x if x == CODE || x == CODE + 2 || x == CODE + 4 || x == CODE + 6),
+            "and the RTE put the 68000 back in its loop"
+        );
+    }
+
     /// The freeze of [`dma_halts_68k_for_reported_time`] is one instant on the beam,
     /// so the control write a cart's DMA loop makes while its own transfer is still
     /// running must not bill the 68000 a second transfer. [`Bus::vdp_control_write`]
