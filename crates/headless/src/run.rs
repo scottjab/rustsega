@@ -203,7 +203,7 @@ pub fn run(args: RunArgs) -> Result<()> {
     let region = resolved_region(&rom, &config)?;
     let movie = read_movie(args.movie.as_deref(), &rom, region)?;
     let pads = parse_pad_script(args.pad1.as_deref())?;
-    warn_past_the_last_frame(&pads, args.frames);
+    warn_unreachable_pad_frames(&pads, args.frames);
     // A script that names one of X, Y, Z or MODE anywhere needs the 6-button
     // pad (#364), and it needs it for the whole run: the pad kind is a device
     // the game can detect, not something that may change with the frame.
@@ -501,19 +501,27 @@ fn parse_pad_script(script: Option<&str>) -> Result<BTreeMap<u32, Buttons>> {
     Ok(pads)
 }
 
-/// Say so when `--pad1` presses a button on a frame the run never reaches (#345).
+/// Say so when `--pad1` presses a button on a frame the run never reaches (#345,
+/// #464).
 ///
 /// The loop that hands the pad to the machine runs `1..=frames`, so an entry past
 /// the end is looked up by nothing: `--pad1 START@1200 --frames 300` held nothing,
-/// ran clean, and never mentioned it. A warning on stderr rather than an error,
-/// because a script left over from a longer run is a person shortening a run, and
-/// the frames it does name are still worth running.
-fn warn_past_the_last_frame(pads: &BTreeMap<u32, Buttons>, frames: u32) {
+/// ran clean, and never mentioned it. Frame 0 has the same shape off the front of
+/// the run (#464): it is never looked up either, and it usually means the script
+/// was written 0-based. A warning on stderr rather than an error, because the
+/// frames the entry *does* name are still worth running.
+fn warn_unreachable_pad_frames(pads: &BTreeMap<u32, Buttons>, frames: u32) {
+    let zero = pads.keys().filter(|frame| **frame == 0).count();
     let past: Vec<String> = pads
         .keys()
         .filter(|frame| **frame > frames)
         .map(|frame| frame.to_string())
         .collect();
+    if zero > 0 {
+        eprintln!(
+            "warning: --pad1 holds nothing on frame 0: frames are 1-based, so the first frame is --pad1 ...@1"
+        );
+    }
     if past.is_empty() {
         return;
     }
