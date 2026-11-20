@@ -172,8 +172,8 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 ///  A04000-A05FFF : 0000 0000 (0000 0000)
 ///  A06000-A07EFF : FFFF FFFF (FFFF FFFF)
 ///  A10000-A1001F : A0A0 A0A0 (A0A0 A0A0)
-///  A11100        : FFFF FFFF (4F00 4F00)
-///  A11100        : FEFE FEFE (4E00 4E00)
+///  A11100        : FFFF 4F71 (4F00 4F00)
+///  A11100        : FEFE 4E71 (4E00 4E00)
 ///  A11200        : FFFF FFFF (4E00 4E00)
 ///  C00000-C00003 : 1122 1122 (1122 1122)
 ///  C00004-C00007 : 3688 3688 (4E88 4E88)
@@ -228,6 +228,27 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 /// FEFE` from its post-release read. The golden was re-recorded
 /// (`0x6bd9b2fb7eede3d2` -> `0x4604981db74b07bf`), blessed by maintainer
 /// 2026-11-19 as part of #260.
+///
+/// # The #479 movement
+///
+/// #479 moved one group of each row again: the *word* read of the register, cells
+/// 22-25, which print `FFFF` -> `4F71` on the first row and `FEFE` -> `4E71` on the
+/// second (cell 23, the `E`, does not move; the byte-read group does not move).
+/// Between #478 and #479 the word read mirrored the grant flag into bit 0, and both
+/// groups read `FEFE`. The unused bits are actually the 68000's prefetched instruction
+/// word, which is what both references answer them with (Genesis Plus GX's
+/// `ctrl_io_read_word`, and BlastEm's `get_open_bus_value`), and what the ticket's
+/// diagnosis measured the cart itself relying on: Time Killers polls this register as
+/// a word read at two sites whose following instruction is `BTST #$0,D0` (`$0810`,
+/// bit 0 clear, the boot `bne.s` exits) and `BTST #$0,D1` (`$0811`, bit 0 set, the
+/// game loop's `beq.s` exits), so a mirrored bit cannot serve both. What the memtest
+/// itself reads back now is honest in the same terms the report already used:
+/// `$4E71`, the byte pair of the `NOP` that follows its own `MOVE.W $A11100,(A5)+` -
+/// "the 68000 bus floating after an instruction fetch", which is what the block above
+/// says the read-backs are. The flag lane still moves: the first pass reads the
+/// register while the Z80 runs (`4F71`), the second while the bus is granted
+/// (`4E71`). The golden was re-recorded
+/// (`0x4604981db74b07bf` -> `0xa50bf36ba9056dcf`).
 #[test]
 fn md_test_pack_memtest_68k_prints_its_memory_report() {
     check(

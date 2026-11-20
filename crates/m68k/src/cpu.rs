@@ -680,6 +680,10 @@ impl M68k {
         self.prefetch[0] = word;
         self.pc = (self.pc + 2) & ADDR_MASK;
         self.prefetch[1] = self.fetch_w(bus, next);
+        // The refill is the queue word an unclaimed data lane answers with, so
+        // the bus has to see it as it lands (`crates/m68k/src/bus.rs`,
+        // `note_prefetched_word`); #479 is the cart that reads it back.
+        bus.note_prefetched_word(self.prefetch[1]);
         word
     }
 
@@ -1086,6 +1090,92 @@ mod tests {
             cpu.cycles - cycles,
             4,
             "one word read, the fetch a NOP pays for"
+        );
+    }
+
+    /// A bus that remembers what the CPU published as its prefetched word
+    /// ([`Bus::note_prefetched_word`]), and which word had been published most
+    /// recently when a watched address was read.
+    struct PrefetchWatch {
+        bus: TestBus,
+        watch: u32,
+        notes: Vec<u16>,
+        note_at_watch: Option<u16>,
+    }
+
+    impl Bus for PrefetchWatch {
+        fn read_byte(&mut self, addr: u32) -> u8 {
+            self.bus.read_byte(addr)
+        }
+
+        fn read_word(&mut self, addr: u32) -> u16 {
+            let word = self.bus.read_word(addr);
+            if addr == self.watch {
+                self.note_at_watch = self.notes.last().copied();
+            }
+            word
+        }
+
+        fn write_byte(&mut self, addr: u32, value: u8) {
+            self.bus.write_byte(addr, value);
+        }
+
+        fn write_word(&mut self, addr: u32, value: u16) {
+            self.bus.write_word(addr, value);
+        }
+
+        fn note_prefetched_word(&mut self, word: u16) {
+            self.notes.push(word);
+        }
+    }
+
+    /// At a data read the word the bus was last told about is the
+    /// instruction-stream word the CPU will consume next: the opcode at the end
+    /// of the instruction doing the reading.
+    ///
+    /// That is the word Genesis Plus GX answers the unused bits of the Z80
+    /// control reads with ("Unused bits return prefetched bus data (Time
+    /// Killers)", `ctrl_io_read_word` case 0x11), and the word BlastEm's
+    /// open-bus value reads at `last_prefetch_address`. Which word that is
+    /// decides Time Killers' boot: `MOVE.W $A11100,D0` is followed by
+    /// `BTST #$0,D0` = `$0810` (bit 0 clear, the `bne.s` poll exits) while
+    /// `MOVE.W $A11100,D1` is followed by `BTST #$0,D1` = `$0811` (bit 0 set,
+    /// the `beq.s` poll exits), so the cart's two polls of `$A11100` fall
+    /// through in opposite directions (#479).
+    #[test]
+    fn data_read_sees_the_next_opcode_as_prefetched_bus_data() {
+        // `MOVE.W $00A11100,D1` = 3239 00A1 1100, then `BTST #$0,D1` = 0811 0000.
+        let mut bus = PrefetchWatch {
+            bus: cpu_with_program(&[0x3239, 0x00A1, 0x1100, 0x0811, 0x0000]).1,
+            watch: 0x00A1_1100,
+            notes: Vec::new(),
+            note_at_watch: None,
+        };
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            bus.note_at_watch,
+            Some(0x0811),
+            "the gameplay poll's read sees the BTST opcode: bit 0 set, `beq.s` exits"
+        );
+
+        // The boot shape: the same read with `BTST #$0,D0` = 0810 0000 following.
+        let mut bus = PrefetchWatch {
+            bus: cpu_with_program(&[0x3039, 0x00A1, 0x1100, 0x0810, 0x0000]).1,
+            watch: 0x00A1_1100,
+            notes: Vec::new(),
+            note_at_watch: None,
+        };
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        cpu.step(&mut bus);
+
+        assert_eq!(
+            bus.note_at_watch,
+            Some(0x0810),
+            "the boot poll's read sees its own BTST opcode: bit 0 clear, `bne.s` exits"
         );
     }
 

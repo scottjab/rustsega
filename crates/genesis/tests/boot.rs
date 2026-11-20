@@ -764,23 +764,31 @@ fn krustys_super_fun_house_boots_to_non_blank_screen() {
     );
 }
 
-/// `Time Killers (USA)`: the 68000 is stopped, but by a hardware read rather than by
-/// itself. All 1800 frames are one three-instruction loop - `MOVE.W $A11100,D0` /
-/// `BTST #$0,D0` / `BNE.S $40E` - which is the plutiedev "Using the Z80" poll between
-/// asking the sound CPU for its bus and touching the sound side. The flag is bit 0 of
-/// that read, and `Bus::read_z80_ctrl_word` answers a *word* read with the flag in bit
-/// 8 and a fixed `1` in bit 0 whether or not the Z80 has been stopped, so the
-/// condition the cart is waiting on is never reported. Filed as
-/// [#437](https://github.com/scottjab/rustsega/issues/437).
+/// `Time Killers (USA)`: the 68000 polls `$A11100` as a *word* read twice, and both
+/// polls' exit condition is bit 0 of the instruction word that follows - which is what
+/// the bus answers with there. The boot poll `MOVE.W $A11100,D0` / `BTST #$0,D0` /
+/// `BNE.S` at `$040E` falls through when bit 0 reads 0: the word following it is the
+/// `BTST` opcode `$0810`, bit 0 clear, so on real hardware it exits in one read. The
+/// game loop's poll `MOVE.W $A11100,D1` / `BTST #$0,D1` / `BEQ.S` at `$02E95C` falls
+/// through when bit 0 reads 1: the word following it is `$0811`, bit 0 set. Between
+/// #478 and #479 our word read mirrored the grant flag into bit 0, which serves the
+/// first poll and deadlocks the second: from frame ~126 the 68000 parks in the game
+/// loop's poll - `D1=$FEFE` forever - and the screen goes dark after the 11 colours
+/// of the boot flash. The word read now answers the prefetched instruction word with
+/// the flag in bit 8, which is what Genesis Plus GX (`ctrl_io_read_word`: "Unused
+/// bits return prefetched bus data (Time Killers)") and BlastEm (`get_open_bus_value`)
+/// both model, and what the blastem oracle confirms the machine does: display still
+/// enabled at frames 100 and 200.
 #[test]
-#[ignore = "needs a commercial ROM, and #437: it spins for ever on bit 0 of the word read of 0xA11100, which our bus-request read-back holds at 1"]
+#[ignore = "needs a commercial ROM; skips without one"]
 fn time_killers_boots_to_non_blank_screen() {
     let path = require_data!(testkit::commercial_rom("Time Killers (USA).md"));
     let colours = colour_count(&path, 300, "time_killers_300.png");
     assert!(
         colours > BLANK,
-        "300 frames in, Time Killers is {colours} distinct colours: it polls bit 0 of the \
-         word at $A11100 for the Z80 to release its bus, and that bit never reads 0 here (#437)"
+        "300 frames in, Time Killers is {colours} distinct colours: the game loop's \
+         `btst #0,d1` / `beq.s` poll of the word at $A11100 waits for bit 0 to read 1, \
+         and the mirrored flag never let it (#479)"
     );
 }
 

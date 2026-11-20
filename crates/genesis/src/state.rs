@@ -74,7 +74,14 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// struct the v8 payload carries - the DSP's IRAM and the `ssp1601::Ssp1601`
 /// core. A v8 payload would decode into a reader whose board expects both,
 /// so the state of the running DSP would be lost with the machine.
-pub const FORMAT_VERSION: u32 = 9;
+///
+/// Version 10 is the bus's `prefetched_word` (#479): one `u16` the 68000's
+/// queue refills publish, which the Z80 control word reads answer their unused
+/// bits with. A v9 payload decodes into a reader whose bus expects the field,
+/// so a restored machine would answer open bus from `0xFFFF` instead of the
+/// word the cart was about to execute - the same class of wrong as every bump
+/// above for any cart mid-poll at the moment of the save.
+pub const FORMAT_VERSION: u32 = 10;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 
