@@ -39,6 +39,23 @@ pub trait Bus {
     fn int_ack(&mut self, _level: u8) -> Option<u8> {
         None
     }
+    /// The word just fetched into the back of the CPU's prefetch queue: the
+    /// instruction-stream word it will consume next.
+    ///
+    /// This is what an unclaimed data lane answers on real hardware. A bus does
+    /// not float to a fixed value; it retains the last word driven over it, and
+    /// in a running instruction stream that is a word of the queue. Genesis
+    /// Plus GX answers the unused bits of the Z80 control reads with exactly
+    /// this - the word at the 68k's PC ("Unused bits return prefetched bus data
+    /// (Time Killers)", `ctrl_io_read_word` case 0x11) - and BlastEm's
+    /// open-bus value is the word at the end of the current instruction
+    /// (`get_open_bus_value`, reading `last_prefetch_address`). Both are the
+    /// word this publishes, one call per queue refill.
+    ///
+    /// The default records nothing. A bus that answers open-bus lanes from the
+    /// instruction stream implements it; one that answers a fixed pattern for
+    /// unclaimed bits ignores it.
+    fn note_prefetched_word(&mut self, _word: u16) {}
     /// Reset every device behind the bus. Used by the 68000 `RESET`
     /// instruction, which restarts the whole console, not just the CPU.
     fn reset_devices(&mut self) {}
