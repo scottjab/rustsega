@@ -29,6 +29,12 @@ set -euo pipefail
 MANIFEST=(
   # SingleStepTests/680x0 @ e0d5ece9670205cc84a0101081837deb446f86a3 (main)
   "680x0|https://github.com/SingleStepTests/680x0/archive/e0d5ece9670205cc84a0101081837deb446f86a3.tar.gz|f90dab5ba7519c6d9e20143be12e433403b6db6586f6bae3e5d3bf0123f01b50|68000/v1|680x0"
+  # Same 680x0 archive, only its map/: 68000.official.json maps all 65536
+  # 16-bit opcodes to the officially-defined operation ("None" for reserved
+  # slots). The decode-table cross-check in crates/m68k/tests/opcode_map.rs
+  # walks it (#477). One row per extract target: this row's dest must stay
+  # disjoint from the row above, whose extraction rm -rf's test-roms/680x0.
+  "680x0-map|https://github.com/SingleStepTests/680x0/archive/e0d5ece9670205cc84a0101081837deb446f86a3.tar.gz|f90dab5ba7519c6d9e20143be12e433403b6db6586f6bae3e5d3bf0123f01b50|map|680x0-map"
   # SingleStepTests/z80 @ ebe1875d48f374bcfd4b505d8eb8ee751568b5f7 (main)
   "z80|https://github.com/SingleStepTests/z80/archive/ebe1875d48f374bcfd4b505d8eb8ee751568b5f7.tar.gz|f44683f0edf1c1c37f98861ccd1bfda3b9bce65b5b258d4817a0f1d2012076a7|v1|z80"
   # Eke's Gens hardware test pack: 15 Mega Drive test ROMs (Nemesis's VDP write
@@ -74,7 +80,7 @@ With no arguments every suite in the manifest is fetched; otherwise only the
 named suites are. Idempotent: a suite whose stamp file already matches the
 pinned SHA-256 is reported "up to date" and nothing is downloaded.
 
-Suites: 680x0, z80, md-test-pack, overdrive2, zexall-cpm, berzerk-smd
+Suites: 680x0, 680x0-map, z80, md-test-pack, overdrive2, zexall-cpm, berzerk-smd
 See docs/test-roms.md for what each one is and what it is good for.
 
 Environment:

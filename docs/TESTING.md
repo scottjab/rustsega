@@ -250,6 +250,7 @@ its hash is the file's own and `subdir` names the file it is written as.
 | Suite | Repo | Pinned commit | Tarball SHA-256 | Lands in | Files |
 |---|---|---|---|---|---|
 | `680x0` | [SingleStepTests/680x0](https://github.com/SingleStepTests/680x0) | `e0d5ece9670205cc84a0101081837deb446f86a3` | `f90dab5ba7519c6d9e20143be12e433403b6db6586f6bae3e5d3bf0123f01b50` | `test-roms/680x0/68000/v1/` | 125 |
+| `680x0-map` | the same archive, kept for its `map/` dir only | `e0d5ece9670205cc84a0101081837deb446f86a3` | `f90dab5ba7519c6d9e20143be12e433403b6db6586f6bae3e5d3bf0123f01b50` | `test-roms/680x0-map/map/` | 2 |
 | `z80` | [SingleStepTests/z80](https://github.com/SingleStepTests/z80) | `ebe1875d48f374bcfd4b505d8eb8ee751568b5f7` | `f44683f0edf1c1c37f98861ccd1bfda3b9bce65b5b258d4817a0f1d2012076a7` | `test-roms/z80/v1/` | 1604 |
 | `md-test-pack` | Eke's Gens hardware test pack, via [Wayback](https://web.archive.org/web/20150610093059if_/http://genplus-gx.googlecode.com/files/md_test.zip) | 2015 capture | `1b37dd77e81f5bfd8e3dc09adc69609f07a30135ea611782a850e8c7336a33ba` | `test-roms/genesis/md-test-pack/` | 15 |
 | `overdrive2` | TiTAN, Overdrive 2, [archive.org mirror](https://archive.org/details/pouet_69648) | 2017 release | `877d3244102531052d2ffc39e0e7390c7b1ca65a7323b49cf28d49ffb3ef6110` | `test-roms/genesis/overdrive2/` | 2 |
