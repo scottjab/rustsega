@@ -14,6 +14,7 @@ pub mod jcart;
 pub mod mapper;
 pub mod smd;
 pub mod sram;
+pub mod svp;
 
 pub use eeprom::{Board, Chip, Eeprom, EepromInfo};
 pub use header::{Regions, RomHeader, compute_checksum, parse_header};
@@ -21,6 +22,7 @@ pub use jcart::Jcart;
 pub use mapper::Mapper;
 pub use smd::{deinterleave, is_smd, normalize_rom};
 pub use sram::{Sram, SramInfo, SramKind};
+pub use svp::Svp;
 
 /// Why a ROM image could not be loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

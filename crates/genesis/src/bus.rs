@@ -63,7 +63,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::audio::Audio;
-use crate::cart::{Eeprom, Jcart, Mapper, Sram, eeprom, jcart, mapper, sram};
+use crate::cart::{Eeprom, Jcart, Mapper, Sram, Svp, eeprom, jcart, mapper, sram, svp};
 use crate::config::version_is_pal;
 use crate::io::Io;
 use crate::z80_bus::{self, Z80Side};
@@ -78,7 +78,10 @@ use vdp::Vdp;
 /// ([`crate::z80_bus`]) and the two sides should not disagree about a placeholder.
 pub(crate) const OPEN_BUS: u8 = 0xFF;
 /// A word read entirely from an area that nothing drives.
-const OPEN_BUS_WORD: u16 = 0xFFFF;
+///
+/// Crate-visible for the same reason as [`OPEN_BUS`]: the SVP's register page
+/// answers its undecoded lanes with it.
+pub(crate) const OPEN_BUS_WORD: u16 = 0xFFFF;
 
 // ---- Bus timing (M3-16, #77) ------------------------------------------------
 //
@@ -203,6 +206,11 @@ const CART_EXTRA_START: u32 = 0xA1_3000;
 const CART_EXTRA_END: u32 = 0xA1_30FF;
 const TMSS_START: u32 = 0xA1_4000;
 const TMSS_END: u32 = 0xA1_4FFF;
+/// The SVP's register page, 0xA15000-0xA15FFF: the 64 KiB Genesis Plus GX
+/// routes to its SVP handler (`case 0x50`, on `(address >> 8) & 0xFF`), of
+/// which only the lanes [`crate::cart::svp::Svp`] decodes answer anything.
+const SVP_PAGE_START: u32 = 0xA1_5000;
+const SVP_PAGE_END: u32 = 0xA1_5FFF;
 const VDP_START: u32 = 0xC0_0000;
 const VDP_END: u32 = 0xDF_FFFF;
 const RAM_START: u32 = 0xE0_0000;
@@ -342,9 +350,22 @@ enum Region {
     /// Only a TMSS console answers either; the rest of the area reads
     /// [`OPEN_BUS`] and drops writes.
     Tmss,
+    /// 0xA15000-0xA15FFF, the SVP's register page: the status/control
+    /// registers of the cart that carries the board ([`crate::cart::svp`],
+    /// #433). notaz *SVP doc* section 3 lists the registers at
+    /// 0xA15000-0xA15009; Genesis Plus GX's `case 0x50` of `mem68k.c` routes
+    /// the whole 64 KiB page to its SVP handler and answers only the XST and
+    /// PM0 lanes of it, so the page is the region and the per-lane decode is
+    /// [`crate::cart::svp::Svp`]'s.
+    ///
+    /// A cart without the board reads [`OPEN_BUS`] here and drops writes,
+    /// exactly what this page did as part of [`Region::Unmapped`] before it
+    /// was decoded - the handlers below answer for the missing board.
+    Svp,
     /// Everything the console does not decode: the expansion slot at
     /// 0x400000-0x7FFFFF, the 32X area at 0x800000-0x9FFFFF, the Sega CD extra
-    /// at 0xA12000-0xA120FF and the 0xA15000-0xBFFFFF gap.
+    /// at 0xA12000-0xA120FF and the 0xA15000-0xBFFFFF gap, minus the SVP's own
+    /// register page inside it.
     ///
     /// TODO(M3-16 #77): open bus, including the corners of the map that stall
     /// the 68k instead of returning a value.
@@ -363,6 +384,7 @@ impl Region {
             Z80_CTRL_START..=Z80_CTRL_END => Self::Z80Ctrl,
             CART_EXTRA_START..=CART_EXTRA_END => Self::CartExtra,
             TMSS_START..=TMSS_END => Self::Tmss,
+            SVP_PAGE_START..=SVP_PAGE_END => Self::Svp,
             _ => Self::Unmapped,
         }
     }
@@ -487,6 +509,7 @@ struct VdpDmaSource<'a> {
     rom: &'a [u8],
     ram: &'a [u8; 0x10000],
     mapper: &'a Mapper,
+    svp: Option<&'a Svp>,
 }
 
 impl vdp::DmaBus for VdpDmaSource<'_> {
@@ -503,8 +526,12 @@ impl vdp::DmaBus for VdpDmaSource<'_> {
     /// and `Mapper::map` takes `&self`: a DMA reads what the 68k would read at
     /// that address today, which is the bank the cart last switched in.
     ///
-    /// Nothing else answers a DMA at all. A source inside [`Region::Vdp`] is not
-    /// modelled, which is a transfer reading the memory it is writing to - the
+    /// Nothing else answers a DMA at all, with one cart-specific exception:
+    /// the SVP's shared DRAM ([`Bus::read_svp_dram_word`]) - a window of the
+    /// cartridge area that Virtua Racing sources transfers from, and which a
+    /// source read must answer with the DRAM and not the image at the same
+    /// offsets. A source inside [`Region::Vdp`] is not modelled, which is a
+    /// transfer reading the memory it is writing to - the
     /// VDP asking itself a question through the bus - and what hardware does
     /// about it is not settled: Genesis Plus GX splits the 68k transfer into
     /// `vdp_dma_68k_ext`, `vdp_dma_68k_ram` and `vdp_dma_68k_io`, and the middle
@@ -514,6 +541,10 @@ impl vdp::DmaBus for VdpDmaSource<'_> {
         let addr = addr & ADDR_MASK;
         let (high, low) = match Region::decode(addr) {
             Region::Rom => {
+                // The SVP's DRAM window before the image at the same offsets.
+                if let Some(word) = Bus::read_svp_dram_word(self.svp, addr) {
+                    return word;
+                }
                 let offset = self.mapper.map(addr).unwrap_or((addr - ROM_START) as usize);
                 (
                     self.rom.get(offset).copied(),
@@ -622,6 +653,19 @@ pub struct Bus {
     /// $380000-$3FFFFF for the carts that have no register - and the decode
     /// below is what keeps the two from ever answering the same read.
     jcart: Option<Jcart>,
+    /// The SVP board, from [`crate::cart::svp::Svp::detect`] on [`Bus::rom`],
+    /// for the one cart that carries it: the shared DRAM of the SSP1601 DSP
+    /// behind $300000-$31FFFF and the status/control registers behind its
+    /// 0xA15000 page ([`crate::cart::svp`], #433).
+    ///
+    /// Like the J-CART above it, half of the board lives inside
+    /// [`Region::Rom`]: the DRAM is a window of the cartridge area, and
+    /// [`Bus::read_rom_byte`] and [`Bus::write_rom_byte`] are the seams, with
+    /// [`VdpDmaSource`] carrying its own view so a VDP transfer sourcing from
+    /// the DRAM reads the DRAM and not the image underneath. The register
+    /// page is its own [`Region::Svp`], because unlike the J-CART quadrant it
+    /// sits in the part of the map nothing else decodes.
+    svp: Option<Svp>,
     /// 64 KiB of work RAM, mapped at 0xE00000 and mirrored every 0x10000.
     ///
     /// Saved as a sequence of its bytes: 64 KiB is past the thirty-two entries
@@ -837,12 +881,18 @@ impl Bus {
         // zero-serial Micro Machines carts the way Genesis Plus GX's database
         // does.
         let jcart = jcart::detect(&rom);
+        // And the SVP board, for the one cart that carries it:
+        // [`crate::cart::svp::Svp::detect`] probes the image the way
+        // Picodrive's own detection does (title + DSP program blob), and a
+        // cart without the board gets nothing at all.
+        let svp = svp::Svp::detect(&rom);
         Self {
             rom,
             sram,
             eeprom,
             mapper,
             jcart,
+            svp,
             ram: Box::new([0; 0x10000]),
             version,
             io: Io::new(),
@@ -1295,6 +1345,16 @@ impl Bus {
         if let Some(byte) = self.read_jcart_byte(addr) {
             return byte;
         }
+        // The SVP's shared DRAM, for the cart that carries the board: the
+        // $300000-$31FFFF window answers the DSP's DRAM and not the image at
+        // the same offsets, which is the whole point of the window ([`Svp`],
+        // #433). It is an overlay like the ones above because the image
+        // decoder below would otherwise eat it - the window is inside the
+        // cartridge area, [`Region::Rom`] - and because it is memory the 68k
+        // owns half of, not a register event.
+        if let Some(byte) = self.read_svp_dram_byte(addr) {
+            return byte;
+        }
         // The one place a cart's addresses are translated, and the only place the
         // mapper is consulted on the way to a byte: the overlay above has already
         // had its say and keeps its priority.
@@ -1325,6 +1385,25 @@ impl Bus {
             let sda = self.eeprom.as_ref().map(Eeprom::sda_level).unwrap_or(true);
             cart.read_byte(addr, sda)
         })
+    }
+
+    /// The SVP's shared DRAM byte at `addr`, or `None` where the cart has no
+    /// board or the address is outside the window ([`Svp::covers_dram`]).
+    fn read_svp_dram_byte(&self, addr: u32) -> Option<u8> {
+        let svp = self.svp.as_ref()?;
+        Svp::covers_dram(addr).then(|| svp.read_dram_byte(addr))
+    }
+
+    /// The SVP's shared DRAM word at `addr`, for [`VdpDmaSource`], which
+    /// cannot go through [`Bus::read_rom_byte`] (it runs with the VDP
+    /// borrowed; the struct docs above say why). A DMA sourcing from the DRAM
+    /// reads the DRAM and not the image underneath - Virtua Racing moves the
+    /// DSP's output into VRAM exactly that way, which is the transfer
+    /// Genesis Plus GX's HISTORY.txt calls "fixed broken VDP DMA from SVP ROM
+    /// latency" on its side.
+    fn read_svp_dram_word(svp: Option<&Svp>, addr: u32) -> Option<u16> {
+        let svp = svp?;
+        Svp::covers_dram(addr).then(|| svp.read_dram_word(addr))
     }
 
     /// Cartridge slot word read: the two bytes, high byte first (M68000UM, "Data
@@ -1374,6 +1453,15 @@ impl Bus {
         // window are both refused here rather than falling through to the image.
         if let Some(save) = self.sram.as_mut() {
             save.write(addr, value);
+        }
+        // And the SVP's shared DRAM, the one writable window of the cartridge
+        // area: a write the board's window claims is memory, not a dropped
+        // write ([`Svp`], #433). It is last the way its read overlay is last
+        // before the image.
+        if let Some(svp) = self.svp.as_mut()
+            && Svp::covers_dram(addr)
+        {
+            svp.write_dram_byte(addr, value);
         }
     }
 
@@ -1634,10 +1722,16 @@ impl Bus {
             rom,
             ram,
             mapper,
+            svp,
             pending_68k_hold,
             ..
         } = self;
-        let mut source = VdpDmaSource { rom, ram, mapper };
+        let mut source = VdpDmaSource {
+            rom,
+            ram,
+            mapper,
+            svp: svp.as_ref(),
+        };
         vdp.write_control(value);
         vdp.run_dma(&mut source);
         // The freeze the transfer just started, if it started one (#101 made the
@@ -1971,6 +2065,46 @@ impl Bus {
         self.write_tmss_byte(addr + 1, value as u8);
     }
 
+    /// SVP register page byte read, [`Region::Svp`]: the lane of the one
+    /// register the address names ([`Svp::read_register_byte`] has the
+    /// per-lane decode and the PM0 read side effect), or [`OPEN_BUS`] for the
+    /// undecoded lanes - and for the whole page on a cart without the board,
+    /// exactly what [`Region::Unmapped`] answered before it was decoded.
+    fn read_svp_byte(&mut self, addr: u32) -> u8 {
+        match self.svp.as_mut() {
+            Some(svp) => svp.read_register_byte(addr),
+            None => OPEN_BUS,
+        }
+    }
+
+    /// SVP register page word read. The registers are 16-bit, so a word read
+    /// is the register whole rather than two byte lanes - the rule the device
+    /// regions of this dispatch follow.
+    fn read_svp_word(&mut self, addr: u32) -> u16 {
+        match self.svp.as_mut() {
+            Some(svp) => svp.read_register_word(addr),
+            None => OPEN_BUS_WORD,
+        }
+    }
+
+    /// SVP register page byte write: dropped, whatever the cart. The
+    /// registers are 16-bit and the reference drops every byte write to the
+    /// page (`m68k_unused_8_w` on its `case 0x50` write path).
+    fn write_svp_byte(&mut self, addr: u32, value: u8) {
+        if let Some(svp) = self.svp.as_mut() {
+            svp.write_register_byte(addr, value);
+        }
+    }
+
+    /// SVP register page word write: the command register takes it on a cart
+    /// that has the board, and everything else is dropped like the
+    /// reference's `m68k_unused_16_w`.
+    fn write_svp_word(&mut self, addr: u32, value: u16) {
+        if let Some(svp) = self.svp.as_mut() {
+            svp.write_register_word(addr, value);
+        }
+    }
+
     /// Undecoded byte read. Placeholder for [`Region::Unmapped`].
     fn read_unmapped_byte(&mut self, _addr: u32) -> u8 {
         OPEN_BUS
@@ -2173,6 +2307,7 @@ impl m68k::Bus for Bus {
             Region::Z80Ctrl => self.read_z80_ctrl_byte(addr),
             Region::CartExtra => self.read_cart_extra_byte(addr),
             Region::Tmss => self.read_tmss_byte(addr),
+            Region::Svp => self.read_svp_byte(addr),
             Region::Unmapped => self.read_unmapped_byte(addr),
         }
     }
@@ -2190,6 +2325,7 @@ impl m68k::Bus for Bus {
             Region::Z80Ctrl => self.read_z80_ctrl_word(addr),
             Region::CartExtra => self.read_cart_extra_word(addr),
             Region::Tmss => self.read_tmss_word(addr),
+            Region::Svp => self.read_svp_word(addr),
             Region::Unmapped => self.read_unmapped_word(addr),
         }
     }
@@ -2207,6 +2343,7 @@ impl m68k::Bus for Bus {
             Region::Z80Ctrl => self.write_z80_ctrl_byte(addr, value),
             Region::CartExtra => self.write_cart_extra_byte(addr, value),
             Region::Tmss => self.write_tmss_byte(addr, value),
+            Region::Svp => self.write_svp_byte(addr, value),
             Region::Unmapped => self.write_unmapped_byte(addr, value),
         }
     }
@@ -2224,6 +2361,7 @@ impl m68k::Bus for Bus {
             Region::Z80Ctrl => self.write_z80_ctrl_word(addr, value),
             Region::CartExtra => self.write_cart_extra_word(addr, value),
             Region::Tmss => self.write_tmss_word(addr, value),
+            Region::Svp => self.write_svp_word(addr, value),
             Region::Unmapped => self.write_unmapped_word(addr, value),
         }
     }
@@ -2598,11 +2736,142 @@ mod tests {
         }
     }
 
+    /// The SVP cart's shared DRAM: a write-then-read-back at both widths
+    /// ([`Svp::covers_dram`]), through the [`m68k::Bus`] dispatch. The window
+    /// starts at `0x300000` and runs to `0x31FFFF`, 16-bit, big-endian lanes
+    /// at byte width.
+    #[test]
+    fn svp_dram_window_write_then_read_back() {
+        let mut bus = Bus::new(svp_cart_rom(), TEST_VERSION);
+
+        bus.write_word(0x30_0000, 0x1234);
+        assert_eq!(bus.read_word(0x30_0000), 0x1234, "word round trip");
+        assert_eq!(bus.read_byte(0x30_0000), 0x12, "high lane");
+        assert_eq!(bus.read_byte(0x30_0001), 0x34, "low lane");
+
+        bus.write_byte(0x31_0001, 0xAB);
+        assert_eq!(bus.read_byte(0x31_0001), 0xAB, "odd lane byte write");
+        bus.write_byte(0x31_0000, 0xCD);
+        assert_eq!(bus.read_word(0x31_0000), 0xCDAB, "both lanes of one word");
+
+        // The last word of the window, and the wrap-free decode: 0x31FFFE is
+        // DRAM word 0xFFFF, the last of the array.
+        bus.write_word(0x31_FFFE, 0xCAFE);
+        assert_eq!(bus.read_word(0x31_FFFE), 0xCAFE);
+        assert_eq!(bus.read_byte(0x31_FFFF), 0xFE);
+    }
+
+    /// The DRAM window answers the DRAM and not the image underneath it -
+    /// which is what it answered before the board was decoded - and the
+    /// registers answer the board and not open bus, at exactly the lanes the
+    /// decode gives them.
+    #[test]
+    fn svp_windows_answer_the_board_and_not_the_image_or_open_bus() {
+        let rom = svp_cart_rom();
+        let mut bus = Bus::new(rom.clone(), TEST_VERSION);
+
+        // The image held 0x00 at 0x300000; the window reads that before any
+        // write, and holds the written value after it, where a write onto the
+        // image would have been dropped.
+        assert_eq!(bus.read_word(0x30_0002), 0x0000, "DRAM words come up clear");
+        bus.write_word(0x30_0002, 0x5AA5);
+        assert_eq!(bus.read_word(0x30_0002), 0x5AA5);
+
+        // Registers: a word write to the command register, XST reads back at
+        // the register and the 0xA15002 mirror, PM0 carries the "68k has
+        // written" bit and no answer bit, and nothing in the write dropped.
+        bus.write_word(0xA1_5000, 0xBEEF);
+        assert_eq!(bus.read_word(0xA1_5000), 0xBEEF);
+        assert_eq!(bus.read_word(0xA1_5002), 0xBEEF, "the mirror");
+        assert_eq!(
+            bus.read_word(0xA1_5004),
+            0x0003,
+            "PM0: written + fake answer"
+        );
+        assert_eq!(bus.read_byte(0xA1_5000), 0xBE, "byte lanes of XST");
+        assert_eq!(bus.read_byte(0xA1_5001), 0xEF);
+    }
+
+    /// A cart without the board: the register page reads open bus and drops
+    /// writes exactly as [`Region::Unmapped`] did, and the DRAM window is
+    /// still the image - which is the detection-negative half of the stage.
+    /// The image is 4 MiB so the window at $300000 overlaps it, the way an
+    /// ordinary big cart's would; a 2 MiB image ends at $1FFFFF and answers
+    /// the window open bus above its end, as every cart does (see
+    /// [`Bus::read_rom_byte`]'s docs on reading past the end).
+    #[test]
+    fn a_cart_without_the_board_answers_the_svp_windows_as_before() {
+        let rom = rom_image(0x400_000);
+        let mut bus = Bus::new(rom.clone(), TEST_VERSION);
+
+        // The page: open bus, reads and writes.
+        for addr in [0xA1_5000, 0xA1_5002, 0xA1_5004, 0xA1_5008] {
+            assert_eq!(bus.read_word(addr), OPEN_BUS_WORD, "word at {addr:#08x}");
+            bus.write_word(addr, 0x2222);
+            assert_eq!(bus.read_word(addr), OPEN_BUS_WORD, "write dropped");
+            assert_eq!(bus.read_byte(addr), OPEN_BUS, "byte at {addr:#08x}");
+        }
+
+        // The window: image bytes at the same offsets, and writes dropped.
+        for offset in [0x300_000_u32, 0x300_002, 0x310_000] {
+            let at = offset as usize;
+            assert_eq!(
+                bus.read_word(offset),
+                u16::from_be_bytes([rom[at], rom[at + 1]]),
+                "image at {offset:#08x}",
+            );
+        }
+        bus.write_word(0x300_000, 0x1234);
+        assert_eq!(
+            bus.read_word(0x300_000),
+            u16::from_be_bytes([rom[0x300_000], rom[0x300_001]]),
+            "write dropped onto image"
+        );
+    }
+
+    /// A VDP transfer sourcing from the DRAM reads the DRAM and not the image:
+    /// [`Bus::read_svp_dram_word`] is [`VdpDmaSource`]'s view, and Virtua
+    /// Racing moves the DSP's output into VRAM through exactly that source.
+    #[test]
+    fn svp_dram_answers_a_vdp_dma_source() {
+        let mut svp = Svp::new();
+        svp.write_dram_word(0x30_0004, 0x7F3E);
+        assert_eq!(
+            Bus::read_svp_dram_word(Some(&svp), 0x30_0004),
+            Some(0x7F3E),
+            "inside the window"
+        );
+        assert_eq!(
+            Bus::read_svp_dram_word(Some(&svp), 0x32_0000),
+            None,
+            "outside the window"
+        );
+        assert_eq!(
+            Bus::read_svp_dram_word(None, 0x30_0004),
+            None,
+            "no board, no answer: the image arm takes it"
+        );
+    }
+
+    /// A synthetic SVP cart image: a 2 MiB image whose overseas title names
+    /// Virtua Racing and whose 0x810 carries the DSP program probe, the two
+    /// halves [`Svp::detect`] asks for. Nothing else is set, which is close
+    /// enough to the real carts for a bus test.
+    fn svp_cart_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x200_000];
+        rom[0x150..0x15D].copy_from_slice(b"Virtua Racing");
+        rom[0x810..0x814].copy_from_slice(b"OHMP");
+        rom
+    }
+
     #[test]
     fn unmapped_reads_return_open_bus_placeholder() {
         let mut bus = Bus::new(Vec::new(), TEST_VERSION);
         for addr in [
-            0x400000, 0x7FFFFE, 0x800000, 0x9FFFFE, 0xA12000, 0xA15000, 0xBFFFFE,
+            // 0xA15100, not 0xA15000: the SVP's register page below it is
+            // [`Region::Svp`] since #433, whose handlers answer open bus for
+            // everything they do not decode - the gap itself starts above it.
+            0x400000, 0x7FFFFE, 0x800000, 0x9FFFFE, 0xA12000, 0xA15100, 0xBFFFFE,
         ] {
             assert_eq!(bus.read_byte(addr), OPEN_BUS, "byte at {addr:#08x}");
             assert_eq!(bus.read_word(addr), OPEN_BUS_WORD, "word at {addr:#08x}");
