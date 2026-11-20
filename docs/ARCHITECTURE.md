@@ -102,6 +102,39 @@ impl M68k {
 
 Addresses are 24 bit; the core masks with `0x00FF_FFFF` before calling the bus.
 
+#### m68k exceptions: the vector map
+
+Exception entry copies SR, sets S, pushes a 6-byte frame (SR word at SP, PC
+long at SP+2), and fetches the handler long from `4 * vector`. The map, with
+what pins each row (M68000UM Table 6-2, "Exception Vector Assignment"; the
+six #436 black carts ship this exact table, with real handlers in the slots
+they use and halt stubs in the ones they don't):
+
+| vector | long at | raises |
+|---|---|---|
+| 0, 1 | `$00`, `$04` | reset SSP / PC |
+| 2 | `$08` | bus error (not implemented) |
+| 3 | `$0C` | address error (`address_error` module; the suite's recording core also sent illegal here — its bug, not the 68000's) |
+| 4 | `$10` | illegal instruction, undefined encodings |
+| 5 | `$14` | divide by zero |
+| 6 | `$18` | CHK out of range |
+| 7 | `$1C` | TRAPV taken |
+| 8 | `$20` | privilege violation |
+| 9 | `$24` | trace |
+| 10 | `$28` | line-1010 emulator (A-line) |
+| 11 | `$2C` | line-1111 emulator (F-line) |
+| 24, 25–31 | `$60`, `$64`–`$7C` | spurious interrupt, level 1–7 autovectors |
+| 32+n | `$80+4n` | TRAP #n |
+
+The line-A/F rows are 68000 rows, not a 68010 addition — only Format Error
+(14) is footnoted 68010-only in the UM's table, and Genesis carts count on
+the rows existing: six carts execute line opcodes deliberately and put
+compact VDP-write handlers in `$28`/`$2C` (#436, #482). What the 68010 adds
+and this crate does not implement is mid-instruction restart and the
+RTE-based emulation mode. The frame PC for illegal/line-A/F and privilege
+violation is the faulting opcode's own address; the handler steps over it
+(e.g. `ADDQ.L #2,$A(A7)` in the carts' handlers) before `RTE`.
+
 ### z80
 
 ```rust

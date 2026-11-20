@@ -999,3 +999,88 @@ fn cosmo_cop_boots_to_non_blank_screen() {
         "800 frames in, Cosmo Cop is {colours} distinct colours"
     );
 }
+
+/// The six carts of the #436 family that execute an A-line or F-line opcode
+/// on purpose and were parked on their own halt stub by the old single-vector
+/// route. Each cart puts a real handler in its `$28`/`$2C` vector slot and a
+/// halt stub in `$10`/`$0C`; once the m68k routes line opcodes to vectors 10
+/// and 11 (m68k, #482) the handler runs and the cart draws. Every one of them
+/// was `Blank` (1 colour) before that fix and boots after it, which is the
+/// before/after pair the ticket asks for.
+///
+/// `#[ignore]`d with the other real-ROM tests: CI has no commercial ROMs. Run
+/// with `cargo nextest run -p genesis --run-ignored only --test boot`.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn warrior_of_rome_ii_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom("Warrior of Rome II (USA).md"));
+    let colours = colour_count(&path, 600, "line_warrior_of_rome_ii.png");
+    assert!(
+        colours > BLANK,
+        "600 frames in, Warrior of Rome II is {colours} distinct colours"
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn caesar_no_yabou_ii_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom("Caesar no Yabou II (Japan).md"));
+    let colours = colour_count(&path, 600, "line_caesar_no_yabou_ii.png");
+    assert!(
+        colours > BLANK,
+        "600 frames in, Caesar no Yabou II is {colours} distinct colours"
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn heavy_nova_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom("Heavy Nova (USA).md"));
+    // The F-line word sits between two JSRs in the reset path (#482), so the
+    // fix reaches this cart almost immediately - but its screens stay dark for
+    // a long stretch after that (2 colours at 600, 5-9 from 1200 on), so this
+    // runs to 1800 before judging.
+    let colours = colour_count(&path, 1800, "line_heavy_nova.png");
+    assert!(
+        colours > BLANK,
+        "1800 frames in, Heavy Nova is {colours} distinct colours"
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn mamono_hunter_youko_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom(
+        "Mamono Hunter Youko - Dai 7 no Keishou (Japan).md"
+    ));
+    let colours = colour_count(&path, 600, "line_mamono_hunter_youko.png");
+    assert!(
+        colours > BLANK,
+        "600 frames in, Mamono Hunter Youko is {colours} distinct colours"
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn star_cruiser_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom("Star Cruiser (Japan).md"));
+    let colours = colour_count(&path, 600, "line_star_cruiser.png");
+    assert!(
+        colours > BLANK,
+        "600 frames in, Star Cruiser is {colours} distinct colours"
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn twinkle_tale_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom("Twinkle Tale (Japan).md"));
+    // The `$F033` opcode is at 0x003D98, early in the boot, and after the fix
+    // the cart runs - but its attract sequence stays near-black for roughly
+    // the first 1500 frames (1-3 colours), settling at 5 colours from 1800 on.
+    let colours = colour_count(&path, 1800, "line_twinkle_tale.png");
+    assert!(
+        colours > BLANK,
+        "1800 frames in, Twinkle Tale is {colours} distinct colours"
+    );
+}
