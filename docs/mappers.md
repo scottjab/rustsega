@@ -238,6 +238,65 @@ switchable slots — so it needs no new mapper; and the file is not in the local
 collection, so there is nothing here to test it against. Recorded so the next
 person does not open it as a new mapper.
 
+### 5. Radica plug-n-play multicarts - implemented (#492)
+
+| Game | Mapper type | Source |
+|---|---|---|
+| Arcade Legends Sega Mega Drive ~ Mega Drive Play TV (World) | Radica (read-latched banking) | reset PC + paged header, measured; MAME `megadriv_rad.cpp` |
+| Arcade Legends Street Fighter II' - Special Champion Edition ~ Mega Drive Play TV 3 (World) | Radica (read-latched banking) | as above |
+
+The two "Arcade Legends" units are Radica's Genesis-on-a-chip plug-n-plays, and
+their failure shape (#492, one RTE storm, one RAM-flag wait, zero VDP writes
+between them) was neither CPU nor VDP: it was the board. MAME's
+`megadriv_rad.cpp` (`read` / `read_a13`, with
+[David Haywood's write-up](https://mamedev.emulab.it/haze/2020/06/05/sega-radica-plug-play-news/)
+on the units) is the only reference that models the silicon, read for behaviour:
+
+- A **read** of `$A13000`-`$A1307F` (byte or word, decoded on the even lane)
+  latches `bank = (word offset from $A13000) & 0x3F`; odd banks collapse to
+  their even neighbour, `$3F` surviving - MAME's
+  `if (m_bank != 0x3f) m_bank &= 0x3e;`, whose comment says the surviving `$3F`
+  is what the menus need. No write reaches the board: MAME maps the block
+  `.r` only, the opposite of the Sega mapper's write-only registers at the top
+  of the same block.
+- The whole cartridge window then answers flash at
+  `(bank * 64 KiB + address) & (flash size - 1)`: not a page swap but the whole
+  4 MiB window shifted by the bank and wrapped into the flash. Bank 0 is the
+  plain image, and the latch resets to it (`m_bank = 0`), which is what lets
+  the units boot at all.
+
+Each dump is the unit's flash with exactly one byte changed: the reset vector
+long at `$4`, patched to point at a launcher the manufacturer added at the end
+of the flash. The launcher copies a stub into work RAM; the stub reads the
+game-select address (`$A1307E` in cart 1, `$A13078` in cart 2 - the read IS
+the bank select), then jumps to `$000400`, which names the menu's own entry
+only once the read has paged the launcher page in. Both dumps are otherwise
+the original game: cart 1's first MiB is byte-identical Kid Chameleon apart
+from that long (its real entry `$4B0`, its real SSP `$FFFFF7FE`), cart 2's
+exception handlers and boot code match the standalone SF2' SCE byte for byte.
+Under `Mapper::None` the jump lands mid-game - cart 1 into Kid Chameleon's
+TRAP #13 stub whose `RTE` pops a zeroed RAM frame and storms from `$000000`
+through the line-F stub, cart 2 into SF2's crash-screen dispatcher waiting on
+a VInt counter the never-configured VDP can never raise.
+
+Detection keys on image content, per this page's rule: exactly 4 MiB, the
+reset PC `(bank << 16) | 0x0300` with `bank` 1..=0x3F, and the launcher page's
+own vector table at `bank << 16` (SSP `$00FFFFF0`, PC `$00000400`). Of the
+2775 local files, exactly the two carts above match.
+
+Measured at the sweep's 600-frame checkpoint (`scripts/resweep.sh`, rows
+folded into [`compat.csv`](compat.csv)):
+
+| Cart | `main` | with the mapper |
+|---|---|---|
+| Arcade Legends Sega Mega Drive | Blank, 1 colour | **47 colours** - the unit's own six-game menu |
+| Arcade Legends SF2' - Special Champion Ed. | Blank, 1 colour | **38 colours** - the unit's own two-game menu |
+
+Both menus are pinned by commercial smoke goldens (`arcadelegends1_600`,
+`arcadelegends2_600`). The menus select a game with further `$A130xx` reads -
+a START press on cart 1's menu reaches Sonic Team's splash under the same
+mapper - and only the menus are pinned here.
+
 ## Header size fields are not trustworthy
 
 The ticket asked whether the header could be used to detect a mapper. It cannot,
