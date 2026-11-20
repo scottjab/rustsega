@@ -358,7 +358,9 @@
           # a directory, a socket or an environment variable, so they need no
           # sandbox of their own and still catch a binary that is missing,
           # unrunnable, or built from another workspace.
-          smoke = pkgs.runCommand "rustsega-smoke" { } ''
+          smoke = pkgs.runCommand "rustsega-smoke"
+            { nativeBuildInputs = [ pkgs.curl ]; }
+            ''
             bin=${self.packages.${system}.default}/bin/rustsega
 
             # The version comes from the workspace Cargo.toml, so this is what
@@ -384,6 +386,70 @@
                   ;;
               esac
             done
+
+            # #421: start the server on loopback and fetch what only a build
+            # with `embed-web` serves. The placeholder (#155) answers `/` with
+            # one static page that names no assets and 404s everything else,
+            # so the wasm fetch below is the discriminator. Loopback works in
+            # the sandbox, and the port is fixed because nothing else is on
+            # this network; the timeout kills the child if startup hangs.
+            export RUSTSEGA_BIND=127.0.0.1
+            export RUSTSEGA_PORT=17842
+            timeout 60 "$bin" >server.log 2>&1 &
+            server=$!
+            quit() {
+              kill "$server" 2>/dev/null || true
+              wait "$server" 2>/dev/null || true
+            }
+            for i in $(seq 1 120); do
+              grep -q "listening on" server.log && break
+              sleep 0.5
+            done
+            if ! grep -q "listening on" server.log; then
+              quit
+              echo "the server never logged a listen line in 60s" >&2
+              cat server.log >&2
+              exit 1
+            fi
+
+            index_headers="$(curl -fsSI http://127.0.0.1:17842/)" || {
+              quit
+              echo "GET / failed" >&2
+              cat server.log >&2
+              exit 1
+            }
+            echo "$index_headers"
+            echo "$index_headers" | tr -d '\r' | grep -qi '^content-type: text/html' || {
+              quit
+              echo "expected / to be text/html" >&2
+              exit 1
+            }
+            index="$(curl -fsS http://127.0.0.1:17842/)"
+            # The index references the wasm from an inline `init({ module_or_path:
+            # '/...bg.wasm' })`, so grab a path-shaped token rather than a quoted
+            # string (the surrounding line carries other quotes).
+            wasm="$(echo "$index" | grep -o '/[A-Za-z0-9._/-]*\.wasm' | head -1)"
+            case "$wasm" in
+              *.wasm) ;;
+              *)
+                quit
+                echo "the served page names no .wasm: this is the placeholder build (#155)" >&2
+                echo "$index" >&2
+                exit 1
+                ;;
+            esac
+            wasm_headers="$(curl -fsSI "http://127.0.0.1:17842$wasm")" || {
+              quit
+              echo "GET $wasm failed" >&2
+              exit 1
+            }
+            echo "$wasm_headers"
+            echo "$wasm_headers" | tr -d '\r' | grep -qi '^content-type: application/wasm' || {
+              quit
+              echo "expected $wasm to be application/wasm" >&2
+              exit 1
+            }
+            quit
 
             touch $out
           '';
