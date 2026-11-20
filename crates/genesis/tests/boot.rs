@@ -1110,3 +1110,27 @@ fn dyna_brothers_2_boots_to_non_blank_screen() {
         "1200 frames in, Dyna Brothers 2 is {colours} distinct colours"
     );
 }
+
+/// Gouketsuji Ichizoku (#495) is the one cart of the #440 inventory that the
+/// #482 fix reached but nothing pinned: it was re-measured after #494 and
+/// still showed its pre-#482 park, because #495's table was taken on c30938f,
+/// before #482 landed. Its vector table puts a halt stub on every slot $08 to
+/// $2C except $28 - `$49FE: NOP / $4A00: BRA.S $4A00` - and a real line-A
+/// handler at $28 -> $522, so an A-line opcode is the only exception whose
+/// destination the #482 fix changed from halt to handler. On the old core its
+/// boot's `DC.W $A001` at `$4AD8` parks it at `$4A00` in frame 233; on the
+/// fixed core the same frame enters `$522` instead and the cart draws.
+///
+/// Measured on the #482 baseline: 10 colours at 300 frames, 17 at 1200 (21
+/// peak), `$4A00` not reached in 1200 (m68k, #482; diagnosis on #495). 600
+/// judges it past a title splash, as for the rest of the family.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn gouketsuji_ichizoku_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::commercial_rom("Gouketsuji Ichizoku (Japan).md"));
+    let colours = colour_count(&path, 600, "line_gouketsuji_ichizoku.png");
+    assert!(
+        colours > BLANK,
+        "600 frames in, Gouketsuji Ichizoku is {colours} distinct colours"
+    );
+}
