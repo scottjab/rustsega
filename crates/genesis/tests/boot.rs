@@ -8,7 +8,7 @@
 //! because CI has no commercial ROMs, and is the only place any of this is
 //! proved against software nobody wrote for it.
 
-use genesis::{Buttons, Config, Genesis, LoadError};
+use genesis::{Buttons, ChipModel, Config, Genesis, LoadError};
 use testkit::require_data;
 
 /// Where the fake ROMs put their program: past the 0x200 bytes a load needs, so
@@ -359,6 +359,50 @@ fn drain_audio_mixes_a_frame_of_host_audio() {
     assert!(
         mixed > 1_400 && mixed.is_multiple_of(2) && mixed < 2_000,
         "one NTSC raster mixed {mixed} halves, which is not about 801 stereo samples"
+    );
+}
+
+/// The `chip_model` setting reaches the chip, and the chip's own sample buffer
+/// is where that shows: a silent discrete YM2612 sits at its ladder's offset,
+/// +4 per converter for six converters (`ym2612::output`), while a silent
+/// YM3438 is at exactly 0. The mixed output cannot be the judge here - the
+/// mixer's DC blocker removes the offset either way, which is
+/// `audio::dc_removed`'s finding - so this reads `bus().audio.ym_samples`, the
+/// raw chip, before the mixer.
+///
+/// One frame of a machine nobody has written sound to: every sample the chip
+/// made is the offset and nothing else. (#342)
+#[test]
+fn chip_model_reaches_the_chip() {
+    let mut discrete = Genesis::new(&fake_rom(&[0x60FE]), Config::default()).expect("loads");
+    discrete.run_frame();
+    assert!(
+        discrete
+            .bus()
+            .audio
+            .ym_samples
+            .iter()
+            .all(|&(left, right)| (left, right) == (24, 24)),
+        "a silent discrete YM2612 sits at the ladder's 6 * 4 offset"
+    );
+
+    let mut integrated = Genesis::new(
+        &fake_rom(&[0x60FE]),
+        Config {
+            chip_model: ChipModel::Ym3438,
+            ..Config::default()
+        },
+    )
+    .expect("loads");
+    integrated.run_frame();
+    assert!(
+        integrated
+            .bus()
+            .audio
+            .ym_samples
+            .iter()
+            .all(|&(left, right)| (left, right) == (0, 0)),
+        "a silent YM3438 sits at 0: it has no ladder"
     );
 }
 

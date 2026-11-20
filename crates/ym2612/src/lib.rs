@@ -246,6 +246,15 @@ impl Ym2612 {
         self.model = model;
     }
 
+    /// Which chip's DAC [`Ym2612::clock`] is modelling, the question
+    /// [`Ym2612::set_model`] answers. `crate::genesis` reads this to keep a
+    /// console's generation across the soft reset line, which rebuilds the chip
+    /// and would otherwise quietly turn a Ym3438 console back into a discrete
+    /// one (#342).
+    pub fn model(&self) -> ChipModel {
+        self.model
+    }
+
     /// Advance the chip by one output sample - 144 68k clocks, about 53267 Hz
     /// (docs/ARCHITECTURE.md, "Clocks and timing") - and return the `(left,
     /// right)` sample.

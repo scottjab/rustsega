@@ -355,7 +355,14 @@ impl Ym2612  { pub fn new() -> Self; pub fn write(&mut self, port: u8, value: u8
 
 `genesis` owns mixing: it clocks each chip at its native rate, then
 resamples to the host rate (48 kHz default) with a band-limited resampler,
-and applies the Model 1 low-pass filter.
+and applies the board's output filter, which follows the console's chip
+generation (`Config::chip_model`, one setting for both halves, #342): a
+discrete-YM2612 Model 1 gets the board's first-order low-pass, about 3.39
+kHz (Genesis Plus GX's default coefficient agrees on the corner and on it
+being one pole), while a YM3438 Model 2/3 gets nothing modelled - its real
+Sallen-Key stage has no published pole or Q (ConsoleArtisan's Genesis repair
+reference), so modelling it would be invention, and Genesis Plus GX likewise
+treats its low-pass as a Model 1 flavour only.
 
 One YM2612 register detail the write path has to model exactly: the `&A4`
 frequency latch is the chip's, not the channel's. `&A4`-`&A6` only latch the

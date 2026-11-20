@@ -42,7 +42,12 @@ pub use z80_bus::{Z80Side, Z80View};
 // `Region` is the console this emulator presents, one of three; `Regions` above
 // is what a cartridge header claims at 0x1F0, a set of three booleans. The names
 // are close on purpose and `config::Config::resolve_region` is the mapping.
-pub use config::{Config, LowPass, Region, RegionSetting};
+pub use config::{Config, Region, RegionSetting};
+// `ChipModel` is the console's sound silicon, which at the output stage is also
+// which board follows it: the one host choice `Config::chip_model` carries
+// (#342). `LowPass` was its old second half and is gone - the chip decides the
+// board, not two settings that have to agree.
+pub use ym2612::ChipModel;
 // `Buttons` is what a front end feeds the emulated pads: docs/ARCHITECTURE.md,
 // "Input: one `InputState` that merges keyboard, Gamepad API, and touch overlay
 // into `Buttons` per port".
@@ -115,6 +120,10 @@ impl Genesis {
         let header = cart::parse_header(&rom)?;
         let region = config.resolve_region(&header);
         let mut bus = Bus::new(rom, region.version_register(config.tmss));
+        // The chip generation is one host setting with two places to land: the
+        // chip itself, here, and the board filter the mixer applies after it
+        // (`Mixer::new`). #342.
+        bus.audio.ym.set_model(config.chip_model);
         // A VDP that has never been talked to sits at line 0, which is a line of
         // active display: leave it there and the program below starts 40 master
         // clocks into line 0, past the point that line is drawn from, and its whole
