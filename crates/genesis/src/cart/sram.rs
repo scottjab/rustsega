@@ -19,7 +19,6 @@
 //! the save in front of the ROM.
 
 use super::header::parse_header;
-use crate::bus::OPEN_BUS;
 use serde::{Deserialize, Serialize};
 
 /// The bit of the type byte that says the extra RAM is battery backed.
@@ -207,9 +206,10 @@ impl Sram {
     /// garbage and to notice it with a magic value and a checksum of their own.
     /// 0xFF is what other emulators fill it with - Genesis Plus GX's `sram_init`
     /// does it "by default ... (Micro Machines 2, Dino Dini Soccer)" - because
-    /// it is what nothing driving the data bus reads as ([`OPEN_BUS`]) and
-    /// because a game checking for a save finds none, which is the safe answer
-    /// for a cart whose battery has run down.
+    /// it is the pull-up state the data bus settles at before anything drives
+    /// it ([`crate::bus::Bus::open_bus_word`], #508) and because a game checking
+    /// for a save finds none, which is the safe answer for a cart whose battery
+    /// has run down.
     pub fn new(info: SramInfo, image_len: usize) -> Self {
         Self {
             info,
@@ -233,20 +233,20 @@ impl Sram {
 
     /// The byte the save answers for the 68k address `addr`:
     ///
-    /// - `Some(value)` when `addr` is inside a mapped window - the storage on
-    ///   the half the window wires up, and [`OPEN_BUS`] on the half a half-width
-    ///   window does not. A mapped window owns all of itself: the image stopped
-    ///   answering there the moment the save was switched in, so nothing drives
-    ///   the dead half either;
+    /// - `Some(Some(value))` when `addr` is inside a mapped window - the storage
+    ///   on the half the window wires up;
+    /// - `Some(None)` on the half a half-width window does not wire up: the
+    ///   window owns the address, so the image must not answer, and nothing
+    ///   drives the byte - which is the bus's float to answer (#508);
     /// - `None` when the window is not mapped or `addr` is outside it, which is
     ///   the cartridge image's turn.
-    pub fn read(&self, addr: u32) -> Option<u8> {
+    pub fn read(&self, addr: u32) -> Option<Option<u8>> {
         if !self.mapped() {
             return None;
         }
         match self.info.storage_index(addr) {
-            Some(index) => Some(self.data[index]),
-            None if self.covers(addr) => Some(OPEN_BUS),
+            Some(index) => Some(Some(self.data[index])),
+            None if self.covers(addr) => Some(None),
             None => None,
         }
     }
@@ -503,17 +503,21 @@ mod tests {
     fn odd_window_addresses_are_every_other_byte() {
         let info = SramInfo::from_extra_memory(&ODD).expect("odd SRAM");
         let mut sram = Sram::new(info, 0x20_0000);
-        assert_eq!(sram.read(0x20_0001), Some(0xFF));
-        assert_eq!(sram.read(0x20_0003), Some(0xFF));
-        assert_eq!(sram.read(0x20_0005), Some(0xFF));
+        assert_eq!(sram.read(0x20_0001), Some(Some(0xFF)));
+        assert_eq!(sram.read(0x20_0003), Some(Some(0xFF)));
+        assert_eq!(sram.read(0x20_0005), Some(Some(0xFF)));
         // The last address of the window is its last storage byte.
-        assert_eq!(sram.read(0x20_FFFF), Some(0xFF));
+        assert_eq!(sram.read(0x20_FFFF), Some(Some(0xFF)));
         // Below the window, above it, and on its dead half, are not the
         // window's: `None` is the image's turn.
         assert_eq!(sram.read(0x20_0000), None);
         assert_eq!(sram.read(0x00_0001), None);
         assert_eq!(sram.read(0x21_0001), None);
-        assert_eq!(sram.read(0x20_0002), Some(0xFF), "dead half reads open bus");
+        assert_eq!(
+            sram.read(0x20_0002),
+            Some(None),
+            "dead half: the window owns it, the bus answers"
+        );
         // The dead half is the window's own business, so nothing is stored there
         // and nothing else is asked either.
         assert!(sram.write(0x20_0002, 0x00), "the window owns the dead half");
@@ -544,8 +548,8 @@ mod tests {
         let mut sram = Sram::new(info, 0x20_0000);
         assert!(sram.mapped(), "the image ends at 0x1FFFFF");
         assert!(sram.write(0x20_0001, 0x42));
-        assert_eq!(sram.read(0x20_0001), Some(0x42));
-        assert_eq!(sram.read(0x20_0002), Some(0xFF), "dead half");
+        assert_eq!(sram.read(0x20_0001), Some(Some(0x42)));
+        assert_eq!(sram.read(0x20_0002), Some(None), "dead half");
         assert!(sram.write(0x20_0003, 0x24));
         assert_eq!(sram.contents()[0..2], [0x42, 0x24]);
     }
@@ -577,20 +581,24 @@ mod tests {
         assert!(sram.take_dirty(), "and that was a change");
         sram.write_control(0x02);
         assert!(sram.mapped(), "and still mapped, the image stops short");
-        assert_eq!(sram.read(0x20_0001), Some(0x11), "reads keep working");
+        assert_eq!(sram.read(0x20_0001), Some(Some(0x11)), "reads keep working");
         sram.write_control(0x03);
         assert!(
             sram.write(0x20_0001, 0x22),
             "the window still takes the write"
         );
-        assert_eq!(sram.read(0x20_0001), Some(0x11), "but nothing is stored");
+        assert_eq!(
+            sram.read(0x20_0001),
+            Some(Some(0x11)),
+            "but nothing is stored"
+        );
         assert!(
             !sram.take_dirty(),
             "a refused write did not change the save"
         );
         sram.write_control(0x01);
         assert!(sram.write(0x20_0001, 0x22));
-        assert_eq!(sram.read(0x20_0001), Some(0x22));
+        assert_eq!(sram.read(0x20_0001), Some(Some(0x22)));
     }
 
     /// What SRAM holds before anything writes it is a decision, not a fact: real
@@ -685,7 +693,11 @@ mod tests {
             "so the window is the image's again"
         );
         sram.write_control(0x01);
-        assert_eq!(sram.read(0x20_0001), Some(0x11), "the contents survived");
+        assert_eq!(
+            sram.read(0x20_0001),
+            Some(Some(0x11)),
+            "the contents survived"
+        );
         assert!(sram.take_dirty(), "and so did the fact that they changed");
     }
 

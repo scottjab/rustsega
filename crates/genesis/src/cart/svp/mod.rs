@@ -252,30 +252,33 @@ impl Svp {
     /// poll sees is [`Svp::write_register_word`]'s fake answer; what the game
     /// makes of the answer itself is the stage-1 measurement, and the real
     /// DSP of stage 2 is what replaces the fake.
-    pub fn read_register_byte(&mut self, addr: u32) -> u8 {
+    ///
+    /// `None` is the undecoded lanes, which are the bus's to answer - the
+    /// float ([`crate::bus::Bus::open_bus_byte`], #508) - and not the board's.
+    pub fn read_register_byte(&mut self, addr: u32) -> Option<u8> {
         if Self::is_xst(addr) {
-            return Self::lane(addr, self.xst);
+            return Some(Self::lane(addr, self.xst));
         }
         if Self::is_pm0(addr) {
             let pm0 = self.pm0;
             self.pm0 &= !1;
-            return Self::lane(addr, pm0);
+            return Some(Self::lane(addr, pm0));
         }
-        crate::bus::OPEN_BUS
+        None
     }
 
     /// Register page word read at `addr`, with [`Svp::read_register_byte`]'s
-    /// PM0 side effect.
-    pub fn read_register_word(&mut self, addr: u32) -> u16 {
+    /// PM0 side effect and the same `None` for the undecoded lanes.
+    pub fn read_register_word(&mut self, addr: u32) -> Option<u16> {
         if Self::is_xst(addr) {
-            return self.xst;
+            return Some(self.xst);
         }
         if Self::is_pm0(addr) {
             let pm0 = self.pm0;
             self.pm0 &= !1;
-            return pm0;
+            return Some(pm0);
         }
-        crate::bus::OPEN_BUS_WORD
+        None
     }
 
     /// Register page byte write at `addr`. Nothing on the board answers a
@@ -506,18 +509,34 @@ mod tests {
     #[test]
     fn xst_reads_answer_at_the_register_and_its_mirror() {
         let mut svp = Svp::new();
-        assert_eq!(svp.read_register_word(0xA1_5000), 0x0000, "clear at reset");
+        assert_eq!(
+            svp.read_register_word(0xA1_5000),
+            Some(0x0000),
+            "clear at reset"
+        );
 
         svp.write_register_word(0xA1_5000, 0xBEEF);
-        assert_eq!(svp.read_register_word(0xA1_5000), 0xBEEF);
-        assert_eq!(svp.read_register_word(0xA1_5002), 0xBEEF, "the mirror");
-        assert_eq!(svp.read_register_byte(0xA1_5000), 0xBE);
-        assert_eq!(svp.read_register_byte(0xA1_5001), 0xEF);
-        assert_eq!(svp.read_register_byte(0xA1_5002), 0xBE, "mirror lanes");
-        assert_eq!(svp.read_register_byte(0xA1_5003), 0xEF);
+        assert_eq!(svp.read_register_word(0xA1_5000), Some(0xBEEF));
+        assert_eq!(
+            svp.read_register_word(0xA1_5002),
+            Some(0xBEEF),
+            "the mirror"
+        );
+        assert_eq!(svp.read_register_byte(0xA1_5000), Some(0xBE));
+        assert_eq!(svp.read_register_byte(0xA1_5001), Some(0xEF));
+        assert_eq!(
+            svp.read_register_byte(0xA1_5002),
+            Some(0xBE),
+            "mirror lanes"
+        );
+        assert_eq!(svp.read_register_byte(0xA1_5003), Some(0xEF));
 
         svp.write_register_word(0xA1_5002, 0x0042);
-        assert_eq!(svp.read_register_word(0xA1_5000), 0x0042, "mirror write");
+        assert_eq!(
+            svp.read_register_word(0xA1_5000),
+            Some(0x0042),
+            "mirror write"
+        );
     }
 
     /// PM0: a write to XST sets the "68k has written" bit (bit 1, svpdoc
@@ -528,12 +547,16 @@ mod tests {
     #[test]
     fn pm0_reads_the_handshake_and_clears_the_answer_bit() {
         let mut svp = Svp::new();
-        assert_eq!(svp.read_register_word(0xA1_5004), 0x0000);
+        assert_eq!(svp.read_register_word(0xA1_5004), Some(0x0000));
 
         svp.write_register_word(0xA1_5000, 0x0001);
-        assert_eq!(svp.read_register_word(0xA1_5004), 0x0002);
-        assert_eq!(svp.read_register_byte(0xA1_5004), 0x00, "high lane");
-        assert_eq!(svp.read_register_byte(0xA1_5005), 0x02, "low lane, bit 1");
+        assert_eq!(svp.read_register_word(0xA1_5004), Some(0x0002));
+        assert_eq!(svp.read_register_byte(0xA1_5004), Some(0x00), "high lane");
+        assert_eq!(
+            svp.read_register_byte(0xA1_5005),
+            Some(0x02),
+            "low lane, bit 1"
+        );
 
         // The DSP answers by writing XST through the core's memory view
         // (the path the running SSP program takes): bit 0 sets, and the
@@ -557,38 +580,40 @@ mod tests {
             ssp16::SspMemory::write_xst(&mut view, 0x0042);
             let _ = dsp;
         }
-        assert_eq!(svp.read_register_word(0xA1_5004), 0x0003);
-        assert_eq!(svp.read_register_word(0xA1_5000), 0x0042, "the result");
+        assert_eq!(svp.read_register_word(0xA1_5004), Some(0x0003));
+        assert_eq!(
+            svp.read_register_word(0xA1_5000),
+            Some(0x0042),
+            "the result"
+        );
         assert_eq!(
             svp.read_register_word(0xA1_5004),
-            0x0002,
+            Some(0x0002),
             "answered bit cleared"
         );
     }
 
     /// The undecoded lanes of the page: `0xA15006` and `0xA15008` (the two
     /// registers the sources name but no working reference decodes) and the
-    /// rest of the page read open bus and drop writes, at both widths.
+    /// rest of the page are `None` - not the board's to answer - and drop
+    /// writes, at both widths. What the bus answers them with is the float,
+    /// which is [`crate::bus`]'s half and has its own test there.
     #[test]
-    fn undecoded_lanes_read_open_bus_and_drop_writes() {
+    fn undecoded_lanes_are_none_and_drop_writes() {
         let mut svp = Svp::new();
         for addr in [0xA1_5006, 0xA1_5008, 0xA1_5009, 0xA1_500A, 0xA1_5FFE] {
-            assert_eq!(
-                svp.read_register_byte(addr),
-                crate::bus::OPEN_BUS,
-                "byte at {addr:#08x}"
-            );
+            assert_eq!(svp.read_register_byte(addr), None, "byte at {addr:#08x}");
             assert_eq!(
                 svp.read_register_word(addr & !1),
-                crate::bus::OPEN_BUS_WORD,
+                None,
                 "word at {addr:#08x}"
             );
             svp.write_register_word(addr & !1, 0x2222);
             svp.write_register_byte(addr, 0x11);
         }
         // None of it reached the latches.
-        assert_eq!(svp.read_register_word(0xA1_5000), 0x0000);
-        assert_eq!(svp.read_register_word(0xA1_5004), 0x0000);
+        assert_eq!(svp.read_register_word(0xA1_5000), Some(0x0000));
+        assert_eq!(svp.read_register_word(0xA1_5004), Some(0x0000));
     }
 
     /// Byte writes to the page are dropped whole: the registers are 16-bit
@@ -600,7 +625,11 @@ mod tests {
         svp.write_register_byte(0xA1_5001, 0xFF);
         svp.write_register_byte(0xA1_5002, 0xFF);
         svp.write_register_byte(0xA1_5003, 0xFF);
-        assert_eq!(svp.read_register_word(0xA1_5000), 0x0000);
-        assert_eq!(svp.read_register_word(0xA1_5004), 0x0000, "no bit 1 either");
+        assert_eq!(svp.read_register_word(0xA1_5000), Some(0x0000));
+        assert_eq!(
+            svp.read_register_word(0xA1_5004),
+            Some(0x0000),
+            "no bit 1 either"
+        );
     }
 }
