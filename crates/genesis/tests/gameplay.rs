@@ -112,9 +112,12 @@ struct Section {
 /// The games the ticket names, in the order it names them.
 ///
 /// Green Hill and Emerald Hill are the two Sonic levels. Emerald Hill's movie
-/// is the suite's two-pad movie: pad 1 is Sonic and pad 2 steers the partner,
-/// and a second player character is visible on screen at its 2100 and 2600
-/// checkpoints. Streets of Rage 2 and Gunstar Heroes are the two that need
+/// is the suite's two-pad movie: pad 1 is Sonic and pad 2 mirrors its Right/A
+/// bursts, and the three checkpoints sit inside the level's own first scene.
+/// The press timings were re-recorded on #555: the DMA-billing fix (#489/#517)
+/// moved when the game reaches the level, and the recording's presses have to
+/// land on the states they were meant for (the story is on the ticket).
+/// Streets of Rage 2 and Gunstar Heroes are the two that need
 /// several presses to get through their menus. Thunder Force IV is a vertical
 /// shooter: holding Right pins the ship to the right of the screen and the
 /// level scrolls at its own pace, which is a different load on the VDP from a
