@@ -3,7 +3,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateAndCyclesSkipExceptions`], the same one the add, subtract
+//! [`harness::Check::StateAndCycles`], the same one the add, subtract
 //! and compare classes use: the cases that end in the suite's exception handler
 //! are left to M1-29 (#37) — see [`harness::is_exception_case`] and #185.
 //!
@@ -47,58 +47,58 @@ mod harness;
 /// plus the `$0200`-`$023F` `ANDI.B` cases.
 #[test]
 fn and_b_file_passes() {
-    harness::assert_file_passes("AND.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("AND.b", harness::Check::StateAndCycles);
 }
 
 /// `AND.W`: operation `001` (`AND <ea>,Dn`) and `101` (`AND Dn,<ea>`), plus
 /// `$0240`-`$027F` `ANDI.W`.
 #[test]
 fn and_w_file_passes() {
-    harness::assert_file_passes("AND.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("AND.w", harness::Check::StateAndCycles);
 }
 
 /// `AND.L`: operation `010` and `110`, plus `$0280`-`$02BF` `ANDI.L`.
 #[test]
 fn and_l_file_passes() {
-    harness::assert_file_passes("AND.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("AND.l", harness::Check::StateAndCycles);
 }
 
 /// `OR.B`: `$8000`-`$803F`/`$8100`-`$813F`-style, plus the `$0000`-`$003F`
 /// `ORI.B` cases.
 #[test]
 fn or_b_file_passes() {
-    harness::assert_file_passes("OR.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("OR.b", harness::Check::StateAndCycles);
 }
 
 /// `OR.W`: operation `001` and `101`, plus `$0040`-`$007F` `ORI.W`.
 #[test]
 fn or_w_file_passes() {
-    harness::assert_file_passes("OR.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("OR.w", harness::Check::StateAndCycles);
 }
 
 /// `OR.L`: operation `010` and `110`, plus `$0080`-`$00BF` `ORI.L`.
 #[test]
 fn or_l_file_passes() {
-    harness::assert_file_passes("OR.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("OR.l", harness::Check::StateAndCycles);
 }
 
 /// `EOR.B`: `$B100`-`$B13F`-style `1011 ddd 100 eeeeee` with every mode but
 /// `001`, plus the `$0A00`-`$0A3F` `EORI.B` cases.
 #[test]
 fn eor_b_file_passes() {
-    harness::assert_file_passes("EOR.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("EOR.b", harness::Check::StateAndCycles);
 }
 
 /// `EOR.W`: operation `101`, plus `$0A40`-`$0A7F` `EORI.W`.
 #[test]
 fn eor_w_file_passes() {
-    harness::assert_file_passes("EOR.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("EOR.w", harness::Check::StateAndCycles);
 }
 
 /// `EOR.L`: operation `110`, plus `$0A80`-`$0ABF` `EORI.L`.
 #[test]
 fn eor_l_file_passes() {
-    harness::assert_file_passes("EOR.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("EOR.l", harness::Check::StateAndCycles);
 }
 
 /// `NOT.B`: `$4600`-`$463F`. The three `NOT` files hold no immediate case at
@@ -106,19 +106,19 @@ fn eor_l_file_passes() {
 /// nowhere here either.
 #[test]
 fn not_b_file_passes() {
-    harness::assert_file_passes("NOT.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("NOT.b", harness::Check::StateAndCycles);
 }
 
 /// `NOT.W`: `$4640`-`$467F`.
 #[test]
 fn not_w_file_passes() {
-    harness::assert_file_passes("NOT.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("NOT.w", harness::Check::StateAndCycles);
 }
 
 /// `NOT.L`: `$4680`-`$46BF`.
 #[test]
 fn not_l_file_passes() {
-    harness::assert_file_passes("NOT.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("NOT.l", harness::Check::StateAndCycles);
 }
 
 /// The twelve file names above are what the suite ships, so a rename fails here

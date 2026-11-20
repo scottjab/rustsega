@@ -2,7 +2,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateAndCyclesSkipExceptions`], the same one the move, add and
+//! [`harness::Check::StateAndCycles`], the same one the move, add and
 //! subtract classes use: the cases that end in the suite's exception handler are
 //! left to M1-29 (#37) — see [`harness::is_exception_case`] and #185.
 //!
@@ -20,20 +20,20 @@ mod harness;
 /// `TST.B`: `$4A00`-`$4A3F`.
 #[test]
 fn tst_b_file_passes() {
-    harness::assert_file_passes("TST.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("TST.b", harness::Check::StateAndCycles);
 }
 
 /// `TST.W`: `$4A40`-`$4A7F`.
 #[test]
 fn tst_w_file_passes() {
-    harness::assert_file_passes("TST.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("TST.w", harness::Check::StateAndCycles);
 }
 
 /// `TST.L`: `$4A80`-`$4ABF`. The next sixth of the group, `$4AC0`-`$4AFF`, is
 /// TAS (M1-27, #35) and ILLEGAL at `$4AFC`.
 #[test]
 fn tst_l_file_passes() {
-    harness::assert_file_passes("TST.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("TST.l", harness::Check::StateAndCycles);
 }
 
 /// The three file names above are what the suite ships, so a rename fails here

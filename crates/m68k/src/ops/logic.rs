@@ -293,6 +293,12 @@ impl M68k {
             let result = self.logic_flags(op.apply(self.d[usize::from(reg)], value), size);
             self.write_ea(bus, Ea::DataReg(reg), size, result);
 
+            // An aborted instruction pays no ALU passes, same as
+            // [`M68k::op_add`] (suite `AND.l`/`OR.l` exception cases are
+            // `ea + 50` with nothing on top).
+            if self.address_error_pending() {
+                return 0;
+            }
             self.advance_opcode(bus);
             // The long ALU operation, less whatever the source's bus accesses
             // cover of it — the same rule `arith::op_add` uses (#225).
@@ -357,6 +363,11 @@ impl M68k {
         let result = self.logic_flags(op.apply(operand, value), size);
         self.write_ea(bus, dest, size, result);
 
+        // An aborted instruction pays no ALU passes: its flags and write-back
+        // were skipped by their own gates, and the passes themselves never ran.
+        if self.address_error_pending() {
+            return 0;
+        }
         self.advance_opcode(bus);
         alu_op_clocks(size, dest_accesses(dest))
     }

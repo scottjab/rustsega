@@ -52,11 +52,14 @@
 //! listed above and their neighbours are 23139 × `0x15`, 4081 × `0x05`,
 //! 3806 × `0x1E`.
 //!
-//! A fourth code, `0x1A` — "code fetch during `RTE`'s SR reload" — appears in
-//! the core this suite was recorded against. Nothing in this crate can produce
-//! it (the only `RTE`-adjacent access that can fault there is a stack read,
-//! which this module reports as `0x15`), so it has no constant here; if the
-//! ticket that reworks `RTE` needs it, that ticket adds it.
+//! A fourth code, `0x1A` — "code fetch during `RTE`'s SR reload" — is what the
+//! suite stacks for an `RTE` whose restored status word cleared `S` and whose
+//! restored PC is odd (`RTE.json.gz` case `4e73 [RTE] 2` stacks `$4E7A`); the
+//! same odd PC with `S` kept stacks the plain `0x1E`. Both are produced now:
+//! the `0x1E` one by the ordinary [`AccessKind::CodeFetch`] fetch in `RTE`'s
+//! `jump_to`, the `0x1A` one by [`AccessKind::RteReload`], raised by
+//! [`M68k::op_rte`] itself. A stack *read* fault on the way out of `RTE` still
+//! has no suite case, and reports `0x15` like any data read.
 //!
 //! # The vector: `$00000C`, matching the suite, not `$000008`
 //!
@@ -87,10 +90,10 @@
 //! # Clocks
 //!
 //! M68000UM "Exception Processing Execution Times" bills the address error at
-//! 50 clock cycles. [`crate::interrupts`] is the model for how that number is
-//! expressed here: the bus accesses charge themselves, so this module adds only
-//! the remainder. Exact per-instruction timing is M1-31 (#39/#40) and the
-//! harness runs with cycles unchecked.
+//! 50 clock cycles, and the pinned suite confirms it per case: every faulted
+//! instruction's `length` is its EA time plus exactly 50. [`crate::interrupts`]
+//! is the model for how that number is expressed here: the bus accesses charge
+//! themselves, so this module adds only the remainder.
 
 use crate::bus::{ADDR_MASK, Bus};
 use crate::cpu::BUS_CYCLE_CLOCKS;
@@ -133,6 +136,14 @@ const STATUS_DATA_WRITE: u16 = 0x05;
 /// e.g. `JMP.json.gz` case `4ed1 [JMP (A1)] 2`.
 const STATUS_CODE_FETCH: u16 = 0x1E;
 
+/// Status word direction bits: the instruction-stream fetch `RTE`'s SR reload
+/// leads into (`0x1A`). Measured on the `RTE.json.gz` cases whose restored
+/// status word clears `S` — `4e73 [RTE] 2` restores `$55FD`, faults at the
+/// restored PC, and stacks `$4E7A` = `($4E73 & $FFE0) | $1A` — while the same
+/// odd return PC with a restored status that *keeps* `S` stacks the plain
+/// [`STATUS_CODE_FETCH`] `$1E`.
+const STATUS_RTE_RELOAD: u16 = 0x1A;
+
 /// What the address error costs in total, per M68000UM "Exception Processing
 /// Execution Times". 34 of it is the part every exception entry pays
 /// ([`EXCEPTION_ENTRY_CLOCKS`]), so what this frame adds on top is the rest.
@@ -140,18 +151,19 @@ const ADDRESS_ERROR_ENTRY_CLOCKS: u64 = 50;
 
 /// The bus accesses the group 0 entry performs: the seven word writes of the
 /// frame, the two reads of the vector long, and the two fetches of the queue
-/// refill at the handler. Each charges itself [`BUS_CYCLE_CLOCKS`], exactly as
+/// refill at the handler — eleven cycles, the 4 reads + 7 writes of yacht.txt's
+/// "EXCEPTION PROCESSING EXECUTION TIMES" row `Address error | 50(4/7)`. Each
+/// charges itself [`BUS_CYCLE_CLOCKS`], exactly as
 /// [`crate::exceptions`] charges its own accesses.
-const ADDRESS_ERROR_ENTRY_ACCESSES: u64 = 10;
+const ADDRESS_ERROR_ENTRY_ACCESSES: u64 = 11;
 
-/// What the entry adds to the access cost: the part of
-/// [`ADDRESS_ERROR_ENTRY_CLOCKS`] that is not bus traffic.
-///
-/// Derived, not chosen, and in the style of
-/// [`crate::interrupts::INTERRUPT_ACK_CLOCKS`] — but as a subtraction from the
-/// documented total rather than a delta on [`EXCEPTION_ENTRY_CLOCKS`], because
-/// the group 0 frame is four words bigger than group 1 and its extra accesses
-/// are what make the two entries differ.
+/// What the entry costs beyond its bus traffic, as a subtraction from the
+/// documented total (yacht.txt's `50(4/7)` = 50 clock periods, 4 reads + 7
+/// writes = 44 clocks on the bus, so 6 off it) rather than a delta on
+/// [`crate::exceptions::EXCEPTION_ENTRY_CLOCKS`], because the group 0 frame is
+/// four words bigger than group 1 and its extra accesses are what make the two
+/// entries differ. Same style as
+/// [`crate::interrupts::INTERRUPT_ACK_CLOCKS`].
 const ADDRESS_ERROR_EXTRA_CLOCKS: u64 =
     ADDRESS_ERROR_ENTRY_CLOCKS - ADDRESS_ERROR_ENTRY_ACCESSES * BUS_CYCLE_CLOCKS;
 
@@ -167,6 +179,12 @@ pub(crate) enum AccessKind {
     /// An instruction fetch: the prefetch queue refill in
     /// [`M68k::pop_word`] / [`M68k::jump_to`].
     CodeFetch,
+    /// The instruction-stream fetch `RTE`'s SR reload leads into, raised by
+    /// [`M68k::op_rte`] when the restored status word took `S` away and the
+    /// restored PC is odd. The suite splits its two RTE shapes on exactly that
+    /// line — see [`STATUS_RTE_RELOAD`] — so this is its own kind rather than a
+    /// variant of [`AccessKind::CodeFetch`].
+    RteReload,
 }
 
 impl AccessKind {
@@ -176,6 +194,7 @@ impl AccessKind {
             AccessKind::DataRead => STATUS_DATA_READ,
             AccessKind::DataWrite => STATUS_DATA_WRITE,
             AccessKind::CodeFetch => STATUS_CODE_FETCH,
+            AccessKind::RteReload => STATUS_RTE_RELOAD,
         }
     }
 }
@@ -252,6 +271,32 @@ impl M68k {
         self.pending_address_error.is_some()
     }
 
+    /// Amend the pending fault's address to `addr`.
+    ///
+    /// For a faulted long access through `-(An)`, where the walking register
+    /// stops one word step above the operand and the frame records the fault
+    /// there: an `ADDX.l` source at `-(A2)` with `A2 = $21B3CE4D` stacks the
+    /// fault address `$21B3CE4B` — one word step above the operand at
+    /// `$21B3CE49` — and leaves `A2` at `$21B3CE4B` (suite case `db8a [ADDX.l
+    /// -(A2), -(A5)] 7`; its `MOVE.l` sibling `2506 [D6, -(A2)] 92` the same).
+    /// The access raised the fault at the operand address; this moves the
+    /// record to where the walk had actually got to.
+    pub(crate) fn amend_pending_fault_address(&mut self, addr: u32) {
+        if let Some(fault) = &mut self.pending_address_error {
+            fault.addr = addr;
+        }
+    }
+
+    /// The faulted long access through a `-(An)` operand, in full: the walking
+    /// register stops one word step above the operand and the recorded fault
+    /// address moves there with it — see [`Self::amend_pending_fault_address`]
+    /// for the suite cases. `ea` is the operand address the access used and
+    /// `reg` the walking register.
+    pub(crate) fn predec_long_walk_stop(&mut self, reg: u8, ea: u32) {
+        self.set_an(reg, ea + 2);
+        self.amend_pending_fault_address(ea + 2);
+    }
+
     /// If an access faulted since the last call, enter the address error.
     ///
     /// Called by [`M68k::step`] once the opcode has finished, which is why
@@ -300,7 +345,9 @@ impl M68k {
         let stacked_pc = match fault.kind {
             // Measured on `JMP.json.gz` case `4ed1 [JMP (A1)] 2`: a fetch fault
             // stacks the address it was fetching, minus the queue ahead of it.
-            AccessKind::CodeFetch => fault.addr.wrapping_sub(4),
+            // The RTE reload fetch stacks the same way (`RTE.json.gz` case
+            // `4e73 [RTE] 12`: fault `$DCB0D3D9`, stacked `$DCB0D3D5`).
+            AccessKind::CodeFetch | AccessKind::RteReload => fault.addr.wrapping_sub(4),
             AccessKind::DataRead | AccessKind::DataWrite => fault.pc,
         };
         let ird = fault.ird;
@@ -324,7 +371,7 @@ impl M68k {
 mod tests {
     use super::*;
     use crate::cpu::BUS_CYCLE_CLOCKS;
-    use crate::sr::{SR_INT_MASK, SR_S, SR_Z};
+    use crate::sr::{SR_INT_MASK, SR_S};
     use crate::testbus::{TestBus, cpu_with_program};
 
     /// Where [`cpu_with_program`] puts the program, and the stack it starts on.
@@ -426,11 +473,17 @@ mod tests {
             0x3015,
             a0,
             0x3010,
-            // `MOVE` sets the condition codes from its operand, which here is
-            // the suppressed (zero) result of the faulting access, so Z is up
-            // when the frame records SR. The entry itself touches no flags.
-            SUP | SR_Z,
+            // The instruction is aborted at the faulting access, so its flag
+            // update never happens: the suite pins this on `TST.w` case `4a79
+            // [TST.w (xxx).l] 1`, whose final `sr` equals `initial.sr` through
+            // the whole exception. `MOVE` would have set Z from the suppressed
+            // (zero) read; it does not. `SR_Z` is deliberately absent.
+            SUP,
             PROGRAM,
+        );
+        assert_eq!(
+            cpu.sr, SUP,
+            "the aborted instruction changed no flag bit at all"
         );
         assert_eq!(
             peek_word(&bus, 0x0000_2000),
@@ -438,13 +491,35 @@ mod tests {
             "the faulting access must not happen"
         );
         assert_eq!(cpu.d[0], 0x1111_2222, "D0 keeps its old value");
-        // 50 for the entry, plus the one access of the `MOVE` that still ran:
-        // the queue pop. The faulting operand read is suppressed, and a
-        // suppressed access charges nothing.
+        // The entry's 50 is the whole cost: its eleven bus cycles charge
+        // themselves (44), the entry adds the remaining 6, and the aborted
+        // instruction charges nothing more — the faulting read is suppressed
+        // and the queue pop's refill fetch short-circuits on the pending fault.
         assert_eq!(
             cpu.cycles - before,
-            ADDRESS_ERROR_ENTRY_CLOCKS + BUS_CYCLE_CLOCKS,
-            "address error costs 50 clocks (M68000UM)"
+            ADDRESS_ERROR_ENTRY_CLOCKS,
+            "address error costs 50 clocks (M68000UM, yacht.txt 50(4/7))"
+        );
+    }
+
+    #[test]
+    fn the_frame_keeps_the_address_bits_above_the_bus() {
+        // The frame records the address the instruction asked for, including
+        // bits 31..24 the bus never sees. Pinned on `TST.w.json.gz` case `4a79
+        // [TST.w (xxx).l] 1`: the reference stacks `$0F4A89D5` as the fault
+        // address, where the 24-bit bus view of the same access is `$4A89D5`
+        // and the masked value this core used to stack was `$004A89D5`.
+        // `MOVE.W (A0),D0` with A0 above the mask is the same shape.
+        let a0: u32 = 0x1234_5679;
+        let (mut cpu, mut bus) = cpu_running(0x3010, a0);
+
+        cpu.step(&mut bus);
+
+        let sp = STACK - ADDRESS_ERROR_FRAME_SIZE;
+        assert_eq!(
+            peek_long(&bus, sp + 2),
+            a0,
+            "SP+2: the faulting address whole, bits 31..24 included"
         );
     }
 
@@ -524,7 +599,7 @@ mod tests {
         );
         assert_eq!(peek_long(&bus, sp + 2), a0, "fault address");
         assert_eq!(peek_word(&bus, sp + 6), 0x3010, "IRD");
-        assert_eq!(peek_word(&bus, sp + 8), SUP | SR_Z, "saved SR");
+        assert_eq!(peek_word(&bus, sp + 8), SUP, "saved SR, flags untouched");
         assert_eq!(peek_long(&bus, sp + 10), PROGRAM, "stacked PC");
         // Halting does not undo the mode change. Motorola's exception sequence is
         // push frame, update SR, *then* fetch the vector long (M68000UM section 6
@@ -575,9 +650,13 @@ mod tests {
 
     #[test]
     fn the_entry_clocks_are_charged_once_and_not_twice() {
-        // The documented 50 is the entry total; ten bus accesses charge
-        // themselves, so the constant added by `address_error` is the remainder.
-        assert_eq!(ADDRESS_ERROR_EXTRA_CLOCKS, 10);
+        // The documented 50 is the entry total; its eleven bus accesses charge
+        // themselves (44 — yacht.txt's `Address error | 50(4/7)`, four reads and
+        // seven writes), so the constant added by `address_error` is the rest.
+        // The old value 10 made the total 54, four clocks over every suite
+        // exception case (#474: `TST.w` lengths 52/56/58 minus their EA time).
+        assert_eq!(ADDRESS_ERROR_EXTRA_CLOCKS, 6);
+        assert_eq!(ADDRESS_ERROR_ENTRY_ACCESSES, 11);
         assert_eq!(
             ADDRESS_ERROR_EXTRA_CLOCKS + ADDRESS_ERROR_ENTRY_ACCESSES * BUS_CYCLE_CLOCKS,
             ADDRESS_ERROR_ENTRY_CLOCKS,

@@ -3,7 +3,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateAndCyclesSkipExceptions`], the same one the move class
+//! [`harness::Check::StateAndCycles`], the same one the move class
 //! uses: the cases that end in the suite's exception handler are left to
 //! M1-29 (#37) — see [`harness::is_exception_case`] and #185.
 //!
@@ -32,50 +32,50 @@ mod harness;
 /// encodings taken out.
 #[test]
 fn add_b_file_passes() {
-    harness::assert_file_passes("ADD.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ADD.b", harness::Check::StateAndCycles);
 }
 
 /// `ADD.W`: `$D040`-`$D07F` / `$D140`-`$D17F`.
 #[test]
 fn add_w_file_passes() {
-    harness::assert_file_passes("ADD.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ADD.w", harness::Check::StateAndCycles);
 }
 
 /// `ADD.L`: `$D080`-`$D0BF` / `$D180`-`$D1BF`.
 #[test]
 fn add_l_file_passes() {
-    harness::assert_file_passes("ADD.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ADD.l", harness::Check::StateAndCycles);
 }
 
 /// `ADDA.W`: operation `011`, word only.
 #[test]
 fn adda_w_file_passes() {
-    harness::assert_file_passes("ADDA.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ADDA.w", harness::Check::StateAndCycles);
 }
 
 /// `ADDA.L`: operation `111`.
 #[test]
 fn adda_l_file_passes() {
-    harness::assert_file_passes("ADDA.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ADDA.l", harness::Check::StateAndCycles);
 }
 
 /// `ADDX.B`: `$D100`-`$D107` style, `ss = 00`, which overlaps `ADD`'s
 /// `$D100`-`$D13F` byte group and must win there.
 #[test]
 fn addx_b_file_passes() {
-    harness::assert_file_passes("ADDX.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ADDX.b", harness::Check::StateAndCycles);
 }
 
 /// `ADDX.W`: `ss = 01` inside the `ADD.W` `$D140`-`$D17F` range.
 #[test]
 fn addx_w_file_passes() {
-    harness::assert_file_passes("ADDX.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ADDX.w", harness::Check::StateAndCycles);
 }
 
 /// `ADDX.L`: `ss = 10` inside the `ADD.L` `$D180`-`$D1BF` range.
 #[test]
 fn addx_l_file_passes() {
-    harness::assert_file_passes("ADDX.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ADDX.l", harness::Check::StateAndCycles);
 }
 
 /// The eight file names above are what the suite ships, so a rename fails here

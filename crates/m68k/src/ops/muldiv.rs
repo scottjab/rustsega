@@ -283,6 +283,12 @@ impl M68k {
         // `-(A0)` — must move it once, when the source is read.
         let multiplicand = self.read_ea(bus, Ea::DataReg(reg), Size::Word) as u16;
         let multiplier = self.read_ea(bus, source, Size::Word) as u16;
+        // Aborted at the faulting read: no product, no flags, and none of the
+        // `38 + 2n` clocks (suite `MULU`/`MULS` exception cases cost their EA
+        // plus the 50-clock entry, nothing else).
+        if self.address_error_pending() {
+            return 0;
+        }
         let iterations = if signed {
             muls_iterations(multiplier)
         } else {
@@ -359,6 +365,13 @@ impl M68k {
         // `DIVU (A0)+,D0` moves A0 exactly once however the divide ends.
         let dividend = self.read_ea(bus, Ea::DataReg(reg), Size::Long);
         let divisor = self.read_ea(bus, source, Size::Word) as u16;
+        // Aborted at the faulting read: no divide-by-zero trap, no overflow, no
+        // result — the group 0 fault outranks everything the divide would do
+        // with the suppressed zero (suite `DIVU`/`DIVS` exception cases leave
+        // `sr` alone and stack only the group 0 frame).
+        if self.address_error_pending() {
+            return 0;
+        }
 
         if divisor == 0 {
             // Divide by zero (M68000UM "Division by Zero"). The instruction is

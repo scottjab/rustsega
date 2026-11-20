@@ -63,7 +63,7 @@
 //! flipped them.
 
 use crate::M68k;
-use crate::bus::{ADDR_MASK, Bus};
+use crate::bus::Bus;
 use crate::ea::{Ea, Size, sign_extend_word};
 use crate::ops::field;
 
@@ -128,9 +128,9 @@ impl M68k {
             let register = movem_list_ea(bit as u8, reversed);
             if to_memory {
                 let value = self.read_ea(bus, register, size);
-                self.write_ea(bus, Ea::Mem(addr & ADDR_MASK), size, value);
+                self.write_ea(bus, Ea::Mem(addr), size, value);
             } else {
-                let raw = self.read_ea(bus, Ea::Mem(addr & ADDR_MASK), size);
+                let raw = self.read_ea(bus, Ea::Mem(addr), size);
                 // Every word loaded back is sign extended to 32 bits, the data
                 // registers included (M68000UM MOVEM, "Note"), and a long is
                 // written whole. `Size::Long` on the write is therefore the point,
@@ -145,6 +145,31 @@ impl M68k {
                 self.write_ea(bus, register, Size::Long, value);
             }
             count += 1;
+            // The transfer that faults still moves a stack-mode walk register one
+            // word — a load through `(An)+` counts the word cycle it faulted on
+            // plus the one it had completed: suite `MOVEM.l` case `4cd8 [(A0)+,
+            // #] 15` (`A0` reads `$91772AAB`, ends `$91772AAD`) and its word
+            // sibling `4c9d` the same. A store through `-(An)` does not move:
+            // its decrement belongs to the faulted store cycle, which never
+            // completed (suite `48a5 [#, -(A5)] 9`, `A5` where it started). Any
+            // other mode's register is untouched by MOVEM anyway. As with the
+            // transfers, the rest of the walk is suppressed and register writes
+            // are gated, so stopping here is the whole of it. `addr` is whole
+            // on purpose — the group 0 frame records the walk address above the
+            // bus mask, like any EA (#474).
+            if self.address_error_pending() {
+                if mode == MODE_POST_INCREMENT {
+                    self.set_an(reg, addr.wrapping_add(2));
+                } else if mode == MODE_PRE_DECREMENT && size == Size::Long {
+                    // The long store's first word cycle is at its low word,
+                    // `addr + 2`, and that is where the frame records the fault
+                    // (suite `48e5 [#, -(A5)] 21`: operand `A5 - 4`, frame at
+                    // `A5 - 2`). Word stores and every non-stack mode fault at
+                    // `addr` itself.
+                    self.amend_pending_fault_address(addr.wrapping_add(2));
+                }
+                return 0;
+            }
         }
 
         // Where a walk upward from the operand ends up: the address after the last
@@ -175,8 +200,9 @@ impl M68k {
         if !to_memory {
             // The extra word read after the last register, at the address the walk
             // ended at: see the module docs for what it is and what it can and
-            // cannot change.
-            self.read_w(bus, end_of_walk & ADDR_MASK);
+            // cannot change. Whole address, like the transfers: a fault here
+            // records the address as the walk left it.
+            self.read_w(bus, end_of_walk);
         }
 
         self.advance_opcode(bus);

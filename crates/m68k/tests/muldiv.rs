@@ -5,7 +5,7 @@
 //! cannot finish yet: 3073 of `MULU` and 3122 of `MULS` end in the suite's
 //! exception handler (`harness::is_exception_case`), because an odd
 //! operand address has to raise address error — M1-29 (#37). Those are left out
-//! by [`harness::Check::StateAndCyclesSkipExceptions`], exactly as the add, logic and
+//! by [`harness::Check::StateAndCycles`], exactly as the add, logic and
 //! shift classes do, and the remaining 4992 / 4943 cases have to pass.
 //!
 //! # Why the cycle tests are separate
@@ -59,14 +59,14 @@ mod harness;
 /// take the suite's exception handler.
 #[test]
 fn mulu_file_passes() {
-    harness::assert_file_passes("MULU", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MULU", harness::Check::StateAndCycles);
 }
 
 /// `MULS`: `$C1C0`–`$C1FF` (`1100 ddd 111 eeeeee`), 8065 cases of which 3122
 /// take the suite's exception handler.
 #[test]
 fn muls_file_passes() {
-    harness::assert_file_passes("MULS", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MULS", harness::Check::StateAndCycles);
 }
 
 /// `DIVU`: `$80C0`–`$80FF` (`1000 ddd 011 eeeeee`). 8065 cases, 3101 of which
@@ -81,7 +81,7 @@ fn muls_file_passes() {
 /// and the 4964 that finish at `4 + 2n` over it with `n` from 42 to 63.
 #[test]
 fn divu_file_passes() {
-    harness::assert_file_passes("DIVU", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("DIVU", harness::Check::StateAndCycles);
 }
 
 /// `DIVS`: `$81C0`–`$81FF` (`1000 ddd 111 eeeeee`), 8065 cases of which 3073
@@ -97,7 +97,7 @@ fn divu_file_passes() {
 /// finish at `4 + 2n` with `n` from 61 to 74.
 #[test]
 fn divs_file_passes() {
-    harness::assert_file_passes("DIVS", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("DIVS", harness::Check::StateAndCycles);
 }
 
 /// `MULU`'s cycle count: `step` returns the case's `length` for every case that

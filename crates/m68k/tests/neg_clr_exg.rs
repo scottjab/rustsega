@@ -3,7 +3,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateAndCyclesSkipExceptions`], the same one the add, subtract
+//! [`harness::Check::StateAndCycles`], the same one the add, subtract
 //! and compare classes use: the cases that end in the suite's exception handler
 //! are left to M1-29 (#37) — see [`harness::is_exception_case`] and #185.
 //!
@@ -32,39 +32,39 @@ mod harness;
 /// `NEG.B`: `$4400`-`$44BF`, `0 - <ea>` → `<ea>`.
 #[test]
 fn neg_b_file_passes() {
-    harness::assert_file_passes("NEG.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("NEG.b", harness::Check::StateAndCycles);
 }
 
 /// `NEG.W`: the same group at `ss` = `01`.
 #[test]
 fn neg_w_file_passes() {
-    harness::assert_file_passes("NEG.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("NEG.w", harness::Check::StateAndCycles);
 }
 
 /// `NEG.L`: the same group at `ss` = `10`. `ss` = `11` is nothing at all in
 /// `$44xx`, which is why the group stops dead at `$44BF`.
 #[test]
 fn neg_l_file_passes() {
-    harness::assert_file_passes("NEG.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("NEG.l", harness::Check::StateAndCycles);
 }
 
 /// `NEGX.B`: `$4000`-`$40BF`, `0 - <ea> - X` → `<ea>` with `SUBX`'s sticky `Z`.
 #[test]
 fn negx_b_file_passes() {
-    harness::assert_file_passes("NEGX.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("NEGX.b", harness::Check::StateAndCycles);
 }
 
 /// `NEGX.W`.
 #[test]
 fn negx_w_file_passes() {
-    harness::assert_file_passes("NEGX.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("NEGX.w", harness::Check::StateAndCycles);
 }
 
 /// `NEGX.L`. The next sixth, `$40C0`-`$40FF`, is MOVE from SR (M1-26, #34) and
 /// stays unimplemented.
 #[test]
 fn negx_l_file_passes() {
-    harness::assert_file_passes("NEGX.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("NEGX.l", harness::Check::StateAndCycles);
 }
 
 /// `CLR.B`: `$4200`-`$42BF`. A memory destination is read before it is written
@@ -72,44 +72,44 @@ fn negx_l_file_passes() {
 /// the read itself is pinned by `ops::arith::tests::clr_to_memory_reads_then_writes`.
 #[test]
 fn clr_b_file_passes() {
-    harness::assert_file_passes("CLR.b", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("CLR.b", harness::Check::StateAndCycles);
 }
 
 /// `CLR.W`.
 #[test]
 fn clr_w_file_passes() {
-    harness::assert_file_passes("CLR.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("CLR.w", harness::Check::StateAndCycles);
 }
 
 /// `CLR.L`.
 #[test]
 fn clr_l_file_passes() {
-    harness::assert_file_passes("CLR.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("CLR.l", harness::Check::StateAndCycles);
 }
 
 /// `EXT.W`: `$4880`+`r`, the low byte of `Dn` sign extended to a word.
 #[test]
 fn ext_w_file_passes() {
-    harness::assert_file_passes("EXT.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("EXT.w", harness::Check::StateAndCycles);
 }
 
 /// `EXT.L`: `$48C0`+`r`, the low word of `Dn` sign extended to a long.
 #[test]
 fn ext_l_file_passes() {
-    harness::assert_file_passes("EXT.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("EXT.l", harness::Check::StateAndCycles);
 }
 
 /// `SWAP`: `$4840`+`r`, the halves of `Dn` exchanged.
 #[test]
 fn swap_file_passes() {
-    harness::assert_file_passes("SWAP", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("SWAP", harness::Check::StateAndCycles);
 }
 
 /// `EXG`: opmode `01000` (`Dx,Dy`), `01001` (`Ax,Ay`) and `10001` (`Dx,Ay`),
 /// none of which sets a flag.
 #[test]
 fn exg_file_passes() {
-    harness::assert_file_passes("EXG", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("EXG", harness::Check::StateAndCycles);
 }
 
 /// The thirteen file names above are what the suite ships for this ticket, so a
