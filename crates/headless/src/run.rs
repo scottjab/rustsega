@@ -183,9 +183,9 @@ fn parse_hex_address(value: &str) -> Result<u32, String> {
 /// for a command line tool.
 pub fn run(args: RunArgs) -> Result<()> {
     let rom = read_rom(&args.rom)?;
-    // `Config::default()` is TMSS off, 48 kHz and the Model 1 low-pass: the
-    // 48 kHz is the rate `--dump-wav` and `--audio-hash` report at, and nothing
-    // else here is a host choice.
+    // `Config::default()` is TMSS off, 48 kHz and the discrete YM2612 of a
+    // Model 1 with its board low-pass: the 48 kHz is the rate `--dump-wav` and
+    // `--audio-hash` report at, and nothing else here is a host choice.
     let config = Config {
         region: args.region.setting(),
         ..Config::default()

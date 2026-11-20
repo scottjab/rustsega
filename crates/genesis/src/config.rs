@@ -9,6 +9,7 @@
 //! [`Region::version_register`] documents the bits.
 
 use crate::cart::{Regions, RomHeader};
+use ym2612::ChipModel;
 
 /// Default host sample rate for [`Config::sample_rate`], the 48 kHz of
 /// docs/ARCHITECTURE.md ("Audio chips").
@@ -151,30 +152,6 @@ impl Region {
     }
 }
 
-/// The console's own output low-pass, which the mixer applies at the host rate
-/// after the two chips have been summed (docs/ARCHITECTURE.md, "Audio chips").
-///
-/// This is the board's filter rather than the chips': the summed audio leaves the
-/// motherboard through a resistor and a capacitor, and a Model 1's is low enough
-/// that a 10 kHz tone is a third of what it was. The shape is the one Genesis
-/// Plus GX has always used - `audio_update` of `core/system.c` runs
-/// `l = l * factora + out * factorb` over the finished buffer, which is exactly
-/// `y += a * (x - y)` (read 2026-07-31), and its own default coefficient is
-/// `0x9999` (`libretro/libretro.c`, `config.lp_range = 0x9999`, 0.6 in 16.16).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LowPass {
-    /// No filtering: the mixed chips straight to the host.
-    Off,
-    /// The first-order low-pass of a Model 1 board, about 3.39 kHz.
-    ///
-    /// The corner is the ticket's figure for a VA3-ish board. It is not
-    /// independent of Genesis Plus GX's default coefficient: `a = 0.6` at 48 kHz
-    /// is a corner of about 3.9 kHz (`-ln(1 - a) * fs / 2 PI`), so the two agree
-    /// to within half a kilohertz on where the board rolls off and on it being
-    /// one pole.
-    Model1,
-}
-
 /// The host's region setting: follow the cartridge, or ignore it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionSetting {
@@ -202,9 +179,39 @@ pub struct Config {
     /// it, and the output really is this rate: the master clock is what decides
     /// how many samples a second of machine time is worth.
     pub sample_rate: u32,
-    /// The console's own output low-pass, [`LowPass::Model1`], the Model 1 board
-    /// filter most hosts want; [`LowPass::Off`] for a clean capture of the chips.
-    pub lowpass: LowPass,
+    /// Which sound chip the console carries, which at the output stage is also
+    /// which board follows it: the two are one physical choice, and this is the
+    /// one place that choice is made (#342).
+    ///
+    /// [`ChipModel::Ym2612`], the default, is a Model 1: the discrete chip's
+    /// ladder DAC (`ym2612::output`), and the board's first-order low-pass of
+    /// about 3.39 kHz applied after the mix
+    /// ([`crate::audio::MODEL1_LOW_PASS_HZ`]).
+    ///
+    /// [`ChipModel::Ym3438`] is a Model 2 or Model 3: the integrated chip
+    /// answers with no ladder, and its board stage is deliberately *not
+    /// modelled* - not because the boards have no filter, but because nobody has
+    /// published numbers for the one they have. What is known is topology only:
+    /// ConsoleArtisan's Genesis repair reference
+    /// (https://consoleartisan.com/reference/genesis/, read 19 Nov 2026) names
+    /// "LM324-class op-amps and a too-high-Q Sallen-Key filter" on the VA0/VA1
+    /// Model 2 and VA7 Model 1 boards, with no pole frequency and no Q;
+    /// Wikipedia's YM2612 article adds that the YM3438's "sound outputs have
+    /// higher impedance", unquantified, which would move the corner of anything
+    /// passive after the chip; and the Crystal Clear Audio Mod (Tiido, 2009)
+    /// exists to bypass that stage outright. The strongest implementation
+    /// precedent models nothing here too: Genesis Plus GX applies one global
+    /// low-pass whatever the model, and its libretro options documentation
+    /// presents that filter as existing "to better simulate the characteristic
+    /// sound of a Model 1 Genesis". So a Ym3438 console is the chips straight to
+    /// the host, which is a fence, not a claim that the hardware has none.
+    ///
+    /// The chip generation travels inside a save state as part of the chip; the
+    /// board does not, because the mixer's coefficients are not saved
+    /// (docs/save-state-format.md, "The audio mixer"). A save carried between
+    /// consoles of different generations is therefore mixed hardware by
+    /// construction.
+    pub chip_model: ChipModel,
     /// The PSG's volume relative to the FM's, in percent: 100 is the balance of a
     /// VA4 Model 1 that `crate::audio::PSG_LEVEL_REFERENCE` is drawn from, 0 is
     /// the FM alone and 200 is the PSG twice as loud as that balance.
@@ -227,7 +234,7 @@ impl Default for Config {
             region: RegionSetting::Auto,
             tmss: false,
             sample_rate: DEFAULT_SAMPLE_RATE,
-            lowpass: LowPass::Model1,
+            chip_model: ChipModel::Ym2612,
             psg_level: DEFAULT_PSG_LEVEL,
             prefer: [Region::Usa, Region::Europe, Region::Japan],
         }
@@ -375,7 +382,7 @@ mod tests {
         assert_eq!(config.region, RegionSetting::Auto);
         assert!(!config.tmss);
         assert_eq!(config.sample_rate, 48_000);
-        assert_eq!(config.lowpass, LowPass::Model1);
+        assert_eq!(config.chip_model, ChipModel::Ym2612);
         assert_eq!(config.psg_level, DEFAULT_PSG_LEVEL);
         assert_eq!(config.prefer, [Region::Usa, Region::Europe, Region::Japan]);
     }

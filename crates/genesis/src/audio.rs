@@ -228,8 +228,13 @@ impl Audio {
     /// the crate offers no `reset`. The clock position is deliberately *not*
     /// wound back - the chip stops being the old one, it does not stop being
     /// clocked - and the samples it had already produced stay in the frame.
+    /// The chip's *generation* is the console's rather than the chip's, though,
+    /// so the rebuild restores it: a soft reset must not turn a Ym3438 console
+    /// back into a discrete one (#342).
     pub fn ym_reset(&mut self) {
+        let model = self.ym.model();
         self.ym = Ym2612::new();
+        self.ym.set_model(model);
         self.ym_resets += 1;
     }
 
@@ -287,8 +292,9 @@ impl std::fmt::Debug for Audio {
 
 // The mixer: two chips, one host rate ---------------------------------------
 
-use crate::config::{Config, LowPass};
+use crate::config::Config;
 use std::f32::consts::PI;
+use ym2612::ChipModel;
 
 /// What an FM sample is multiplied by on its way into the mix.
 ///
@@ -361,7 +367,7 @@ const PHASES: usize = 256;
 /// or two.
 const DC_BLOCK_HZ: f32 = 20.0;
 
-/// The corner of [`LowPass::Model1`], in Hz: 3390.
+/// The corner of a [`ChipModel::Ym2612`] console's board low-pass, in Hz: 3390.
 ///
 /// The Model 1's output stage is a resistor and a capacitor, and this is the
 /// corner the ticket gives for a VA3-ish board. It agrees with the only other
@@ -751,7 +757,9 @@ pub struct Mixer {
     ym: Stream,
     /// The PSG's one.
     psg: Stream,
-    /// The `a` of the board's low-pass, or `None` for [`LowPass::Off`].
+    /// The `a` of the board's low-pass, or `None` when the console's board has
+    /// none modelled ([`ChipModel::Ym3438`], whose real stage has no published
+    /// numbers to build one from; #342).
     low_pass: Option<f32>,
     /// What the DC-blocking high-pass keeps of its own previous output: one less
     /// the `a` of the same one-pole the low-pass uses, because the blocker is
@@ -763,7 +771,8 @@ pub struct Mixer {
 
 impl Mixer {
     /// A mixer for a machine clocked at `master_hz`, taking its rate, its PSG
-    /// level and its output filter from `config`.
+    /// level and - through the console's chip generation - its output filter
+    /// from `config`.
     ///
     /// The master clock is a separate argument because `Config` does not carry
     /// it and cannot: it is a property of the console the cartridge turned out to
@@ -796,9 +805,12 @@ impl Mixer {
                 master_hz,
                 PSG_FRAME_CAPACITY,
             ),
-            low_pass: match config.lowpass {
-                LowPass::Off => None,
-                LowPass::Model1 => Some(one_pole(MODEL1_LOW_PASS_HZ, rate)),
+            low_pass: match config.chip_model {
+                // The discrete-chip boards' output resistor and capacitor.
+                ChipModel::Ym2612 => Some(one_pole(MODEL1_LOW_PASS_HZ, rate)),
+                // The ASIC-era boards' Sallen-Key stage has no published numbers
+                // to build a filter from: `Config::chip_model` carries the fence.
+                ChipModel::Ym3438 => None,
             },
             dc_keep: 1.0 - one_pole(DC_BLOCK_HZ, rate),
             state: [FilterState::default(); 2],
@@ -989,8 +1001,9 @@ const PI64: f64 = std::f64::consts::PI;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, LowPass, Region};
+    use crate::config::{Config, Region};
     use std::f64::consts::PI;
+    use ym2612::ChipModel;
 
     /// The NTSC master clock, which every mixer test runs on
     /// (docs/ARCHITECTURE.md, "Clocks and timing").
@@ -1182,8 +1195,9 @@ mod tests {
     /// A 1 kHz sine at the FM's own rate keeps its amplitude through the
     /// resampler: within 1%.
     ///
-    /// Mixed with the low-pass off, because what is under test is the resampler;
-    /// [`lowpass_attenuates_10khz`] is the board filter's own test.
+    /// Mixed as a [`ChipModel::Ym3438`] console, whose board has no filter
+    /// modelled (#342), because what is under test is the resampler;
+    /// [`lowpass_attenuates_10khz`] is the Model 1 board filter's own test.
     #[test]
     fn sine_through_resampler_keeps_amplitude() {
         let (ym_count, psg_count) = counts(4);
@@ -1194,7 +1208,7 @@ mod tests {
             .collect();
         let psg = vec![0_i16; psg_count];
         let config = Config {
-            lowpass: LowPass::Off,
+            chip_model: ChipModel::Ym3438,
             ..Config::default()
         };
         assert_eq!(config.sample_rate, RATE);
@@ -1254,7 +1268,7 @@ mod tests {
             .collect();
         let ym = vec![(0_i16, 0_i16); ym_count];
         let config = Config {
-            lowpass: LowPass::Off,
+            chip_model: ChipModel::Ym3438,
             ..Config::default()
         };
         let mut mixer = mixer(config);
@@ -1284,13 +1298,14 @@ mod tests {
         }
     }
 
-    /// The Model 1 low-pass does what it is there for, and `LowPass::Off` does
-    /// not do it.
+    /// The Model 1 board's low-pass does what it is there for, and a
+    /// [`ChipModel::Ym3438`] console has no board filter to do it with (#342).
     ///
     /// A first-order filter at 3.39 kHz is 9.4 dB down at 10 kHz, and that is
     /// what a VA3-ish board's output resistor and capacitor are. Measured against
-    /// the same signal through `Off` so that the resampler's own answer at 10 kHz
-    /// cancels out of the comparison.
+    /// the same frames through a Ym3438 mixer, whose resampler arm is identical
+    /// and whose board models nothing, so that the resampler's own answer at
+    /// 10 kHz cancels out of the comparison and what is left is the board.
     #[test]
     fn lowpass_attenuates_10khz() {
         let (ym_count, psg_count) = counts(8);
@@ -1307,14 +1322,10 @@ mod tests {
         };
 
         let mut through = Vec::new();
-        mixer(Config {
-            lowpass: LowPass::Model1,
-            ..Config::default()
-        })
-        .mix(&frame, &mut through);
+        mixer(Config::default()).mix(&frame, &mut through);
         let mut bypassed = Vec::new();
         mixer(Config {
-            lowpass: LowPass::Off,
+            chip_model: ChipModel::Ym3438,
             ..Config::default()
         })
         .mix(&frame, &mut bypassed);
@@ -1328,6 +1339,51 @@ mod tests {
         let without = rms(steady(&left(&bypassed), window));
         let loss = decibels(with, without);
         assert!(loss <= -9.0, "Model 1 left {loss:.2} dB on a 10 kHz tone");
+    }
+
+    /// The [`ChipModel::Ym3438`] console's board has no filter modelled, and
+    /// this is the pin on that: a 10 kHz tone comes through a Ym3438 mixer about
+    /// as well as a 1 kHz one does, where the Model 1's board takes 9 dB off the
+    /// same tone ([`lowpass_attenuates_10khz`]).
+    ///
+    /// The margin is the resampler's own pass band, not a claim of mathematical
+    /// flatness: the kernel's corner is 21.6 kHz and its 24 taps spend some of
+    /// the pass band getting there. That droop is shared by both consoles'
+    /// mixers, so it cancels out of the Model 1 comparison above; this test
+    /// measures a Ym3438 mixer against itself at two frequencies, so the margin
+    /// has to cover it.
+    #[test]
+    fn ym3438_board_has_no_lowpass() {
+        let mixed = |hz: f64| -> Vec<i16> {
+            let (ym_count, psg_count) = counts(8);
+            let ym: Vec<(i16, i16)> = sine(ym_count, YM_SAMPLE_MCLK, hz, 400.0)
+                .into_iter()
+                .map(|v| (v, v))
+                .collect();
+            let psg = vec![0_i16; psg_count];
+            let frame = ChipFrame {
+                ym: &ym,
+                ym_first: 0,
+                psg: &psg,
+                psg_first: 0,
+            };
+            let mut out = Vec::new();
+            mixer(Config {
+                chip_model: ChipModel::Ym3438,
+                ..Config::default()
+            })
+            .mix(&frame, &mut out);
+            out
+        };
+
+        let ten_khz = rms(steady(&left(&mixed(10_000.0)), 3_072));
+        let one_khz = rms(steady(&left(&mixed(1_000.0)), 3_072));
+        let droop = decibels(ten_khz, one_khz);
+        assert!(
+            droop >= -1.5,
+            "a Ym3438 console left {droop:.2} dB between 1 and 10 kHz, which is \
+             a board filter, not a resampler"
+        );
     }
 
     /// A constant is not a sound: the ladder's offset and the PSG's are gone by
@@ -1386,6 +1442,23 @@ mod tests {
             twice.is_empty(),
             "the second call mixed {} halves again",
             twice.len()
+        );
+    }
+
+    /// The soft reset line rebuilds the chip, and the rebuild is a power-on chip
+    /// of the generation the console carries: a Ym3438 machine does not become a
+    /// discrete one because its Z80 was reset, the reset edge being the only
+    /// thing that calls [`Audio::ym_reset`] (`crate::bus`, which follows
+    /// BlastEm's `io_write`).
+    #[test]
+    fn the_reset_line_keeps_the_chip_generation() {
+        let mut audio = Audio::new();
+        audio.ym.set_model(ChipModel::Ym3438);
+        audio.ym_reset();
+        assert_eq!(
+            audio.ym.model(),
+            ChipModel::Ym3438,
+            "the reset line reset the chip, not the console"
         );
     }
 }
