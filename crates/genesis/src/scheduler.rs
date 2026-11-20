@@ -113,11 +113,13 @@ const MAX_SLICES_PER_LINE: u32 = MASTER_CLOCKS_PER_LINE as u32;
 const LINES_PER_FRAME_NTSC: u16 = 262;
 /// Scanlines in one PAL frame.
 pub(crate) const LINES_PER_FRAME_PAL: u16 = 313;
-/// How far the VBlank line moves when R1 bit 3 is written: [`vdp::Vdp::active_height`]
-/// is 224 in V28 and 240 in V30, and `vdp::timing::start_line` compares the beam
-/// against it live, so a mid-frame write moves the frame boundary by this much
-/// (#371). [`Scheduler::max_frame_lines`] and the frame buffers of [`crate::Audio`]
-/// are both sized off it.
+/// How far the VBlank line moves when R1 bit 3 is written: `vdp::timing::vblank_line`
+/// is 224 in V28 and 240 in V30 in either region, and `vdp::timing::start_line` compares
+/// the beam against it live, so a mid-frame write moves the frame boundary by this much
+/// (#371). The shift is 16 lines on both rasters, and the VBlank line differs from
+/// [`vdp::Vdp::active_height`] only on NTSC in V30, where the boundary moves to 240
+/// while the picture stays 224 lines. [`Scheduler::max_frame_lines`] and the frame
+/// buffers of [`crate::Audio`] are both sized off it.
 pub(crate) const VBLANK_LINE_SHIFT: u16 = 16;
 
 /// Where [`Scheduler::run_line_to_pc`] stops the line, and the reason the line loop
@@ -421,8 +423,10 @@ impl Scheduler {
     /// which is one VBlank-to-VBlank interval and nothing more.
     ///
     /// [`vdp::Vdp::frame_done`] is raised when the beam enters
-    /// [`vdp::Vdp::active_height`], 224 in V28 and 240 in V30, and R1 bit 3 can be
-    /// written on any line - so the interval, not the raster, is what a frame is.
+    /// `vdp::timing::vblank_line`, 224 in V28 and 240 in V30 in either region, and R1
+    /// bit 3 can be written on any line - so the interval, not the raster, is what a
+    /// frame is. The VBlank line differs from [`vdp::Vdp::active_height`] only on NTSC
+    /// in V30, where the beam runs to 240 while the picture stays 224.
     /// Kabuto's hardware notes, "V28/V30 tricks", describe programs that move the
     /// border by writing the bit mid-frame, and on the PAL carts of #371 that makes
     /// the interval 329 lines (`Story of Thor, The (Europe)`, V30 set at line 120)
