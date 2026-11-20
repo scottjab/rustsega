@@ -13,13 +13,10 @@
 //! [`M68k::pc`].
 //!
 //! [`M68k::step`] decodes the opcode at the front of the queue through the
-//! table in [`decode`] and dispatches to the handlers in [`ops`] (M1-07, #15).
-//! No instruction is implemented yet, so every real opcode takes the loud
-//! `unimplemented!` path; what exists is the routing, the illegal / line A /
-//! line F exception stubs, and the effective-address layer the handlers will
-//! use.
-//!
-//! Not implemented yet: instructions, real exception frames, interrupts.
+//! table in [`decode`] and dispatches to the handlers in [`ops`]. The full
+//! user instruction set is implemented (M1-07, #15, through the M3 gates:
+//! SingleStepTests conformance and the hardware suite), along with real
+//! exception frames ([`exceptions`]) and interrupt dispatch ([`interrupts`]).
 
 mod address_error;
 mod bus;
