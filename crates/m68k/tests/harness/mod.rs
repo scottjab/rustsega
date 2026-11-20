@@ -189,8 +189,10 @@ pub struct CpuState {
     /// as an `sr` mismatch in the sweep rather than being hidden by the mask.
     pub sr: u16,
     pub pc: u32,
-    /// The prefetch queue, IRC then IRD — the pair the suite models and the
-    /// core has to reproduce to pass (M1-04, #12).
+    /// The prefetch queue, IRD then IRC — element 0 is the word at `pc`, the
+    /// instruction being executed, element 1 the word at `pc + 2`. The
+    /// derivation, the 986 556-case sweep behind it and the trap in the
+    /// manual's wording are on [`M68k::pc`] (M1-04, #12).
     pub prefetch: [u16; 2],
     /// Sparse RAM: only the addresses the case cares about are listed, and they
     /// are listed byte by byte, so odd addresses are fine.
