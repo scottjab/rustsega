@@ -235,6 +235,8 @@
             pkgs.git
             pkgs.ripgrep
             pkgs.jq
+            # For format-checking flake.nix and nix/*.nix (`just fmt-nix-check`).
+            pkgs.nixpkgs-fmt
             # For linting the shell scripts in scripts/ (`shellcheck scripts/*.sh`).
             pkgs.shellcheck
             # For linting the workflow files in .github/workflows/ (`just actionlint`),
