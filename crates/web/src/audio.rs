@@ -2,13 +2,20 @@
 //!
 //! [`AudioOut`] owns one [`web_sys::AudioContext`], the [`web_sys::GainNode`] in
 //! front of its destination, and the time the next block of sound is due at.
-//! Every console frame appends whatever [`genesis::Genesis::drain_audio`] made to
-//! a fresh [`web_sys::AudioBuffer`] and schedules it with
+//! Every console frame appends whatever [`genesis::Genesis::drain_audio`] made
+//! to a fresh [`web_sys::AudioBuffer`] and schedules it with
 //! [`web_sys::AudioBufferSourceNode::start_with_when`], so the speakers are told
 //! what is coming before they are asked to play it and the emulator never has to
 //! guess how long a frame took. No AudioWorklet: that would need a JavaScript
 //! file, and docs/ARCHITECTURE.md says the only JavaScript here is what
 //! wasm-bindgen generates.
+//!
+//! On a WebKit user agent several console frames share one block, and the
+//! cursor target deepens to cover it - see
+//! [`crate::audio_pacing::frames_per_block_for`] and
+//! [`crate::audio_pacing::target_ahead_secs`] for the counts and the reasons
+//! (#629). The schedule below is the same either way, only less frequent and
+//! held further ahead on WebKit.
 //!
 //! The scheduling scheme, and why it is click-free:
 //!
@@ -36,7 +43,9 @@ use web_sys::AudioContextOptions;
 use web_sys::AudioContextState;
 use web_sys::GainNode;
 
+use crate::audio_pacing::BlockBatcher;
 use crate::audio_pacing::deinterleave;
+use crate::audio_pacing::frames_per_block_for;
 
 /// The sample rate asked of the browser, which is `Config::default`'s too.
 ///
@@ -77,6 +86,22 @@ pub struct AudioOut {
     /// (see [`crate::audio_pacing::deinterleave`]).
     left: Vec<f32>,
     right: Vec<f32>,
+    /// How many console frames one scheduled block carries: one everywhere but
+    /// the WebKit family, which batches ([`crate::audio_pacing::frames_per_block_for`],
+    /// #629). Set for good in [`Self::set_batching`]; until then, and for every
+    /// non-WebKit browser, one frame is one block, which is the schedule the
+    /// 60-second per-engine measurement shows working on Chrome and Firefox.
+    frames_per_block: u32,
+    /// The scheduled-ahead amount the pacer holds this output to: the plain
+    /// [`crate::audio_pacing::TARGET_AHEAD_SECS`] until batching is sized, one
+    /// batch plus pacer room after it (see
+    /// [`crate::audio_pacing::target_ahead_secs`] for why a batched cursor
+    /// needs the deeper target).
+    target_ahead: f64,
+    /// The frames gathered towards the next batched block. Unused (always
+    /// empty) while [`Self::frames_per_block`] is one, because [`Self::push`]
+    /// bypasses it.
+    batch: BlockBatcher,
     /// The volume [`Self::set_volume`] last asked for, which is what mute returns
     /// to when it is switched back off.
     volume: f32,
@@ -120,6 +145,9 @@ impl AudioOut {
             next_time: 0.0,
             left: Vec::new(),
             right: Vec::new(),
+            frames_per_block: frames_per_block_for(&user_agent()),
+            target_ahead: crate::audio_pacing::TARGET_AHEAD_SECS,
+            batch: BlockBatcher::new(1, 0),
             volume: crate::settings::DEFAULT_VOLUME as f32,
             muted: false,
             scheduled: Vec::new(),
@@ -142,6 +170,32 @@ impl AudioOut {
         self.ctx.sample_rate() as u32
     }
 
+    /// Sizes the batched blocks a WebKit browser gets, once the caller knows
+    /// one console frame's length in seconds (the emulator, at start-up: the
+    /// console's rate is a property of the cartridge, not of the context).
+    ///
+    /// A no-op for the one-frame-per-block browsers: there is nothing to size.
+    /// Each block then carries [`crate::audio_pacing::WEBKIT_FRAMES_PER_BLOCK`]
+    /// frames, which is what keeps a batched schedule inside the cursor target.
+    pub fn set_batching(&mut self, frame_secs: f64) {
+        self.target_ahead =
+            crate::audio_pacing::target_ahead_secs(self.frames_per_block, frame_secs);
+        if self.frames_per_block > 1 {
+            let samples_per_frame =
+                (f64::from(self.ctx.sample_rate()) * frame_secs * f64::from(CHANNELS)).round()
+                    as usize;
+            self.batch = BlockBatcher::new(self.frames_per_block, samples_per_frame);
+        }
+        self.publish();
+    }
+
+    /// The scheduled-ahead amount [`crate::audio_pacing::frames_to_run`] is
+    /// asked to hold this output to: the plain target, or one batch plus pacer
+    /// room on a browser whose blocks carry several frames.
+    pub fn target_ahead(&self) -> f64 {
+        self.target_ahead
+    }
+
     /// Whether the play head is moving.
     ///
     /// `false` for a context that autoplay is holding back and for a paused one,
@@ -162,9 +216,20 @@ impl AudioOut {
     /// [`genesis::Genesis::drain_audio`] appends - after everything already
     /// promised, and moves the cursor to the end of it.
     ///
-    /// Returns `false` when the browser refused any part of it, which means this
-    /// output cannot take more sound; the caller is expected to stop asking.
+    /// On a WebKit browser the block is [`crate::audio_pacing::WEBKIT_FRAMES_PER_BLOCK`]
+    /// console frames gathered by [`Self::batch`] rather than the one frame
+    /// Chrome and Firefox get (#629): the sound, the cursor arithmetic and the
+    /// underrun counting are the same, the per-second node and allocation churn
+    /// is a quarter of it. Returns `false` when the browser refused any part of
+    /// it, which means this output cannot take more sound; the caller is
+    /// expected to stop asking.
     pub fn push(&mut self, samples: &[i16]) -> bool {
+        if self.frames_per_block > 1 {
+            match self.batch.push(samples) {
+                Some(block) => return self.schedule(&block).is_some(),
+                None => return true,
+            }
+        }
         self.schedule(samples).is_some()
     }
 
@@ -219,6 +284,9 @@ impl AudioOut {
     /// measurement of a load looks at.
     pub fn discard(&mut self) -> f64 {
         let ahead = self.buffered_secs();
+        // The frames gathered towards the next batched block belong to the
+        // moment the console just left, same as everything else scheduled.
+        self.batch.clear();
         for played in self.scheduled.iter() {
             // Off the graph rather than `stop()`: web-sys marks both `stop`
             // overloads of a buffer source deprecated, and a source that is
@@ -281,6 +349,7 @@ impl AudioOut {
     pub fn resume(&mut self) {
         let _ = self.ctx.resume();
         self.next_time = self.ctx.current_time() + RESTART_LEAD_SECS;
+        self.batch.clear();
         self.publish();
     }
 
@@ -288,6 +357,7 @@ impl AudioOut {
     /// blocks already scheduled stop where they are rather than playing out.
     pub fn suspend(&mut self) {
         let _ = self.ctx.suspend();
+        self.batch.clear();
         self.publish();
     }
 
@@ -307,6 +377,10 @@ impl AudioOut {
         set("ahead", JsValue::from_f64(self.buffered_secs()));
         set("underruns", JsValue::from_f64(f64::from(self.underruns)));
         set("blocks", JsValue::from_f64(f64::from(self.blocks)));
+        set(
+            "framesPerBlock",
+            JsValue::from_f64(f64::from(self.frames_per_block)),
+        );
         set(
             "sampleRate",
             JsValue::from_f64(f64::from(self.ctx.sample_rate())),
@@ -332,6 +406,15 @@ impl AudioOut {
             _ => "closed",
         }
     }
+}
+
+/// `navigator.userAgent`, or empty when the browser would not say: the UA is
+/// only read to pick the scheduling shape ([`crate::audio_pacing::frames_per_block_for`]),
+/// so "unknown" just means "do not change anything".
+fn user_agent() -> String {
+    web_sys::window()
+        .and_then(|window| window.navigator().user_agent().ok())
+        .unwrap_or_default()
 }
 
 /// One block of sound the context has been told to play, and the context time its
