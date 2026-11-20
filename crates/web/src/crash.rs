@@ -1,10 +1,13 @@
 //! The one thing the shell says when the core panics (M7-19, #152).
 //!
-//! A panic in the frame loop is not a dead page: `wasm32-unknown-unknown` unwinds,
-//! the browser logs it through [`console_error_panic_hook`], and the shell carries on
-//! with its buttons and its drawer - while the picture sits frozen on the last frame
-//! and nothing on screen says why. #387 is the running list of core bugs that end
-//! there.
+//! A panic in the frame loop *is* a dead page, and it does not unwind: on this
+//! target (`wasm32-unknown-unknown`, built `panic = "abort"`, pinned by
+//! [`crates/web/tests/wasm_panic_strategy.rs`]) the trap aborts without running `Drop`s -
+//! which is exactly what #387 was, a `RefCell` borrow held for the life of the tab,
+//! panicking on every later frame, keypress and click. What keeps the page usable is
+//! the panic hook: it runs before the abort, so the shell learns the emulator is
+//! finished and can show this card - while the picture sits frozen on the last frame.
+//! #387 is the running list of core bugs that end there.
 //!
 //! So this module keeps a flag rather than catching anything. There is no
 //! `catch_unwind` here and none is wanted: wrapping the frame loop in one would turn
