@@ -15,7 +15,9 @@
 //! reading the frame loop publishes for the overlay to show, and [`perf`] is the
 //! arithmetic that turns the loop's own frame timings into the number the browser
 //! budget test asserts on. Bytes that outlive the page - a cart's saved RAM today, save states tomorrow - go through
-//! [`storage`], and [`emulator`] is the half that gets them there.
+//! [`storage`], and [`emulator`] is the half that gets them there. Input movies
+//! (`.rsm`) are the one thing the frame loop reads that is not the page's own
+//! input: [`movie`] is that session and the checks around it.
 
 pub mod app;
 pub mod audio;
@@ -30,6 +32,7 @@ pub mod input;
 pub mod keyboard_events;
 pub mod library;
 pub mod menu;
+pub mod movie;
 pub mod nav;
 pub mod perf;
 pub mod recents;

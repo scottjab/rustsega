@@ -27,6 +27,8 @@ use std::rc::Weak;
 
 use genesis::Config;
 use genesis::Genesis;
+use genesis::Region;
+use genesis::movie::Movie;
 use leptos::html;
 use leptos::prelude::*;
 use vdp::FrameBuffer;
@@ -42,6 +44,8 @@ use crate::audio_pacing::frames_to_run;
 use crate::fps::FpsMeter;
 use crate::frame_pacer::FramePacer;
 use crate::frame_pacer::ff_frames;
+use crate::movie::MovieSession;
+use crate::movie::MovieState;
 use crate::render::FilterSetting;
 use crate::render::Renderer;
 use crate::render::RendererKind;
@@ -630,6 +634,10 @@ pub struct Controls {
     /// Written by [`start`] and by [`crate::rom_picker::load_file`], which is why
     /// [`Controls`] is provided as a context by the shell.
     pub loading: RwSignal<bool>,
+    /// What the running console's movie session is doing, for the top bar's
+    /// chip and the drawer's buttons (M7-18, #365). The session itself is the
+    /// console's; this is its one-word report, reset with every console.
+    pub movie: RwSignal<MovieState>,
 }
 
 impl Controls {
@@ -917,6 +925,78 @@ impl Controls {
         );
         spawn_local(apply_imported_sram(emulator, rom_id, bytes, self, toasts));
     }
+
+    /// Starts recording the running console's pads (M7-18, #365). The run
+    /// restarts from the top - a movie records a run, and a run starts at
+    /// frame 0 - and stopping writes the file out; the chip in the top bar
+    /// says a recording is on while the drawer is closed.
+    pub fn record_movie(self, toasts: Toasts) {
+        let Some(emulator) = running() else {
+            toasts.push(ToastKind::Warn, "Load a cartridge to record a movie");
+            return;
+        };
+        emulator.with(Emulator::begin_recording);
+        self.movie.set(MovieState::Recording);
+        toasts.push(
+            ToastKind::Info,
+            "Recording from the top of the game. Stop recording to download the .rsm.",
+        );
+    }
+
+    /// Stops the movie session: a recording downloads as this cartridge's
+    /// `.rsm`, a replay just stops - and with it the movie's ownership of the
+    /// pads, so the page's own input reaches the game again.
+    pub fn stop_movie(self, toasts: Toasts) {
+        let Some(emulator) = running() else {
+            self.movie.set(MovieState::Idle);
+            return;
+        };
+        let rom_id = emulator
+            .with(|emulator| emulator.rom_id.clone())
+            .unwrap_or_default();
+        // `with` answers `None` for a console it cannot reach and `end_movie`
+        // for one it can, so the two layers flatten to one `Option<Movie>`.
+        let stopped = emulator.with(Emulator::end_movie).flatten();
+        self.movie.set(MovieState::Idle);
+        let Some(movie) = stopped else {
+            toasts.push(ToastKind::Info, "The movie stopped.");
+            return;
+        };
+        let text = movie.format();
+        let name = crate::movie::file_name(&rom_id);
+        crate::movie::save_to_disk(&name, text.as_bytes());
+        toasts.push(ToastKind::Ok, format!("Downloaded {name}"));
+    }
+
+    /// Takes `text` as a replay for the running console: the admission check
+    /// ([`crate::movie::prepare_replay`]) refuses it with a toast unless it
+    /// parses, names this cartridge and is of this run's region; then the run
+    /// restarts and the movie owns the pads until it is stopped.
+    pub fn replay_movie(self, text: String, toasts: Toasts) {
+        let Some(emulator) = running() else {
+            toasts.push(ToastKind::Danger, "Load a cartridge to replay a movie");
+            return;
+        };
+        let checked = emulator.with(|emulator| {
+            crate::movie::prepare_replay(&text, emulator.rom_hash, emulator.region)
+        });
+        let movie = match checked {
+            Some(Ok(movie)) => movie,
+            Some(Err(error)) => {
+                toasts.push(ToastKind::Danger, error.to_string());
+                return;
+            }
+            // The console was taken by another callback between `running()`
+            // and this read: nothing left to answer about.
+            None => return,
+        };
+        emulator.with(|emulator| emulator.begin_replay(movie));
+        self.movie.set(MovieState::Replaying);
+        toasts.push(
+            ToastKind::Info,
+            "Replaying. The movie owns the pads until you stop it - your own controls are ignored.",
+        );
+    }
 }
 
 /// Store `bytes` as this cart's SRAM and then put them into the cart, off the
@@ -1068,6 +1148,9 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
         fps: RwSignal::new(String::new()),
         fast_forward: RwSignal::new(false),
         loading: RwSignal::new(false),
+        // A new console is no movie session: whatever was rolling on the one
+        // it replaces died with it (M7-18, #365).
+        movie: RwSignal::new(MovieState::Idle),
     };
 
     Effect::new(move |started: Option<Option<String>>| {
@@ -1077,6 +1160,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
         let (Some(canvas), Some(canvas_gl)) = (canvas.get(), canvas_gl.get()) else {
             stop();
             console.loading.set(false);
+            console.movie.set(MovieState::Idle);
             return None;
         };
         // The cartridge, taken out of the signal as an owned value: `start` waits
@@ -1085,6 +1169,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
         let Some(rom) = roms.with(|rom| rom.clone()) else {
             stop();
             console.loading.set(false);
+            console.movie.set(MovieState::Idle);
             return None;
         };
         if started.as_deref() == Some(rom.id.as_str()) {
@@ -1093,6 +1178,7 @@ pub fn use_cartridge(canvas: NodeRef<html::Canvas>, canvas_gl: NodeRef<html::Can
         }
         start(&rom, &canvas, &canvas_gl, console, settings, toasts);
         paused.set(false);
+        console.movie.set(MovieState::Idle);
         Some(rom.id)
     });
 
@@ -1238,6 +1324,25 @@ struct Emulator {
     /// keyed by: `None` only for a browser that would not open IndexedDB at all
     /// (M7-15, #148).
     slot_store: Option<SlotStore>,
+    /// The movie identity of this run, read once at the start: the hash a
+    /// `.rsm`'s `rom-hash` line names ([`crate::movie::rom_hash`] of the image
+    /// as loaded) and the region the run resolved to. A replay's admission
+    /// check compares against these, so it compares against exactly the
+    /// machine that is running (M7-18, #365).
+    rom_hash: u64,
+    region: Region,
+    /// The cartridge's id, for naming what the session downloads. Kept on the
+    /// console rather than read off [`Save`], because a cart with no
+    /// battery-backed RAM still has a name and still records movies.
+    rom_id: String,
+    /// The frame the loop is about to run: 0 after the cartridge loads and
+    /// after a movie (re)starts the run, which is how a movie's own frame
+    /// numbers count (`docs/movie-format.md`, "Frame numbers"). The Reset
+    /// button leaves it: a reset is a game state, not a new run.
+    frames: u32,
+    /// The movie session: nothing, a recording, or a replay whose movie owns
+    /// the pads ([`crate::movie`], M7-18, #365).
+    session: MovieSession,
     /// Blocks of sound to hand to the output and forget, which is how a console
     /// whose mixer is now ahead of - or behind - the machine it has just been
     /// loaded with stops sending that difference to the speakers. One load sets
@@ -1392,6 +1497,12 @@ impl Emulator {
         });
 
         let target_hz = target_hz(&config, &rom.bytes);
+        // The movie identity of this run (M7-18, #365). The same header that
+        // `Genesis::new` above read has already parsed, so the region resolve
+        // cannot fail here; the fallback only keeps the field total for a
+        // cartridge that could not have started anyway.
+        let rom_hash = crate::movie::rom_hash(&rom.bytes);
+        let region = crate::movie::run_region(&rom.bytes).unwrap_or(Region::Usa);
         // One read of the canvas, and both the baseline `paint` compares against
         // and the size the shell is told come from it (#145).
         let seeded = (canvas.width(), canvas.height());
@@ -1403,6 +1514,11 @@ impl Emulator {
             console,
             save,
             slot_store,
+            rom_hash,
+            region,
+            rom_id: rom.id.clone(),
+            frames: 0,
+            session: MovieSession::Idle,
             drop_audio_blocks: 0,
             sram_checked: now_ms(),
             toasts,
@@ -1483,6 +1599,9 @@ impl Emulator {
                 // costs, not what the scheduler does (M7-17, #150).
                 let frame_started = crate::emulator::now_ms();
                 self.genesis.run_frame();
+                // The frame that has just run is one more of the run a movie
+                // numbers its own frames against (the `frames` field doc).
+                self.frames += 1;
                 let finished = crate::emulator::now_ms();
                 self.pump_audio(fast);
                 self.fps_meter.record(finished, finished - frame_started);
@@ -1605,22 +1724,30 @@ impl Emulator {
         Ok(())
     }
 
-    /// Reports the page's merged pad state to the console, once per frame.
+    /// Reports the frame's pads to the console, once per frame.
     ///
     /// Before [`genesis::Genesis::run_frame`], because that call reads the pads
     /// as they stand at the start of the frame: a press that lands while a frame
     /// is running is then current for the next one (M7-07, #140). The state is
     /// the page's, not the console's - see [`crate::input::with_state`] for why.
+    /// Where the pads come from is the movie session's answer
+    /// ([`MovieSession::sync_pads`]): the page's live input while a recording
+    /// is on - noted by the recorder - and the replay movie's own while a
+    /// replay is on, the page's keys going unread (M7-18, #365).
     ///
     /// The gamepads are read a little before this, by
     /// [`crate::gamepad_events::poll_gamepads`] in the animation frame, rather
     /// than here: it is the same per-frame moment, but outside the borrow this
     /// runs under.
     fn sync_pads(&mut self) {
-        for port in 0..crate::input::PORTS {
-            let buttons = crate::input::with_state(|input| input.buttons(port));
-            self.genesis.set_pad(port, buttons);
+        // Both ports read once, whatever the session is: a replay needs the
+        // live row to ignore it, and a recorder needs it to note it.
+        let mut live = [genesis::Buttons::empty(); crate::movie::MOVIE_PADS];
+        for (port, buttons) in live.iter_mut().enumerate() {
+            *buttons = crate::input::with_state(|input| input.buttons(port));
         }
+        let frame = self.frames;
+        self.session.sync_pads(&mut self.genesis, frame, &live);
     }
 
     /// How many frames this tick owes: from the audio clock when there is one,
@@ -1978,6 +2105,42 @@ impl Emulator {
         self.paint();
     }
 
+    /// Starts a recording (M7-18, #365): the run goes back to its top and the
+    /// recorder starts from frame 0 there, so what is written down is a run
+    /// the format can replay - a movie's frame numbers count from the first
+    /// frame of a run, and a movie begun mid-game is a movie of nothing in
+    /// particular. The pads are not touched: they stay the page's, which is
+    /// what is being recorded.
+    fn begin_recording(&mut self) {
+        self.session.start_recording(self.rom_hash, self.region);
+        self.restart_run();
+    }
+
+    /// Puts `movie` on the pads (M7-18, #365), the run restarted with it: a
+    /// movie's frame 0 is the first frame of a run, so it plays from the top
+    /// of one.
+    fn begin_replay(&mut self, movie: Movie) {
+        self.session.start_replay(movie);
+        self.restart_run();
+    }
+
+    /// Stops the session, handing back the recording if one was rolling.
+    /// The frame count is left where it stopped: it means nothing while the
+    /// session is off, and the next begin restarts it.
+    fn end_movie(&mut self) -> Option<Movie> {
+        self.session.stop()
+    }
+
+    /// The top of a run, as a movie run begins: the console to its reset
+    /// state - the same reset the Reset button gives, with the working RAM it
+    /// keeps - and the frame count back to 0 with it, and a repaint so the
+    /// player sees the game they are back at the start of.
+    fn restart_run(&mut self) {
+        self.genesis.reset();
+        self.frames = 0;
+        self.paint();
+    }
+
     /// Stops the loop, takes the gesture listeners off `window`, and closes the
     /// audio output.
     ///
@@ -2233,6 +2396,7 @@ mod tests {
             fps: RwSignal::new(String::new()),
             fast_forward: RwSignal::new(false),
             loading: RwSignal::new(false),
+            movie: RwSignal::new(MovieState::Idle),
         };
 
         // No console, so the frame size is the one `use_cartridge` started with -
@@ -2508,6 +2672,7 @@ mod browser {
             fps: RwSignal::new(String::new()),
             fast_forward: RwSignal::new(false),
             loading: RwSignal::new(false),
+            movie: RwSignal::new(MovieState::Idle),
         };
         let console = Emulator::start(
             &rom,
