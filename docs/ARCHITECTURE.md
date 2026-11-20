@@ -321,6 +321,20 @@ of every entry:
   (Mickey Mania's 3d level, the Overdrive demo). A line-granular model has no
   slot budget to shrink, so the fence holds until there is one to measure.
 
+The layer buffer those entries are drawn into is filled a clipped cell run at a
+time, not a tested pixel at a time (#368): the pixels of one cell are a
+contiguous run, so the two edges of the line buffer are decided once per cell
+and the pixel loop walks two slices of that one length. The shape is a
+constraint, not a style: the per-pixel bounds test it replaced spilled the
+whole loop to the stack (the line pointer and the pattern index were reloaded
+a pixel at a time), and three other shapes the ticket measured - a deferred
+masking-mode-2 scan, a byte-at-a-time `tile_row`, forced `#[inline]` on the
+SAT fetch - each lost to the simpler code it replaced. What the same ticket
+learned about measuring: `perf` shares per symbol move when inlining moves code
+between symbols (one profile had `fill_cell_run` jump from 1.3% to 10.4% with
+its code untouched), so a candidate is believed only when the two bench
+binaries, run interleaved, agree on it and the digests never move.
+
 ### VDP debug views
 
 `crates/vdp/src/debug.rs` (M4-24, #104) renders VDP internals into RGBA buffers for

@@ -929,6 +929,7 @@ impl Vdp {
         let row_in_cell = row % cell_rows;
         let layer_base = (u16::from(palette) << 4) | (u16::from(priority) << PRIORITY_SHIFT);
         let left = i32::from(sprite.x) - ORIGIN;
+        let out_len = out.len() as i32;
 
         for cell in 0..pixels / CELL_WIDTH {
             let column = if hflip {
@@ -945,16 +946,23 @@ impl Vdp {
                 hflip,
                 cell_rows,
             );
+            // The cell's pixels sit at the screen columns `x0..x0 + CELL_WIDTH`,
+            // so the clip to `out` is two edges a cell, not a test a pixel: the
+            // offsets that land on the display are `lo..hi`, and the loop below
+            // walks two slices of that one length (a perf rewrite of #368 that
+            // keeps the drawn pixels byte for byte).
             let x0 = left + (cell * CELL_WIDTH) as i32;
-            for (offset, index) in indices.into_iter().enumerate() {
-                let x = x0 + offset as i32;
-                if x < 0 || usize::try_from(x).unwrap_or(usize::MAX) >= out.len() {
-                    continue;
-                }
-                let x = x as usize;
+            let lo = (-x0).max(0);
+            let hi = (out_len - x0).min(CELL_WIDTH as i32);
+            if lo >= hi {
+                continue;
+            }
+            let visible = &mut out[(x0 + lo) as usize..(x0 + hi) as usize];
+            let drawn = &indices[lo as usize..hi as usize];
+            for (pixel, &index) in visible.iter_mut().zip(drawn.iter()) {
                 if index != 0 {
-                    if out[x] == 0 {
-                        out[x] = (layer_base + u16::from(index)) as u8;
+                    if *pixel == 0 {
+                        *pixel = (layer_base + u16::from(index)) as u8;
                     } else {
                         // Two sprites, one pixel, both opaque: d5 of section 6.
                         collision = true;
