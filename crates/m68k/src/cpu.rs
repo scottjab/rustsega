@@ -1151,7 +1151,8 @@ mod tests {
     /// Illegal, line A and line F all record the illegal-instruction vector and
     /// take its frame — the 68000 has no line emulator, so all three reserved
     /// routes take the one exception (M1-07, #15 routed them; M1-08, #16 gave
-    /// them the frame; real line-A/F vectors are the 68010's, M1-12, #20).
+    /// them the frame; real line-A/F vectors are a 68010 feature this crate
+    /// does not implement).
     #[test]
     fn step_records_the_exception_vector_of_each_illegal_route() {
         use crate::exceptions::EXC_ILLEGAL;

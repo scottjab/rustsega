@@ -46,7 +46,7 @@
 //! the `1010` and `1111` groups are reserved encodings and a reserved opcode
 //! raises the illegal-instruction exception ([`EXC_ILLEGAL`]) — one vector,
 //! three routes. The separate line-A and line-F emulator vectors are a 68010
-//! addition (M1-12, #20), which is why [`crate::decode::Op::LineA`] and
+//! feature this crate does not implement, which is why [`crate::decode::Op::LineA`] and
 //! [`crate::decode::Op::LineF`] stay distinct in the decode table even though
 //! they route identically here. There is deliberately **no line-A or line-F
 //! vector constant in this crate**: the pinned suite has no A-line or F-line
