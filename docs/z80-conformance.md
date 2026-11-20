@@ -69,8 +69,8 @@ nix develop -c cargo nextest run -p z80 --run-ignored all --no-capture all_opcod
 - `just test-all` runs it, and CI runs it as its own step on every push and pull
   request — see [In CI](#in-ci).
 - `--no-capture` is what puts the per-file table in the log at all: nextest hides
-  the output of a test that passes. [#186] is about doing that for every passing
-  test of `just test-all`.
+  the output of a test that passes. `just test-all` does that for every passing
+  test via `--success-output final` (#186).
 - With `test-roms/` absent the sweep prints `SKIPPED: missing test data: Z80
   SingleStepTests (z80/v1)` and passes, like every other data-driven test here.
 

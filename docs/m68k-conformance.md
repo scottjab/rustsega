@@ -63,9 +63,9 @@ nix develop -c cargo nextest run -p m68k --run-ignored all --no-capture all_inst
 - CI also runs the command above as its own step on every push and every PR —
   see [In CI](#in-ci).
 - Nextest hides the output of a *passing* test, so `--no-capture` is what puts
-  the table in the log at all. [#186] is about `just test-all` doing that for
-  every passing test; until it lands, the sweep's counts only reach the CI log
-  from the step that passes `--no-capture`.
+  the table in the log at all here. `just test-all` does it for every passing
+  test via `--success-output final` (#186): the sweep's counts reach the CI log
+  from that step.
 
 [#186]: https://github.com/scottjab/rustsega/issues/186
 
@@ -199,8 +199,8 @@ only reporting on `main` afterwards.
 
 The step passes `--no-capture`, so the table above is what a CI log shows for a
 green run and the failing cases' first ten lines per file is what it shows for a
-red one. `just test-all` on `main` runs the sweep again; that one loses its
-output to nextest's "hide a passing test" default until [#186] lands.
+red one. `just test-all` on `main` runs the sweep again; `--success-output
+final` (#186) carries its counts into that log too.
 
 ## The table
 
