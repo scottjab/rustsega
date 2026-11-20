@@ -42,7 +42,8 @@
         # keep honest, and it needs no `git` at eval time.
         #
         # `crates/web/dist` is the one part of `crates/` that is not source: it
-        # is what trunk produces, and this derivation produces it too.
+        # is what trunk produces, and the `webDist` derivation below produces it
+        # once for both server packages (#424).
         sourceFileset = pkgs.lib.fileset.difference ./crates (pkgs.lib.fileset.maybeMissing ./crates/web/dist);
 
         src = pkgs.lib.fileset.toSource {
@@ -63,8 +64,69 @@
           rustc = rust;
         };
 
-        # The single binary (M8-05, #160): the frontend built by trunk and baked
-        # into the server by `embed-web`, in one derivation and with no network.
+        # The frontend dist (M8-05, #160, shared since #424): `trunk build
+        # --release` over `crates/web`, as its own derivation so that the glibc
+        # and musl servers below embed one store path instead of each running
+        # trunk. The wasm runs in the browser and the server only embeds its
+        # bytes, so nothing in the dist depends on the server's C library or
+        # target: one dist serves both packages.
+        #
+        # Not `buildRustPackage`, because there is no rust package to install:
+        # the only cargo run here is the one inside trunk. `cargoSetupHook`
+        # with `cargoDeps` is the vendoring half of `buildRustPackage`, and it
+        # is what keeps trunk's inner cargo offline in the sandbox, exactly as
+        # in the two server packages below.
+        webDist = pkgs.stdenv.mkDerivation {
+          pname = "rustsega-web-dist";
+          version = workspaceVersion;
+          inherit src;
+
+          cargoDeps = rustPlatform.fetchCargoVendor {
+            pname = "rustsega-web-dist";
+            version = workspaceVersion;
+            inherit src;
+            hash = "sha256-h6qzFnXKtiIAU4Qd6KuCx/4+6LkbIAXRSp/zPt+Lmm0=";
+          };
+
+          # cargo and rustc are this flake's pinned toolchain - the whole
+          # toolchain package, which is what `rustPlatform` wraps as `cargo` and
+          # `rustc` above - whose `wasm32-unknown-unknown` target is what the
+          # frontend builds for. The three tools of the trunk build all have to
+          # come from PATH: `crates/web/Trunk.toml` sets `offline = true`
+          # because NixOS cannot exec the binaries trunk would otherwise
+          # download, and it pins the two versions trunk checks these against.
+          nativeBuildInputs = [
+            rust
+            rustPlatform.cargoSetupHook
+            pkgs.trunk
+            pkgs.wasm-bindgen-cli
+            pkgs.binaryen
+          ];
+
+          buildPhase = ''
+            runHook preBuild
+
+            # trunk wants a home for its tool cache and a sandbox has no writable
+            # one; $TMPDIR is the directory stdenv made for exactly this.
+            export HOME=$TMPDIR
+            (cd crates/web && trunk build --release --offline)
+
+            runHook postBuild
+          '';
+
+          installPhase = ''
+            runHook preInstall
+            # $out is the dist directory itself, `index.html` at the top: what
+            # the `preBuild` of the two server packages copies into their build
+            # trees for `embed-web` to read at compile time.
+            cp -r crates/web/dist/ $out
+            runHook postInstall
+          '';
+        };
+
+        # The single binary (M8-05, #160): the server built with `embed-web`,
+        # baking in the frontend dist that the `webDist` derivation above built
+        # once for it and the static build below (#424), with no network.
         rustsega = rustPlatform.buildRustPackage {
           pname = "rustsega";
           version = workspaceVersion;
@@ -76,24 +138,23 @@
           # keeps `cargoLock.outputHashes` out of this file.
           cargoLock.lockFile = ./Cargo.lock;
 
-          # The three tools of the trunk build, all from nixpkgs. They have to
-          # come from PATH: `crates/web/Trunk.toml` sets `offline = true` because
-          # NixOS cannot exec the binaries trunk would otherwise download, and it
-          # pins the two versions trunk checks these against.
-          nativeBuildInputs = [ pkgs.trunk pkgs.wasm-bindgen-cli pkgs.binaryen ];
+          # The frontend to embed, as an input so its store path lands in the
+          # sandbox here and in `rustsegaStatic` below (#424): the wasm runs in
+          # the browser, so nothing in the dist depends on the server's C
+          # library or target.
+          inherit webDist;
 
-          # Step 1 of 2, the frontend, into `crates/web/dist` in the build tree.
-          # It is a `preBuild` because `embed-web` reads that directory at compile
-          # time, so the cargo build below needs it to already be there.
+          # `embed-web` reads `crates/web/dist` at compile time
+          # (`crates/server/src/assets.rs`), so the dist has to be in the build
+          # tree before the cargo build runs. Copying it in is what is left of
+          # the trunk run this package used to do itself; the files arrive
+          # read-only out of the store, which rust-embed only reads anyway.
           preBuild = ''
-            # trunk wants a home for its tool cache and a sandbox has no writable
-            # one; $TMPDIR is the directory stdenv made for exactly this.
-            export HOME=$TMPDIR
-            (cd crates/web && trunk build --release --offline)
+            cp -r "$webDist" crates/web/dist
           '';
 
-          # Step 2 of 2: the default cargo build, narrowed to the binary that
-          # ships. What is left out of that choice is `headless` and `testkit`,
+          # The cargo build, narrowed to the binary that ships. What is left
+          # out of that choice is `headless` and `testkit`,
           # which are test tooling: every other crate of the workspace is either
           # a dependency of `server` or part of the wasm build above.
           cargoBuildFlags = [ "-p" "server" ];
@@ -129,12 +190,13 @@
         # promises a binary for.
         supportsNixosTest = pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isx86_64;
 
-        # The pinned toolchain of `rust-toolchain.toml` plus the musl target. A
-        # `rust.override` replaces the target list rather than adding to it, so
-        # `wasm32` is repeated here, and it is this package alone that pays for
-        # the extra target: the dev shell keeps the file as it is.
+        # The pinned toolchain of `rust-toolchain.toml` plus the musl target
+        # only (#424): a `rust.override` replaces the target list rather than
+        # adding to it, and `wasm32` used to be repeated here for the trunk
+        # run this package no longer does - the dev shell keeps the file as it
+        # is.
         rustMusl = rust.override {
-          targets = [ "wasm32-unknown-unknown" muslTarget ];
+          targets = [ muslTarget ];
         };
 
         rustMuslPlatform = pkgs.makeRustPlatform {
@@ -157,12 +219,9 @@
         # `target/release` - so the two phases that touch the target are written
         # out instead. Everything else is the machinery of #160: the same `src`,
         # the same crates vendored from `Cargo.lock` by `cargoLock`, the same
-        # strip in `fixupPhase`.
-        #
-        # The frontend is built here rather than shared with `rustsega` because
-        # `crates/web/dist` is not an output of that derivation, so there is
-        # nothing in the store to share. What is shared is that both bake in the
-        # same tree: the wasm half of the build does not depend on the target.
+        # strip in `fixupPhase`. The frontend is the same `webDist` store path
+        # that `rustsega` embeds (#424): the wasm half of the build never
+        # depended on the target, which is what makes the sharing correct.
         rustsegaStatic = rustMuslPlatform.buildRustPackage {
           pname = "rustsega-static";
           version = workspaceVersion;
@@ -170,31 +229,32 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
-          # The three tools of the trunk step, as in `rustsega`, and the C linker
-          # of the musl link step. `muslCc` has to be an input, not just a path in
-          # a variable: only an input puts it in the sandbox.
-          nativeBuildInputs = [
-            pkgs.trunk
-            pkgs.wasm-bindgen-cli
-            pkgs.binaryen
-            muslCc
-          ];
+          # The frontend to embed, as in `rustsega`: an input, not just a path
+          # in a variable, because only an input puts it in the sandbox (#424).
+          inherit webDist;
+
+          # The C linker of the musl link step, same rule: an input or it is
+          # not in the sandbox. The trunk tools live with `webDist` now.
+          nativeBuildInputs = [ muslCc ];
+
+          # `embed-web` reads `crates/web/dist` at compile time, so the dist
+          # from the shared `webDist` store path has to be in the build tree
+          # before the cargo build below runs.
+          preBuild = ''
+            cp -r "$webDist" crates/web/dist
+          '';
 
           # The link step only, and only for the musl target, so build scripts
           # and everything else keep this package set's own `cc`.
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER =
             "${muslCc}/bin/${muslCc.targetPrefix}cc";
 
-          # Step 1 of 2, as in `rustsega`, and step 2 for one target only: the
-          # hook would pass this platform's glibc target as well, doubling a
-          # release build that has to be small enough to wait for.
+          # The cargo build is for the musl target only: the hook would pass
+          # this platform's glibc target as well, doubling a release build
+          # that has to be small enough to wait for. The dist it embeds came
+          # from `preBuild` above.
           buildPhase = ''
             runHook preBuild
-
-            # trunk wants a home for its tool cache and a sandbox has no writable
-            # one; $TMPDIR is the directory stdenv made for exactly this.
-            export HOME=$TMPDIR
-            (cd crates/web && trunk build --release --offline)
 
             cargo build --release --offline -p server --features embed-web \
               --target ${muslTarget}
