@@ -135,6 +135,18 @@ RTE-based emulation mode. The frame PC for illegal/line-A/F and privilege
 violation is the faulting opcode's own address; the handler steps over it
 (e.g. `ADDQ.L #2,$A(A7)` in the carts' handlers) before `RTE`.
 
+Maskability is a property of the interrupt exception alone (M68000UM 6.2.5,
+"Exception Processing Sequence": "For the reset and interrupt exceptions, the
+interrupt priority mask is also updated appropriately" — the only mention of
+the mask in the entry sequence). Illegal, line-A/F, TRAP, TRAPV, CHK and
+divide-by-zero are taken whatever the SR interrupt mask holds, and leave it as
+they found it; the UM's own grouping (6.2.3) puts trace, interrupt, privilege
+and illegal in group 1 and the instruction traps in group 2, so "unmaskable"
+spans both groups and it is wrong to gate any of them on `SR >> 8 & 7`. This
+is load-bearing for the carts: Dyna Brothers 2's main loop does `ORI.W
+#$700,SR` and then calls a 1111-format service routine expecting its `$2C`
+handler to be entered anyway (#494), and it boots because it is.
+
 ### z80
 
 ```rust
