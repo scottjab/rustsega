@@ -570,12 +570,15 @@ fn compare_ram(bus: &mut TestBus, want: &[RamByte], out: &mut Vec<Mismatch>) {
 /// "Exception Vector Memory Map": vector 2), and the suite really does not put
 /// it there. `crates/m68k/src/address_error.rs` measured the recorded suite
 /// instead: every group 0 frame case fetches its handler long from $00000C, and
-/// the recording core sends the address error and the illegal instruction to the
-/// same slot, so `EXC_ADDRESS_ERROR == EXC_ILLEGAL == 3` there. This crate's
-/// convention is that the measured slot wins, so this predicate and that module
-/// read the same long. If a test ROM ever settles the question and
-/// `address_error::EXC_ADDRESS_ERROR` moves to $000008, this moves with it; do
-/// not "fix" it here first.
+/// the recording core sends the address error and the illegal instruction to
+/// the same slot — its illegal slot was the address-error slot, which is the
+/// recording core's bug and not a fact about the 68000: hardware has illegal
+/// instruction at $000010 (vector 4), which #482 measured against M68000UM
+/// Table 6-2 and the six #436 carts' own vector tables. This predicate still
+/// reads $00000C, on purpose: it describes the recorded data, and the data
+/// lands where the recording core sent it. If a test ROM ever settles the
+/// address-error slot and `address_error::EXC_ADDRESS_ERROR` moves to $000008,
+/// this moves with it; do not "fix" it here first.
 ///
 /// # What the skipped set is, and is not
 ///

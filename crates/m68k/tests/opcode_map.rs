@@ -192,9 +192,10 @@ fn token(operation: &str) -> &str {
 /// * [`Op::Undefined`] — an encoding outside the ISA entirely (#355 split it
 ///   from `Illegal` so audits could tell the two complaints apart);
 /// * [`Op::LineA`] / [`Op::LineF`] — the two 4 096-word emulator-line groups,
-///   `"None"` throughout the map; the 68000 has no line emulator, so both take
-///   the illegal-instruction exception like any other reserved word (measured
-///   in #194).
+///   `"None"` throughout the map; the 68000 has no line emulator *instructions*,
+///   so a word in either group raises the matching line-emulator exception
+///   (vector 10 / 11 since #482) rather than executing anything, like any other
+///   word the map records as `"None"` (measured in #194).
 const NONE_EXCEPTION_TAGS: &[Op] = &[Op::Illegal, Op::Undefined, Op::LineA, Op::LineF];
 
 /// `"None"` slots that decode to [`Op::Unimplemented`] — the pessimistic tag a

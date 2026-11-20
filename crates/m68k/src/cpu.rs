@@ -215,10 +215,10 @@ pub struct M68k {
     ///
     /// CPU state rather than a return value because the routes set it from deep
     /// inside a handler while the trace decision is taken by `step` once that
-    /// handler returns; and it cannot be read back out of
-    /// [`M68k::pending_exception`], because
-    /// [`crate::EXC_ADDRESS_ERROR`] and [`crate::EXC_ILLEGAL`] are numerically
-    /// the same vector (see [`crate::address_error`]).
+    /// handler returns; and it is not read back out of
+    /// [`M68k::pending_exception`] either — whether a route suppresses tracing
+    /// is a property of the route, not of the vector it raises, so the flag
+    /// lives here.
     pub(crate) trace_suppressed: bool,
     /// The diagnostic instruction trail, [`None`] until [`M68k::arm_trail`] is
     /// called ([`crate::trail`], #436).
@@ -1253,22 +1253,23 @@ mod tests {
         (cpu, bus)
     }
 
-    /// Illegal, line A and line F all record the illegal-instruction vector and
-    /// take its frame — the 68000 has no line emulator, so all three reserved
-    /// routes take the one exception (M1-07, #15 routed them; M1-08, #16 gave
-    /// them the frame; real line-A/F vectors are a 68010 feature this crate
-    /// does not implement).
+    /// Each reserved route records its own vector — illegal instruction 4 for
+    /// the `ILLEGAL` opcode and the undefined encodings, line-A emulator 10 and
+    /// line-F emulator 11 for the `1010`/`1111` groups — and all of them take
+    /// the same frame (M1-07, #15 routed them; M1-08, #16 gave them the frame;
+    /// the per-route vectors are M68000UM Table 6-2, and #482 is what un-merged
+    /// them).
     #[test]
     fn step_records_the_exception_vector_of_each_illegal_route() {
-        use crate::exceptions::EXC_ILLEGAL;
-        for (opcode, name) in [
-            (0x4AFC, "ILLEGAL"),
-            (0xA123, "line A"),
-            (0xF123, "line F"),
-            (0xA000, "line A, group start"),
-            (0xAFFF, "line A, group end"),
-            (0xF000, "line F, group start"),
-            (0xFFFF, "line F, group end"),
+        use crate::exceptions::{EXC_ILLEGAL, EXC_LINE_A, EXC_LINE_F};
+        for (opcode, vector, name) in [
+            (0x4AFCu16, EXC_ILLEGAL, "ILLEGAL"),
+            (0xA123u16, EXC_LINE_A, "line A"),
+            (0xF123u16, EXC_LINE_F, "line F"),
+            (0xA000u16, EXC_LINE_A, "line A, group start"),
+            (0xAFFFu16, EXC_LINE_A, "line A, group end"),
+            (0xF000u16, EXC_LINE_F, "line F, group start"),
+            (0xFFFFu16, EXC_LINE_F, "line F, group end"),
         ] {
             let (mut cpu, mut bus) = cpu_at_opcode(opcode);
             let before = cpu.clone();
@@ -1279,8 +1280,8 @@ mod tests {
             );
             assert_eq!(
                 cpu.pending_exception,
-                Some(EXC_ILLEGAL),
-                "{name} (${opcode:04X}) must record the illegal-instruction vector"
+                Some(vector),
+                "{name} (${opcode:04X}) must record its own vector"
             );
             // The frame, which is what the route is for: SR where it was, the
             // address of the opcode that could not execute, handler in `pc`.
@@ -1297,7 +1298,7 @@ mod tests {
             );
             assert_eq!(
                 cpu.pc, ILLEGAL_HANDLER,
-                "{name}: PC from the long at $00000C"
+                "{name}: PC from the route's vector long"
             );
             assert_eq!(
                 cpu.cycles - before.cycles,
@@ -1319,8 +1320,9 @@ mod tests {
     /// This sits next to [`step_panics_loudly_on_an_unimplemented_opcode`] on
     /// purpose. The two together are the rule: `$4E74` — a slot this ticket did
     /// not derive, and the anchor of that test — still panics, while these take
-    /// the same route `ILLEGAL`, line A and line F take above, with the same
-    /// frame, the same vector fetch and the same 34 clocks.
+    /// the same entry sequence `ILLEGAL` takes (and line A and line F take with
+    /// their own vectors), with the same frame, the same vector fetch and the
+    /// same 34 clocks.
     #[test]
     fn step_takes_the_illegal_exception_for_an_undefined_encoding() {
         use crate::decode::Op as Decoded;
@@ -1364,7 +1366,7 @@ mod tests {
             );
             assert_eq!(
                 cpu.pc, ILLEGAL_HANDLER,
-                "{why}: PC from the long at $00000C"
+                "{why}: PC from the long at $000010"
             );
             assert_eq!(cpu.d, before.d, "{why} must not touch Dn");
             assert_eq!(cpu.a[..7], before.a[..7], "{why} must not touch An");
@@ -1393,7 +1395,7 @@ mod tests {
     /// CPU ever took.
     #[test]
     fn step_replaces_the_previous_step_s_exception_record() {
-        use crate::exceptions::EXC_ILLEGAL;
+        use crate::exceptions::{EXC_ILLEGAL, EXC_LINE_A};
         let (mut cpu, mut bus) = cpu_at_opcode(0x4AFC);
         cpu.step(&mut bus);
         assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
@@ -1406,8 +1408,8 @@ mod tests {
         cpu.step(&mut bus);
         assert_eq!(
             cpu.pending_exception,
-            Some(EXC_ILLEGAL),
-            "the same route twice still records it once"
+            Some(EXC_LINE_A),
+            "a different route records a different vector"
         );
 
         cpu.pending_exception = Some(99);
@@ -1415,7 +1417,7 @@ mod tests {
         cpu.step(&mut bus);
         assert_eq!(
             cpu.pending_exception,
-            Some(EXC_ILLEGAL),
+            Some(EXC_LINE_A),
             "replaced, not kept"
         );
     }
@@ -1448,15 +1450,15 @@ mod tests {
     /// from `pc` or decoded `prefetch[1]` would panic instead of routing.
     #[test]
     fn step_runs_the_instruction_at_the_front_of_the_queue() {
-        use crate::exceptions::{EXC_ILLEGAL, EXCEPTION_ENTRY_CLOCKS};
+        use crate::exceptions::{EXC_LINE_A, EXCEPTION_ENTRY_CLOCKS};
         let (mut cpu, mut bus) = cpu_at_opcode(0x4E74);
         cpu.prefetch = [0xA000, 0x4E74];
         assert_eq!(
             u64::from(cpu.step(&mut bus)),
             EXCEPTION_ENTRY_CLOCKS,
-            "an illegal opcode costs the exception entry, which is the whole step"
+            "a line-A opcode costs the exception entry, which is the whole step"
         );
-        assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
+        assert_eq!(cpu.pending_exception, Some(EXC_LINE_A));
 
         // And the same opcode written into memory at `pc` is still not what it
         // runs, because the queue front is.
@@ -1464,7 +1466,7 @@ mod tests {
         bus.mem[PROGRAM_BASE as usize] = 0x4E;
         bus.mem[PROGRAM_BASE as usize + 1] = 0x74;
         assert_eq!(u64::from(cpu.step(&mut bus)), EXCEPTION_ENTRY_CLOCKS);
-        assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
+        assert_eq!(cpu.pending_exception, Some(EXC_LINE_A));
     }
 
     /// With HALT asserted the CPU stops accessing the bus; the clocks are a

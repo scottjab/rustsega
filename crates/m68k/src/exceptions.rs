@@ -24,34 +24,51 @@
 //! |---|---|---|---|
 //! | — | 0, 1 | `$00`, `$04` | reset SSP / PC ([`crate::M68k::reset`]) |
 //! | — | 2 | `$08` | address error **on hardware**: the slot is claimed by [`crate::address_error::EXC_ADDRESS_ERROR`] at `$0C`, which is what the suite's frames read — see that module for the discrepancy |
-//! | [`EXC_ILLEGAL`] | 3 | `$0C` | every exception case of 62 suite files fetches `$0C` (illegal EA), and `tests/harness/mod.rs` installs its handler there |
+//! | [`crate::address_error::EXC_ADDRESS_ERROR`] | 3 | `$0C` | address error on the hardware map (M68000UM Table 6-2) and in every group-0 case of the suite, which fetches `$0C`; the six #436 carts put halt stubs there, and `Warrior of Rome II` stores `#$3` into its exception-code word |
+//! | [`EXC_ILLEGAL`] | 4 | `$10` | M68000UM Table 6-2 ("Exception Vector Assignment"), and all six #436 carts put their illegal-instruction handler there while halting on `$0C` (`Warrior of Rome II`'s `$10` stub stores `#$4`). The suite cannot arbitrate this slot: its illegal-effective-address cases fetch `$0C` because the recording core routed illegal to the address-error slot (`tests/harness/mod.rs` documents this), and the suite has no line-A/F file to pin the neighbouring rows either |
 //! | [`EXC_DIV_ZERO`] | 5 | `$14` | `DIVU.json.gz` case `80ef [DIVU (d16, A7), D0] 5745`: divisor word at `$0000F0` is zero, the case reads the long at `$14`/`$16` and the frame goes on the stack. Only case in the suite that divides by zero |
-//! | [`EXC_CHK`] | 6 | `$18` | 4272 of the 7389 exception cases in `CHK.json.gz` fetch `$18` (the rest are illegal-EA cases fetching `$0C`) |
+//! | [`EXC_CHK`] | 6 | `$18` | 4272 of the 7389 exception cases in `CHK.json.gz` fetch `$18` (the rest are illegal-EA cases fetching the recording core's `$0C`) |
 //! | [`EXC_TRAPV`] | 7 | `$1C` | all 4095 exception cases in `TRAPV.json.gz` fetch `$1C` |
 //! | [`EXC_PRIVILEGE`] | 8 | `$20` | **not covered by the suite** — every case in every file runs in supervisor mode (`sr & $2000` set in all 8065 `TRAP.json.gz` cases, and `RESET`, `MOVEtoUSP`, `MOVEfromUSP` and friends have no exception cases at all), so no case can show which slot a privilege violation fetches. Chosen as the slot after [`EXC_TRAPV`], which is where both the ticket's map and the measured `CHK`/`TRAPV`/divide-by-zero sequence put it |
 //! | [`EXC_TRACE`] | 9 | `$24` | **not covered by the suite** either: no case in the 125 files starts with `sr & $8000` set (checked over all 1 000 060 cases), so nothing fetches the trace vector. The slot is the hardware map's — M68000UM "Exception Vector Memory Map", the group 2 slot between privilege violation and the spurious-interrupt slot |
+//! | [`EXC_LINE_A`] | 10 | `$28` | M68000UM Table 6-2, row 10, and all six #436 carts populate it with a real handler wherever they execute an A-line opcode on purpose (`Mamono Hunter Youko`'s `$28` handler is a compact VDP register write, see the line section below) |
+//! | [`EXC_LINE_F`] | 11 | `$2C` | M68000UM Table 6-2, row 11, and the same six carts populate it (`Warrior of Rome II`'s `$2C` handler dispatches through a jump table) |
 //! | — | 24, 25..31 | `$60`, `$64`–`$7C` | spurious and level 1–7 autovectors: M1-28 (#36), taken by [`crate::interrupts`] |
 //! | [`trap_vector`] | 32 + n | `$80 + 4 * n` | all 8065 `TRAP.json.gz` cases: `4e40` reads `$80`, `4e42` reads `$88`, `4e4f` reads `$BC` |
 //!
-//! The three slots the suite pins are one slot above where some Genesis
-//! documentation puts divide-by-zero, CHK and TRAPV. The suite is what this
-//! crate is scored against, so its slots win here and the discrepancy is on a
-//! issue for a hardware test ROM to settle; nothing outside this table depends
-//! on the difference.
+//! The suite pins the CHK/TRAPV/divide-by-zero/trap rows and — through the
+//! recording core's own routing — the illegal and address-error rows share one
+//! slot. It cannot settle the two rows between them: those come from M68000UM
+//! Table 6-2 plus the one map every Genesis cart is written against (all six
+//! #436 carts agree on it, down to storing exception codes 2/3/4 in their
+//! `$08`/`$0C`/`$10` halt stubs). The slots the suite does pin are one slot
+//! above where some Genesis documentation puts divide-by-zero, CHK and TRAPV;
+//! that discrepancy stays on an issue for a hardware test ROM to settle, and
+//! nothing outside this table depends on it.
 //!
-//! # There is no line A or line F vector on the 68000
+//! # The line-A and line-F vectors are the 68000's own
 //!
-//! M68000UM lists Format I ("Line 1010 emulator instruction") and Format J
-//! ("Line 1111 emulator instruction"), but the MC68000 implements neither, so
-//! the `1010` and `1111` groups are reserved encodings and a reserved opcode
-//! raises the illegal-instruction exception ([`EXC_ILLEGAL`]) — one vector,
-//! three routes. The separate line-A and line-F emulator vectors are a 68010
-//! feature this crate does not implement, which is why [`crate::decode::Op::LineA`] and
-//! [`crate::decode::Op::LineF`] stay distinct in the decode table even though
-//! they route identically here. There is deliberately **no line-A or line-F
-//! vector constant in this crate**: the pinned suite has no A-line or F-line
-//! file, so nothing could pin one, and a number nobody can check is worse than
-//! none.
+//! M68000UM Table 6-2 ("Exception Vector Assignment", section 6-7) lists line
+//! 1010 emulator at vector 10, long `$028`, and line 1111 emulator at vector
+//! 11, long `$02C`, as plain rows: the only row in the whole table footnoted
+//! "MC68010 only" is Format Error (14). Section 6.3.6 says it outright —
+//! "word patterns with bits 15–12 equaling 1010 or 1111 are distinguished as
+//! unimplemented instructions, and separate exception vectors are assigned to
+//! these patterns to permit efficient emulation" — so the separate vectors are
+//! a 68000 feature, not something the 68010 introduced. What the 68010 adds on
+//! top is mid-instruction restart (the format/offset word and the
+//! restart-capable frames) and the RTE-based emulation mode, and *those* this
+//! crate still does not implement.
+//!
+//! Genesis carts treat the two vectors as part of the machine: all six of the
+//! #436 black carts execute an A-line or F-line opcode on purpose and populate
+//! the matching slot with a real handler while parking halt stubs on `$08`/
+//! `$0C`/`$10`. `Mamono Hunter Youko`'s `$28` handler is the compact one, and
+//! it shows the mechanism: `MOVEM.L D7/A4,-(A7)`, `MOVEA.L $A(A7),A0` (the
+//! frame PC, the opcode's own address), `ADDQ.L #$2,$A(A7)` (step over the
+//! one-word opcode), `MOVE.W (A0),D0`, apply `$8000`, write `$C00004`, `RTE` —
+//! an A-line opcode used as a VDP register write. On the crate's old single
+//! vector those carts fell into their own halt stub and never drew.
 //!
 //! # The frame, and which PC goes into it
 //!
@@ -74,8 +91,16 @@
 //!   disagrees.)
 //! - illegal instruction, line A, line F and privilege violation push the
 //!   address of the faulting instruction itself, so a handler can decode it
-//!   (M68000PM "Illegal Instruction"). The suite never reaches these through a
-//!   decoded opcode of ours, so the rule is documented rather than measured.
+//!   (M68000PM "Illegal Instruction"; the M68000UM's general rule says the
+//!   stacked PC "usually" points at the next unexecuted instruction, but the
+//!   family manual states the exception for these routes: the saved value is
+//!   the address of the illegal or unimplemented instruction, and it is the
+//!   handler's job to adjust it to skip the instruction on return). The carts
+//!   do exactly that adjustment — Mamono Hunter Youko's `$28` handler does
+//!   `ADDQ.L #$2,$A(A7)` after reading the opcode through the frame PC — so
+//!   the opcode's own address is what these routes push, unchanged for all
+//!   three of them. The suite never reaches these through a decoded opcode of
+//!   ours, so the rule is documented rather than measured.
 //!
 //! The saved SR is the SR as it was *before* the mode change, S and T bits and
 //! all — that is what makes `RTE` able to return to user mode. The suite has no
@@ -99,11 +124,28 @@ use crate::bus::{ADDR_MASK, Bus};
 use crate::cpu::{BUS_CYCLE_CLOCKS, M68k};
 use crate::sr::{SR_S, SR_T};
 
-/// Illegal instruction — and, on the 68000, line A and line F as well.
+/// Illegal instruction, slot `$000010` (vector 4).
 ///
-/// Slot `$00000C`. See the module docs for why this is 3 here and 4 in
-/// Motorola's figure.
-pub const EXC_ILLEGAL: u8 = 3;
+/// This used to be 3, the address-error slot — the suite's illegal-EA cases
+/// fetch `$0C`, but only because the suite's recording core routed illegal to
+/// the same slot as address error, which is the bug this constant carried for
+/// years. The hardware map and all six #436 carts put illegal instruction at
+/// vector 4 (see the module docs); `tests/harness/mod.rs` still reads the
+/// suite's `$0C`, on purpose, because the recorded data is what it is.
+pub const EXC_ILLEGAL: u8 = 4;
+
+/// Line-1010 emulator (A-line), slot `$000028` (vector 10).
+///
+/// M68000UM Table 6-2 row 10, and the slot every A-line-using Genesis cart
+/// puts its handler in. See the module docs for why this is a 68000 feature
+/// and what the 68010 adds on top.
+pub const EXC_LINE_A: u8 = 10;
+
+/// Line-1111 emulator (F-line), slot `$00002C` (vector 11).
+///
+/// M68000UM Table 6-2 row 11, and the slot the F-line-using Genesis carts
+/// populate. See [`EXC_LINE_A`].
+pub const EXC_LINE_F: u8 = 11;
 
 /// Divide by zero (CHK-style group 1 exception), slot `$000014`.
 ///
@@ -287,6 +329,7 @@ impl M68k {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::address_error::EXC_ADDRESS_ERROR;
     use crate::sr::{SR_C, SR_INT_MASK, SR_N, SR_V, SR_X, SR_Z};
     use crate::{EXC_CHK, EXC_DIV_ZERO, EXC_TRAPV};
 
@@ -579,8 +622,9 @@ mod tests {
         assert_eq!(cpu.pc, HANDLER);
         assert_eq!(
             bus.reads(),
-            vec![0x0000_000C, 0x0000_000E, HANDLER, HANDLER + 2,],
-            "the illegal-instruction long is at $00000C (vector {})",
+            vec![0x0000_0010, 0x0000_0012, HANDLER, HANDLER + 2,],
+            "the illegal-instruction long is at $000010 (vector {}) — six #436 carts\
+             put their illegal handler there and halt on the old $00000C",
             EXC_ILLEGAL
         );
         assert_eq!(
@@ -590,39 +634,102 @@ mod tests {
         );
     }
 
+    /// The line-A and line-F emulators are vectors 10 and 11, slots `$000028`
+    /// and `$00002C` (M68000UM Table 6-2, "Exception Vector Assignment": plain
+    /// rows, no MC68010-only footnote). All six #436 black carts ship handler
+    /// longs there and halt stubs at `$10`/`$0C`, which is what settled the
+    /// numbering: on hardware an A-line opcode such as Mamono Hunter Youko's
+    /// `DC.W $A004` lands on `$28`, where its handler reads the frame PC (the
+    /// opcode's own address, see the frame docs) and steps over it.
     #[test]
-    fn line_a_and_line_f_take_the_illegal_frame() {
-        // The 68000 has no line emulator: Formats I and J are reserved, so the
-        // `1010` and `1111` groups take the illegal-instruction exception with
-        // the illegal instruction's frame — same vector, same pushed PC, same
-        // cost. The 68010's own line-A/F vectors are #20's, and there is no
-        // constant for them to use here.
-        for opcode in [0x4AFCu16, 0xA123, 0xF123, 0xA000, 0xFFFF] {
+    fn line_a_and_line_f_take_their_own_vectors() {
+        // `$A004` is the word Mamono Hunter Youko executes at 0x0084B4; `$FF1F`
+        // is the word Warrior of Rome II (and Caesar no Yabou II) executes.
+        for (opcode, vector, slot, name) in [
+            (0xA004u16, 10u8, 0x0000_0028u32, "line A"),
+            (0xFF1Fu16, 11u8, 0x0000_002Cu32, "line F"),
+        ] {
             let (mut cpu, mut bus) = cpu_at(opcode, SUP);
             let before = cpu.cycles;
             cpu.step(&mut bus);
             assert_eq!(
                 cpu.pending_exception,
-                Some(EXC_ILLEGAL),
-                "${opcode:04X} must take the illegal-instruction vector"
+                Some(vector),
+                "{name} (${opcode:04X}) must raise vector {vector}"
             );
             assert_frame(&cpu, &bus, STACK - 6, SUP, PROGRAM);
             assert_eq!(
-                cpu.pc, HANDLER,
-                "${opcode:04X} must jump to the $00000C long"
+                bus.peek_long(STACK - 4),
+                PROGRAM,
+                "{name}: the frame PC is the opcode's own address, so a handler can\
+                 fetch the opcode and ADDQ #2 past it"
+            );
+            assert_eq!(cpu.pc, HANDLER);
+            assert_eq!(
+                bus.reads(),
+                vec![slot, slot + 2, HANDLER, HANDLER + 2],
+                "{name} must fetch its handler long from ${slot:08X}"
             );
             assert_eq!(
                 cpu.cycles - before,
                 EXCEPTION_ENTRY_CLOCKS,
-                "${opcode:04X} costs the same 34 clocks"
+                "{name} costs the same 34 clocks ILLEGAL costs"
             );
-            let mut illegal_bus_reads = vec![0x0000_000C, 0x0000_000E, HANDLER, HANDLER + 2];
-            illegal_bus_reads.sort();
-            let mut reads = bus.reads();
-            reads.sort();
+        }
+    }
+
+    /// The A-line group routes to vector [`EXC_LINE_A`], slot `$000028`, with
+    /// the illegal route's frame (the opcode's own address) and its 34 clocks.
+    /// `$A03B` is Star Cruiser's word.
+    #[test]
+    fn a_line_opcodes_take_vector_ten_across_the_group() {
+        for opcode in [0xA123u16, 0xA000, 0xAFFF, 0xA004, 0xA03B] {
+            let (mut cpu, mut bus) = cpu_at(opcode, SUP);
+            let before = cpu.cycles;
+            cpu.step(&mut bus);
             assert_eq!(
-                reads, illegal_bus_reads,
-                "${opcode:04X} must read the same four words as ILLEGAL"
+                cpu.pending_exception,
+                Some(EXC_LINE_A),
+                "${opcode:04X} must take the line-A emulator vector"
+            );
+            assert_frame(&cpu, &bus, STACK - 6, SUP, PROGRAM);
+            assert_eq!(
+                bus.reads()[0],
+                0x0000_0028,
+                "${opcode:04X} must fetch its handler long from $000028"
+            );
+            assert_eq!(
+                cpu.cycles - before,
+                EXCEPTION_ENTRY_CLOCKS,
+                "${opcode:04X} costs the same 34 clocks ILLEGAL costs"
+            );
+        }
+    }
+
+    /// The F-line group routes to vector [`EXC_LINE_F`], slot `$00002C`, same
+    /// frame and same 34 clocks. `$FF1F` is Warrior of Rome II's word (and
+    /// Caesar no Yabou II's); `$F033` is Twinkle Tale's.
+    #[test]
+    fn f_line_opcodes_take_vector_eleven_across_the_group() {
+        for opcode in [0xF123u16, 0xF000, 0xFFFF, 0xFF1F, 0xF033] {
+            let (mut cpu, mut bus) = cpu_at(opcode, SUP);
+            let before = cpu.cycles;
+            cpu.step(&mut bus);
+            assert_eq!(
+                cpu.pending_exception,
+                Some(EXC_LINE_F),
+                "${opcode:04X} must take the line-F emulator vector"
+            );
+            assert_frame(&cpu, &bus, STACK - 6, SUP, PROGRAM);
+            assert_eq!(
+                bus.reads()[0],
+                0x0000_002C,
+                "${opcode:04X} must fetch its handler long from $00002C"
+            );
+            assert_eq!(
+                cpu.cycles - before,
+                EXCEPTION_ENTRY_CLOCKS,
+                "${opcode:04X} costs the same 34 clocks ILLEGAL costs"
             );
         }
     }
@@ -647,14 +754,14 @@ mod tests {
             assert_frame(&cpu, &bus, STACK - 6, SUP, PROGRAM);
             assert_eq!(
                 cpu.pc, HANDLER,
-                "${opcode:04X} must jump to the $00000C long"
+                "${opcode:04X} must jump to the $000010 long"
             );
             assert_eq!(
                 cpu.cycles - before,
                 EXCEPTION_ENTRY_CLOCKS,
                 "${opcode:04X} costs the same 34 clocks ILLEGAL costs"
             );
-            let mut illegal_bus_reads = vec![0x0000_000C, 0x0000_000E, HANDLER, HANDLER + 2];
+            let mut illegal_bus_reads = vec![0x0000_0010, 0x0000_0012, HANDLER, HANDLER + 2];
             illegal_bus_reads.sort();
             let mut reads = bus.reads();
             reads.sort();
@@ -662,27 +769,6 @@ mod tests {
                 reads, illegal_bus_reads,
                 "${opcode:04X} must read the same four words as ILLEGAL"
             );
-        }
-    }
-
-    #[test]
-    fn no_line_a_or_line_f_vector_number_is_taken() {
-        // The anti-test for the ticket's `line_a_vector_10` / `line_f_vector_11`:
-        // those slots belong to the 68010's line emulators, so on the 68000
-        // nothing may reach them. Assert the slots the 68010 would use
-        // (`$24`..`$2C` is where the ticket's numbers 9/10/11 would land) are
-        // never fetched, by checking the routes that would use them.
-        for opcode in [0x4AFCu16, 0xA123, 0xF123] {
-            let (mut cpu, mut bus) = cpu_at(opcode, SUP);
-            cpu.step(&mut bus);
-            let forbidden: Vec<u32> = (0x10..=0x30).step_by(4).collect();
-            for addr in bus.reads() {
-                assert!(
-                    !forbidden.contains(&addr),
-                    "${opcode:04X} fetched its handler from ${addr:08X}, \
-                     which is one of the reserved/68010-only slots"
-                );
-            }
         }
     }
 
@@ -750,14 +836,26 @@ mod tests {
     #[test]
     fn vector_numbers_are_slot_addresses_over_four() {
         // The convention, pinned on the numbers themselves: every constant
-        // times four is the long address the suite measures.
-        assert_eq!(vector_address(EXC_ILLEGAL), 0x0000_000C);
+        // times four is the long address the suite measures — and, for rows the
+        // suite cannot measure (the illegal slot and the two line rows), the
+        // long address M68000UM Table 6-2 names and the six #436 carts write
+        // their handlers into.
+        assert_eq!(vector_address(EXC_ADDRESS_ERROR), 0x0000_000C);
+        assert_eq!(vector_address(EXC_ILLEGAL), 0x0000_0010);
         assert_eq!(vector_address(EXC_DIV_ZERO), 0x0000_0014);
         assert_eq!(vector_address(EXC_CHK), 0x0000_0018);
         assert_eq!(vector_address(EXC_TRAPV), 0x0000_001C);
         assert_eq!(vector_address(EXC_PRIVILEGE), 0x0000_0020);
+        assert_eq!(vector_address(EXC_TRACE), 0x0000_0024);
+        assert_eq!(vector_address(EXC_LINE_A), 0x0000_0028);
+        assert_eq!(vector_address(EXC_LINE_F), 0x0000_002C);
         assert_eq!(vector_address(trap_vector(0)), 0x0000_0080);
         assert_eq!(vector_address(trap_vector(15)), 0x0000_00BC);
+        // Address error stays vector 3; the illegal route no longer shares it.
+        assert_eq!(EXC_ADDRESS_ERROR, 3);
+        assert_eq!(EXC_ILLEGAL, 4);
+        assert_eq!(EXC_LINE_A, 10);
+        assert_eq!(EXC_LINE_F, 11);
     }
 
     #[test]

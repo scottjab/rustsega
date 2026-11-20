@@ -121,7 +121,7 @@ impl M68k {
 mod tests {
     use super::*;
     use crate::address_error::{ADDRESS_ERROR_FRAME_SIZE, EXC_ADDRESS_ERROR};
-    use crate::exceptions::{EXC_ILLEGAL, EXC_PRIVILEGE};
+    use crate::exceptions::{EXC_ILLEGAL, EXC_LINE_A, EXC_LINE_F, EXC_PRIVILEGE};
     use crate::interrupts::AUTO_VECTOR_BASE;
     use crate::sr::{SR_INT_MASK, SR_S};
     use crate::testbus::{TestBus, cpu_with_program};
@@ -341,18 +341,23 @@ mod tests {
         assert_eq!(cpu.pc, TRACE_HANDLER + 2);
     }
 
-    /// An illegal instruction — and the line A / line F routes with it — never
+    /// An illegal instruction, a line-A opcode and a line-F opcode never
     /// traced: the instruction did not execute, so there is nothing to have
-    /// completed (M68000UM section 6.3.8).
+    /// completed (M68000UM section 6.3.8). Each route takes its own vector
+    /// (M68000UM Table 6-2, #482) and only that one frame.
     #[test]
     fn no_trace_for_the_illegal_instruction() {
-        for opcode in [0x4AFCu16, 0xA123, 0xF123] {
+        for (opcode, vector) in [
+            (0x4AFCu16, EXC_ILLEGAL),
+            (0xA123u16, EXC_LINE_A),
+            (0xF123u16, EXC_LINE_F),
+        ] {
             let (mut cpu, mut bus) = cpu_tracing(&[opcode, NOP]);
-            point_at(&mut bus, EXC_ILLEGAL, ILLEGAL_HANDLER);
+            point_at(&mut bus, vector, ILLEGAL_HANDLER);
 
             cpu.step(&mut bus);
 
-            assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL), "${opcode:04X}");
+            assert_eq!(cpu.pending_exception, Some(vector), "${opcode:04X}");
             assert_eq!(
                 cpu.pc, ILLEGAL_HANDLER,
                 "${opcode:04X}: one exception, not two"
@@ -360,7 +365,7 @@ mod tests {
             assert_eq!(
                 cpu.a[7],
                 STACK - FRAME,
-                "${opcode:04X}: only the illegal frame was pushed"
+                "${opcode:04X}: only the group 1 frame was pushed"
             );
         }
     }

@@ -16,7 +16,10 @@
 #[path = "harness/mod.rs"]
 mod harness;
 
-use m68k::{EXC_CHK, EXC_DIV_ZERO, EXC_ILLEGAL, EXC_PRIVILEGE, EXC_TRAPV, trap_vector};
+use m68k::{
+    EXC_ADDRESS_ERROR, EXC_CHK, EXC_DIV_ZERO, EXC_ILLEGAL, EXC_LINE_A, EXC_LINE_F, EXC_PRIVILEGE,
+    EXC_TRACE, EXC_TRAPV, trap_vector,
+};
 
 /// The vector table the suite's cases put their handlers in: the first 256
 /// bytes, one long per vector (M68000UM "Exception Vector Memory Map").
@@ -161,8 +164,16 @@ fn trap_frames_hold_the_saved_sr_and_the_next_instruction_address() {
 
 /// CHK's own exception is vector [`EXC_CHK`] (long at `$000018`) in 4272 cases,
 /// and its frame points past the instruction — at `pc + 2`, `+4` or `+6`, the
-/// length of the CHK form, never a bare `+2`. 3117 more fetch [`EXC_ILLEGAL`]
-/// because their effective address is illegal, which is a different route.
+/// length of the CHK form, never a bare `+2`. 3117 more fetch the recording
+/// core's illegal slot `$00000C` because their effective address is illegal,
+/// which is a different route.
+///
+/// That slot is *the recording core's* illegal slot, not the hardware's: the
+/// core that recorded these cases routed illegal instruction to the
+/// address-error slot, and the suite's recorded bytes carry that routing (#482
+/// measured illegal instruction at `$10` — M68000UM Table 6-2 and the six
+/// carts' tables). This test reads the recorded data, so it classifies by the
+/// slot the data actually fetches; [`EXC_ILLEGAL`] is the hardware slot.
 ///
 /// The remaining 676 fetch no handler at all, because CHK is also the one
 /// instruction here that usually *succeeds*: its range check passes and the
@@ -175,7 +186,9 @@ fn trap_frames_hold_the_saved_sr_and_the_next_instruction_address() {
 fn chk_exceptions_use_vector_six_and_point_past_the_instruction() {
     let cases = harness::load_file("CHK").expect("CHK file should load");
     let chk_slot = u32::from(EXC_CHK) * VECTOR_STRIDE;
-    let illegal_slot = u32::from(EXC_ILLEGAL) * VECTOR_STRIDE;
+    // The recording core's illegal slot, where it sent illegal-EA cases: the
+    // address-error long at `$0C`. Not [`EXC_ILLEGAL`] — see the doc above.
+    const RECORDING_ILLEGAL_SLOT: u32 = 0x0000_000C;
     let mut measured = 0;
     let mut illegal_route = 0;
     let mut no_exception = 0;
@@ -199,14 +212,15 @@ fn chk_exceptions_use_vector_six_and_point_past_the_instruction() {
             continue;
         }
         match slots.as_slice() {
-            [slot] if *slot == illegal_slot => {
+            [slot] if *slot == RECORDING_ILLEGAL_SLOT => {
                 illegal_route += 1;
                 continue;
             }
             [slot] if *slot == chk_slot => {}
             other => panic!(
                 "case {:?}: CHK case fetched its handler from {other:?}, \
-                 which is neither CHK (${chk_slot:08X}) nor illegal (${illegal_slot:08X})",
+                 which is neither CHK (${chk_slot:08X}) nor the recording core's \
+                 illegal slot (${RECORDING_ILLEGAL_SLOT:08X})",
                 case.name
             ),
         }
@@ -316,16 +330,17 @@ fn divide_by_zero_uses_vector_five_and_pushes_the_faulting_address() {
     );
 }
 
-/// There is no line-A or line-F vector on the 68000, and this crate has no
-/// constant for one: the slots the 68010 would use are never fetched by any case
-/// in any exception file, and the suite has no A-line or F-line file to pin a
-/// number from in the first place. The anti-test for the `line_a_vector_10` /
-/// `line_f_vector_11` the ticket asks for.
+/// The suite still cannot arbitrate the line-A or line-F slot: vectors 10 and
+/// 11 (`$28`/`$2C`, [`m68k::EXC_LINE_A`] / [`m68k::EXC_LINE_F`]) exist on the
+/// 68000 — M68000UM Table 6-2, and the six #436 carts put real handlers there —
+/// but no case in any exception file fetches those slots and the suite has no
+/// A-line or F-line file to pin a number from. The cart tables plus the UM are
+/// the evidence for those two rows; this test pins the suite side of that
+/// claim: nothing in the suite's data reaches the slots either way.
 #[test]
 fn the_suite_has_nothing_to_pin_a_line_a_or_line_f_vector_to() {
-    // `$24`..`$30`: where the ticket's numbers 9, 10 and 11 would land under the
-    // "slot address = number x 4" convention. Trace (#38) owns `$24`; `$28` and
-    // `$2C` are the 68010's line-A and line-F slots in the ticket's labelling.
+    // `$24`..`$30`: trace's slot, the line-A and line-F slots, and the two
+    // unassigned slots between them and the uninitialized-interrupt slot.
     let forbidden: Vec<u32> = (0x24..=0x30).step_by(VECTOR_STRIDE as usize).collect();
     for name in EXCEPTION_FILES {
         let cases = harness::load_file(name).unwrap_or_else(|| panic!("{name} should load"));
@@ -334,7 +349,7 @@ fn the_suite_has_nothing_to_pin_a_line_a_or_line_f_vector_to() {
                 assert!(
                     !forbidden.contains(&slot),
                     "case {:?} in {name} fetched a handler from ${slot:08X}, \
-                     a slot the 68000 has no exception for",
+                     a slot no suite case is supposed to reach",
                     case.name
                 );
             }
@@ -348,26 +363,38 @@ fn the_suite_has_nothing_to_pin_a_line_a_or_line_f_vector_to() {
         let upper = file.to_uppercase();
         assert!(
             !(upper.contains("LINEA") || upper.contains("LINEF") || upper.contains("ILLEGAL")),
-            "{file}: the suite would have to be re-read before #20 (M1-12) claims \
-             to have measured a line-A or line-F vector"
+            "{file}: a suite file for the line groups would have to be re-read before \
+             anything here claims to have measured the line-A or line-F slots"
         );
     }
 }
 
 /// The map, in one place, with the slot each constant names. `#16` measured the
-/// first three and the traps; [`EXC_PRIVILEGE`] is the slot after
-/// [`EXC_TRAPV`], which no suite case can confirm because every case in every
-/// file runs in supervisor mode.
+/// divide-by-zero, CHK, TRAPV and trap slots from the suite; the illegal slot
+/// and the two line slots are the hardware map's — M68000UM Table 6-2 plus the
+/// one vector table all six #436 carts ship (illegal handler at `$10`, real
+/// handlers at `$28`/`$2C`, halt stubs at `$08`/`$0C`) — because the suite's
+/// recording core routed illegal to the address-error slot and has no line
+/// files at all (#482). [`EXC_PRIVILEGE`] is the slot after [`EXC_TRAPV`],
+/// which no suite case can confirm because every case in every file runs in
+/// supervisor mode.
 #[test]
 fn the_vector_map_is_the_slot_address_over_four() {
-    assert_eq!(u32::from(EXC_ILLEGAL) * VECTOR_STRIDE, 0x0000_000C);
+    assert_eq!(u32::from(EXC_ADDRESS_ERROR) * VECTOR_STRIDE, 0x0000_000C);
+    assert_eq!(u32::from(EXC_ILLEGAL) * VECTOR_STRIDE, 0x0000_0010);
     assert_eq!(u32::from(EXC_DIV_ZERO) * VECTOR_STRIDE, 0x0000_0014);
     assert_eq!(u32::from(EXC_CHK) * VECTOR_STRIDE, 0x0000_0018);
     assert_eq!(u32::from(EXC_TRAPV) * VECTOR_STRIDE, 0x0000_001C);
     assert_eq!(u32::from(EXC_PRIVILEGE) * VECTOR_STRIDE, 0x0000_0020);
+    assert_eq!(u32::from(EXC_TRACE) * VECTOR_STRIDE, 0x0000_0024);
+    assert_eq!(u32::from(EXC_LINE_A) * VECTOR_STRIDE, 0x0000_0028);
+    assert_eq!(u32::from(EXC_LINE_F) * VECTOR_STRIDE, 0x0000_002C);
     assert_eq!(u32::from(trap_vector(0)) * VECTOR_STRIDE, 0x0000_0080);
     assert_eq!(u32::from(trap_vector(15)) * VECTOR_STRIDE, 0x0000_00BC);
-    // The numbering the tickets quote from Motorola's figure is one higher: it
-    // labels this table's slot 3 as "vector 4". The slots are what matter.
-    assert_eq!(EXC_ILLEGAL, 3);
+    // Address error stays vector 3 and illegal instruction is vector 4, one
+    // slot apart, as the carts' own tables have it.
+    assert_eq!(EXC_ADDRESS_ERROR, 3);
+    assert_eq!(EXC_ILLEGAL, 4);
+    assert_eq!(EXC_LINE_A, 10);
+    assert_eq!(EXC_LINE_F, 11);
 }
