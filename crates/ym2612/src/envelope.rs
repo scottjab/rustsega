@@ -561,6 +561,26 @@ impl Envelope {
         self.am_enable
     }
 
+    /// Whether this envelope can produce nothing and move no more without a
+    /// register write: no key on it, and already at the silence its release
+    /// clamps at ([`SILENT`]).
+    ///
+    /// This is the absorbing idle state of [`crate::Ym2612::clock`]'s fast
+    /// path. The key-off half of `&28` is what put a released envelope in
+    /// motion, and a keyed one has an attack left to run, so with no key the
+    /// state stands at [`State::Release`]; an update of a released envelope at
+    /// [`SILENT`] adds nothing (the increment clamps, an SSG-EG envelope past
+    /// halfway is gated off, and the restarts of `&90` need a key); and an
+    /// operator at [`SILENT`] attenuation outputs zero through the whole of
+    /// `crate::operator`'s sine ([`crate::operator::SILENT_OCTAVES`]), whatever
+    /// its phase or its feedback. So a chip whose 24 envelopes all stand here
+    /// sums to the same silence every sample, and a later key-on restarts the
+    /// note from silence at the `&28` write the same way it would have without
+    /// the samples in between being skipped.
+    pub(crate) fn at_rest(&self) -> bool {
+        !self.key_on && self.att == SILENT
+    }
+
     /// The state of this envelope, for the model's own tests and for
     /// `Ym2612`'s.
     #[cfg(test)]
@@ -645,7 +665,47 @@ impl EnvelopeGen {
     /// Nothing happens on two samples in three: the envelopes go a third as
     /// often as the phase counters do, and all 24 of them are stepped against
     /// the one counter of the chip (Nemesis, "YM2612 envelope generator").
+    /// [`EnvelopeGen::tick_resting`] with nothing at rest: what the
+    /// generator's own tests drive, which is why it is test-only.
+    #[cfg(test)]
     pub(crate) fn tick(&mut self, phases: &PhaseGen) {
+        self.tick_resting(phases, &[false; CHANNELS]);
+    }
+
+    /// [`EnvelopeGen::tick`], with the per-channel rest summary of
+    /// [`crate::Ym2612::clock`]: a channel marked at rest has its four updates
+    /// skipped, which is what makes the summary worth computing.
+    pub(crate) fn tick_resting(&mut self, phases: &PhaseGen, rest: &[bool; CHANNELS]) {
+        self.advance();
+        if self.sample != 0 {
+            return;
+        }
+
+        // The key code per operator, since the two are one thing in a normal
+        // channel and separate ones in the special mode of channel 3 (#114).
+        for (channel, &at_rest) in rest.iter().enumerate() {
+            if at_rest {
+                // An at-rest channel's four updates are no-ops: the state is
+                // absorbing under [`Envelope::update`] (a released envelope at
+                // silence gains nothing, and the restarts of `&90` need a
+                // key). [`Ym2612::clock`] computed `rest` off the envelopes as
+                // this sample began, and nothing since has touched them.
+                continue;
+            }
+            for slot in 0..SLOTS {
+                let keycode = phases.keycode(channel, slot);
+                self.envelopes[channel][slot].update(self.counter, keycode);
+            }
+        }
+    }
+
+    /// Move the sample divider and the chip counter one sample on, without the
+    /// per-operator updates [`EnvelopeGen::tick`] would run on the third
+    /// sample: what [`crate::Ym2612::clock`]'s idle path steps while every
+    /// envelope stands at rest, so that an update landing after the idle
+    /// stretch lands on the same counter phase and the same sample it would
+    /// have without it.
+    pub(crate) fn advance(&mut self) {
         self.sample += 1;
         if self.sample < SAMPLES_PER_UPDATE {
             return;
@@ -657,15 +717,20 @@ impl EnvelopeGen {
         } else {
             self.counter + 1
         };
+    }
 
-        // The key code per operator, since the two are one thing in a normal
-        // channel and separate ones in the special mode of channel 3 (#114).
-        for channel in 0..CHANNELS {
-            for slot in 0..SLOTS {
-                let keycode = phases.keycode(channel, slot);
-                self.envelopes[channel][slot].update(self.counter, keycode);
-            }
-        }
+    /// Whether all four envelopes of `channel` stand at rest
+    /// ([`Envelope::at_rest`]), the per-channel half of the condition
+    /// [`crate::Ym2612::clock`]'s idle fast path and its per-channel skip ask
+    /// for.
+    pub(crate) fn channel_at_rest(&self, channel: usize) -> bool {
+        self.envelopes[channel].iter().all(Envelope::at_rest)
+    }
+
+    /// Whether all 24 envelopes stand at rest ([`Envelope::at_rest`]), the
+    /// condition [`crate::Ym2612::clock`]'s idle fast path asks of the chip.
+    pub(crate) fn all_at_rest(&self) -> bool {
+        self.envelopes.iter().flatten().all(Envelope::at_rest)
     }
 
     /// The CSM key of channel 3: `on` is the pulse of a timer A overflow, held for

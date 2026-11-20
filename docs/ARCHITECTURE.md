@@ -391,6 +391,18 @@ every-channel effect of the rule is rarely heard. The `&A8`-`&AE` group of
 channel 3 special mode (#114) is modelled the same way: one `&AC` latch for
 the whole group.
 
+The chip's idle fast path (#369) rests on three constraints any later change
+has to keep. The gate is `busy == 0` (a data write outlives one sample: 32
+internal cycles against 24), neither timer running, and all 24 envelopes at
+rest - no key, attenuation at the silence a release clamps at - which is an
+absorbing state, and the path skips only what that makes no-ops: the
+envelope updates and the per-operator sum. The phase counters are not
+skipped even though an operator at silence outputs zero whatever its phase:
+the model pins them counting every sample, keyed or not. And the gate is
+recomputed per sample rather than cached in a field, because the `serde`
+derive carries the whole chip into the save-state payload and any added
+field moves it, which is a version bump, not a perf ticket's side effect.
+
 ### genesis
 
 ```rust
