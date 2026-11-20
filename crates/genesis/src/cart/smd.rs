@@ -9,8 +9,9 @@
 //! MacDonald, section "File formats"), which segaretro.org's "SMD" page quotes;
 //! it is the closest thing the format has to a specification. It documents the
 //! 512-byte header, the file size in units of 16 KiB, and the interleave - but
-//! see [`EvenHalf`] for why the last of those is read from the data rather than
-//! assumed.
+//! the interleave is read from the data rather than assumed: the even half of
+//! the block sits in the lower or upper half depending on the dump (the
+//! `EvenHalf` convention documented on the type below).
 //!
 //! Header bytes 8 and 9 are often `0xAA 0xBB`, and it is deliberately not a
 //! check: `smdtech.txt` records it as "for identification purposes only, the BIOS
