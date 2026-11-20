@@ -48,6 +48,7 @@
 //! they already charge.
 
 use crate::M68k;
+use crate::address_error::AccessKind;
 use crate::bus::Bus;
 use crate::ea::{Ea, SP_REG, Size, sign_extend_byte, sign_extend_word};
 use crate::exceptions::EXC_TRAPV;
@@ -296,6 +297,16 @@ impl M68k {
             return self.op_illegal(bus);
         };
 
+        // A target the code fetch would fault on aborts the call before the
+        // return address is pushed: the suite's faulting `JSR` cases stack a
+        // bare group 0 frame at `ssp - 14` and no return long (case `4e90 [JSR
+        // (A0)] 1` ends `a7` at the frame base). The fetch records the fault
+        // itself, as a code fetch, on the way out of the step.
+        if target & 1 != 0 {
+            self.alignment_fault(target, AccessKind::CodeFetch, false);
+            return 0;
+        }
+
         // `ea_address` has popped every extension word by now, so `prefetch[0]`
         // is the instruction after the call and `pc + 2` is its address.
         self.push_long(bus, self.pc.wrapping_add(INSTRUCTION_WIDTH));
@@ -354,6 +365,21 @@ impl M68k {
         let return_pc = self.pop_return_address(bus);
 
         self.set_sr(status);
+        // A restored PC that faults the code fetch at it is the suite's two RTE
+        // shapes: the SR-reload fetch (`$1A`, [`AccessKind::RteReload`]) when the
+        // reload took `S` away, and the plain code fetch (`$1E`) when it kept `S`
+        // — the frame's SR word is the *restored* one either way, because this
+        // raise happens after `set_sr` (`RTE.json.gz` cases `4e73 [RTE] 2` and
+        // `4e73 [RTE] 12`). The entry refills the queue from the handler on its
+        // own, so the jump itself can be skipped once the fault is recorded.
+        if return_pc & 1 != 0 {
+            if self.is_supervisor() {
+                self.jump_to(bus, return_pc);
+            } else {
+                self.alignment_fault(return_pc, AccessKind::RteReload, false);
+            }
+            return 0;
+        }
         self.jump_to(bus, return_pc);
         0
     }

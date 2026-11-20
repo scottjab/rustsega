@@ -258,6 +258,14 @@ impl M68k {
             alu_op_clocks(size, dest_accesses(dest))
         };
 
+        // The faulting access aborted the instruction (see [`M68k::set_flag`]):
+        // the write-back and the flags were skipped by their own gates, and the
+        // long ALU pass this would have charged never ran (suite `ADD.l`
+        // exception cases are `ea + 50` exactly).
+        if self.address_error_pending() {
+            return 0;
+        }
+
         self.advance_opcode(bus);
         pass_clocks
     }
@@ -282,6 +290,12 @@ impl M68k {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, size);
+        // Aborted at the faulting read: returning here skips the An write and
+        // the sign-extension/add passes, which never ran (suite `ADDA.w`
+        // `d6dd [(A5)+, A3] 5` expects its `ea + 50` with nothing on top).
+        if self.address_error_pending() {
+            return 0;
+        }
         let addend = if size == Size::Word {
             sign_extend_word(value as u16)
         } else {
@@ -341,10 +355,37 @@ impl M68k {
             return self.op_illegal(bus);
         };
         let left = self.read_ea(bus, src_ea, size);
+        // Aborted at the faulting read. A faulted long walk also steps back one
+        // word above the operand: the register and the recorded fault address
+        // both read `An - 2` there (suite `ADDX.l` case `db8a [-(A2),-(A5)] 7`,
+        // `A2 = $21B3CE4D`: operand `$21B3CE49`, register and frame address
+        // `$21B3CE4B`). Word walks are whole at resolve and stay put.
+        if self.address_error_pending() {
+            if size == Size::Long
+                && let Ea::Mem(a) = src_ea
+            {
+                self.predec_long_walk_stop(src, a);
+            }
+            return 0;
+        }
+        // The destination's predecrement never happens on the abort path (suite
+        // `ADDX.w` case `dd4a [-(A2),-(A6)] 1` keeps `A6` at the value the
+        // source's own decrement left it with).
         let Some(dest_ea) = self.resolve_arith_ea_write(bus, EA_PREDEC, dest, size) else {
             return self.op_illegal(bus);
         };
         let right = self.read_ea(bus, dest_ea, size);
+        // Aborted at the faulting destination read, with the same long-walk
+        // correction as the source: the register and the recorded fault address
+        // sit one word step above the operand.
+        if self.address_error_pending() {
+            if size == Size::Long
+                && let Ea::Mem(a) = dest_ea
+            {
+                self.predec_long_walk_stop(dest, a);
+            }
+            return 0;
+        }
         let result = self.add_extend_flags(left, right, size);
         self.write_ea(bus, dest_ea, size, result);
 
@@ -384,6 +425,11 @@ impl M68k {
         let result = self.add_flags(addend, value, false, size);
         self.write_ea(bus, dest, size, result);
 
+        // An aborted instruction pays no ALU passes: its flags and write-back
+        // were skipped by their own gates, and the passes themselves never ran.
+        if self.address_error_pending() {
+            return 0;
+        }
         self.advance_opcode(bus);
         alu_op_clocks(size, dest_accesses(dest))
     }
@@ -426,6 +472,11 @@ impl M68k {
         let result = self.add_flags(data, value, false, size);
         self.write_ea(bus, dest, size, result);
 
+        // An aborted instruction pays no ALU passes: its flags and write-back
+        // were skipped by their own gates, and the passes themselves never ran.
+        if self.address_error_pending() {
+            return 0;
+        }
         self.advance_opcode(bus);
         alu_op_clocks(size, dest_accesses(dest))
     }
@@ -474,6 +525,12 @@ impl M68k {
             alu_op_clocks(size, dest_accesses(dest))
         };
 
+        // Same abort as [`M68k::op_add`]: the faulting access stops the
+        // instruction before its ALU passes.
+        if self.address_error_pending() {
+            return 0;
+        }
+
         self.advance_opcode(bus);
         pass_clocks
     }
@@ -499,6 +556,11 @@ impl M68k {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, size);
+        // Same abort as [`M68k::op_adda`]: the faulting read stops the
+        // instruction before the An write and the ALU passes.
+        if self.address_error_pending() {
+            return 0;
+        }
         let subtrahend = if size == Size::Word {
             sign_extend_word(value as u16)
         } else {
@@ -558,10 +620,32 @@ impl M68k {
             return self.op_illegal(bus);
         };
         let subtrahend = self.read_ea(bus, src_ea, size);
+        // Same abort as [`M68k::op_addx`], with the same long-walk correction:
+        // the faulted register and the recorded fault address sit one word step
+        // above the operand.
+        if self.address_error_pending() {
+            if size == Size::Long
+                && let Ea::Mem(a) = src_ea
+            {
+                self.predec_long_walk_stop(src, a);
+            }
+            return 0;
+        }
         let Some(dest_ea) = self.resolve_arith_ea_write(bus, EA_PREDEC, dest, size) else {
             return self.op_illegal(bus);
         };
         let minuend = self.read_ea(bus, dest_ea, size);
+        // Aborted at the faulting destination read, with the same long-walk
+        // correction as the source: the register and the recorded fault address
+        // sit one word step above the operand.
+        if self.address_error_pending() {
+            if size == Size::Long
+                && let Ea::Mem(a) = dest_ea
+            {
+                self.predec_long_walk_stop(dest, a);
+            }
+            return 0;
+        }
         let result = self.sub_extend_flags(subtrahend, minuend, size);
         self.write_ea(bus, dest_ea, size, result);
 
@@ -598,6 +682,11 @@ impl M68k {
         let result = self.sub_flags(subtrahend, value, false, size);
         self.write_ea(bus, dest, size, result);
 
+        // An aborted instruction pays no ALU passes: its flags and write-back
+        // were skipped by their own gates, and the passes themselves never ran.
+        if self.address_error_pending() {
+            return 0;
+        }
         self.advance_opcode(bus);
         alu_op_clocks(size, dest_accesses(dest))
     }
@@ -637,6 +726,11 @@ impl M68k {
         let result = self.sub_flags(data, value, false, size);
         self.write_ea(bus, dest, size, result);
 
+        // An aborted instruction pays no ALU passes: its flags and write-back
+        // were skipped by their own gates, and the passes themselves never ran.
+        if self.address_error_pending() {
+            return 0;
+        }
         self.advance_opcode(bus);
         alu_op_clocks(size, dest_accesses(dest))
     }
@@ -672,8 +766,10 @@ impl M68k {
         // twelve modes of `CMP.L` (the `#imm` one included) measure exact at 2
         // (#230). `ADD.l` and friends, which also write a result back, are the
         // two-pass rule of [`alu_op_clocks`] instead. `CMP.b`/`CMP.w` are
-        // already exact.
-        if size == Size::Long {
+        // already exact. An aborted instruction never ran the pass (suite
+        // `CMP.l` exception cases are `ea + 50` with nothing on top), hence
+        // the guard.
+        if size == Size::Long && !self.address_error_pending() {
             ALU_PASS_CLOCKS
         } else {
             0
@@ -703,6 +799,11 @@ impl M68k {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, size);
+        // Same abort as [`M68k::op_adda`]: the faulting read stops the
+        // instruction before the compare pass.
+        if self.address_error_pending() {
+            return 0;
+        }
         let subtrahend = if size == Size::Word {
             sign_extend_word(value as u16)
         } else {
@@ -739,6 +840,12 @@ impl M68k {
             return self.op_illegal(bus);
         };
         let subtrahend = self.read_ea(bus, src_ea, size);
+        // Aborted at the faulting read: the destination EA is never resolved, so
+        // its `(Ay)+` does not step either (suite `CMP.w` case `b74c
+        // [(A4)+, (A3)+] 6` keeps `A3` at its starting value).
+        if self.address_error_pending() {
+            return 0;
+        }
         let Some(dest_ea) = self.resolve_arith_ea(bus, EA_POSTINC, dest, size) else {
             return self.op_illegal(bus);
         };
@@ -937,6 +1044,13 @@ impl M68k {
         // The bound is read before anything is decided: `CHK (A0)+,D0` steps `A0`
         // once whether or not it traps.
         let bound = self.read_ea(bus, src, Size::Word);
+        // Aborted at the faulting read: no bound compare, no flags, and no CHK
+        // exception — the group 0 fault outranks the group 1 trap the compare
+        // would take on the suppressed zero (suite `CHK` exception cases leave
+        // `sr` alone and stack no CHK frame).
+        if self.address_error_pending() {
+            return 0;
+        }
         let value = self.d[usize::from(reg)];
         // Both sides of the compare are the low word, sign-extended, and the
         // result is only ever 0, positive or negative — no wrap-around to worry

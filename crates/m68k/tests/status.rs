@@ -3,7 +3,7 @@
 //! the six `ANDI`/`ORI`/`EORI` to CCR/SR files (M1-26, #34).
 //!
 //! One test per suite file, in the style of `movem.rs`, checked with
-//! [`harness::Check::StateAndCyclesSkipExceptions`] (clocks since #41). The
+//! [`harness::Check::StateAndCycles`] (clocks since #41). The
 //! skip matters more here than in
 //! most files: `MOVEfromSR`, `MOVEtoSR` and `MOVEtoCCR` run their word operand
 //! through every addressing mode, so a couple of thousand cases per file end in
@@ -46,73 +46,73 @@ mod harness;
 /// SR").
 #[test]
 fn move_from_sr_file_passes() {
-    harness::assert_file_passes("MOVEfromSR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MOVEfromSR", harness::Check::StateAndCycles);
 }
 
 /// `MOVEtoSR`: `$46C0` + `<ea>`, `0100 0110 11 mmm rrr`, including `$46FC`
 /// (`MOVE #imm,SR`) (M68000UM "MOVE to SR").
 #[test]
 fn move_to_sr_file_passes() {
-    harness::assert_file_passes("MOVEtoSR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MOVEtoSR", harness::Check::StateAndCycles);
 }
 
 /// `MOVEtoCCR`: `$44C0` + `<ea>`, `0100 0100 11 mmm rrr` — the 68000 spelling,
 /// not the 68020 byte form (M68000UM "MOVE to CCR").
 #[test]
 fn move_to_ccr_file_passes() {
-    harness::assert_file_passes("MOVEtoCCR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MOVEtoCCR", harness::Check::StateAndCycles);
 }
 
 /// `MOVEfromUSP`: `$4E60` + n, `0100 1110 011 nnn nnn` with `d` = 1 —
 /// `MOVE USP,An` (M68000UM "MOVE to/from USP").
 #[test]
 fn move_from_usp_file_passes() {
-    harness::assert_file_passes("MOVEfromUSP", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MOVEfromUSP", harness::Check::StateAndCycles);
 }
 
 /// `MOVEtoUSP`: `$4E68` + n — `MOVE An,USP`, the other half of the same
 /// 16-opcode block (M68000UM "MOVE to/from USP").
 #[test]
 fn move_to_usp_file_passes() {
-    harness::assert_file_passes("MOVEtoUSP", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MOVEtoUSP", harness::Check::StateAndCycles);
 }
 
 /// `ANDI.B #imm,CCR` (`$023C`): the byte AND that may only clear flag bits
 /// (M68000UM "ANDI/ORI/EORI to CCR").
 #[test]
 fn andi_to_ccr_file_passes() {
-    harness::assert_file_passes("ANDItoCCR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ANDItoCCR", harness::Check::StateAndCycles);
 }
 
 /// `ANDI.W #imm,SR` (`$027C`): the word AND over the whole status register,
 /// mask and S bit included (M68000UM "ANDI/ORI/EORI to SR").
 #[test]
 fn andi_to_sr_file_passes() {
-    harness::assert_file_passes("ANDItoSR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ANDItoSR", harness::Check::StateAndCycles);
 }
 
 /// `ORI.B #imm,CCR` (`$003C`) (M68000UM "ANDI/ORI/EORI to CCR").
 #[test]
 fn ori_to_ccr_file_passes() {
-    harness::assert_file_passes("ORItoCCR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ORItoCCR", harness::Check::StateAndCycles);
 }
 
 /// `ORI.W #imm,SR` (`$007C`) (M68000UM "ANDI/ORI/EORI to SR").
 #[test]
 fn ori_to_sr_file_passes() {
-    harness::assert_file_passes("ORItoSR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("ORItoSR", harness::Check::StateAndCycles);
 }
 
 /// `EORI.B #imm,CCR` (`$0A3C`) (M68000UM "ANDI/ORI/EORI to CCR").
 #[test]
 fn eori_to_ccr_file_passes() {
-    harness::assert_file_passes("EORItoCCR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("EORItoCCR", harness::Check::StateAndCycles);
 }
 
 /// `EORI.W #imm,SR` (`$0A7C`) (M68000UM "ANDI/ORI/EORI to SR").
 #[test]
 fn eori_to_sr_file_passes() {
-    harness::assert_file_passes("EORItoSR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("EORItoSR", harness::Check::StateAndCycles);
 }
 
 /// The eleven file names above are what the suite ships, so a rename fails here

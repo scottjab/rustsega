@@ -506,8 +506,23 @@ impl M68k {
     }
 
     /// Set or clear a single SR bit. `mask` is one of the `SR_*` constants.
+    ///
+    /// Ignored while an address error is pending: the instruction is aborted at
+    /// the faulting access (M68000UM "Address Error"), so nothing it does after
+    /// that access happens — its condition-code updates included. The suite
+    /// pins this: `TST.w` case `4a79 [TST.w (xxx).l] 1` reads its odd operand,
+    /// gets the suppressed zero back, and still ends with `sr` equal to
+    /// `initial.sr` — neither the final SR nor the word the group 0 frame
+    /// stacks at `sp+8` carries a flag from the aborted instruction. This is
+    /// the flag-channel twin of [`M68k::write_ea`]'s `address_error_pending`
+    /// check on the register channel ([`crate::address_error`]). The exception
+    /// entries are unaffected: [`M68k::take_address_error`] takes the pending
+    /// fault before it changes SR, so entry-time `set_sr` calls pass.
     #[inline]
     pub fn set_flag(&mut self, mask: u16, on: bool) {
+        if self.address_error_pending() {
+            return;
+        }
         self.set_sr(if on { self.sr | mask } else { self.sr & !mask });
     }
 

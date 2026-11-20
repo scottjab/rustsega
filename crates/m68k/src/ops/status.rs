@@ -117,6 +117,13 @@ impl M68k {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, Size::Word);
+        // Aborted at the faulting read: the CCR keeps its bits (suite
+        // `MOVEtoCCR` exception cases leave `sr`'s low byte at `initial.sr`).
+        // `set_ccr` is a whole-word write like [`M68k::set_sr`], so the
+        // pending-fault gate on [`M68k::set_flag`] does not cover it.
+        if self.address_error_pending() {
+            return 0;
+        }
 
         self.set_ccr(value as u16);
         self.advance_opcode(bus);
@@ -146,6 +153,11 @@ impl M68k {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, Size::Word);
+        // Same abort as [`M68k::op_move_to_ccr`]: a faulted operand leaves SR
+        // alone (suite `MOVEtoSR` exception cases keep `sr` at `initial.sr`).
+        if self.address_error_pending() {
+            return 0;
+        }
 
         self.set_sr(value as u16);
         self.advance_opcode(bus);

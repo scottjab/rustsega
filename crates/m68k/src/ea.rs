@@ -25,14 +25,19 @@
 //! [`M68k::ext_addr`] for the address an extension word has while it is still
 //! queued. PC-relative modes measure from that address.
 //!
-//! The 24-bit rule: an [`Ea::Mem`] carries the address already masked with
-//! [`ADDR_MASK`], which is the address the bus is asked about. Masking there is
-//! the same address as masking late at the bus, because addition commutes with
-//! the modulo — pinned by `tests::masking_wraps_at_24_bits` — but it is not the
-//! address an address-*as-data* instruction wants: `LEA` keeps the unmasked
-//! 32-bit sum in its destination register (`LEA.json.gz` case
-//! `41fa [LEA (d16, PC), A0] 59` ends with `a0 = 0xFFFFAFEB`), so those
-//! instructions need the sum itself rather than an [`Ea::Mem`] — see #193.
+//! The 24-bit rule: an [`Ea::Mem`] carries the **unmasked** 32-bit address the
+//! mode computed, and the bus accessors mask late with [`ADDR_MASK`] when they
+//! ask the bus. Addition commutes with the modulo — pinned by
+//! `tests::masking_wraps_at_24_bits` — so the bus sees the same address either
+//! way, but the unmasked value is what the group 0 frame must record for a
+//! faulting access (`TST.w.json.gz` case `4a79 [TST.w (xxx).l] 1` stacks the
+//! fault address `$0F4A89D5`, bits 31..24 and all, where the bus only ever sees
+//! `$4A89D5`; #474), and keeping it whole here is what lets
+//! [`M68k::alignment_fault`] see it. It is still not the address an
+//! address-*as-data* instruction wants when the mode computes one:
+//! `LEA` keeps the unmasked 32-bit sum in its destination register (`LEA.json.gz`
+//! case `41fa [LEA (d16, PC), A0] 59` ends with `a0 = 0xFFFFAFEB`), so those
+//! instructions take the sum itself rather than an [`Ea::Mem`] — see #193.
 
 use crate::bus::{ADDR_MASK, Bus};
 use crate::cpu::M68k;
@@ -415,8 +420,9 @@ impl M68k {
     ///
     /// The address registers stay full 32-bit values — the suite keeps nonzero
     /// upper bytes in them (`MOVEA.w.json.gz` case `364a [MOVEA.w A2, A3] 3`
-    /// ends with `a3 = 0xFFFF_E780`) — and only [`Ea::Mem`] is masked to
-    /// [`ADDR_MASK`], which is the address that actually reaches the bus.
+    /// ends with `a3 = 0xFFFF_E780`) — and so does [`Ea::Mem`]: the mode's
+    /// computed address, which the bus accessors mask late (see the module docs
+    /// for why the faulting address must stay whole).
     pub(crate) fn resolve_ea(
         &mut self,
         bus: &mut impl Bus,
@@ -461,11 +467,11 @@ impl M68k {
             0b001 => Ea::AddrReg(reg)
                 .accepts_size(size)
                 .then_some(Ea::AddrReg(reg)),
-            0b010 => Some(Ea::Mem(self.a[r] & ADDR_MASK)),
+            0b010 => Some(Ea::Mem(self.a[r])),
             0b011 => {
                 // Postincrement: the current value is the address, then the
                 // register moves past the operand.
-                let addr = self.a[r] & ADDR_MASK;
+                let addr = self.a[r];
                 self.set_an(reg, self.a[r].wrapping_add(ea_step(reg, size)));
                 Some(Ea::Mem(addr))
             }
@@ -477,16 +483,16 @@ impl M68k {
                 if use_ == EaUse::Source {
                     self.cycles += PREDEC_CALC_CLOCKS;
                 }
-                Some(Ea::Mem(self.a[r] & ADDR_MASK))
+                Some(Ea::Mem(self.a[r]))
             }
             // 101 d16(An): one extension word, sign extended, added to An
             // (M68000UM, "Address Register Displacement Addressing Mode").
             0b101 => {
                 let disp = sign_extend_word(self.fetch_ext_word(bus));
-                Some(Ea::Mem(self.a[r].wrapping_add(disp) & ADDR_MASK))
+                Some(Ea::Mem(self.a[r].wrapping_add(disp)))
             }
             // 110 d8(An,Xn): one brief extension word, An + Xn + d8.
-            0b110 => Some(Ea::Mem(self.indexed_addr(bus, self.a[r]) & ADDR_MASK)),
+            0b110 => Some(Ea::Mem(self.indexed_addr(bus, self.a[r]))),
             // 111: the sub-mode comes from the register field of the EA
             // (M68000UM, "Effective Address Calculation", mode 111).
             0b111 => match reg {
@@ -494,12 +500,12 @@ impl M68k {
                 // 0x8000 is 0xFFFF_8000 and reaches the bus as 0x00FF_8000.
                 0b000 => {
                     let addr = sign_extend_word(self.fetch_ext_word(bus));
-                    Some(Ea::Mem(addr & ADDR_MASK))
+                    Some(Ea::Mem(addr))
                 }
                 // abs.L: two extension words, high word first.
                 0b001 => {
                     let addr = self.fetch_ext_long(bus);
-                    Some(Ea::Mem(addr & ADDR_MASK))
+                    Some(Ea::Mem(addr))
                 }
                 // d16(PC): measured from the extension word's own address, not
                 // from `pc` — see [`M68k::ext_addr`] and
@@ -507,12 +513,12 @@ impl M68k {
                 0b010 => {
                     let base = self.ext_addr();
                     let disp = sign_extend_word(self.fetch_ext_word(bus));
-                    Some(Ea::Mem(base.wrapping_add(disp) & ADDR_MASK))
+                    Some(Ea::Mem(base.wrapping_add(disp)))
                 }
                 // d8(PC,Xn): the indexed form, same base.
                 0b011 => {
                     let base = self.ext_addr();
-                    Some(Ea::Mem(self.indexed_addr(bus, base) & ADDR_MASK))
+                    Some(Ea::Mem(self.indexed_addr(bus, base)))
                 }
                 // #imm: the operand *is* the extension word(s). A byte
                 // immediate occupies the low byte of one word, with the high
@@ -539,10 +545,9 @@ impl M68k {
     ///
     /// Two differences from [`M68k::resolve_ea`], and both matter:
     ///
-    /// * the sum is **not** masked to [`ADDR_MASK`]. [`Ea::Mem`] holds the
-    ///   address that reaches the bus, so masking there is right; but `LEA` and
+    /// * the sum goes back as a plain `u32`, not as an [`Ea::Mem`]. `LEA` and
     ///   `PEA` put the value in an address register, where the top eight bits are
-    ///   real. `LEA.json.gz` case `41fa [LEA (d16, PC), A0] 59` starts at
+    ///   real: `LEA.json.gz` case `41fa [LEA (d16, PC), A0] 59` starts at
     ///   `pc = $000C00` with displacement `$FFFFA3E9` and expects `A0 =
     ///   $FFFFAFEB`, not the masked `$0000AFEB` — the report is #193, and 7162 of
     ///   that file's 8065 cases and 7153 of `PEA.json.gz`'s end above the mask,
@@ -714,8 +719,12 @@ impl M68k {
     /// A save state and the conformance harness read `ssp`/`usp` back, which is
     /// how a core that only updated `a[7]` was caught — `MOVEA.w (A7)+,A0`
     /// (case `305f [MOVEA.w (A7)+, A0] 117`).
+    ///
+    /// `pub(crate)` because `MOVEM`'s fault path needs it too: its walk register
+    /// moves one step for the transfer that faults, outside `write_ea`'s gated
+    /// route (#474).
     #[inline]
-    fn set_an(&mut self, reg: u8, value: u32) {
+    pub(crate) fn set_an(&mut self, reg: u8, value: u32) {
         if reg == SP_REG {
             self.set_active_sp(value);
         } else {
@@ -1208,20 +1217,22 @@ mod tests {
         );
         assert_eq!(
             ea,
-            Ea::Mem(0x00FF_FFFE),
-            "the address that reaches the bus is masked to 24 bits"
+            Ea::Mem(0xFFFF_FFFE),
+            "the EA carries the full 32-bit address; the bus masks it"
         );
     }
 
     #[test]
-    fn mem_ea_is_masked_to_24_bits() {
+    fn mem_ea_keeps_the_full_address_and_masks_at_the_bus() {
         let mut bus = Ram::new();
         bus.poke_word(0x1000, 0xABCD);
         let mut cpu = M68k::new();
         cpu.a[0] = 0xFF00_1000;
 
         let ea = cpu.resolve_ea(&mut bus, AN_IND, 0, Size::Word).unwrap();
-        assert_eq!(ea, Ea::Mem(0x0000_1000));
+        // The EA carries the whole computed address (a faulting access on it
+        // must record bits 31..24; #474), and the bus still sees the masked one.
+        assert_eq!(ea, Ea::Mem(0xFF00_1000));
         assert_eq!(cpu.read_ea(&mut bus, ea, Size::Word), 0xABCD);
         assert_eq!(bus.reads, [0x1000]);
     }
@@ -1394,7 +1405,7 @@ mod tests {
         let ea = cpu
             .resolve_ea(&mut bus, ABSOLUTE, ABS_W, Size::Word)
             .expect("abs.W resolves");
-        assert_eq!(ea, Ea::Mem(0x00FF_8000));
+        assert_eq!(ea, Ea::Mem(0xFFFF_8000));
         assert_eq!(cpu.read_ea(&mut bus, ea, Size::Word), 0xBEEF);
         assert_eq!(
             bus.reads,
@@ -1552,20 +1563,20 @@ mod tests {
 
     // ---- masking ----
 
-    /// Masking inside [`M68k::resolve_ea`] (what [`Ea::Mem`] carries) and
-    /// masking late, at the bus, give the same address for every mode here,
-    /// because masking is a ring homomorphism for addition:
+    /// The 32-bit sum an [`Ea::Mem`] now carries (see the module docs) and the
+    /// 24-bit address the bus is asked about agree under masking, for every mode
+    /// here, because masking is a ring homomorphism for addition:
     /// `(a + b) mod 2^24 == (a mod 2^24 + b mod 2^24) mod 2^24`. Pinned at the
     /// wrap points, where any other rule would show up.
     #[test]
     fn masking_wraps_at_24_bits() {
-        // (An, d16, expected masked address)
+        // (An, d16, expected unmasked sum, expected bus address)
         let cases = [
-            (0x00FF_FFFCu32, 0x0006u16, 0x0000_0002u32), // off the top, wraps to 2
-            (0x0000_0000, 0xFFFE, 0x00FF_FFFE),          // below 0, wraps to the top
-            (0xFFFF_FFFF, 0x0003, 0x0000_0002),          // An itself above 24 bits
+            (0x00FF_FFFCu32, 0x0006u16, 0x0100_0002u32, 0x0000_0002u32), // off the top
+            (0x0000_0000, 0xFFFE, 0xFFFF_FFFE, 0x00FF_FFFE), // below 0, wraps at the bus
+            (0xFFFF_FFFF, 0x0003, 0x0000_0002, 0x0000_0002), // An itself above 24 bits
         ];
-        for (an, disp, want) in cases {
+        for (an, disp, want, bus_addr) in cases {
             let (mut cpu, mut bus) = ram_with_program(&[0x2028, disp, 0x4E71]);
             cpu.a[0] = an;
 
@@ -1576,21 +1587,28 @@ mod tests {
             assert_eq!(
                 ea,
                 Ea::Mem(want),
-                "0x{an:x} + d16 {disp:#x} wraps to 0x{want:x}"
+                "0x{an:x} + d16 {disp:#x} is the whole 32-bit sum"
             );
             assert_eq!(
-                ea,
-                Ea::Mem(an.wrapping_add(sign_extend_word(disp)) & ADDR_MASK),
-                "early masking is the same address as masking the full 32-bit sum at the bus"
+                want & crate::bus::ADDR_MASK,
+                bus_addr,
+                "masking the sum at the bus gives the wrapped address"
             );
         }
 
-        // abs.L is truncated the same way: there is no 25th address line.
+        // abs.L above the mask reaches the bus truncated the same way: there is
+        // no 25th address line. The EA itself keeps the full value, which is
+        // what a faulting access on it must record (#474).
         let (mut cpu, mut bus) = ram_with_program(&[0x2039, 0xFF80, 0x0000, 0x4E71]);
         let ea = cpu
             .resolve_ea(&mut bus, ABSOLUTE, ABS_L, Size::Long)
             .expect("abs.L resolves");
-        assert_eq!(ea, Ea::Mem(0x0080_0000), "0xFF800000 -> 0x800000");
+        assert_eq!(ea, Ea::Mem(0xFF80_0000), "abs.L keeps bits 31..24");
+        assert_eq!(
+            ea,
+            Ea::Mem(0x0080_0000 | 0xFF00_0000),
+            "... which the bus masks back to 0x800000"
+        );
     }
 
     // ---- the extension-word ladder ----

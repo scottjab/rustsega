@@ -1,7 +1,7 @@
 //! `CHK` in the pinned 680x0 suite (M1-27, #35).
 //!
 //! One test for `CHK.json.gz`, in the style of `status.rs`, checked with
-//! [`harness::Check::StateAndCyclesSkipExceptions`] since #241: the trap clock
+//! [`harness::Check::StateAndCycles`] since #241: the trap clock
 //! law below made the file's 4948 ran cases deterministic, so clocks are now
 //! compared along with state. It is still not [`harness::Check::StateAndCycles`]
 //! because a large share of its cases end in the suite's exception handler on an
@@ -66,7 +66,7 @@ mod harness;
 /// case the suite dates, so the trap paths are pinned like the rest.
 #[test]
 fn chk_file_passes() {
-    harness::assert_file_passes("CHK", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("CHK", harness::Check::StateAndCycles);
 }
 
 /// The file name above is what the suite ships, so a rename fails here with a

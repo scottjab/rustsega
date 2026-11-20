@@ -167,6 +167,16 @@ Things this run cannot see, with the issue that owns each:
   suite's exception handler at $00000C. `is_exception_case` skips them because
   the core could not take them when the harness was written; the exception path
   has since been built out (#37, #41), and enabling those cases is [#223].
+  Part of that landed in #474 (2026-11-19): the address-error path was corrected
+  against the recorded suite — unmasked fault address, the aborted-instruction
+  rule (no flag write-back, no destination EA side effect, no ALU pass on a
+  faulted access), the group 0 entry at its documented 50 clocks — and 13 of
+  the 15 files that could not survive the skip being removed moved their
+  per-file tests up to full `Check::StateAndCycles` (`moves.rs` moved
+  `MOVE.b`/`MOVEA.w`/`MOVEA.l`/`MOVE.q` and holds `MOVE.w`/`MOVE.l` one level
+  down for the one residual shape, [#616]). The gate itself stays at
+  `StateAndCyclesSkipExceptions` until #616 closes; the per-file tests are the
+  stricter pin in the meantime.
 - **"Skipped" is not "address error"** ([#185], closed by the rename). The suite
   records its address error at $00000C, not at hardware's $000008, because the
   core it was recorded against routes the address error and the illegal

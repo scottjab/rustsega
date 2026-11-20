@@ -76,6 +76,13 @@ const SIZE_SHIFT: u32 = 12;
 const DEST_REG_SHIFT: u32 = 9;
 /// Shift of MOVE's destination *mode*, bits 8..6.
 const DEST_MODE_SHIFT: u32 = 6;
+
+/// EA mode `011`, `(An)+` — the destination whose register update waits for the
+/// store (see [`M68k::op_move`]).
+const EA_MODE_POSTINCREMENT: u8 = 0b011;
+/// EA mode `100`, `-(An)` — the destination whose register decrement is part of
+/// the address calculation (see [`M68k::op_move`]).
+const EA_MODE_PREDECREMENT: u8 = 0b100;
 /// Shift of the source EA's mode, bits 5..3; the register is bits 2..0.
 const SRC_MODE_SHIFT: u32 = 3;
 
@@ -112,6 +119,13 @@ impl M68k {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, size);
+        // The faulting read stops the instruction: the destination EA is never
+        // resolved, so its `(An)+` / `-(An)` side effect does not happen (suite
+        // `MOVE.w` case `3af7 [(d8, A7, Xn), (A5)+] 7` keeps `A5` where it
+        // started, and `3d2c [(d16, A4), -(A6)] 24` does not decrement `A6`).
+        if self.address_error_pending() {
+            return 0;
+        }
 
         let dest_reg = field(opcode, DEST_REG_SHIFT);
         let dest_mode = field(opcode, DEST_MODE_SHIFT);
@@ -119,10 +133,52 @@ impl M68k {
         else {
             return self.op_illegal(bus);
         };
-        self.write_ea(bus, dest, size, value);
-
+        // The flags come from the source operand before the write, exactly as
+        // the abort rule needs: a faulting *write* leaves the source's flags in
+        // place (suite `MOVE.w` case `3b5e [(A6)+, (d16, A5)] 9` ends with the
+        // N/Z of the data it read), while the write itself does not happen.
         self.set_logic_flags(value, size);
-        self.advance_opcode(bus);
+        // A predecrement destination computes its address by decrementing, and
+        // the queue slides before the store cycle issues — both stay done when
+        // the store faults (suite `MOVE.w` `3d08 [A0, -(A6)] 80`: `A6` is two
+        // lower, the frame stacks the post-slide `pc`, and the refill's 4
+        // clocks are charged). For every other destination the slide waits for
+        // the write, below.
+        let predecor = dest_mode == EA_MODE_PREDECREMENT;
+        if predecor {
+            self.advance_opcode(bus);
+        }
+        self.write_ea(bus, dest, size, value);
+        // A postincrement destination only moves after a store that completes:
+        // on a faulting store the register stays put and the queue never slides
+        // (suite `MOVE.w` `3af7 [(d8, A7, Xn), (A5)+] 7` and `MOVE.l` `22cb
+        // [A3, (A1)+] 32`: the register ends where it started, the frame stacks
+        // the pre-slide `pc`, and no refill clock is charged). The bump to undo
+        // is `resolve_move_ea`'s, `size` wide, `dest_mode` `011` being the only
+        // postincrement mode.
+        if self.address_error_pending() {
+            if dest_mode == EA_MODE_POSTINCREMENT {
+                self.set_an(
+                    dest_reg,
+                    self.a[usize::from(dest_reg)].wrapping_sub(size.bytes()),
+                );
+            }
+            // A faulted long store through `-(An)` stops the walk one word step
+            // above the operand: the register and the recorded fault address
+            // read `An - 2` there (suite `MOVE.l` case `2506 [D6, -(A2)] 92`,
+            // `A2 = $01A41DF9`: operand `$01A41DF5`, register and frame address
+            // `$01A41DF7`). Word stores walk whole at resolve and stay put.
+            else if dest_mode == EA_MODE_PREDECREMENT
+                && size == Size::Long
+                && let Ea::Mem(a) = dest
+            {
+                self.predec_long_walk_stop(dest_reg, a);
+            }
+            return 0;
+        }
+        if !predecor {
+            self.advance_opcode(bus);
+        }
         0
     }
 

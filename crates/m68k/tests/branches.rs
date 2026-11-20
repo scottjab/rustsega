@@ -3,7 +3,7 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is
-//! [`harness::Check::StateAndCyclesSkipExceptions`]: state *and* the clock
+//! [`harness::Check::StateAndCycles`]: state *and* the clock
 //! count, as in the add, logic and move files. M1-31c (#41) turned the cycle
 //! half on for these four files; the cases that end in the suite's exception
 //! handler are still left to M1-29 (#37) — see [`harness::is_exception_case`]
@@ -29,26 +29,26 @@ mod harness;
 /// `pc + 2 + d8` (or `+ d16` when `d8` is zero), taking no flags.
 #[test]
 fn bcc_file_passes() {
-    harness::assert_file_passes("Bcc", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("Bcc", harness::Check::StateAndCycles);
 }
 
 /// `BSR`: `$6100`..`$61FF`, the same displacement plus a long push of the
 /// address of the following instruction.
 #[test]
 fn bsr_file_passes() {
-    harness::assert_file_passes("BSR", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("BSR", harness::Check::StateAndCycles);
 }
 
 /// `DBcc`: `$50C8`..`$5FCF`, decrement-and-branch on a word counter.
 #[test]
 fn dbcc_file_passes() {
-    harness::assert_file_passes("DBcc", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("DBcc", harness::Check::StateAndCycles);
 }
 
 /// `Scc`: `$50C0`..`$5FC7` at every mode but `001`, writing `$FF` or `$00`.
 #[test]
 fn scc_file_passes() {
-    harness::assert_file_passes("Scc", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("Scc", harness::Check::StateAndCycles);
 }
 
 /// The four file names above are what the suite ships for this ticket, so a
