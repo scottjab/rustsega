@@ -17,12 +17,6 @@
 # The list is deliberately wider than "Sonic and see if it crashes". These
 # entries cover SRAM (Phantasy Star II/IV), EEPROM (NBA Jam), the Super Street
 # Fighter II cart mapper, and a banked/mega cartridge (Sonic 3D Blast).
-#
-# Three more were ready to go in and are held out because they panic before the
-# checkpoint, not because they are uninteresting: `Aladdin (USA)`,
-# `Earthworm Jim (USA)` and `Ecco the Dolphin (USA, Europe, Korea) (En)` die in
-# the YM2612 LFO - [#349](https://github.com/scottjab/rustsega/issues/349). Add
-# them back when that is fixed.
 
 [[game]]
 key = "sonic1"
@@ -143,3 +137,29 @@ key = "toystory"
 prefix = "Toy Story (USA)"
 frames = 600
 start_press = [300, 301]
+
+[[game]]
+key = "aladdin"
+prefix = "Aladdin (USA)"
+# START at 300 leaves the splash for the title menu, at 450 it starts the game;
+# 600 is still the fade into the level, and the tutorial overlay is settled by
+# 700.
+frames = 900
+start_press = [300, 301, 450, 451]
+
+[[game]]
+key = "earthwormjim"
+prefix = "Earthworm Jim (USA)"
+# START at 300 leaves the splash for the title menu, at 450 it starts the
+# intro; the New Junk City level itself starts around frame 950.
+frames = 1200
+start_press = [300, 301, 450, 451]
+
+[[game]]
+key = "ecco"
+prefix = "Ecco the Dolphin (USA, Europe, Korea) (En)"
+# Ecco ignores START until its title card is up, so the first press is at 500
+# (attract bay -> title card) and the second at 1000 (title card -> level);
+# gameplay is settled by 1100.
+frames = 1200
+start_press = [500, 501, 1000, 1001]
