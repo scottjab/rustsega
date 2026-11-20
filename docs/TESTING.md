@@ -134,6 +134,30 @@ afford either sweep, so the Z80's `sst_sample` runs in its place: the first 20
 cases of all 1604 files. `just test-all`, which runs on `main`, includes both
 full sweeps.
 
+### Driving the built frontend headlessly: geckodriver quirks (M8-08, #413)
+
+The dev shell pins Firefox + geckodriver 0.37.1, whose WebDriver API differs from
+the W3C standard in ways that cost a session to rediscover. Recorded so the next
+agent does not:
+
+- `moz:firefoxOptions.log.type` is rejected with "Invalid log field type"; only
+  `{level: ...}` is accepted inside that object.
+- The `/session/{id}/logs` endpoints are gone (HTTP 405). Console capture has to
+  be in-page: install `securitypolicyviolation` and `error` listeners, then read
+  them back with `execute_script`.
+- Setting a file input is `POST /session/{id}/element/{id}/value`. The W3C
+  `POST /session/{id}/element/{id}` path 405s on this version.
+
+That last one is what makes "play a ROM in the browser" automatable: sending
+`test-roms/genesis/overdrive2/titan-overdrive2.bin` to `#rom-input` loads the
+ROM, the header shows "OVERDRIVE 2 Europe", the canvas goes to 320x224, and two
+screenshots ~2 s apart hash differently - which is how "frames are being drawn"
+is asserted without a human.
+
+What headless Firefox still cannot check here: sound (no audio output device),
+pad gameplay beyond scripted input events, commercial ROMs (they never leave
+`$RUSTSEGA_ROM_DIR`), and TLS (terminate it in a proxy in front of the server).
+
 ### The external reference oracle: `scripts/ref/`
 
 Three tickets (#404, #441, #357) stalled where every internal measurement had run
