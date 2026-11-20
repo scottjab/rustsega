@@ -437,10 +437,10 @@ enum VdpPort {
 /// lane - A5 has to be low for the chip to answer at all, and nothing above A5
 /// reaches the decode, which is what "mirrors every $40" is.
 ///
-/// Modelling the hang itself - no DTACK, so the 68k stops - is
-/// [#508](https://github.com/scottjab/rustsega/issues/508); until
-/// then an address with this bit set answers what the rest of the undecoded area
-/// answers.
+/// The hang itself - no DTACK, so the 68k stops - is modelled by
+/// [`Bus::vdp_hang`], called from the [`m68k::Bus`] dispatch in front of the
+/// region's own functions (#508); an address with this bit set never reaches a
+/// port function.
 const VDP_HANG_BIT: u32 = 1 << 5;
 
 /// The port that `addr` names inside [`Region::Vdp`], or `None` for the corner of
@@ -1047,6 +1047,82 @@ impl Bus {
         }
         self.locked_up = true;
         true
+    }
+
+    /// Does this access to [`Region::Vdp`] land in the corner of the area that
+    /// decodes to nothing: `$C00020`-`$C0003F` and its every-0x40 mirrors, the
+    /// addresses with [`VDP_HANG_BIT`] set?
+    ///
+    /// plutiedev "Memory map", on the VDP area, verbatim: "Accessing address
+    /// range `$C00020` to `$C0003F` hangs up". A hang is no DTACK, and no DTACK
+    /// is a stopped 68000, so asking is also what records the freeze - the same
+    /// flag the TMSS gate sets ([`Bus::locked_up`]), cleared by nothing but
+    /// [`m68k::Bus::reset_devices`]. Genesis Plus GX answers the same corner with
+    /// its `m68k_lockup_w_8`/`m68k_lockup_r_8` handlers, which halt the CPU
+    /// (its `mem68k.c`, "Illegal areas (cause system to lock-up since !DTACK is
+    /// not returned)"); the lockup reads there return the prefetched word, which
+    /// is the float this bus answers undriven reads with ([`Bus::open_bus_word`],
+    /// #508).
+    ///
+    /// It is called from the `Region::Vdp` arms of the [`m68k::Bus`] dispatch, in
+    /// front of `read_vdp_*`/`write_vdp_*`, for the same reason the TMSS gate is
+    /// (see [`Bus::vdp_access_denied`]): a check written inside those four
+    /// functions is a check that gets rewritten away when the stubs fill in.
+    /// Every path into [`Region::Vdp`] goes through the dispatch - the 68k's own
+    /// accesses, the Z80's `$7F00`-`$7FFF` port window (masked to the 0x20-byte
+    /// port block by [`z80_bus::vdp_port_addr`], so it cannot reach the corner)
+    /// and the Z80's bank window, whose 9 bit register can point it anywhere in
+    /// the 68k space including here - so one guard covers every master. The Z80
+    /// itself is not separately held: on
+    /// hardware its access would stall mid-cycle with the rest of the bus, and
+    /// this model freezes the 68k and lets the sound CPU run on, which no test
+    /// ROM reaches and which #508 records as a known simplification.
+    fn vdp_hang(&mut self, addr: u32) -> bool {
+        let hangs = addr & VDP_HANG_BIT != 0;
+        self.locked_up |= hangs;
+        hangs
+    }
+
+    /// The byte an undriven read answers: one lane of [`Bus::open_bus_word`],
+    /// the lane the read's address sits on - A0 of the access selects the byte
+    /// lane of the 16 bit bus (genvdp.txt section 7 "8-bit port access"; BlastEm
+    /// answers its unmapped byte reads the same way, `value = location & 1 ?
+    /// word : word >> 8`, `genesis.c` `io_read_b`'s fall-through).
+    fn open_bus_byte(&self, addr: u32) -> u8 {
+        if addr & 1 == 0 {
+            (self.prefetched_word >> 8) as u8
+        } else {
+            self.prefetched_word as u8
+        }
+    }
+
+    /// The word an undriven read answers: the 68000's prefetched instruction
+    /// word.
+    ///
+    /// That is the model both surviving references implement for every read
+    /// nothing drives - Genesis Plus GX's `m68k_read_bus_16` answers the word at
+    /// `m68k.pc`, BlastEm's `get_open_bus_value` answers `m68k->prefetch` (its
+    /// new core) or the word at `last_prefetch_address` (its old one), and the
+    /// place hardware has been observed doing it is Kabuto's VDP-port note
+    /// (v1.5): reading `$C00018`/`$C0001C` "returns the following opcode as the
+    /// 68k prefetches it before doing the actual read access". The last bus
+    /// cycle before a typical undriven read is the fetch of the next opcode, so
+    /// the lines the read samples hold that word - which is "data left on the
+    /// bus" in Kabuto's phrasing, and what the 68k last drove onto the bus in
+    /// this crate's. `prefetched_word` is that value: the CPU publishes it on
+    /// every queue refill ([`m68k::Bus::note_prefetched_word`], #479).
+    ///
+    /// `$FFFF` before the first fetch is the pull-up state: the data lines have
+    /// pull-ups (Kabuto: "a value of `$FFFF` is read (due to bus pull-up)"), so
+    /// a bus nothing has driven reads as ones. That is also all the pull-up is
+    /// here - Kabuto's "every now and then" `$FFFF` readings, the pull-up
+    /// showing through after bus delays, are folded into the one state this
+    /// model gives a bus that nothing recent has driven, and there is no decay:
+    /// no source gives a value the float settles to after N cycles, and the
+    /// ticket that invents one is worse than the placeholder it replaces
+    /// (#508, "Sources, and the honest limit").
+    fn open_bus_word(&self) -> u16 {
+        self.prefetched_word
     }
 
     /// Feed one byte of the security string to the detector at [`TMSS_SECURITY`].
@@ -2361,7 +2437,8 @@ impl m68k::Bus for Bus {
             // The TMSS gate: asking costs the access on a locked console. It lives in
             // the dispatch rather than in `read_vdp_byte` so that M3-09 (#69) cannot
             // fill the stub in and lose it - see [`Bus::vdp_access_denied`].
-            Region::Vdp if self.vdp_access_denied() => OPEN_BUS,
+            Region::Vdp if self.vdp_access_denied() => self.open_bus_byte(addr),
+            Region::Vdp if self.vdp_hang(addr) => self.open_bus_byte(addr),
             Region::Vdp => self.read_vdp_byte(addr),
             Region::Z80 => self.read_z80_byte(addr),
             Region::Io => self.read_io_byte(addr),
@@ -2379,7 +2456,8 @@ impl m68k::Bus for Bus {
             Region::Rom => self.read_rom_word(addr),
             Region::Ram => self.read_ram_word(addr),
             // TMSS, and see the note on [`Bus::read_byte`].
-            Region::Vdp if self.vdp_access_denied() => OPEN_BUS_WORD,
+            Region::Vdp if self.vdp_access_denied() => self.open_bus_word(),
+            Region::Vdp if self.vdp_hang(addr) => self.open_bus_word(),
             Region::Vdp => self.read_vdp_word(addr),
             Region::Z80 => self.read_z80_word(addr),
             Region::Io => self.read_io_word(addr),
@@ -2398,6 +2476,7 @@ impl m68k::Bus for Bus {
             Region::Ram => self.write_ram_byte(addr, value),
             // TMSS, and see the note on [`Bus::read_byte`].
             Region::Vdp if self.vdp_access_denied() => {}
+            Region::Vdp if self.vdp_hang(addr) => {}
             Region::Vdp => self.write_vdp_byte(addr, value),
             Region::Z80 => self.write_z80_byte(addr, value),
             Region::Io => self.write_io_byte(addr, value),
@@ -2416,6 +2495,7 @@ impl m68k::Bus for Bus {
             Region::Ram => self.write_ram_word(addr, value),
             // TMSS, and see the note on [`Bus::read_byte`].
             Region::Vdp if self.vdp_access_denied() => {}
+            Region::Vdp if self.vdp_hang(addr) => {}
             Region::Vdp => self.write_vdp_word(addr, value),
             Region::Z80 => self.write_z80_word(addr, value),
             Region::Io => self.write_io_word(addr, value),
@@ -4024,6 +4104,80 @@ mod tests {
             let _ = bus.read_word(addr & EVEN_LANE);
             assert!(!bus.locked_up, "{addr:#08x} is open once unlocked");
         }
+    }
+
+    /// The corner of [`Region::Vdp`] that decodes to nothing does not answer at
+    /// all: plutiedev "Memory map", verbatim, "Accessing address range $C00020 to
+    /// $C0003F hangs up". A hang is a machine state, not a return value - no
+    /// DTACK comes back, so the 68000 stops - and the closest model the crate has
+    /// is the TMSS freeze: [`Bus::locked_up`], cleared by nothing but
+    /// [`m68k::Bus::reset_devices`]. Genesis Plus GX answers the same corner with
+    /// its `m68k_lockup_w_8`/`m68k_lockup_r_8` handlers, which halt the CPU
+    /// (https://github.com/ekeeke/Genesis-Plus-GX/blob/master/core/mem68k.c), and
+    /// its lockup reads return the prefetched word, which is what the float half
+    /// of this ticket answers here too (#508).
+    #[test]
+    fn an_access_to_the_hang_corner_locks_up_the_68k() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        assert!(!bus.locked_up(), "setup: nothing has frozen yet");
+
+        bus.write_byte(0xC00020, 0x5A);
+        assert!(bus.locked_up(), "the write hung the bus");
+
+        // No recovery short of a reset - the same rule as the TMSS freeze.
+        bus.write_byte(0xC00004, 0x80);
+        bus.reset_devices();
+        assert!(!bus.locked_up(), "reset_devices is the one clear");
+
+        // A read hangs the same way.
+        let _ = bus.read_byte(0xC00022);
+        assert!(bus.locked_up(), "the read hung the bus too");
+        bus.reset_devices();
+
+        // Word accesses hang; the ports on the other side of A5 do not.
+        bus.write_word(0xC00020, 0x0000);
+        assert!(bus.locked_up(), "the word write hung the bus");
+        bus.reset_devices();
+        let _ = bus.read_word(0xC00020);
+        assert!(bus.locked_up(), "the word read hung the bus");
+        bus.reset_devices();
+        bus.write_word(0xC00004, 0x3FA0);
+        assert!(!bus.locked_up(), "the control port still answers");
+    }
+
+    /// The hang is the decoder, not one address: A5 is the only line that
+    /// separates the ports from the corner, so the whole 0x20-byte span hangs
+    /// and every 0x40 mirror of it hangs with it (plutiedev "Memory map": the
+    /// ports run to $C0001F, the corner is $C00020-$C0003F, and "VDP mirrors
+    /// every $40 up to $DFFFFF" is the same decoder one line later). The Z80's
+    /// bank window is the one route of its own that reaches the corner - its
+    /// `$7F00`-`$7FFF` port window is masked to the 0x20-byte port block and
+    /// cannot - so a bank-window read of the corner hangs the bus through the
+    /// same dispatch.
+    #[test]
+    fn the_hang_covers_the_corner_and_every_mirror_of_it() {
+        let hang_addresses = [
+            0xC00020, 0xC00021, 0xC0002E, 0xC0003F, // the span itself
+            0xC00060, 0xC000A0, 0xDFFFE0, // the every-0x40 mirrors
+        ];
+        for addr in hang_addresses {
+            let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+            bus.write_byte(addr, 0x5A);
+            assert!(bus.locked_up, "{addr:#08x} is inside the hang");
+        }
+
+        // The Z80's bank window is the other route into the VDP area, and it is
+        // not masked down to the port block: the register selects the top 9 bits
+        // of the 68k space ([`z80_bus::Z80Side::window_addr`]), so bank `$180`
+        // puts `$8020`-`$803F` on the corner. The shift protocol that loads the
+        // register has its own tests; the value is poked here.
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        bus.z80.bank = 0x180;
+        Z80View::new(&mut bus).read(0x8020);
+        assert!(
+            bus.locked_up(),
+            "the Z80's bank-window read of $C00020 hung the bus"
+        );
     }
 
     /// The PSG has a second spelling on the 68k side, the Z80 window's `0xA07F11`
