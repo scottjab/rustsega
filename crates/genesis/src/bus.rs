@@ -2105,6 +2105,21 @@ impl Bus {
         }
     }
 
+    /// Clock the SVP's DSP alongside the 68000: one SSP cycle per 68000
+    /// cycle clocked (the ratio the references tie their SVP loops to, and
+    /// within svpdoc section 4's "10-12M instructions/sec (or possibly less)
+    /// is sufficient" against the 68k's 7.67 MHz). Nothing here on a cart
+    /// without the board.
+    pub(crate) fn svp_run_dsp(&mut self, m68k_cycles: u32) {
+        if m68k_cycles == 0 {
+            return;
+        }
+        let Bus { svp, rom, .. } = self;
+        if let Some(svp) = svp {
+            svp.run_dsp(rom, m68k_cycles);
+        }
+    }
+
     /// Undecoded byte read. Placeholder for [`Region::Unmapped`].
     fn read_unmapped_byte(&mut self, _addr: u32) -> u8 {
         OPEN_BUS
@@ -2480,6 +2495,14 @@ impl m68k::Bus for Bus {
         if let Some(cart) = self.jcart.as_mut() {
             cart.reset();
         }
+        // And the SVP's DSP goes back to its entry point with ST and the PMC
+        // state clear (GPGX's `svp_reset` + `ssp1601_reset`): the DRAM, the
+        // IRAM and the handshake latches survive like the save RAM does, but
+        // the core itself restarts - a reset is a power-cycle for the cart's
+        // processor, whatever the RAMs were doing.
+        if let Some(svp) = self.svp.as_mut() {
+            svp.reset();
+        }
     }
 }
 
@@ -2785,8 +2808,8 @@ mod tests {
         assert_eq!(bus.read_word(0xA1_5002), 0xBEEF, "the mirror");
         assert_eq!(
             bus.read_word(0xA1_5004),
-            0x0003,
-            "PM0: written + fake answer"
+            0x0002,
+            "PM0 bit 1: the command was taken"
         );
         assert_eq!(bus.read_byte(0xA1_5000), 0xBE, "byte lanes of XST");
         assert_eq!(bus.read_byte(0xA1_5001), 0xEF);

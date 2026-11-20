@@ -141,9 +141,10 @@ fn header_written_and_checked() {
     );
     assert_eq!(
         u32::from_le_bytes(state[4..8].try_into().expect("4 bytes of version")),
-        8,
-        "format version 8, which is the SVP board carrying one field on the bus \
-         of #433, on top of the YM2612's `&A4` F-Num latch moving off the \
+        9,
+        "format version 9, which is the SVP board carrying its DSP core and \
+         IRAM of #433 stage 2, on top of the SVP board field that made it 8, \
+         on top of the YM2612's `&A4` F-Num latch moving off the \
          per-channel fields of #336 that made it 7, on top of the J-CART register carrying one \
          field on the bus of #356, on top of the Acclaim 32 Mbit board's \
          read-window latch carrying one field in the EEPROM of #271 that made it 5, on top of \

@@ -256,22 +256,25 @@ gigabyte. So detection in this module is keyed on what cannot lie — the actual
 image length, and the location of a `SEGA` system signature (`0x100` for a plain
 cart, `0x7E100` for a Realtec) — and never on a declared size.
 
-## Not a mapper, but the one cart-side gap worth naming here: the SVP (#374)
+## Not a mapper, but the one cart-side board worth naming here: the SVP (#374, #433)
 
-The SVP (Sega Virtual Processor) - the Fujitsu SSP1601 DSP, its own program ROM
-and 2 KB of DRAM that the `Virtua Racing` cartridge carries, which the 68k
-addresses at `0xA15000`-`0xA15009` and `0x300000`-`0x31FFFF` (notaz *SVP doc*
-section 3 "Memory map") - is unemulated, and `Virtua Racing (USA)` and
-`Virtua Racing (Japan) (En)` are therefore expected to draw a blank frame.
+The SVP (Sega Virtual Processor) - the Fujitsu SSP1601 DSP, its own program
+ROM and 128 KiB of DRAM that the `Virtua Racing` cartridge carries, which the
+68k addresses at `0xA15000`-`0xA15009` and `0x300000`-`0x31FFFF` (notaz *SVP
+doc* section 3 "Memory map") - is emulated since
+[#433](https://github.com/scottjab/rustsega/issues/433): [`crate::cart::svp`]
+detects the board the way Picodrive's own `carthw.cfg` does (the overseas title
+plus the DSP program's `OHMP` bytes at 0x810), answers the DRAM and register
+windows on the bus, and clocks the SSP1601 core from the scheduler. `Virtua
+Racing` draws and its boot test passes un-ignored.
 
 It is in none of the groups above because it translates nothing: the game ROM is
 read whole, at the offsets the cart area already gives it. The alias people get
-wrong - the SVP program IRAM at `0x000000`-`0x0007FF`, which must read the game
-image at the same offsets - is already right here for the plainest reason, that
-range is `Region::Rom`. What is missing is the other two windows: `0xA15000` is
-[`Region::Unmapped`](../crates/genesis/src/bus.rs) and reads open bus, and
-`0x300000` is cart ROM, so nothing there can be written and read back. The work
-is [#433](https://github.com/scottjab/rustsega/issues/433).
+wrong - the SVP program IRAM at `0x000000`-`0x0007FF`, which reads the game
+image at the same offsets - is right here for the plainest reason, that range is
+`Region::Rom`; the DSP's own IRAM copy (which its external window at `0x390000`
+writes) lives in [`crate::cart::svp`]. Detection keys on image content, not a
+hash table, per this page's rule above.
 
 ## Follow-up issues opened from this survey
 
