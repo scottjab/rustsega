@@ -2,10 +2,10 @@
 //!
 //! The browser offers animation frames at the display's rate; the console runs at
 //! its own - 60 Hz for NTSC, 50 Hz for PAL. A 120 Hz display therefore has to run
-//! the console on every other tick, and a 30 Hz one twice per tick. This is the
-//! whole policy of the loop until [`crate::emulator`] has audio to pace itself
-//! against, which is M7-05 (#138): the audio clock is the master and this module
-//! goes away with the guess.
+//! the console on every other tick, and a 30 Hz one twice per tick. The audio
+//! clock is the master ([`crate::emulator`], M7-05, #138); this module is the
+//! fallback used when the audio context has not started yet, so the loop has a
+//! pacing policy before the first sample.
 //!
 //! Pure, and the reason the loop is testable at all: no browser, no clock, a
 //! `now_ms` handed in by the caller.
