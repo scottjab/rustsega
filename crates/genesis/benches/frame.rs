@@ -424,7 +424,10 @@ fn scene_program(parts: Parts) -> Vec<u16> {
     // access (genvdp.txt section 7), which is what lets a whole table be
     // written from one command word.
     vdp_register(&mut program, 15, 0x02);
-    vdp_register(&mut program, 0, 0x00);
+    // R0 bit 2 set, as plutiedev "$80xx" has software write it: with the bit
+    // clear the palette is reduced to the LSBs of each CRAM word (genvdp.txt
+    // section 17 "$00"; #282), and the scene check's colour count fails.
+    vdp_register(&mut program, 0, 0x04);
     vdp_register(&mut program, 12, 0x01);
     vdp_register(&mut program, 2, 0x30);
     vdp_register(&mut program, 4, 0x07);
