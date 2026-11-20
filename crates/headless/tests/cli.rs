@@ -433,6 +433,36 @@ fn pad1_pressing_past_the_last_frame_warns() {
     }
 }
 
+/// `--pad1 START@0` is the same silent no-op off the front of the run (#464):
+/// the pad loop runs 1..=frames, so frame 0 is never looked up. Doing nothing
+/// is still what it does, but it has to say so, and name the 1-based rule.
+#[test]
+fn pad1_pressing_frame_zero_warns() {
+    let dir = TempDir::new("pad1-zero");
+    let rom = dir.join("fake.md");
+    write_fake_rom(&rom);
+
+    let out = run(&[
+        "run",
+        rom.to_str().expect("utf-8 path"),
+        "--frames",
+        "1",
+        "--pad1",
+        "START@0,A@0",
+    ]);
+
+    assert!(
+        out.status.success(),
+        "an unreachable press is a warning, not a failed run\nstderr: {}",
+        stderr(&out)
+    );
+    let text = stderr(&out);
+    assert!(
+        text.contains("frame 0") && text.contains("1-based"),
+        "the warning must say frame 0 is unreachable and name the 1-based rule: {text}"
+    );
+}
+
 /// The same warning is not owed to a script the run does reach, so that it stays
 /// a signal rather than noise on every run that uses `--pad1`.
 #[test]
