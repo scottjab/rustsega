@@ -526,6 +526,14 @@ canvas {
   cursor: default;
 }
 
+/* The movie chip (M7-18, #365): the same pill again, for the same kind of fact -
+   a recording or a replay is on, and during a replay the pads the game sees are
+   not the pads the player is pressing. Accent, like the badge it sits beside. */
+.chip--movie {
+  border-color: var(--accent);
+  cursor: default;
+}
+
 /* The screen is the hero: it fills what is left of the page, and the canvas is
    centred in it with a soft accent glow behind. */
 .screen-area {
@@ -1448,6 +1456,32 @@ canvas {
 .keycap--capturing {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* The paste box of the Input movie section (M7-18, #365): a .rsm is text, so
+   the box it is pasted into is the keycap's surface, border and mono font, at
+   reading size and as tall as a few lines of a file need. */
+.movie-paste {
+  display: block;
+  width: 100%;
+  min-height: 96px;
+  margin-bottom: var(--space-2);
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  resize: vertical;
+}
+
+.movie-paste:focus-visible {
+  box-shadow: var(--focus);
+}
+
+.movie-paste::placeholder {
+  color: var(--text-muted);
 }
 
 .toasts {

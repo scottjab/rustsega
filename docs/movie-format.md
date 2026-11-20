@@ -12,7 +12,9 @@ ROM.
 
 The code is [`movie.rs`](../crates/genesis/src/movie.rs), which never touches a
 file: `headless run --movie PATH` and `--record PATH` are the file side
-(`crates/headless/src/run.rs`).
+(`crates/headless/src/run.rs`), and the browser front end is the other - its
+Input movie section records the pads, downloads the text as a `.rsm`, and
+takes one back by file pick or paste (`crates/web/src/movie.rs`).
 
 ## Layout
 
@@ -141,7 +143,12 @@ for frame in 0..frames {
 
 `headless` also refuses a movie whose `region` is not the region the run resolved
 to, because a PAL replay of an NTSC recording is a different run rather than a
-broken file.
+broken file. The browser front end refuses the same two ways, with a toast that
+says which side is wrong, and then restarts its console's run from the reset so
+frame 0 is frame 0 - the page's own keyboard, gamepad and touch input are not
+read while a replay is on, because a movie owns the pads until it is stopped
+(`crates/web/src/movie.rs`). Its recorder is `Movie::record` on both ports,
+started from the top of a run, and stopping it downloads the file.
 
 Which pad replay attaches is a property of the file: a pad that holds `X`, `Y`,
 `Z` or `Mode` anywhere in the run is replayed through `Genesis::set_pad6` - the
@@ -180,9 +187,6 @@ that a person fixes it by hand.
 
 ## What a movie cannot do yet
 
-- **Recording from the browser.** `#129` keeps the front end out of scope; the
-  format is the same text, so a front end that keeps one in memory can offer the
-  same record/replay once input arrives there (#365).
 - **Audio, saves and the memory watch.** A movie is input only. What the machine
   did with it is what `--hash` and `--dump-png` report, and SRAM is
   `Genesis::sram`.

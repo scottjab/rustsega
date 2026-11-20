@@ -450,6 +450,14 @@ frame buffer) and what that means after a load, is
 - Input: one `InputState` that merges keyboard, Gamepad API, and touch
   overlay into `Buttons` per port. All bindings are rebindable and stored in
   `localStorage`.
+- Input movies: the drawer's Input movie section records the two pads to a
+  `.rsm` and stops into a download, and replays a picked or pasted one. A
+  replay is admitted only when it parses, names this cartridge (`rom-hash`)
+  and is of the region this run resolved to; either session restarts the run
+  from the console's reset with the frame count at 0, because a movie's
+  frame 0 is the first frame of a run. While a replay is on, `Movie::set_pads`
+  feeds the loop and the page's own input is unread until it is stopped; a
+  recording notes the pads the page reports (`crates/web/src/movie.rs`, #365).
 - Persistence: SRAM and save states in IndexedDB (via the `rexie` or
   `idb` crate, or raw `web-sys`), keyed by ROM SHA-1.
 - ROMs are loaded by file picker / drag and drop, or from the server's

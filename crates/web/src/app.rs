@@ -20,6 +20,9 @@ use crate::keyboard_events::use_keyboard;
 use crate::library::LibraryOpen;
 use crate::library::use_library;
 use crate::menu::use_menu;
+use crate::movie::MovieFileInput;
+use crate::movie::MovieState;
+use crate::movie::open_movie_picker;
 use crate::recents::Recents;
 use crate::render::FilterSetting;
 use crate::render::RendererKind;
@@ -142,6 +145,10 @@ pub fn App() -> impl IntoView {
     // work on. `Slots` is a `Copy` handle over the console, so the keyboard, the
     // pads and the cards all move the same one (M7-15, #148).
     let slots_open = RwSignal::new(false);
+    // The box a movie is pasted into (M7-18, #365): read only when the replay
+    // button is pressed, there being nothing reactive about text nobody has
+    // submitted.
+    let movie_paste = NodeRef::<html::Textarea>::new();
     // The two elements the screen's own half needs: the shell, which is what goes
     // fullscreen, and the screen area, which is what reports how much room the
     // picture has (M7-12, #145).
@@ -359,6 +366,18 @@ pub fn App() -> impl IntoView {
                         }
                     })
                 }}
+                // The movie chip (M7-18, #365): a recording or a replay is on,
+                // which is otherwise invisible while the drawer is shut - and
+                // during a replay the pads the game sees are not the pads the
+                // player is pressing, which is worth a word on the bar.
+                {move || {
+                    let label = console.movie.get().label();
+                    (!label.is_empty()).then(|| {
+                        view! {
+                            <span class="chip chip--movie" role="status">{label}</span>
+                        }
+                    })
+                }}
                 // Two halves of one nav, of which the stylesheet shows exactly one
                 // (M7-19, #152): all six actions where there is room for them, and
                 // on a phone the single menu button that opens the drawer they have
@@ -524,6 +543,7 @@ pub fn App() -> impl IntoView {
                 {move || crashed.get().then(|| view! { <CrashCard/> })}
                 <RomFileInput/>
                 <SrmFileInput/>
+                <MovieFileInput/>
             </main>
 
             <Drawer
@@ -777,6 +797,69 @@ pub fn App() -> impl IntoView {
                     </Button>
                     <Button on_click=Callback::new(move |_| crate::srm::open_srm_picker())>
                         "Import .srm"
+                    </Button>
+                </section>
+
+                // Input movies (M7-18, #365): beside the cartridge save section,
+                // and for the same reasons - the drawer rather than the top bar,
+                // and a section whose note, buttons and paste box are drawn out
+                // of contrast-checked tokens only. The note is the replay
+                // contract in full: what a movie owns, what starting one does
+                // to the game, and what is refused.
+                <section class="settings-section">
+                    <h3 class="settings-section__title">"Input movie"</h3>
+                    <p class="settings-section__note">
+                        "A .rsm movie records the two pads frame by frame. Record "
+                        "starts the game over and writes down your input; stopping "
+                        "downloads the file. Replaying starts the game over and the "
+                        "movie owns the pads until you stop it - your keyboard, "
+                        "gamepad and touch input are ignored. A movie for another "
+                        "cartridge or region is refused, and one that holds X, Y, Z "
+                        "or Mode replays on a 6-button pad by itself."
+                    </p>
+                    <div class="console-actions">
+                        <Button
+                            disabled=Signal::derive(move || !loaded.get())
+                            on_click=Callback::new(move |_| {
+                                if console.movie.get() == MovieState::Recording {
+                                    console.stop_movie(toasts);
+                                } else {
+                                    console.record_movie(toasts);
+                                }
+                            })
+                        >
+                            {move || {
+                                if console.movie.get() == MovieState::Recording {
+                                    "Stop recording"
+                                } else {
+                                    "Record movie"
+                                }
+                            }}
+                        </Button>
+                        <Button
+                            disabled=Signal::derive(move || !loaded.get())
+                            on_click=Callback::new(move |_| open_movie_picker())
+                        >
+                            "Replay .rsm file"
+                        </Button>
+                    </div>
+                    <textarea
+                        class="movie-paste"
+                        rows="4"
+                        placeholder="...or paste a .rsm movie here"
+                        aria-label="Paste a .rsm movie"
+                        node_ref=movie_paste
+                    />
+                    <Button
+                        disabled=Signal::derive(move || !loaded.get())
+                        on_click=Callback::new(move |_| {
+                            let Some(area) = movie_paste.get() else {
+                                return;
+                            };
+                            console.replay_movie(area.value(), toasts);
+                        })
+                    >
+                        "Replay pasted movie"
                     </Button>
                 </section>
 
