@@ -36,6 +36,8 @@
 use super::header::parse_header;
 use serde::{Deserialize, Serialize};
 
+mod ssp16;
+
 /// The DRAM window, in 68k byte addresses: `0x300000`-`0x31FFFF`, 128 KiB read
 /// as 16-bit words (notaz *SVP doc*, section 1: "128KB of DRAM"; section 3's
 /// memory-map table; Genesis Plus GX's `svp.h` carries it as `dram[0x20000]`).
