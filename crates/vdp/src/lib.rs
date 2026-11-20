@@ -508,8 +508,14 @@ impl Vdp {
     }
 
     /// R0 bit 5 (LCB): blank the leftmost 8 pixels of the display, filling them
-    /// with the backdrop colour (genvdp.txt section 17 "$00"; plutiedev
-    /// "$80xx").
+    /// with the backdrop colour (plutiedev "VDP register reference", the
+    /// "$80xx" table: "LCB: 1 to blank the leftmost column (8px wide)" -
+    /// the source #79 picked the bit from).
+    ///
+    /// The two sources disagree on this bit: genvdp.txt section 17 "$00" lists
+    /// d5 as "No effect" (as does the Sega manual it mirrors), while plutiedev
+    /// documents the blank. This follows plutiedev; settling which is right on
+    /// silicon wants a test ROM and is #491's family, not a guess either way.
     ///
     /// Read per line by [`Vdp::render_line`]'s compositor rather than once a
     /// frame, so the bit may be written at any point of a raster and what it says
