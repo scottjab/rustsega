@@ -60,7 +60,7 @@ pub use io::{Buttons, Device, Io, Pad6State, Port};
 /// against the same [`Bus`], and handing either out on its own is how a front
 /// end ends up running one without the other. What a caller needs instead is
 /// here already: [`Genesis::frame`] for the picture, [`Genesis::sram`] for the
-/// save, and [`Genesis::set_pad`] for the pads.
+/// save, and [`Genesis::set_pad`] and [`Genesis::set_pad6`] for the pads.
 pub struct Genesis {
     /// The 68000, held the way the scheduler leaves it: [`Bus`] is its memory
     /// map, and it is never stepped outside [`Genesis::run_frame`].
@@ -235,7 +235,7 @@ impl Genesis {
     ///
     /// Attaches a 3-button pad, which is what the I/O chip's own front-end
     /// entry point attaches; see [`Io::set_buttons`] for the pad, and
-    /// [`Io::set_buttons_6`] for the 6-button one a front end that has a
+    /// [`Genesis::set_pad6`] for the 6-button one a front end that has a pad
     /// setting for it uses instead.
     ///
     /// # Panics
@@ -244,6 +244,36 @@ impl Genesis {
     /// one that says so, and a caller with no pad to attach has no port either.
     pub fn set_pad(&mut self, port: usize, buttons: Buttons) {
         self.bus.io.set_buttons(port, buttons);
+    }
+
+    /// Say what the 6-button pad on port `port` is reporting: [`Buttons`], one
+    /// bit per button, `X`, `Y`, `Z` and `Mode` included (plutiedev
+    /// "Controllers", "6-button controller").
+    ///
+    /// Attaches a 6-button pad, the way [`Genesis::set_pad`] attaches a
+    /// 3-button one; see [`Io::set_buttons_6`] for the pad and the `TH` pulse
+    /// counter that reads the extra four out. Which of the two pads a port has
+    /// is a front end's per-port device setting (#143's pad type), not a
+    /// per-frame one, so a caller picks one of the two calls and then calls it
+    /// every frame: each call re-attaches its pad, and a caller alternating
+    /// them would change the hardware the game thinks it is talking to
+    /// mid-session. Re-attaching the same pad every frame is what both calls
+    /// are for - it restarts the 6-button pad's counter, which the pad's own
+    /// 1.5 ms idle timeout would do anyway across a frame boundary, a frame
+    /// being ten-odd times the timeout long.
+    ///
+    /// A 6-button pad answers the five rows a 3-button game reads identically
+    /// ([`Device::Pad6`]), so a game that has never heard of it sees exactly
+    /// the pad [`Genesis::set_pad`] would have attached; only a game that
+    /// walks the detection steps can tell the two apart, which is the point.
+    ///
+    /// # Panics
+    ///
+    /// If `port` is not one of the console's three. [`Io::set_buttons_6`] is
+    /// the one that says so, and a caller with no pad to attach has no port
+    /// either.
+    pub fn set_pad6(&mut self, port: usize, buttons: Buttons) {
+        self.bus.io.set_buttons_6(port, buttons);
     }
 
     /// The cart's battery-backed save, or `None` for a cart that has none.

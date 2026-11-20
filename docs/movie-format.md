@@ -125,8 +125,9 @@ available without carrying the ROM.
 
 ## Replaying
 
-`Genesis::set_pad` per frame is all a replay is, so `Movie::set_pads` does that
-loop and `headless` calls it before every `Genesis::run_frame`:
+`Genesis::set_pad` per frame is all a replay is - plus the 6-button `set_pad6`
+a movie's letters can ask for, below - so `Movie::set_pads` does that loop and
+`headless` calls it before every `Genesis::run_frame`:
 
 ```rust
 let movie = genesis::movie::parse(&text)?;   // or Movie::new(...) while recording
@@ -141,6 +142,18 @@ for frame in 0..frames {
 `headless` also refuses a movie whose `region` is not the region the run resolved
 to, because a PAL replay of an NTSC recording is a different run rather than a
 broken file.
+
+Which pad replay attaches is a property of the file: a pad that holds `X`, `Y`,
+`Z` or `Mode` anywhere in the run is replayed through `Genesis::set_pad6` - the
+6-button pad - and one that never does through `Genesis::set_pad`, the 3-button
+pad (#364). The file knows what it needs, and the choice is made once per pad
+for the whole movie: the pad kind is a piece of hardware the game can detect at
+boot, not something that may flip with what the pad holds on frame N. A
+6-button pad answers the five rows a 3-button game reads identically (plutiedev
+"Controllers", "6-button controller"), so the frames of a movie that never uses
+the four letters do not move. A front end that knows better - whose pad type is
+a setting rather than a property of the recording (#143) - drives
+`Genesis::set_pad6` itself.
 
 ## Errors
 
@@ -167,12 +180,6 @@ that a person fixes it by hand.
 
 ## What a movie cannot do yet
 
-- **`X`, `Y`, `Z` and `Mode` reach the file but not the game.** A movie records
-  all twelve buttons, but replay goes through `Genesis::set_pad`, which attaches a
-  3-button pad, and a 3-button pad cannot report those four
-  (plutiedev "Controllers", "Button layout"). Delivering them needs a 6-button
-  pad on the console's API (`Io::set_buttons_6` exists; `Genesis` does not expose
-  it), which is #364 rather than part of this format.
 - **Recording from the browser.** `#129` keeps the front end out of scope; the
   format is the same text, so a front end that keeps one in memory can offer the
   same record/replay once input arrives there (#365).

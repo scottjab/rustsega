@@ -24,11 +24,17 @@ const CODE: u32 = 0x1000;
 const STACK: u32 = 0x00FF_0000;
 /// Port 1's data register (`IoData1`, plutiedev "I/O ports").
 const IO_DATA_1: u32 = 0xA1_0003;
+/// Port 2's data register (`IoData2`), for the per-pad test of #364.
+const IO_DATA_2: u32 = 0xA1_0005;
 /// Where the pad program copies the `TH` high sample: the last mirror of the
 /// 64 KiB of work RAM at `0xE00000` (plutiedev "Memory map"), as `boot.rs` uses.
 const PAD_HIGH: u32 = 0xFF_0000;
 /// Where it copies the `TH` low sample, the next byte of the same RAM.
 const PAD_LOW: u32 = 0xFF_0001;
+/// Where the 6-button walk stores port 1's eight answers, one byte apart
+/// (#364's tests); `PAD6_WALK2` is port 2's, on the next page of the same RAM.
+const PAD6_WALK: u32 = 0xFF_0010;
+const PAD6_WALK2: u32 = 0xFF_0020;
 /// The movie's pad count: the fake program watches port 1 only.
 const PADS: usize = 1;
 /// Frames of [`replay_matches_record`]'s run.
@@ -134,6 +140,59 @@ fn pad_ram(machine: &Genesis) -> Vec<u8> {
     let ram = &machine.bus().ram[..];
     let at = PAD_HIGH as usize & 0xFFFF;
     ram[at..at + 0x40].to_vec()
+}
+
+/// The 6-button walk, as a 6-button game reads the pad on `port_data` once a
+/// frame: set `TH` to the step's level and read, eight steps, storing the eight
+/// answers at `dest` onwards, then loop forever (plutiedev "Controllers",
+/// "6-button controller", the 1st-8th step). The eighth step leaves the pad's
+/// counter one short of wrapping, so the next pass' first `TH` edge is what
+/// wraps it: every pass of the loop reads the same eight bytes.
+fn pad6_walker(port_data: u32, dest: u32) -> Vec<u8> {
+    let mut program = Vec::new();
+    for (step, th) in [0x40_u16, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40, 0x00]
+        .into_iter()
+        .enumerate()
+    {
+        program.extend(store_imm_byte(th, port_data));
+        program.extend(copy_byte(port_data, dest + step as u32));
+    }
+    // Eight steps of 18 bytes is 144, past a `BRA.B` displacement's reach, so
+    // this is a `BRA.W`: the displacement is measured from the address of its
+    // own extension word (opcode + 2, M68000UM section 8 "BRA"), so back over
+    // the body plus the extension word: -146 = 0xFF6E.
+    program.extend([0x6000, 0xFF6E]);
+    fake_rom(&program)
+}
+
+/// Both ports walked in one loop: each step sets `TH` and reads port 1 into
+/// `dest1`, then does the same step of port 2 into `dest2`, eight steps, then
+/// loops forever. This is the shape a two-pad game reads in, one walk a frame.
+fn both_pads_walker(dest1: u32, dest2: u32) -> Vec<u8> {
+    let mut program = Vec::new();
+    for (step, th) in [0x40_u16, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40, 0x00]
+        .into_iter()
+        .enumerate()
+    {
+        program.extend(store_imm_byte(th, IO_DATA_1));
+        program.extend(copy_byte(IO_DATA_1, dest1 + step as u32));
+        program.extend(store_imm_byte(th, IO_DATA_2));
+        program.extend(copy_byte(IO_DATA_2, dest2 + step as u32));
+    }
+    // Eight steps of 36 bytes is 288, and the branch base rule is the same as
+    // [`pad6_walker`]'s: the displacement is measured from the extension word's
+    // own address, so back over the body plus the extension word: -290 =
+    // 0xFEDE.
+    program.extend([0x6000, 0xFEDE]);
+    fake_rom(&program)
+}
+
+/// The eight bytes a walk stored, as one array.
+fn walk_bytes(machine: &Genesis, dest: u32) -> [u8; 8] {
+    let at = dest as usize & 0xFFFF;
+    machine.bus().ram[at..at + 8]
+        .try_into()
+        .expect("a walk stores eight consecutive bytes")
 }
 
 /// The whole of a movie's text with `rom_hash` in its header and `frames` as its
@@ -712,6 +771,73 @@ fn the_pad_copier_reads_both_halves_of_the_pad() {
         assert_eq!(ram[0], pins_th_high(buttons), "{buttons:?} TH high");
         assert_eq!(ram[1], pins_th_low(buttons), "{buttons:?} TH low");
     }
+}
+
+/// A movie whose pad holds one of the four 6-button letters replays through a
+/// 6-button pad: `set_pads` picks [`Genesis::set_pad6`] for that pad, and the
+/// game's walk sees the detection row and the `X`/`Y`/`Z`/`Mode` row a
+/// 3-button pad cannot answer (#364). The expected bytes are the walk of a pad
+/// holding `Z`: `0000` on the 6th step says "6-button pad", `Z` is bit 0 of the
+/// 7th step's `?1CBMXYZ` (plutiedev "Controllers", "6-button controller"), and
+/// the 8th holds the four lines high again.
+#[test]
+fn a_movie_holding_a_six_button_letter_replays_on_a_six_button_pad() {
+    let rom = pad6_walker(IO_DATA_1, PAD6_WALK);
+    let mut movie = Movie::new(movie::rom_hash(&rom), Region::Usa, PADS);
+    movie.set(0, &[Buttons::Z]);
+    let mut machine = Genesis::new(&rom, Config::default()).expect("fake ROM loads");
+    movie.set_pads(&mut machine, 0);
+    machine.run_frame();
+    assert_eq!(
+        walk_bytes(&machine, PAD6_WALK),
+        [0x7F, 0x33, 0x7F, 0x33, 0x7F, 0x30, 0x7E, 0x3F],
+        "6th step 0000 = 6-button pad, 7th step bit 0 low = Z held"
+    );
+}
+
+/// A movie of 3-button letters only replays on the 3-button pad it always had:
+/// the walk reads the two 3-button banks all eight steps, whose 6th-step low
+/// nibble `0011` is what tells a game to stop looking. This is the "existing
+/// movies do not move" half of #364: replay through [`Genesis::set_pad`], the
+/// call every movie written before it went through, unchanged.
+#[test]
+fn a_movie_of_three_button_letters_only_stays_a_three_button_pad() {
+    let rom = pad6_walker(IO_DATA_1, PAD6_WALK);
+    let mut movie = Movie::new(movie::rom_hash(&rom), Region::Usa, PADS);
+    movie.set(0, &[Buttons::UP]);
+    let mut machine = Genesis::new(&rom, Config::default()).expect("fake ROM loads");
+    movie.set_pads(&mut machine, 0);
+    machine.run_frame();
+    assert_eq!(
+        walk_bytes(&machine, PAD6_WALK),
+        // Up is bit 0 of both banks, so it pulls every step's byte down to bit 0.
+        [0x7E, 0x32, 0x7E, 0x32, 0x7E, 0x32, 0x7E, 0x32],
+        "the 3-button pad's own rows, with no 6-button detection anywhere"
+    );
+}
+
+/// The choice is per pad: a two-pad movie where only pad 2 needs the extra
+/// letters replays pad 1 as a 3-button pad and pad 2 as a 6-button one. The
+/// pad kind is a piece of hardware the game can detect, so it is decided once
+/// per pad for the whole movie, not per frame.
+#[test]
+fn the_six_button_choice_is_per_pad() {
+    let rom = both_pads_walker(PAD6_WALK, PAD6_WALK2);
+    let mut movie = Movie::new(movie::rom_hash(&rom), Region::Usa, 2);
+    movie.set(0, &[Buttons::UP, Buttons::Z]);
+    let mut machine = Genesis::new(&rom, Config::default()).expect("fake ROM loads");
+    movie.set_pads(&mut machine, 0);
+    machine.run_frame();
+    assert_eq!(
+        walk_bytes(&machine, PAD6_WALK),
+        [0x7E, 0x32, 0x7E, 0x32, 0x7E, 0x32, 0x7E, 0x32],
+        "pad 1 holds 3-button letters and stays a 3-button pad"
+    );
+    assert_eq!(
+        walk_bytes(&machine, PAD6_WALK2),
+        [0x7F, 0x33, 0x7F, 0x33, 0x7F, 0x30, 0x7E, 0x3F],
+        "pad 2 holds Z and gets the 6-button pad"
+    );
 }
 
 /// A movie whose change list is a `BTreeMap` frame by frame: `changes` is the

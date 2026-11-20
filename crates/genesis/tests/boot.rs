@@ -22,6 +22,11 @@ const VDP_CONTROL: u32 = 0xC0_0004;
 /// area is read-only, so it has to be work RAM; 0xFF0000 is the last mirror of
 /// the 64 KiB at 0xE00000 (plutiedev "Memory map").
 const PAD_COPY: u32 = 0xFF_0000;
+/// Port 1's data register (`IoData1`, plutiedev "I/O ports"), the register the
+/// 6-button walk is read through.
+const IO_DATA_1: u32 = 0xA1_0003;
+/// Where the 6-button walk stores its eight answers, one byte apart.
+const PAD6_WALK: u32 = 0xFF_0010;
 /// The V counter of the first line of VBlank: line 224, the `E0h` of genvdp.txt
 /// section 4 "Vertical interrupts" ("a level 6 interrupt will occur when the V
 /// counter is at line E0h"), counting as itself because the NTSC counter counts
@@ -104,6 +109,64 @@ fn pins(buttons: Buttons) -> u8 {
         }
     }
     pins
+}
+
+/// `move.b #$value, (addr).L`: `MOVE.B #imm, (xxx).L` is `13FC imm16 addr32`,
+/// the encoding `tests/movie.rs`'s pad copier checked against the core.
+fn store_imm_byte(value: u16, addr: u32) -> Vec<u16> {
+    let imm = value.to_be_bytes();
+    let addr = addr.to_be_bytes();
+    let mut words = vec![0x13FC, u16::from_be_bytes([imm[0], imm[1]])];
+    words.extend([
+        u16::from_be_bytes([addr[0], addr[1]]),
+        u16::from_be_bytes([addr[2], addr[3]]),
+    ]);
+    words
+}
+
+/// `move.b (src).L, (dest).L`: `MOVE.B (xxx).L, (yyy).L` is `13F9 src32 dst32`,
+/// the encoding [`sample_forever`] uses.
+fn copy_byte(src: u32, dest: u32) -> Vec<u16> {
+    let src = src.to_be_bytes();
+    let dest = dest.to_be_bytes();
+    let mut words = vec![0x13F9, u16::from_be_bytes([src[0], src[1]])];
+    words.extend([
+        u16::from_be_bytes([src[2], src[3]]),
+        u16::from_be_bytes([dest[0], dest[1]]),
+        u16::from_be_bytes([dest[2], dest[3]]),
+    ]);
+    words
+}
+
+/// The 6-button walk, as a 6-button game reads its pad once a frame: set `TH`
+/// to the step's level and read port 1, eight steps, storing the eight answers
+/// at `dest` onwards, then loop forever (plutiedev "Controllers",
+/// "6-button controller", the 1st-8th step). The eighth step leaves the pad's
+/// counter one short of wrapping, so the next pass' first `TH` edge is what
+/// wraps it: every pass of the loop reads the same eight bytes.
+fn pad6_walker(dest: u32) -> Vec<u8> {
+    let mut program = Vec::new();
+    for (step, th) in [0x40_u16, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40, 0x00]
+        .into_iter()
+        .enumerate()
+    {
+        program.extend(store_imm_byte(th, IO_DATA_1));
+        program.extend(copy_byte(IO_DATA_1, dest + step as u32));
+    }
+    // Eight steps of 18 bytes is 144, past a `BRA.B` displacement's reach, so
+    // this is a `BRA.W`: the displacement is measured from the address of its
+    // own extension word (opcode + 2, M68000UM section 8 "BRA"), so back over
+    // the body plus the extension word: -146 = 0xFF6E.
+    program.extend([0x6000, 0xFF6E]);
+    fake_rom(&program)
+}
+
+/// The eight bytes the walk stored, as one array.
+fn walk_bytes(machine: &Genesis, dest: u32) -> [u8; 8] {
+    let at = dest as usize & 0xFFFF;
+    machine.bus().ram[at..at + 8]
+        .try_into()
+        .expect("the walk stores eight consecutive bytes")
 }
 
 /// A ROM too small to hold the header at 0x100 is not a Genesis program, and the
@@ -289,6 +352,42 @@ fn set_pad_visible_to_game() {
             "{buttons:?} reaches the program through the port"
         );
     }
+}
+
+/// `set_pad6` is visible to the program, the four extra buttons included: a
+/// game walks the pad's `TH` sequence (plutiedev "Controllers", "6-button
+/// controller", 1st-8th step), and the 7th step's `?1CBMXYZ` row answers
+/// `Mode`/`X`/`Y`/`Z` only when the console attached the 6-button pad. The
+/// same walk against [`Genesis::set_pad`]'s 3-button pad reads the 3-button
+/// pad's own rows all the way through, which is exactly the difference a
+/// game's 6-button detection code looks for (M6-09 #129's file could hold the
+/// letters; #364 is what makes them reach the machine).
+#[test]
+fn set_pad6_delivers_the_six_button_buttons() {
+    let mut machine = Genesis::new(&pad6_walker(PAD6_WALK), Config::default())
+        .expect("a ROM with a header loads");
+
+    machine.set_pad6(0, Buttons::X | Buttons::Y | Buttons::Z | Buttons::MODE);
+    machine.run_frame();
+    assert_eq!(
+        walk_bytes(&machine, PAD6_WALK),
+        // 6th step `?0SA0000`: the 6-button pad saying what it is. 7th step
+        // `?1CBMXYZ`: pins 3-0 low, so Mode, X, Y and Z are all held (Z is bit
+        // 0, X bit 2 - plutiedev calls the swap out twice). 8th step `?0SA1111`.
+        [0x7F, 0x33, 0x7F, 0x33, 0x7F, 0x30, 0x70, 0x3F],
+        "the walk reads the 6-button pad's detection and X/Y/Z/Mode rows"
+    );
+
+    // The 3-button pad [`Genesis::set_pad`] attaches cannot report the four,
+    // whatever a front end holds: the walk reads the two 3-button banks, whose
+    // 6th step low nibble `0011` is what tells a game to stop looking.
+    machine.set_pad(0, Buttons::X | Buttons::Y | Buttons::Z | Buttons::MODE);
+    machine.run_frame();
+    assert_eq!(
+        walk_bytes(&machine, PAD6_WALK),
+        [0x7F, 0x33, 0x7F, 0x33, 0x7F, 0x33, 0x7F, 0x33],
+        "a 3-button pad answers its own rows whatever buttons are held"
+    );
 }
 
 /// The reset button, by the three things it is allowed to change: the 68000 goes

@@ -351,15 +351,37 @@ impl Movie {
     /// Put the pads of frame `frame` onto `machine` - the whole of what a replay
     /// has to do, once per frame before [`Genesis::run_frame`].
     ///
-    /// The pads go on through [`Genesis::set_pad`], which attaches a 3-button
-    /// pad, so the `X`, `Y`, `Z` and `Mode` letters a movie can hold are recorded
-    /// and replayed but are not visible to the game: delivering them needs a
-    /// 6-button pad on the API, which is not this format's business (see
-    /// `docs/movie-format.md`, "What a movie cannot do yet").
+    /// Each pad goes on through [`Genesis::set_pad`], which attaches a 3-button
+    /// pad - unless the pad holds one of `X`, `Y`, `Z` or `Mode` anywhere in
+    /// this movie, in which case replay attaches a 6-button pad for it through
+    /// [`Genesis::set_pad6`] (#364). The file knows what it needs, and the pad
+    /// kind is decided once per pad for the whole movie rather than per frame:
+    /// it is a piece of hardware the game can detect at boot, not something
+    /// that may flip with what the pad happens to hold on frame N. A 6-button
+    /// pad answers the five rows a 3-button game reads identically
+    /// ([`genesis::Device::Pad6`]), so a movie that never uses the four letters
+    /// makes the frames it always made; a front end that knows better, whose
+    /// pad type is a setting rather than a property of the recording (#143),
+    /// drives [`Genesis::set_pad6`] itself instead of going through here.
     pub fn set_pads(&self, machine: &mut Genesis, frame: u32) {
         for pad in 0..self.pads {
-            machine.set_pad(pad, self.buttons_at(frame, pad));
+            let buttons = self.buttons_at(frame, pad);
+            if self.holds_a_six_button_button(pad) {
+                machine.set_pad6(pad, buttons);
+            } else {
+                machine.set_pad(pad, buttons);
+            }
         }
+    }
+
+    /// Does pad `pad` hold one of the four 6-button buttons anywhere in this
+    /// movie? Anywhere, not on a frame: the answer is this pad's device for the
+    /// whole run, so it reads the whole change list, not one row of it.
+    fn holds_a_six_button_button(&self, pad: usize) -> bool {
+        self.changes.values().any(|row| {
+            row.get(pad)
+                .is_some_and(|buttons| buttons.intersects(Buttons::SIX_BUTTON_ONLY))
+        })
     }
 
     /// Refuse this movie unless it was written for `rom`: the movie's
