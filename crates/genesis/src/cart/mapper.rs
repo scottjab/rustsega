@@ -117,6 +117,35 @@ const REALTEC_REGISTER_MIRROR: u32 = 32 * 1024;
 /// How many registers a Realtec cart has.
 const REALTEC_REGISTERS_COUNT: usize = 3;
 
+/// The flash size every Radica multicart unit MAME lists carries:
+/// `ROM_START(...) ... 0x400000` for all of them in `megadriv_rad.cpp`, which
+/// is also the whole cartridge window, so [`Mapper::map`] may wrap at it the
+/// way MAME's `read` wraps at `m_romsize - 1`.
+const RADICA_IMAGE_SIZE: usize = CARTRIDGE_SIZE;
+
+/// The bottom of the `$A13000` block: where a Radica latch counts its word
+/// offsets from. This is [`crate::bus`]'s whole cart-extra region; the Sega
+/// mapper's [`REGISTER_BLOCK`] is the pair at the top of it, a different
+/// decode of the same lane of addresses.
+const RADICA_WINDOW: u32 = 0xA1_3000;
+
+/// The bank latch's reset state: MAME's `machine_reset` does `m_bank = 0`, and
+/// bank 0 is the plain image, which is what lets the unit's patched reset
+/// vector reach the launcher at all.
+const RADICA_RESET_BANK: u8 = 0;
+
+/// The low half of the reset PC every Radica unit's patched reset vector
+/// carries: the launcher sits at `bank << 16` plus this, the same offset in
+/// each unit's flash (`$3F0300` in the local cart 1, `$3C0300` in cart 2).
+const RADICA_LAUNCHER_OFFSET: u32 = 0x0300;
+
+/// The launcher page's own vector table at `bank << 16`, as the two local
+/// dumps carry it (#492): an SSP of `$00FFFFF0` (work RAM, just under the top)
+/// and an entry PC of `$00000400`, the address the launcher's copied stub
+/// jumps to once the read that banks the page in has happened. Both longs
+/// together are the in-image fingerprint [`Mapper::detect`] keys on.
+const RADICA_PAGE_HEADER: [u8; 8] = [0x00, 0xFF, 0xFF, 0xF0, 0x00, 0x00, 0x04, 0x00];
+
 /// What turns a cartridge address into an offset in the image: nothing, or the
 /// Sega mapper's seven bank registers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,15 +178,41 @@ pub enum Mapper {
     },
     /// The Sega mapper, with one page of the image behind each of the eight
     /// 512 KiB slots.
+    ///
+    /// `banks[0]` is always 0 and is kept in the array so that a read is one
+    /// index rather than an index with a special case: slot 0 is pinned to
+    /// page 0 by the hardware, so that a cart boots, and the lane its
+    /// register would be at is the save RAM control instead
+    /// ([`REGISTER_BLOCK`]).
     SegaSsf2 {
         /// Page of the image behind each slot, indexed by slot.
-        ///
-        /// `banks[0]` is always 0 and is kept in the array so that a read is one
-        /// index rather than an index with a special case: slot 0 is pinned to
-        /// page 0 by the hardware, so that a cart boots, and the lane its
-        /// register would be at is the save RAM control instead
-        /// ([`REGISTER_BLOCK`]).
         banks: [u8; 8],
+    },
+    /// A Radica "Arcade Legends / Mega Drive Play TV" plug-n-play board: a
+    /// 4 MiB flash of whole games whose low window the board shifts in 64 KiB
+    /// steps, latched by reads of the `$A13000` block itself.
+    ///
+    /// The board MAME drives as `megadriv_rad.cpp` has no bank registers a cart
+    /// writes and no second signature the image carries: the latch is set by
+    /// the *address a program reads*, `bank = (word offset from $A13000) & 0x3F`
+    /// (its `read_a13`), and the whole cartridge window then answers flash at
+    /// `(bank * 64 KiB + address) & (flash size - 1)` (its `read`). The unit's
+    /// boot lives on both halves: the game image's reset vector long points at
+    /// a launcher in the flash's last quarter, the launcher copies a stub into
+    /// work RAM, and the stub banks the unit's menu page in by reading
+    /// `$A1307E` (the local cart 1) or `$A13078` (cart 2) before jumping to
+    /// `$000400`, which only names the menu's entry once the read has paged it
+    /// in (#492).
+    ///
+    /// MAME lists every multicart unit at exactly [`RADICA_IMAGE_SIZE`], which
+    /// is why [`Mapper::detect`] keys on that size and [`Mapper::map`] may wrap
+    /// at [`CARTRIDGE_SIZE`] the way `read` wraps at `m_romsize - 1`.
+    Radica {
+        /// The bank latch, 0x00-0x3F: the 64 KiB step the window is shifted
+        /// by. Reset state 0, which is the plain image - the unit boots with
+        /// the window reading the flash in address order, and the first
+        /// `$A130xx` read it makes is the launcher's game-select.
+        bank: u8,
     },
 }
 
@@ -210,6 +265,11 @@ impl Mapper {
                 regs: [0; REALTEC_REGISTERS_COUNT],
                 start: REALTEC_RESET_START,
                 size: REALTEC_RESET_SIZE,
+            };
+        }
+        if is_radica(rom) {
+            return Self::Radica {
+                bank: RADICA_RESET_BANK,
             };
         }
         if rom.len() > CARTRIDGE_SIZE || asks_for_the_mapper(rom) {
@@ -268,6 +328,15 @@ impl Mapper {
                 let page = usize::from(banks[(addr >> SLOT_SHIFT) as usize]);
                 Some(page * SLOT_SIZE + (addr as usize & (SLOT_SIZE - 1)))
             }
+            Self::Radica { bank } => {
+                // MAME's `read`: the byte the window answers is the flash at
+                // `(bank * 0x10000) + address`, wrapped into the flash - which
+                // for a cart [`Mapper::detect`] named Radica is exactly
+                // [`CARTRIDGE_SIZE`], so the wrap is the cartridge area's own
+                // mask. Bank 0 gives back `addr`, the plain image: the state a
+                // Radica unit resets into.
+                Some((usize::from(*bank) << 16).wrapping_add(addr as usize) & (CARTRIDGE_SIZE - 1))
+            }
         }
     }
 
@@ -286,6 +355,40 @@ impl Mapper {
         if slot != 0 && slot < banks.len() {
             banks[slot] = page;
         }
+    }
+
+    /// A read of the byte (or word, on its even lane) address `addr` in the
+    /// `$A13000` block, which is what latches a Radica board's bank: MAME's
+    /// `read_a13`, the board MAME drives as `megadriv_rad.cpp`.
+    ///
+    /// `bank = (word offset from $A13000) & 0x3F`, then odd banks collapse to
+    /// their even neighbour unless the value is `$3F` - MAME's
+    /// `if (m_bank != 0x3f) m_bank &= 0x3e;`, whose comment there says the low
+    /// bit reaching `$3F` is what the menu units need. The effect is that the
+    /// even byte lane `$A13000..$A1307F` names banks `$00`-`$3E` and its odd
+    /// neighbour `$A1307E` names `$3F`; the carts of #492 read exactly those
+    /// two (`$A1307E` and `$A13078`).
+    ///
+    /// A cart that is not a Radica cart drops the event, the way [`Mapper::set_bank`]
+    /// drops a bank write on a cart without the Sega mapper, so the bus can call
+    /// this for every read of the block. Writes still drop for every cart: the
+    /// board has no registers a write reaches (MAME maps the block `.r` only),
+    /// which is the opposite of the Sega mapper's write-only registers at the
+    /// top of the same block.
+    pub fn set_radica_bank(&mut self, addr: u32) {
+        let Self::Radica { bank } = self else {
+            return;
+        };
+        // The word offset of the even lane of `addr` within the block: a byte
+        // read of the odd lane is the same register on the board, as for every
+        // register pair of this block ([`bank_slot`]).
+        let offset = (addr & !1).wrapping_sub(RADICA_WINDOW) >> 1;
+        let latched = (offset & 0x3F) as u8;
+        *bank = if latched == 0x3F {
+            0x3F
+        } else {
+            latched & 0x3E
+        };
     }
 
     /// A write of `value` to the Realtec register `reg`, as [`realtec_register`]
@@ -318,6 +421,7 @@ impl Mapper {
     pub fn reset(&mut self) {
         match self {
             Self::SegaSsf2 { banks } => *banks = Self::identity(),
+            Self::Radica { bank } => *bank = RADICA_RESET_BANK,
             Self::Realtec { regs, start, size } => {
                 *regs = [0; REALTEC_REGISTERS_COUNT];
                 // Not the slice `regs` would give: a Realtec cart comes up with
@@ -406,6 +510,43 @@ pub fn bank_slot(addr: u32) -> Option<usize> {
         return None;
     }
     Some(((lane - REGISTER_BLOCK) / 2) as usize)
+}
+
+/// Is the image a Radica "Arcade Legends / Mega Drive Play TV" plug-n-play
+/// multicart? The shape the two local dumps carry, and nothing else in the
+/// 2775-file collection matches (#492):
+///
+/// - exactly [`RADICA_IMAGE_SIZE`]: the flash size MAME lists every unit at,
+///   which is the whole cartridge window;
+/// - the header reset PC (the long at `$4`, M68000UM Table 6-2 vector 1) is
+///   `(bank << 16) | 0x0300` with `bank` in `1..=0x3F`: the reset vector the
+///   board's manufacturer patched to point at the launcher it added at
+///   `bank * 64 KiB` - `$3F0300` in cart 1 (Kid Chameleon, whose own entry is
+///   `$4B0`) and `$3C0300` in cart 2 (SF2' SCE, whose own entry is `$8000`);
+/// - and the launcher page carries its own vector table at `bank << 16`
+///   ([`RADICA_PAGE_HEADER`]): the mini-ROM the paging is meant to expose, so
+///   the launcher's `LEA $400,A0; JMP (A0)` lands on the menu's own entry once
+///   the game-select read has banked the page in.
+///
+/// Nothing but these patched units satisfies all three at once. A plain cart's
+/// reset PC is its real entry, in `bank 0`'s low range (`$200`-`$900` in
+/// practice) and never a nonzero bank with `$0300` in it; and no other image
+/// carries a vector table at a 64 KiB boundary with that exact shape.
+/// Detection is content, not a hash table, per the survey rule of
+/// [`docs/mappers.md`](../../../../docs/mappers.md).
+fn is_radica(rom: &[u8]) -> bool {
+    if rom.len() != RADICA_IMAGE_SIZE {
+        return false;
+    }
+    // Read out of the image rather than out of [`parse_header`]: the vectors
+    // live below the header's `$100`, and `RomHeader` has no field for them.
+    let pc = u32::from_be_bytes([rom[4], rom[5], rom[6], rom[7]]);
+    let bank = (pc >> 16) as u8;
+    if !(1..=0x3F).contains(&bank) || pc & 0xFFFF != RADICA_LAUNCHER_OFFSET {
+        return false;
+    }
+    let page = (bank as usize) << 16;
+    rom[page..page + 8] == RADICA_PAGE_HEADER
 }
 
 /// Does the header of `rom` ask for the mapper with [`SYSTEM_TYPE`]?
@@ -860,5 +1001,157 @@ mod tests {
         assert_eq!(mapper.map(0x08_0000), None);
         assert_eq!(mapper.map(0x38_0000), None);
         assert_eq!(image[0x08_0000], 0);
+    }
+
+    // The Radica mapper: the plug-n-play boards of #492, whose bank latch is set
+    // by the read that names it. The reference is MAME's `megadriv_rad.cpp`
+    // (`read` / `read_a13`), read for behaviour.
+
+    /// A synthetic Radica unit: a SEGA header, the patched reset vector
+    /// `(0x3F << 16) | 0x0300`, and the launcher page's own vector table at
+    /// `0x3F0000`. Every byte of each 64 KiB block is that block's number, so a
+    /// mapped read names the flash byte it reached.
+    fn radica_rom() -> Vec<u8> {
+        let mut rom = vec![0u8; RADICA_IMAGE_SIZE];
+        for block in 0..64usize {
+            rom[block << 16..(block + 1) << 16].fill(block as u8);
+        }
+        rom[0x100..0x110].copy_from_slice(b"SEGA MEGA DRIVE ");
+        let pc: u32 = (0x3F << 16) | 0x0300;
+        rom[4..8].copy_from_slice(&pc.to_be_bytes());
+        rom[0x3F_0000..0x3F_0008].copy_from_slice(&RADICA_PAGE_HEADER);
+        rom
+    }
+
+    /// Detection is the patched reset vector and the paged header together: a
+    /// plain cart's entry, a launcher offset that is not `$0300`, a missing page
+    /// header, or an image the wrong size each fail, on their own.
+    #[test]
+    fn a_radica_cart_is_named_by_its_patched_reset_and_paged_header() {
+        assert_eq!(
+            Mapper::detect(&radica_rom()),
+            Mapper::Radica {
+                bank: RADICA_RESET_BANK
+            }
+        );
+
+        // A plain cart's reset PC: same everything, entry in the low bank. This
+        // is the shape of every ordinary image, including the real Kid Chameleon
+        // and SF2' SCE whose bytes the two units carry.
+        let mut plain = radica_rom();
+        plain[4..8].copy_from_slice(&0x0000_04B0u32.to_be_bytes());
+        assert_eq!(Mapper::detect(&plain), Mapper::None);
+
+        // A nonzero bank whose low half is not the launcher offset.
+        let mut offset = radica_rom();
+        offset[4..8].copy_from_slice(&((0x3F_u32 << 16) | 0x0301).to_be_bytes());
+        assert_eq!(Mapper::detect(&offset), Mapper::None);
+
+        // No page header where the paging would put it.
+        let mut headerless = radica_rom();
+        headerless[0x3F_0000..0x3F_0008].fill(0);
+        assert_eq!(Mapper::detect(&headerless), Mapper::None);
+
+        // The wrong size: the fingerprint means nothing on a 2 MB image.
+        let mut short = radica_rom();
+        short.truncate(0x20_0000);
+        short[4..8].copy_from_slice(&((0x1F_u32 << 16) | 0x0300).to_be_bytes());
+        assert_eq!(Mapper::detect(&short), Mapper::None);
+    }
+
+    /// The whole window shifts by the bank, wrapping into the flash: bank 0 is
+    /// the plain image, bank `0x3F` answers `$000400` with flash `$3F0400`, and
+    /// a shift that runs off the end of the flash comes back around it - MAME's
+    /// `read` masks with `m_romsize - 1`, which for a detected Radica cart is
+    /// [`CARTRIDGE_SIZE`] - 1.
+    #[test]
+    fn the_radica_window_shifts_by_the_bank_and_wraps() {
+        let rom = radica_rom();
+        let mut mapper = Mapper::detect(&rom);
+
+        assert_eq!(mapper.map(0x00_0400), Some(0x00_0400), "bank 0 is identity");
+        assert_eq!(mapper.map(0x3F_FFFE), Some(0x3F_FFFE));
+
+        mapper.set_radica_bank(0xA1_307E);
+        assert_eq!(mapper, Mapper::Radica { bank: 0x3F });
+        assert_eq!(mapper.map(0x00_0000), Some(0x3F_0000));
+        assert_eq!(mapper.map(0x00_0400), Some(0x3F_0400));
+        // The shift runs off the end of the flash at `0x010000` and wraps.
+        assert_eq!(mapper.map(0x01_0000), Some(0x00_0000));
+        // And the byte the translation names is the block the launcher page is
+        // in: what `Bus::read_rom_byte` looks up in the image.
+        assert_eq!(mapper.map(0x00_0400).map(|o| rom[o]), Some(0x3F));
+
+        mapper.set_radica_bank(0xA1_3078);
+        assert_eq!(mapper, Mapper::Radica { bank: 0x3C });
+        assert_eq!(mapper.map(0x00_0400), Some(0x3C_0400));
+    }
+
+    /// The latch decodes the even lane of the address read, and odd banks
+    /// collapse to their even neighbour unless the value is `$3F` - MAME's
+    /// `read_a13` verbatim, whose comment there says the surviving `$3F` is what
+    /// the menu units need. Every read of the block names a bank, the upper half
+    /// folded into it (`$A130FE` names `$3F`), and a cart that is not a Radica
+    /// cart drops the event without state.
+    #[test]
+    fn radica_reads_latch_the_bank_the_way_mames_read_a13_does() {
+        let mut mapper = Mapper::detect(&radica_rom());
+
+        // The two reads the local units' boot stubs make.
+        mapper.set_radica_bank(0xA1_3078);
+        assert_eq!(mapper, Mapper::Radica { bank: 0x3C });
+        mapper.set_radica_bank(0xA1_307E);
+        assert_eq!(mapper, Mapper::Radica { bank: 0x3F });
+
+        // The odd lane is the same register on the board: `$A13079` names what
+        // `$A13078` names, the word offset of the even lane.
+        mapper.set_radica_bank(0xA1_3079);
+        assert_eq!(mapper, Mapper::Radica { bank: 0x3C });
+
+        // An odd bank other than `$3F` collapses to its even neighbour.
+        mapper.set_radica_bank(0xA1_3072);
+        assert_eq!(mapper, Mapper::Radica { bank: 0x38 }, "0x39 -> 0x38");
+        mapper.set_radica_bank(0xA1_307E);
+        assert_eq!(mapper, Mapper::Radica { bank: 0x3F }, "and 0x3F survives");
+
+        // The upper half of the block folds into the same 64 banks.
+        mapper.set_radica_bank(0xA1_30F8);
+        assert_eq!(mapper, Mapper::Radica { bank: 0x3C }, "0x7C & 0x3F");
+        mapper.set_radica_bank(0xA1_30FE);
+        assert_eq!(mapper, Mapper::Radica { bank: 0x3F }, "0x7F & 0x3F");
+
+        // The other mappers have no latch, so the bus can call this for every
+        // read of the block and nothing changes for them.
+        let mut none = Mapper::None;
+        none.set_radica_bank(0xA1_307E);
+        assert_eq!(none, Mapper::None);
+        let mut realtec = Mapper::detect(&realtec_rom());
+        realtec.set_radica_bank(0xA1_307E);
+        assert_eq!(realtec, Mapper::detect(&realtec_rom()));
+        let mut sega = Mapper::SegaSsf2 {
+            banks: Mapper::identity(),
+        };
+        sega.set_radica_bank(0xA1_307E);
+        assert_eq!(
+            sega,
+            Mapper::SegaSsf2 {
+                banks: Mapper::identity()
+            }
+        );
+    }
+
+    /// A reset puts the latch back on bank 0, the plain image - MAME's
+    /// `machine_reset` does `m_bank = 0`, and it is what lets the patched reset
+    /// vector reach the launcher again.
+    #[test]
+    fn a_radica_reset_banks_zero() {
+        let rom = radica_rom();
+        let mut mapper = Mapper::detect(&rom);
+        mapper.set_radica_bank(0xA1_307E);
+        assert_eq!(mapper.map(0x00_0400), Some(0x3F_0400));
+
+        mapper.reset();
+        assert_eq!(mapper, Mapper::Radica { bank: 0 });
+        assert_eq!(mapper.map(0x00_0400), Some(0x00_0400), "identity again");
     }
 }

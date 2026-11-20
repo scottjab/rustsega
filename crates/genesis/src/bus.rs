@@ -1975,14 +1975,42 @@ impl Bus {
     /// registers do read back; no game has ever needed this one, which is why
     /// `stub_regions_read_open_bus_until_their_ticket` can keep the whole area at
     /// [`OPEN_BUS`] whatever lives here.
-    fn read_cart_extra_byte(&mut self, _addr: u32) -> u8 {
+    ///
+    /// What did turn out to live here, and does answer, is the Radica board's
+    /// game-select latch below: a read is how that board is banked (#492).
+    fn read_cart_extra_byte(&mut self, addr: u32) -> u8 {
+        if self.radica_reads_the_block() {
+            self.mapper.set_radica_bank(addr);
+            return 0x00;
+        }
         OPEN_BUS
     }
 
-    /// Cartridge slot extra word read: nothing is readable, as
-    /// [`Bus::read_cart_extra_byte`].
-    fn read_cart_extra_word(&mut self, _addr: u32) -> u16 {
+    /// Cartridge slot extra word read: the same latch on the same lane, and
+    /// otherwise open bus, as [`Bus::read_cart_extra_byte`]. MAME's `read_a13`
+    /// answers a word of 0 for the whole block, which is what the boot stubs'
+    /// `MOVE.W $A130xx,D0` of #492 reads and discards.
+    fn read_cart_extra_word(&mut self, addr: u32) -> u16 {
+        if self.radica_reads_the_block() {
+            self.mapper.set_radica_bank(addr);
+            return 0x0000;
+        }
         OPEN_BUS_WORD
+    }
+
+    /// Is the cart of [`Self::mapper`] a Radica board, whose `$A13000` block is
+    /// the game-select latch? Everything else that could answer the block - the
+    /// save RAM control and the Sega mapper's registers - lives in it too, and
+    /// a cart with any of those is a cart [`Mapper::detect`] did not name
+    /// Radica.
+    ///
+    /// The latch itself is not a value but an event: MAME's `megadriv_rad.cpp`
+    /// `read_a13` sets the bank from the address the program read and answers
+    /// 0. The answer of 0 is MAME's: no source says what the board drives the
+    /// bus with, and the boot stubs store the read into a D0 nothing else
+    /// reads, so 0 is what the one reference that models the board answers.
+    fn radica_reads_the_block(&self) -> bool {
+        matches!(self.mapper, Mapper::Radica { .. })
     }
 
     /// Cartridge slot extra byte write: the save RAM control register, for a cart
@@ -2129,6 +2157,10 @@ impl Bus {
         }
     }
 
+    /// Cartridge slot extra byte read: a Radica board's game-select latch, on
+    /// the cart that carries the board, and open bus otherwise.
+    ///
+    /// The latch is the one readable thing in the block, and it is not a value
     /// Undecoded byte read. Placeholder for [`Region::Unmapped`].
     fn read_unmapped_byte(&mut self, _addr: u32) -> u8 {
         OPEN_BUS
@@ -4822,6 +4854,102 @@ mod tests {
             bus.read_byte(0x20_0001),
             8,
             "and the bank is back, where the mapper put it"
+        );
+    }
+
+    // Radica: the plug-n-play boards of #492, whose bank latch is set by the
+    // read that names it. The translation arithmetic is
+    // [`crate::cart::mapper`]'s own tests; these are the ones about the seam in
+    // [`Bus::read_cart_extra_byte`] and the read's answer.
+
+    /// A synthetic Radica unit: a SEGA header, the patched reset vector
+    /// `(0x3F << 16) | 0x0300`, and the launcher page's own vector table at
+    /// `0x3F0000`, the fingerprint [`Mapper::detect`] keys on. Every byte of
+    /// each 64 KiB block is that block's number, so a read names the flash byte
+    /// it reached.
+    fn radica_cart() -> Vec<u8> {
+        let mut rom = vec![0u8; 0x40_0000];
+        for block in 0..64u8 {
+            let size = 64 * 1024;
+            rom[usize::from(block) * size..(usize::from(block) + 1) * size].fill(block);
+        }
+        rom[0x100..0x110].copy_from_slice(b"SEGA MEGA DRIVE ");
+        rom[4..8].copy_from_slice(&0x3F_0300u32.to_be_bytes());
+        rom[0x3F_0000..0x3F_0008]
+            .copy_from_slice(&[0x00, 0xFF, 0xFF, 0xF0, 0x00, 0x00, 0x04, 0x00]);
+        rom
+    }
+
+    /// A read of the `$A13000` block is what banks a Radica board, and the read
+    /// itself answers 0 (MAME `read_a13`): the two boot stubs' `MOVE.W
+    /// $A130xx,D0` reads and discards it, and `$000400` then answers the byte
+    /// the bank shifted in rather than the one the image has there.
+    #[test]
+    fn a_radica_read_banks_the_board_and_answers_zero() {
+        let rom = radica_cart();
+        let mut bus = Bus::new(rom.clone(), TEST_VERSION);
+
+        // Bank 0: the plain image, which is what `$000400` answers before any
+        // read of the block - block 0's fill byte.
+        assert_eq!(bus.read_byte(0x00_0400), 0, "identity before any latch");
+
+        // The unit cart 1's boot read: banks $3F in, and the answer is 0, not
+        // open bus and not a register value.
+        assert_eq!(bus.read_byte(0xA1_307E), 0x00);
+        assert_eq!(
+            bus.read_byte(0x00_0400),
+            0x3F,
+            "the launcher page shifted in"
+        );
+        assert_eq!(bus.read_word(0x00_0400), 0x3F3F, "and it wraps the window");
+        // The shift runs off the end of the flash and comes back around it:
+        // MAME's `read` masks with the flash size.
+        assert_eq!(bus.read_byte(0x01_0000), 0x00);
+
+        // A word read latches the same way, which is what cart 2's boot does:
+        // `MOVE.W $A13078,D0`.
+        assert_eq!(bus.read_word(0xA1_3078), 0x0000);
+        assert_eq!(bus.read_byte(0x00_0400), 0x3C, "banked by the word read");
+
+        // The block's upper half folds into the same 64 banks.
+        assert_eq!(bus.read_byte(0xA1_30FE), 0x00);
+        assert_eq!(bus.read_byte(0x00_0400), 0x3F);
+    }
+
+    /// A cart that is not a Radica cart keeps the block at open bus, and the
+    /// read moves nothing: the latch is the cart's board, not a console decode.
+    #[test]
+    fn a_non_radica_read_of_the_block_is_open_bus_and_banks_nothing() {
+        let image = radica_cart();
+        // Cut the image down to a plain 4 MiB cart by putting the reset vector
+        // back where a game's entry is: detection fails, the block is open bus.
+        let mut plain = image.clone();
+        plain[4..8].copy_from_slice(&0x0000_04B0u32.to_be_bytes());
+        let mut bus = Bus::new(plain, TEST_VERSION);
+
+        assert_eq!(bus.read_byte(0xA1_307E), OPEN_BUS);
+        assert_eq!(bus.read_word(0xA1_307E), OPEN_BUS_WORD);
+        assert_eq!(
+            bus.read_byte(0x00_0400),
+            image[0x00_0400],
+            "and the image did not move"
+        );
+    }
+
+    /// A reset puts a Radica board's latch back on bank 0 with the rest of the
+    /// register state: the patched reset vector has to reach the launcher
+    /// again, which only bank 0's plain image can do.
+    #[test]
+    fn reset_devices_banks_a_radica_board_zero() {
+        let mut bus = Bus::new(radica_cart(), TEST_VERSION);
+        bus.read_byte(0xA1_307E);
+        assert_eq!(bus.read_byte(0x00_0400), 0x3F, "banked by the read");
+
+        bus.reset_devices();
+        assert_eq!(
+            bus.read_byte(0x00_0400),
+            0x00,
+            "bank 0, the plain image again"
         );
     }
 

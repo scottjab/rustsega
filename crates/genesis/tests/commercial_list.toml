@@ -163,3 +163,19 @@ prefix = "Ecco the Dolphin (USA, Europe, Korea) (En)"
 # gameplay is settled by 1100.
 frames = 1200
 start_press = [500, 501, 1000, 1001]
+
+# The two Radica "Arcade Legends" plug-n-play dumps (#492), the carts of the
+# Radica mapper. Their boot is the mapper's own proof: the reset vector points
+# at a launcher that only reaches the unit's menu once a read of `$A1307E` (or
+# `$A13078`) has paged the menu in, so a golden here is a claim that the
+# board's game-select latch works. No START press: the menu is the picture.
+
+[[game]]
+key = "arcadelegends1"
+prefix = "Arcade Legends Sega Mega Drive (World)"
+frames = 600
+
+[[game]]
+key = "arcadelegends2"
+prefix = "Arcade Legends Street Fighter II' - Special Champion Edition (World)"
+frames = 600

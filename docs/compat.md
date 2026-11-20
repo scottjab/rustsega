@@ -4,13 +4,15 @@
 
 | Status | ROMs |
 |---|---|
-| Boots | 2607 |
-| Blank | 153 |
+| Boots | 2609 |
+| Blank | 151 |
 | Panic | 15 |
 
 These tables are the #373 resweep: every cart runs for the 600-frame checkpoint *and on to 1800 frames*, every frame of that run watched for a picture, and a cart that never drew is run a second time holding START. One sampled frame was the wrong measurement - a title screen fades in, holds and fades out - so `Blank` used to mean "frame 600 held four colours or fewer" and now means "no frame of the run drew, with or without a button". Against the table that resweep wrote it was **Boots 2517 / Blank 148 / Panic 110** where it read Boots 2111 / Blank 567 / Panic 97: 416 carts move to `Boots`, 13 of them only once START is held (each named in the CSV's `input_gate` column and listed under "Boots with input" below), and the rest of the `Blank` set is the carts that genuinely never draw - 31 of them BIOS images, so 117 Mega Drive carts. `Panic` is up from 97 for the same reason: three times the frames find three times as many crashes, which is a better picture of what is broken, not a new fault.
 
 Those counts have moved twice since, both times over the `frame_done` watchdog: [#523](https://github.com/scottjab/rustsega/issues/523) re-ran the 26 carts [#354](https://github.com/scottjab/rustsega/issues/354) named, and [#489](https://github.com/scottjab/rustsega/issues/489) re-ran the 69 that still carried the note in [`compat.csv`](compat.csv), with `scripts/resweep.sh` so the rows are the sweep's own rather than somebody's arithmetic. All 95 finish the watched 1800-frame run today and 90 of them draw, which is where **Boots 2607 / Blank 153 / Panic 15** comes from. The other 2680 rows are still the #373 sweep, so read one of those as a claim about that build and not about this one.
+
+They moved once more for a different cause: [#492](https://github.com/scottjab/rustsega/issues/492) implemented the Radica plug-n-play mapper, and the two "Arcade Legends" units it was diagnosed from went `Blank` to `Boots` (both now show their unit's own game-select menu; the rows are `scripts/resweep.sh`'s) - hence **Boots 2609 / Blank 151 / Panic 15**.
 
 ## Known issues
 
@@ -313,7 +315,7 @@ what the single colour actually was (`#000000`).
 | `Virtua Racing (Japan) (En).md` | Virtua Racing | 17 colours with START@300,START@301 |
 | `Virtua Racing (USA).md` | Virtua Racing | 17 colours with START@300,START@301 |
 
-### Blank (153 - see the CSV for the full table)
+### Blank (151 - see the CSV for the full table)
 
 | ROM | Title | Notes |
 |---|---|---|
@@ -327,8 +329,6 @@ what the single colour actually was (`#000000`).
 | `ATP Tour Championship Tennis (USA) (Beta) (1994-09-08).md` | ATP Tour Championship Tennis | 2 colours |
 | `ATP Tour Championship Tennis (USA).md` | ATP Tour Championship Tennis | 2 colours |
 | `Al Michaels Announces HardBall III (USA, Europe).md` | HardBall III | 2 colours |
-| `Arcade Legends Sega Mega Drive (World).md` | KID CHAMELEON | 1 colours |
-| `Arcade Legends Street Fighter II' - Special Champion Edition (World).md` | STREET FIGHTER.U'SPECIAL CHAMPION EDITION | 1 colours |
 | `Aworg - Hero in the Sky (Japan) (Game no Kanzume Vol. 2) [b].md` | SEGA NET CARTRIDGE "GAME LIBRARY" | 1 colours |
 | `Baby Boom (USA) (Proto) (1994-06-03).md` | BABY BOOM S | 4 colours |
 | `Back to the Future Part III (Europe).md` | BTTF3 | 1 colours |
