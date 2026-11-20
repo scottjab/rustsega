@@ -14,9 +14,10 @@ nix develop -c just test-commercial
 ```
 
 One row of this table is one game. A game runs for its checkpoint with START
-held on frames 300 and 301, and three things are checked: the machine did not
-panic, the last frame has more than four distinct colours, and its hash is the
-one in `crates/genesis/tests/golden/commercial.toml`.
+held on the frames its `start_press` names in `commercial_list.toml`, and three
+things are checked: the machine did not panic, the last frame has more than four
+distinct colours, and its hash is the one in
+`crates/genesis/tests/golden/commercial.toml`.
 
 ## What a row does and does not prove
 
@@ -61,25 +62,15 @@ behind; bless it only the way `docs/TESTING.md` says
 | Road Rash II | `Road Rash II (USA, Europe).md` | 600 | `roadrash2_600` | |
 | Ristar | `Ristar (USA, Europe).md` | 600 | `ristar_600` | |
 | Toy Story | `Toy Story (USA).md` | 600 | `toystory_600` | |
+| Aladdin | `Aladdin (USA).md` | 900 | `aladdin_900` | needs a second START on the title menu; frame 600 is a fade into the level |
+| Earthworm Jim | `Earthworm Jim (USA).md` | 1200 | `earthwormjim_1200` | needs a second START on the title menu; New Junk City gameplay starts around frame 950 |
+| Ecco the Dolphin | `Ecco the Dolphin (USA, Europe, Korea) (En).md` | 1200 | `ecco_1200` | ignores START until its title card; presses at 500 and 1000 reach level gameplay |
 
-No row in this table has a rendering defect open against it. Two checkpoints are
-900 rather than 600, and say so in the table and in the list: the 600th frame of
-Sonic 2 and of Vectorman is a black transition, and a golden of a black frame
-would catch nothing.
-
-## Held out of the list
-
-Three more games were set up to run and panic before the checkpoint, so they are
-not in `commercial_list.toml` yet:
-
-| Game | What happens | |
-|---|---|---|
-| Aladdin (`Aladdin (USA).md`) | panics in `Lfo::tick` | [#349](https://github.com/scottjab/rustsega/issues/349) |
-| Earthworm Jim (`Earthworm Jim (USA).md`) | panics in `Lfo::tick` | #349 |
-| Ecco the Dolphin (`Ecco the Dolphin (USA, Europe, Korea) (En).md`) | panics in `Lfo::tick` | #349 |
-
-The sound chip is what fails, not the video path, and each of the three goes
-back into the list the moment #349 is fixed.
+No row in this table has a rendering defect open against it. Five checkpoints
+sit past 600, and say so in the table and in the list: the 600th frame of Sonic
+2, Vectorman and Aladdin is a black transition, and Earthworm Jim and Ecco the
+Dolphin reach gameplay only well past 600. A golden of a black or mid-fade
+frame would catch nothing.
 
 ## Adding a game
 
