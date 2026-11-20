@@ -43,9 +43,10 @@
 //! `docs/movie-format.md`). `gameplay_movies_are_committed_and_parse` is
 //! the part CI can check, CI having no cartridges.
 //!
-//! `X`, `Y`, `Z` and `Mode` are deliberately absent from every movie: replay
-//! goes through [`Genesis::set_pad`], which attaches a 3-button pad, so those
-//! four round-trip through the file but never reach a game (#364).
+//! The movies hold none of `X`, `Y`, `Z` and `Mode`: they were recorded with
+//! the CLI's 3-button script before #364, and a letter added to one would flip
+//! its replay onto a 6-button pad (`Movie::set_pads` now reads the movie's
+//! letters) and move these goldens - a deliberate rebless, not an edit.
 //!
 //! # Running it
 //!

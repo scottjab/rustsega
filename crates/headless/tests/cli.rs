@@ -674,6 +674,42 @@ fn write_rom(path: &Path, bytes: &[u8]) -> Vec<u8> {
     bytes.to_vec()
 }
 
+/// A ROM that walks port 1's 6-button sequence once a pass and paints every
+/// step's byte onto the screen (M68000UM section 8 "MOVE"; the VDP command
+/// shape and the opening register commands are [`pad_reader_rom`]'s). The
+/// bytes it paints are the 1st-8th step of plutiedev "Controllers",
+/// "6-button controller", so a 3-button pad and a 6-button pad leave
+/// different pictures - which is what lets the six-button smoke test tell pad
+/// kinds apart rather than pass on any pad.
+fn pad6_walk_rom() -> Vec<u8> {
+    const STACK: u32 = 0x00FF_0000;
+    const CODE: u32 = 0x1000;
+    let mut program: Vec<u16> = Vec::new();
+    for command in [0x8140_u16, 0x8705, 0xC00A, 0x0000] {
+        program.extend([0x33FC, command, 0x00C0, 0x0004]);
+    }
+    // Eight steps: set `TH`, read the port, paint the byte (1st-8th step).
+    for th in [0x40_u16, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40, 0x00] {
+        program.extend([0x13FC, th, 0x00A1, 0x0003]); // move.b #th,($A10003).L
+        program.extend([0x1039, 0x00A1, 0x0003]); // move.b ($A10003).L,d0
+        program.extend([0x33C0, 0x00C0, 0x0000]); // move.w d0,($C00000).L
+    }
+    // The body is 96 words = 192 bytes, past a `BRA.B` displacement's reach,
+    // so this is a `BRA.W`; the displacement is measured from the extension
+    // word's own address, so back over the body plus that word: -194 = 0xFF3E.
+    program.extend([0x6000, 0xFF3E]);
+
+    let mut rom = vec![0_u8; (CODE as usize + 2 * program.len()).max(0x200)];
+    rom[0..4].copy_from_slice(&STACK.to_be_bytes());
+    rom[4..8].copy_from_slice(&CODE.to_be_bytes());
+    for (word, at) in program.iter().zip(0..) {
+        let at = CODE as usize + 2 * at;
+        rom[at..at + 2].copy_from_slice(&word.to_be_bytes());
+    }
+    rom[0x150..0x158].copy_from_slice(b"PAD6 ROM");
+    rom
+}
+
 /// The text of a one-pad movie for `rom_hash`, with `frames` as its change list.
 fn movie_text(rom_hash: u64, region: &str, frames: &[(u32, &str)]) -> String {
     let mut text =
@@ -760,6 +796,75 @@ fn record_then_movie_hashes_the_same_run() {
         frame_hash_line(&replayed),
         frame_hash_line(&idle),
         "a run with a frame of UP held cannot hash the same as one with nothing held"
+    );
+}
+
+/// #364 from the command line: `--pad1` takes the 6-button letters now (a
+/// script that names one used to be refused, the CLI only having a 3-button
+/// pad), the run holds Z on a 6-button pad, and the replay of the recorded
+/// movie has to attach that pad too, or its frames would not match. The ROM
+/// paints the walk bytes, so the pad kind is in the picture and this test
+/// cannot pass on both pads at once.
+#[test]
+fn six_button_script_runs_a_six_button_pad_and_round_trips() {
+    let dir = TempDir::new("six-button");
+    let rom = dir.join("pad.md");
+    let bytes = write_rom(&rom, &pad6_walk_rom());
+    let rom_hash = genesis::movie::rom_hash(&bytes);
+    let movie = dir.join("run.rsm");
+    let rom = rom.to_str().expect("utf-8 path");
+    let movie = movie.to_str().expect("utf-8 path");
+
+    let script = "Z@6";
+    let recorded = run(&[
+        "run", rom, "--frames", "6", "--pad1", script, "--record", movie, "--hash",
+    ]);
+    assert!(
+        recorded.status.success(),
+        "a script naming Z used to be refused: {:?}\nstderr: {}",
+        recorded.status.code(),
+        stderr(&recorded)
+    );
+    let held_hash = frame_hash_line(&recorded);
+
+    // The movie holds Z, the letter the old CLI would not take.
+    let text = fs::read_to_string(movie).expect("the movie was written");
+    assert_eq!(
+        movie_lines(&text),
+        [
+            "rustsega-movie 1",
+            &format!("rom-hash 0x{rom_hash:016x}"),
+            "region usa",
+            "pads 1",
+            "5 Z"
+        ],
+        "the recorded movie holds Z: {text}"
+    );
+
+    // Replay: the movie's letters are what pick the pad, and the frames say
+    // it was picked right - the replay hashes the same as the recorded run.
+    let replayed = run(&["run", rom, "--frames", "6", "--movie", movie, "--hash"]);
+    assert!(
+        replayed.status.success(),
+        "replay failed: {:?}\nstderr: {}",
+        replayed.status.code(),
+        stderr(&replayed)
+    );
+    assert_eq!(
+        frame_hash_line(&replayed),
+        held_hash,
+        "replaying a Z movie must reproduce the 6-button run it came from"
+    );
+
+    // And the pad kind is really in the picture: a 3-button script on the same
+    // ROM is a different walk, so this test would notice a replay that forgot
+    // the 6-button pad.
+    let three_button = run(&["run", rom, "--frames", "6", "--pad1", "A@6", "--hash"]);
+    assert!(three_button.status.success());
+    assert_ne!(
+        frame_hash_line(&three_button),
+        held_hash,
+        "a 6-button walk paints a different picture from a 3-button one"
     );
 }
 

@@ -415,6 +415,7 @@ impl Genesis {
     pub fn frame(&self) -> &FrameBuffer;
     pub fn drain_audio(&mut self, out: &mut Vec<i16>); // interleaved stereo at config.sample_rate
     pub fn set_pad(&mut self, port: usize, buttons: Buttons); // bitflags: UP DOWN LEFT RIGHT A B C START X Y Z MODE
+    pub fn set_pad6(&mut self, port: usize, buttons: Buttons); // the 6-button pad: X Y Z MODE reach the game (plutiedev "Controllers")
     pub fn save_state(&self) -> Vec<u8>;   // the container of docs/save-state-format.md
     pub fn load_state(&mut self, data: &[u8]) -> Result<(), StateError>;
     pub fn sram(&self) -> Option<&[u8]>;

@@ -187,6 +187,15 @@ impl Buttons {
     /// The `Mode` button, 6-button pad only.
     pub const MODE: Self = Self { bits: 1 << 11 };
 
+    /// The four buttons a 6-button pad adds to the 3-button one: `X`, `Y`, `Z`
+    /// and `Mode` (plutiedev "Controllers", "Button layout"). What a held
+    /// [`Buttons`] has to intersect for a port to need [`Device::Pad6`] - and
+    /// "intersect", not "contain": the set is an any-of question about a set
+    /// of held buttons, not a match on one.
+    pub const SIX_BUTTON_ONLY: Self = Self {
+        bits: Self::X.bits | Self::Y.bits | Self::Z.bits | Self::MODE.bits,
+    };
+
     /// No button held down.
     pub const fn empty() -> Self {
         Self { bits: 0 }
@@ -195,6 +204,11 @@ impl Buttons {
     /// Are all of `other`'s buttons held down?
     pub const fn contains(self, other: Self) -> bool {
         self.bits & other.bits == other.bits
+    }
+
+    /// Is any of `other`'s buttons held down?
+    pub const fn intersects(self, other: Self) -> bool {
+        self.bits & other.bits != 0
     }
 }
 
@@ -1173,6 +1187,43 @@ mod tests {
                 Some(*expected),
                 "step {} after the reset",
                 index + 1
+            );
+        }
+    }
+
+    /// [`Buttons::SIX_BUTTON_ONLY`] is exactly the four buttons the 6-button
+    /// pad adds: each of them intersects it, none of the 3-button pad's does,
+    /// and it is an "any of" test, not a `contains` one - a front end holding
+    /// `A` and `Z` at once intersects it without containing any one letter
+    /// twice (plutiedev "Controllers", "Button layout").
+    #[test]
+    fn six_button_only_is_the_four_extra_buttons() {
+        for button in [
+            Buttons::X,
+            Buttons::Y,
+            Buttons::Z,
+            Buttons::MODE,
+            Buttons::Z | Buttons::A,
+        ] {
+            assert!(
+                button.intersects(Buttons::SIX_BUTTON_ONLY),
+                "{button:?} needs a 6-button pad"
+            );
+        }
+        for button in [
+            Buttons::UP,
+            Buttons::DOWN,
+            Buttons::LEFT,
+            Buttons::RIGHT,
+            Buttons::A,
+            Buttons::B,
+            Buttons::C,
+            Buttons::START,
+            Buttons::empty(),
+        ] {
+            assert!(
+                !button.intersects(Buttons::SIX_BUTTON_ONLY),
+                "{button:?} a 3-button pad holds"
             );
         }
     }

@@ -129,10 +129,11 @@ pub struct RunArgs {
     ///
     /// Frame numbers are 1-based - `A@1` is held during the first frame this
     /// command runs - and one entry's buttons are joined with `+`. A frame with
-    /// no entry is run with the pad released. The 3-button pad's names only: UP
-    /// DOWN LEFT RIGHT A B C START. `X`, `Y`, `Z` and `Mode` belong to a 6-button
-    /// pad, which this command cannot attach, so they are refused rather than
-    /// silently dropped - a movie holds them fine (`--movie`, `--record`).
+    /// no entry is run with the pad released. The pad's names: UP DOWN LEFT
+    /// RIGHT A B C START, plus the 6-button pad's X Y Z MODE. A script that
+    /// names any of those four runs port 1 as a 6-button pad for the whole run
+    /// (#364); one that does not keeps the 3-button pad, so every script
+    /// written before #364 runs unchanged.
     #[arg(long = "pad1", value_name = "SCRIPT")]
     pub pad1: Option<String>,
     /// Replay the pad input of a `.rsm` movie instead of holding `--pad1`.
@@ -203,6 +204,10 @@ pub fn run(args: RunArgs) -> Result<()> {
     let movie = read_movie(args.movie.as_deref(), &rom, region)?;
     let pads = parse_pad_script(args.pad1.as_deref())?;
     warn_past_the_last_frame(&pads, args.frames);
+    // A script that names one of X, Y, Z or MODE anywhere needs the 6-button
+    // pad (#364), and it needs it for the whole run: the pad kind is a device
+    // the game can detect, not something that may change with the frame.
+    let six_button = wants_six_button_pad(&pads);
     // The recorder records what the machine is handed, frame by frame; it starts
     // empty and `Movie::record` keeps only the frames that change.
     let mut recorder = args
@@ -250,6 +255,8 @@ pub fn run(args: RunArgs) -> Result<()> {
             // Movie frames are 0-based and this loop is 1-based: `--pad1 A@1` and
             // a movie's frame 0 are the same, first, frame.
             movie.set_pads(&mut machine, frame - 1);
+        } else if six_button {
+            machine.set_pad6(0, held);
         } else {
             machine.set_pad(0, held);
         }
@@ -517,9 +524,11 @@ fn warn_past_the_last_frame(pads: &BTreeMap<u32, Buttons>, frames: u32) {
     );
 }
 
-/// The buttons `--pad1` can hold, by the name it spells them with: the eight of
-/// a 3-button pad (plutiedev, "Controllers", "Button layout").
-const BUTTONS: [(&str, Buttons); 8] = [
+/// The buttons `--pad1` can hold, by the name it spells them with: the twelve
+/// of a 6-button pad (plutiedev, "Controllers", "Button layout"). The last four
+/// are the ones the 3-button pad cannot report; a script that names any of them
+/// runs port 1 as a 6-button pad (`wants_six_button_pad`).
+const BUTTONS: [(&str, Buttons); 12] = [
     ("UP", Buttons::UP),
     ("DOWN", Buttons::DOWN),
     ("LEFT", Buttons::LEFT),
@@ -528,27 +537,20 @@ const BUTTONS: [(&str, Buttons); 8] = [
     ("B", Buttons::B),
     ("C", Buttons::C),
     ("START", Buttons::START),
+    ("X", Buttons::X),
+    ("Y", Buttons::Y),
+    ("Z", Buttons::Z),
+    ("MODE", Buttons::MODE),
 ];
 
-/// One button name, as `--pad1` spells it: upper case, and the four a 6-button
-/// pad adds are refused rather than quietly dropped.
-///
-/// `Genesis::set_pad` attaches a 3-button pad, which cannot report `X`, `Y`, `Z`
-/// or `MODE`, so a script that asked for one would be holding a button no game
-/// can see (plutiedev, "Controllers", "6-button controller"). A movie records and
-/// replays those letters all the same; what it cannot do until the console grows a
-/// 6-button `set_pad` is show them to the game (`docs/movie-format.md`).
+/// One button name, as `--pad1` spells it: upper case, all twelve of the pad.
+/// Before #364 the four 6-button letters were refused here, because the CLI
+/// could only attach a 3-button pad; now a script that names one of them is
+/// what makes the run a 6-button one.
 fn parse_button(name: &str) -> Result<Buttons> {
-    const SIX_BUTTON_ONLY: [&str; 4] = ["X", "Y", "Z", "MODE"];
     let wanted = name.trim().to_ascii_uppercase();
     if let Some((_, buttons)) = BUTTONS.iter().find(|(button, _)| *button == wanted) {
         return Ok(*buttons);
-    }
-    if SIX_BUTTON_ONLY.contains(&wanted.as_str()) {
-        bail!(
-            "--pad1: {wanted} is a 6-button pad button and the CLI attaches a 3-button \
-             pad; 6-button input comes with the movie format (#129)"
-        );
     }
     let names = BUTTONS
         .iter()
@@ -556,6 +558,19 @@ fn parse_button(name: &str) -> Result<Buttons> {
         .collect::<Vec<_>>()
         .join(" ");
     bail!("--pad1: {name:?} is not a button; use {names}")
+}
+
+/// Does this run's port 1 pad have to be the 6-button one? A script that names
+/// `X`, `Y`, `Z` or `MODE` anywhere does - those four are what a 3-button pad
+/// cannot report ([`Buttons::SIX_BUTTON_ONLY`]) - and the question is answered
+/// once for the whole run rather than per frame: the pad kind is a device the
+/// game can detect, not something that may change with the frame (#364). A
+/// 6-button pad answers the 3-button rows exactly as the 3-button pad does, so
+/// the frames of a script that never names the four are the frames it always
+/// made.
+fn wants_six_button_pad(pads: &BTreeMap<u32, Buttons>) -> bool {
+    pads.values()
+        .any(|buttons| buttons.intersects(Buttons::SIX_BUTTON_ONLY))
 }
 
 #[cfg(test)]
@@ -599,13 +614,26 @@ mod tests {
         assert!(err.to_string().contains("not a button"), "unhelpful: {err}");
     }
 
+    /// #364: the four letters a 6-button pad adds are scriptable now, by the
+    /// same names the movie format spells them.
     #[test]
-    fn pad_script_refuses_a_button_the_cli_cannot_hold() {
-        // Not silently dropped: a script that asked for Z would test nothing,
-        // because `Genesis::set_pad` attaches a 3-button pad.
-        let err =
-            parse_pad_script(Some("Z@3")).expect_err("Z is not reachable through the CLI's pad");
-        assert!(err.to_string().contains("6-button"), "unhelpful: {err}");
+    fn pad_script_accepts_the_six_button_letters() {
+        let pads = script("X@3,Y@4,Z@5,MODE@6");
+        assert_eq!(pads.get(&3), Some(&Buttons::X));
+        assert_eq!(pads.get(&4), Some(&Buttons::Y));
+        assert_eq!(pads.get(&5), Some(&Buttons::Z));
+        assert_eq!(pads.get(&6), Some(&Buttons::MODE));
+    }
+
+    /// A script that names any of the four anywhere makes this a 6-button run;
+    /// one that does not keeps the 3-button pad, so existing scripts run
+    /// unchanged.
+    #[test]
+    fn a_script_naming_a_six_button_letter_needs_the_six_button_pad() {
+        assert!(wants_six_button_pad(&script("A@1,Z@2")));
+        assert!(wants_six_button_pad(&script("MODE@10")));
+        assert!(!wants_six_button_pad(&script("START@1,LEFT+A@2")));
+        assert!(!wants_six_button_pad(&BTreeMap::new()));
     }
 
     /// `--audio-hash` hashes the run's audio as little-endian PCM bytes: the
