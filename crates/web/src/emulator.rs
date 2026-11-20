@@ -39,7 +39,6 @@ use web_sys::HtmlCanvasElement;
 
 use crate::audio::AudioOut;
 use crate::audio_pacing::MAX_FRAMES_PER_TICK;
-use crate::audio_pacing::TARGET_AHEAD_SECS;
 use crate::audio_pacing::frames_to_run;
 use crate::fps::FpsMeter;
 use crate::frame_pacer::FramePacer;
@@ -1497,6 +1496,13 @@ impl Emulator {
         });
 
         let target_hz = target_hz(&config, &rom.bytes);
+        let frame_secs = 1.0 / target_hz;
+        // The batched-block size is a per-frame length times the WebKit frame
+        // count, so the output is told the frame length once it is known (the
+        // console's rate is a property of the cartridge, #629).
+        if let Some(audio) = audio.as_mut() {
+            audio.set_batching(frame_secs);
+        }
         // The movie identity of this run (M7-18, #365). The same header that
         // `Genesis::new` above read has already parsed, so the region resolve
         // cannot fail here; the fallback only keeps the field total for a
@@ -1523,7 +1529,7 @@ impl Emulator {
             sram_checked: now_ms(),
             toasts,
             samples: Vec::new(),
-            frame_secs: 1.0 / target_hz,
+            frame_secs,
             canvas_2d: canvas.clone(),
             canvas_gl: canvas_gl.clone(),
             kind,
@@ -1776,13 +1782,12 @@ impl Emulator {
         let Some(buffered) = buffered else {
             return self.pacer.frames_due(now_ms);
         };
+        let target = self.audio.as_ref().map_or(
+            crate::audio_pacing::TARGET_AHEAD_SECS,
+            AudioOut::target_ahead,
+        );
         let _ = self.pacer.frames_due(now_ms);
-        frames_to_run(
-            buffered,
-            TARGET_AHEAD_SECS,
-            self.frame_secs,
-            MAX_FRAMES_PER_TICK,
-        )
+        frames_to_run(buffered, target, self.frame_secs, MAX_FRAMES_PER_TICK)
     }
 
     /// Hands the frame that has just run to the speakers - or, while `fast_forward`

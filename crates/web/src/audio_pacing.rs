@@ -76,6 +76,116 @@ pub fn frames_to_run(
 /// multiplication is exact and `i16::MIN` lands on `-1.0` rather than near it.
 const FULL_SCALE: f32 = 1.0 / 32768.0;
 
+/// How many console frames of sound one scheduled block carries on a WebKit
+/// browser (#629). Safari on macOS and iOS is the one engine reporting choppy
+/// audio and rendering, and the cost the measurement could put numbers on is
+/// per-second scheduling churn: a fresh `AudioBufferSourceNode` plus two
+/// channel copies every console frame. Four frames per block is a fifteenth of
+/// a second of sound per node - 15 nodes a second instead of 60 - while
+/// staying inside [`TARGET_AHEAD_SECS`], so the cursor never carries more than
+/// the target's worth of undelivered sound. Chrome and Firefox keep one frame
+/// per block: the 60-second per-engine measurement shows the per-frame scheme
+/// working there with nothing to fix.
+pub const WEBKIT_FRAMES_PER_BLOCK: u32 = 4;
+
+/// How many console frames of sound one scheduled block carries for a browser,
+/// read off its user agent.
+///
+/// The WebKit family is "says `Safari` and does not say `Chrome`": Chrome's UA
+/// still carries the historical `Safari` token, and the whole Chromium family
+/// (Chrome, Edge, Opera, Brave) carries `Chrome`. Firefox names itself. A UA a
+/// browser did not hand over is not a reason to change anything.
+///
+/// This is a scheduling-shape cut, not a capability test: both answers produce
+/// the same sound, the same cursor arithmetic and the same underrun counting;
+/// see [`BlockBatcher`] for what batching changes.
+pub fn frames_per_block_for(user_agent: &str) -> u32 {
+    let webkit = user_agent.contains("Safari") && !user_agent.contains("Chrome");
+    if webkit { WEBKIT_FRAMES_PER_BLOCK } else { 1 }
+}
+
+/// The scheduled-ahead amount a batched browser aims for: one whole batch, plus
+/// two frames of room for the pacer to see the deficit and run before the play
+/// head reaches the cursor.
+///
+/// The why is measured (#629): a batched cursor advances only once per batch, so
+/// between two flushes the play head eats up to a whole batch length out of the
+/// lead while the batcher is still gathering. At the plain [`TARGET_AHEAD_SECS`]
+/// the lead's floor lands right on the too-late line and the schedule restarts
+/// about twice a second; at one-batch-plus-two the floor sits three frames
+/// clear. Unbatched browsers keep [`TARGET_AHEAD_SECS`].
+pub fn target_ahead_secs(frames_per_block: u32, frame_secs: f64) -> f64 {
+    if frames_per_block <= 1 {
+        TARGET_AHEAD_SECS
+    } else {
+        (f64::from(frames_per_block) + 2.0) * frame_secs
+    }
+}
+
+/// Holds console frames of sound until one scheduled block's worth has
+/// gathered, for the browsers that get batched blocks (#629, and
+/// [`frames_per_block_for`] for where the count comes from).
+///
+/// The caller is [`crate::audio::AudioOut::push`], which is handed one console
+/// frame at a time and schedules one block at a time; the batcher sits between
+/// the two. Nothing else about the schedule changes: the block still starts at
+/// the cursor and the cursor still moves by the block's own length, so the
+/// pacing arithmetic ([`frames_to_run`]) is untouched. A cursor re-seat -
+/// [`crate::audio::AudioOut::discard`], `resume`, `suspend` - drops whatever
+/// is pending, because those samples belong to a moment the schedule no longer
+/// covers.
+///
+/// A batcher built with one frame per block hands every push straight back, so
+/// the non-WebKit browsers take the same path they always took.
+pub struct BlockBatcher {
+    /// The frames gathered so far, interleaved stereo, exactly as they arrived.
+    pending: Vec<i16>,
+    /// Kept empty but reserved, so handing a batch out (`std::mem::swap`)
+    /// never gives the pending buffer's allocation back to the allocator.
+    spare: Vec<i16>,
+    /// The sample count one scheduled block carries: frames per block times
+    /// samples per frame.
+    capacity: usize,
+}
+
+impl BlockBatcher {
+    /// A batcher for `frames_per_block` console frames of `samples_per_frame`
+    /// interleaved samples each. `frames_per_block` of one means every push is
+    /// a full block: the batcher never holds anything.
+    pub fn new(frames_per_block: u32, samples_per_frame: usize) -> Self {
+        let capacity = frames_per_block.max(1) as usize * samples_per_frame;
+        Self {
+            pending: Vec::with_capacity(capacity),
+            spare: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Adds one console frame of interleaved samples. Returns the whole block
+    /// once at least one block's worth has gathered; `None` while it is still
+    /// short.
+    pub fn push(&mut self, samples: &[i16]) -> Option<Vec<i16>> {
+        self.pending.extend_from_slice(samples);
+        if self.capacity == 0 || self.pending.len() < self.capacity {
+            return None;
+        }
+        let block = std::mem::take(&mut self.pending);
+        std::mem::swap(&mut self.pending, &mut self.spare);
+        self.spare.clear();
+        Some(block)
+    }
+
+    /// Drops whatever is pending: the sound of a moment the console has left.
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Whether anything is pending.
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
 /// Splits interleaved stereo `i16` into two `f32` channels.
 ///
 /// `src` is what [`genesis::Genesis::drain_audio`] appends - `left right left
@@ -259,5 +369,200 @@ mod tests {
         assert_eq!(right.len(), 1);
         assert_eq!(left[0], 1.0 / 32768.0);
         assert_eq!(right[0], 2.0 / 32768.0);
+    }
+
+    // ---- #629: batching console frames into fewer AudioBuffers on WebKit.
+    // Safari (macOS + iOS) is the one engine reporting choppy audio and
+    // rendering, and the difference this rig could measure is per-second
+    // scheduling churn: one `AudioBufferSourceNode` plus two channel copies per
+    // console frame. The batch arithmetic is pure so the engine cut and the
+    // fill/flush behaviour are testable on the host.
+
+    /// Safari desktop, what a macOS report shows.
+    const SAFARI_MAC: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
+    /// Safari iOS, where the ticket says the same choppiness shows.
+    const SAFARI_IOS: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+    /// Chrome's UA still says Safari (historical), so "contains Safari" alone
+    /// is not the cut.
+    const CHROME: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    /// Edge, Opera and the rest of the Chromium family all carry the Chrome
+    /// token.
+    const EDGE: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0";
+    /// Firefox has no Safari token at all.
+    const FIREFOX: &str =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0";
+
+    /// The WebKit engines the ticket is about batch; everything else -
+    /// Chromium family, Firefox, and a UA a browser did not hand over - keeps
+    /// the per-frame scheme that the measurement shows working (60 s, 0
+    /// underruns).
+    #[test]
+    fn only_webkit_engines_batch() {
+        assert_eq!(frames_per_block_for(SAFARI_MAC), WEBKIT_FRAMES_PER_BLOCK);
+        assert_eq!(frames_per_block_for(SAFARI_IOS), WEBKIT_FRAMES_PER_BLOCK);
+        // A WPE/GTK WebKit UA (the engine the measurement ran on) batches too.
+        assert_eq!(
+            frames_per_block_for(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
+            ),
+            WEBKIT_FRAMES_PER_BLOCK
+        );
+        assert_eq!(frames_per_block_for(CHROME), 1);
+        assert_eq!(frames_per_block_for(EDGE), 1);
+        assert_eq!(frames_per_block_for(FIREFOX), 1);
+        assert_eq!(frames_per_block_for(""), 1);
+    }
+
+    /// A batcher built for one frame per block never forms, which is what the
+    /// non-WebKit path passes so its `push` stays a straight schedule.
+    #[test]
+    fn a_one_frame_batcher_schedules_every_push_at_once() {
+        let mut batcher = BlockBatcher::new(1, 800);
+        assert_eq!(batcher.push(&[0; 800]).map(|block| block.len()), Some(800));
+    }
+
+    /// The WebKit path: four console frames of 800 samples are held until the
+    /// fourth arrives, and leave as one 3200-sample batch.
+    #[test]
+    fn four_frames_leave_as_one_batch() {
+        let mut batcher = BlockBatcher::new(WEBKIT_FRAMES_PER_BLOCK, 800);
+        assert_eq!(batcher.push(&[1; 800]), None);
+        assert_eq!(batcher.push(&[2; 800]), None);
+        assert_eq!(batcher.push(&[3; 800]), None);
+        assert!(!batcher.is_empty());
+        let batch = batcher
+            .push(&[4; 800])
+            .expect("the fourth push fills the batch");
+        assert_eq!(batch.len(), 4 * 800);
+        assert!(batch.starts_with(&[1; 800]));
+        assert!(batch.ends_with(&[4; 800]));
+        assert!(batcher.is_empty());
+    }
+
+    /// A partial batch left pending is dropped by `clear`, which is what a
+    /// cursor re-seat (`discard`, `resume`, `suspend`) asks for: those samples
+    /// belong to a moment the schedule no longer covers.
+    #[test]
+    fn clear_drops_a_pending_batch() {
+        let mut batcher = BlockBatcher::new(WEBKIT_FRAMES_PER_BLOCK, 800);
+        assert_eq!(batcher.push(&[1; 800]), None);
+        batcher.clear();
+        assert!(batcher.is_empty());
+        // And the batcher keeps working after the drop.
+        assert_eq!(batcher.push(&[2; 800]), None);
+        assert_eq!(batcher.push(&[3; 800]), None);
+        assert_eq!(batcher.push(&[4; 800]), None);
+        assert_eq!(
+            batcher.push(&[5; 800]).map(|block| block.len()),
+            Some(4 * 800)
+        );
+    }
+
+    /// A batch that arrives over capacity in one push still comes out, whole.
+    #[test]
+    fn an_oversized_push_comes_out_whole() {
+        let mut batcher = BlockBatcher::new(WEBKIT_FRAMES_PER_BLOCK, 800);
+        assert_eq!(batcher.push(&[7; 3 * 800]), None);
+        assert_eq!(
+            batcher.push(&[8; 2 * 800]).map(|block| block.len()),
+            Some(5 * 800)
+        );
+    }
+
+    /// The pending buffer is reused across batches: `push` after a flush must
+    /// not pay the capacity back allocation by allocation (same contract as
+    /// `deinterleave`'s reuse note above).
+    #[test]
+    fn the_pending_buffer_keeps_its_capacity_across_flushes() {
+        let mut batcher = BlockBatcher::new(WEBKIT_FRAMES_PER_BLOCK, 800);
+        assert_eq!(batcher.push(&[1; 800]), None);
+        assert_eq!(batcher.push(&[2; 800]), None);
+        assert_eq!(batcher.push(&[3; 800]), None);
+        assert_eq!(
+            batcher.push(&[4; 800]).map(|block| block.len()),
+            Some(4 * 800)
+        );
+        // Second batch: three pushes pending again, and the same capacity is
+        // already there.
+        assert_eq!(batcher.push(&[5; 800]), None);
+        assert_eq!(batcher.push(&[6; 800]), None);
+        assert_eq!(batcher.push(&[7; 800]), None);
+        assert_eq!(
+            batcher.push(&[8; 800]).map(|block| block.len()),
+            Some(4 * 800)
+        );
+    }
+
+    // ---- #629, second half: the cursor target must cover a batch. A batched
+    // cursor advances only once per batch, so between two flushes the play head
+    // eats up to a whole batch length out of the lead while the batcher is still
+    // gathering. Measured on WebKit: at the unbatched target the lead's floor
+    // lands right on the 10 ms underrun line and the schedule restarts about
+    // twice a second (28 underruns in the 60 s window); at a target of one
+    // batch plus two frames of pacer room the floor sits three frames clear and
+    // the window is clean.
+
+    /// The unbatched target is the unbatched target.
+    #[test]
+    fn a_one_frame_browser_keeps_the_plain_target() {
+        assert_eq!(target_ahead_secs(1, NTSC), TARGET_AHEAD_SECS);
+        assert_eq!(target_ahead_secs(0, PAL), TARGET_AHEAD_SECS);
+    }
+
+    /// Batched blocks get one batch plus two frames: 4 NTSC frames of batch +
+    /// 2 of room = 6 frames of lead, PAL 6 fiftieths.
+    #[test]
+    fn a_batched_browser_gets_a_batch_plus_two_frames() {
+        assert_eq!(target_ahead_secs(WEBKIT_FRAMES_PER_BLOCK, NTSC), 6.0 * NTSC);
+        assert_eq!(target_ahead_secs(WEBKIT_FRAMES_PER_BLOCK, PAL), 6.0 * PAL);
+    }
+
+    /// Where the lead bottoms out over a batch cycle: a batched cursor only
+    /// advances once per batch, so between two flushes the play head eats up to
+    /// a whole batch length out of the lead while the batcher is still
+    /// gathering. The floor is therefore `target - batch + one frame`.
+    fn batched_floor(target: f64, frames_per_block: u32, frame_secs: f64) -> f64 {
+        target - f64::from(frames_per_block) * frame_secs + frame_secs
+    }
+
+    /// The 10 ms too-late margin of `AudioOut::UNDERRUN_SECS`, restated here
+    /// because that constant is private to the browser module.
+    const UNDERRUN_SECS: f64 = 0.01;
+
+    /// At the plain target a batched cursor's floor lands exactly on the
+    /// too-late line: 60 ms - 3 frames = 10 ms, which is what the first WebKit
+    /// measurement with batching alone hit - the schedule restarting whenever
+    /// a tick ran long (28 restarts in the measured 60 s window). This is the
+    /// arithmetic reason the target has to deepen with the batch.
+    #[test]
+    fn a_batched_cursor_at_the_plain_target_floors_on_the_too_late_line() {
+        let floor = batched_floor(TARGET_AHEAD_SECS, WEBKIT_FRAMES_PER_BLOCK, NTSC);
+        assert!(
+            floor <= UNDERRUN_SECS,
+            "plain target with 4-frame batches floors at {floor}, under the {UNDERRUN_SECS} line"
+        );
+        assert!(
+            (floor - UNDERRUN_SECS).abs() < 1e-9,
+            "the floor is the line itself"
+        );
+    }
+
+    /// At the batched target - one batch plus two frames - the floor sits two
+    /// frames clear of the line: 100 ms - 3 frames = 50 ms, which is what the
+    /// re-measured WebKit window ran on (0 restarts in 60 s).
+    #[test]
+    fn the_batched_target_holds_the_floor_clear_of_the_line() {
+        let target = target_ahead_secs(WEBKIT_FRAMES_PER_BLOCK, NTSC);
+        let floor = batched_floor(target, WEBKIT_FRAMES_PER_BLOCK, NTSC);
+        assert!(
+            floor > UNDERRUN_SECS + 2.0 * NTSC,
+            "the deep target floors at {floor}, inside jitter reach of the line"
+        );
+        // And the PAL batch, whose cycle is longer: 6 fiftieths - 4 fiftieths
+        // + 1 = 3 fiftieths = 60 ms.
+        let pal_target = target_ahead_secs(WEBKIT_FRAMES_PER_BLOCK, PAL);
+        assert!(
+            batched_floor(pal_target, WEBKIT_FRAMES_PER_BLOCK, PAL) > UNDERRUN_SECS + 2.0 * PAL
+        );
     }
 }

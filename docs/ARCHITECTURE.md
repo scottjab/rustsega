@@ -492,6 +492,28 @@ frame buffer) and what that means after a load, is
   scaling/CRT filter.
 - Audio: Web Audio API through `web-sys`, scheduling `AudioBufferSourceNode`s
   ahead of the play head. No hand written JS files.
+- Audio on Safari/WebKit (#629): Safari on macOS and iOS was reported choppy -
+  audio and rendering together - with Chrome fine on the same laptop. A 60 s
+  headless measurement of all three engines (Playwright Chromium 156, Firefox
+  157 and WebKit 27.2, each against a live audio clock) showed the per-frame
+  scheme itself healthy on WebKit: 0 underruns, `start_with_when` honoured,
+  `currentTime` advancing smoothly. What the engine gets instead is a coarser
+  schedule: on a WebKit user agent one scheduled block carries 4 console frames
+  (`crates/web/src/audio_pacing.rs::WEBKIT_FRAMES_PER_BLOCK`, 15 nodes a second
+  instead of 60, a quarter of the per-second `AudioBuffer` + channel-copy churn
+  on the engine whose JIT and GC are the suspected frame-budget culprit), and
+  the cursor target deepens to one batch plus two frames of pacer room
+  (`target_ahead_secs`, 100 ms on NTSC) - a batched cursor only advances once
+  per batch, and the first measurement with batching alone ran the lead's floor
+  onto the too-late line (28 restarts in the 60 s window; the deeper target
+  brought the same window to 0). Chrome and Firefox keep one frame per block at
+  the plain 60 ms target, which the measurement shows working;
+  `framesPerBlock` on `window.rustsegaAudio` says which shape a given browser
+  got. What the headless rig cannot see, and what stays browser-specific:
+  CoreAudio's real output latency on macOS, iOS's gesture and sample-rate
+  conversion rules, and Safari's low-power rAF throttling - a real-device pass
+  is still the acceptance test. The no-AudioWorklet decision stands; revisiting
+  it wants a measurement, not a suspicion.
 - Input: one `InputState` that merges keyboard, Gamepad API, and touch
   overlay into `Buttons` per port. All bindings are rebindable and stored in
   `localStorage`.
