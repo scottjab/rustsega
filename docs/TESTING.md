@@ -207,7 +207,10 @@ Nothing copyrighted gets committed. Test data is fetched or found at test time.
 - `RUSTSEGA_ROM_DIR` (default `~/games/roms/genesis`): the owner's commercial
   ROM set. Note: files there use the `.md` extension (Mega Drive), they are
   raw binary ROMs, not markdown. A few are `.bin`. Some may be interleaved
-  `.smd` format, detect that by content, not by name.
+  `.smd` format, detect that by content, not by name. One variable, two
+  consumers: this is also what `rustsega --rom-dir` reads (the server's ROM
+  library, M8-03), and the dev shell exports it, so inside `nix develop` a
+  bare `rustsega` starts with the library pointed at the whole collection.
 
 ### Pinned by `scripts/fetch-test-data.sh`
 

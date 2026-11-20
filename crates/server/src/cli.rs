@@ -76,7 +76,9 @@ pub struct Args {
     ///
     /// `RUSTSEGA_ROM_DIR` is the name this repo already uses for the owner's
     /// collection (`docs/TESTING.md`), so inside `nix develop` there is a ROM
-    /// directory before anyone asks for one. That is the point of the shared name.
+    /// directory before anyone asks for one. That is the point of the shared name:
+    /// one variable, two consumers - these harnesses and the server library
+    /// (`docs/TESTING.md` documents both).
     #[arg(long, env = "RUSTSEGA_ROM_DIR", value_name = "DIR")]
     pub rom_dir: Option<PathBuf>,
 

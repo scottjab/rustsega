@@ -66,6 +66,11 @@ nix build                                    # -> ./result/bin/rustsega
 nix run . -- --rom-dir ~/games/roms/genesis  # build it, and serve the ROM library
 ```
 
+The server's ROM library reads `RUSTSEGA_ROM_DIR` - the same variable the test
+harnesses use for the owner's commercial ROM collection (see
+[TESTING.md](docs/TESTING.md)), and one the dev shell exports, so inside
+`nix develop` a bare `rustsega` already serves the library it points at.
+
 Trunk runs once: the frontend dist is its own derivation, and the server is
 compiled with the result embedded in it - the same dist store path that the
 static build embeds (#424). What `./result` holds is therefore the whole app,
