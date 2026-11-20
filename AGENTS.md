@@ -97,10 +97,17 @@ git fetch origin
 git rebase origin/main        # fix conflicts if any (Cargo.toml and mod lists are common)
 nix develop -c just check     # must pass AFTER the rebase, not just before
 git push -u origin HEAD --force-with-lease
-gh pr create --fill --body "Closes #<N>
+gh pr create --title "<area>: <summary> (#<N>)" \
+  --body "Closes #<N>
 
 <what you did, what tests you added, anything surprising>"
 ```
+
+`--fill` takes the first commit's subject as the title, so a WIP checkpoint or
+an issue-slug branch name lands on `main` as the squash subject. Give the title
+explicitly: `<area>` is the crate or system (`m68k`, `vdp`, `genesis`, `cart`,
+`sn76489`, `ym2612`, `readme`, `infra`), and the summary is the change, not the
+ticket name.
 
 Then wait for CI. Every push to `main` and every PR runs the `CI` workflow,
 which is `just check` on a runner. There is no "this repo has no CI yet" state.
