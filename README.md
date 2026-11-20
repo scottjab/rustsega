@@ -6,8 +6,11 @@ A Sega Genesis / Mega Drive emulator written in Rust. It runs in the browser
 through WebAssembly and deploys as one binary: the server embeds the whole web
 app, so you copy one file and run it.
 
-Status: planning, no code yet (the first ticket creates the Cargo workspace). Work is tracked in GitHub issues; the issue labeled
-`tracking` lists every ticket in order.
+Status: working. The core runs commercial cartridges, the CPU cores pass
+their conformance suites, audio and save states are modelled, and the web
+frontend plus the single-binary server are in the tree - see
+[compat.md](docs/compat.md) for which games run and how well. Work is tracked
+in GitHub issues; the issue labeled `tracking` lists every ticket in order.
 
 To play with it rather than read the code: the
 [user guide](docs/USER_GUIDE.md) covers the quick start, the NixOS service,
