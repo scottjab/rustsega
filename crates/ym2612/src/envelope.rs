@@ -665,7 +665,17 @@ impl EnvelopeGen {
     /// Nothing happens on two samples in three: the envelopes go a third as
     /// often as the phase counters do, and all 24 of them are stepped against
     /// the one counter of the chip (Nemesis, "YM2612 envelope generator").
+    /// [`EnvelopeGen::tick_resting`] with nothing at rest: what the
+    /// generator's own tests drive, which is why it is test-only.
+    #[cfg(test)]
     pub(crate) fn tick(&mut self, phases: &PhaseGen) {
+        self.tick_resting(phases, &[false; CHANNELS]);
+    }
+
+    /// [`EnvelopeGen::tick`], with the per-channel rest summary of
+    /// [`crate::Ym2612::clock`]: a channel marked at rest has its four updates
+    /// skipped, which is what makes the summary worth computing.
+    pub(crate) fn tick_resting(&mut self, phases: &PhaseGen, rest: &[bool; CHANNELS]) {
         self.advance();
         if self.sample != 0 {
             return;
@@ -673,7 +683,15 @@ impl EnvelopeGen {
 
         // The key code per operator, since the two are one thing in a normal
         // channel and separate ones in the special mode of channel 3 (#114).
-        for channel in 0..CHANNELS {
+        for (channel, &at_rest) in rest.iter().enumerate() {
+            if at_rest {
+                // An at-rest channel's four updates are no-ops: the state is
+                // absorbing under [`Envelope::update`] (a released envelope at
+                // silence gains nothing, and the restarts of `&90` need a
+                // key). [`Ym2612::clock`] computed `rest` off the envelopes as
+                // this sample began, and nothing since has touched them.
+                continue;
+            }
             for slot in 0..SLOTS {
                 let keycode = phases.keycode(channel, slot);
                 self.envelopes[channel][slot].update(self.counter, keycode);
@@ -699,6 +717,14 @@ impl EnvelopeGen {
         } else {
             self.counter + 1
         };
+    }
+
+    /// Whether all four envelopes of `channel` stand at rest
+    /// ([`Envelope::at_rest`]), the per-channel half of the condition
+    /// [`crate::Ym2612::clock`]'s idle fast path and its per-channel skip ask
+    /// for.
+    pub(crate) fn channel_at_rest(&self, channel: usize) -> bool {
+        self.envelopes[channel].iter().all(Envelope::at_rest)
     }
 
     /// Whether all 24 envelopes stand at rest ([`Envelope::at_rest`]), the

@@ -321,9 +321,22 @@ impl Ym2612 {
         let ssg_pg_reset = self.envelopes.ssg_pg_resets();
         self.phases
             .tick(&ssg_pg_reset, self.lfo.pms(), self.lfo.pm_phase());
-        self.envelopes.tick(&self.phases);
+        // The per-channel rest summary, after the CSM step (its key pulse is
+        // the one thing that can key a channel without a write) and before
+        // anything this sample moves: an at-rest channel's updates are no-ops
+        // and its operator sum is zero whatever its phase, so the update and
+        // the step below can both skip it. The zero-sum test in front of the
+        // envelope scan is the cheap half: an at-rest channel's mix is 0, and
+        // a sounding channel fails it in one load.
+        let rest = std::array::from_fn(|channel| {
+            self.channels[channel].output() == 0 && self.envelopes.channel_at_rest(channel)
+        });
+        self.envelopes.tick_resting(&self.phases, &rest);
 
-        for channel in 0..CHANNELS {
+        for (channel, &at_rest) in rest.iter().enumerate() {
+            if at_rest {
+                continue;
+            }
             let phase = std::array::from_fn(|slot| self.phases.phase(channel, slot));
             let att = std::array::from_fn(|slot| self.attenuation(channel, slot));
             self.channels[channel].step(phase, att);
