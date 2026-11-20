@@ -109,15 +109,17 @@ pub enum Op {
     /// side of the split, which #477 audits.
     Undefined,
     /// An opcode in the `1010` group (M68000UM Format I, "Line 1010 emulator
-    /// instruction"). The 68000 has no line emulator, so it takes
-    /// [`crate::exceptions::EXC_ILLEGAL`] like any other reserved opcode; the variant
-    /// is separate from [`Op::Illegal`] because the 68010 routes the two
-    /// differently (its line-A emulator vector is a 68010 feature this crate
-    /// does not implement).
+    /// instruction"). It raises the line-A emulator exception, vector 10 at
+    /// `$028` ([`crate::exceptions::EXC_LINE_A`]; M68000UM Table 6-2 assigns
+    /// the row to the MC68000 — the only 68010-only row in the table is
+    /// Format Error), which is why the variant is separate from
+    /// [`Op::Illegal`]. What the 68010 adds on top is mid-instruction restart
+    /// and the RTE-based emulation mode, which this crate does not implement.
     LineA,
     /// An opcode in the `1111` group (M68000UM Format J, "Line 1111 emulator
-    /// instruction"). [`Op::LineA`] in every respect on the 68000 — illegal
-    /// instruction — and separate for the same 68010 reason.
+    /// instruction"). [`Op::LineA`] in every respect except the vector: the
+    /// line-F emulator exception, vector 11 at `$02C`
+    /// ([`crate::exceptions::EXC_LINE_F`]).
     LineF,
     /// `TRAP #n`, `$4E40 + n` (M68000PM section 8, "TRAP — Trap"): the opcode's
     /// low nibble is the trap number and the whole instruction is one word, so

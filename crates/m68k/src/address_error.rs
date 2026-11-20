@@ -75,12 +75,13 @@
 //! table in [`crate::exceptions`]), so [`EXC_ADDRESS_ERROR`] is 3. Two
 //! consequences worth stating out loud:
 //!
-//! - numerically it *collides* with [`crate::exceptions::EXC_ILLEGAL`], which
-//!   also owns `$00000C`. That is not this module confusing the two exceptions —
-//!   the recording core genuinely sends both to the same slot, and the suite
-//!   installs one handler at `$00001400` in every vector so it cannot tell them
-//!   apart either. Anything that has to distinguish them must not use
-//!   [`M68k::pending_exception`] alone.
+//! - it is *distinct from* [`crate::exceptions::EXC_ILLEGAL`] (vector 4,
+//!   `$000010`): the two used to share the number 3 because the recording core
+//!   sends both to `$00000C`, and #482 un-merged them — illegal instruction is
+//!   vector 4 on the hardware map and in the six carts' own vector tables, so
+//!   the shared slot is now understood as the recording core's routing bug
+//!   rather than a fact about the 68000. [`M68k::pending_exception`] can tell
+//!   them apart again.
 //! - the hardware slot is a one-line change once a test ROM settles it, which is
 //!   the same open question [`crate::exceptions`] records for the divide, CHK
 //!   and TRAPV slots, and is related to issue #185 (the harness predicate
@@ -108,8 +109,8 @@ use serde::{Deserialize, Serialize};
 /// Address error, the group 0 exception.
 ///
 /// `$00000C` under the suite's numbering — see the module docs for why this is
-/// 3 (and therefore numerically the same as
-/// [`crate::exceptions::EXC_ILLEGAL`]) when hardware says vector 2 / `$000008`.
+/// 3 when hardware's map says vector 2 / `$000008`, and for how it stopped
+/// sharing the number with [`crate::exceptions::EXC_ILLEGAL`] (#482).
 pub const EXC_ADDRESS_ERROR: u8 = 3;
 
 /// Size of the group 0 frame in bytes: status word, fault address long, IRD,

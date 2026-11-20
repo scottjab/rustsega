@@ -23,15 +23,20 @@
 //! # The exception path
 //!
 //! `Op::Illegal` covers the reserved opcodes, `Op::Undefined` the encodings no
-//! instruction occupies, and `Op::LineA` / `Op::LineF` cover the `1010` and
-//! `1111` groups — see [`crate::decode`]. All four run [`M68k::op_illegal`],
-//! which enters the illegal-instruction exception. That is
-//! the 68000's behaviour: the MC68000 has no line emulator, so Formats I and J
-//! in M68000UM are reserved encodings there and a reserved opcode raises the
-//! illegal-instruction exception (M68000PM section 8, "ILLEGAL INSTRUCTION").
-//! The separate line-A and line-F emulator vectors are a 68010 feature this
-//! crate does not implement — which is why `Op::LineA` and `Op::LineF` are
-//! distinct variants rather than aliases of `Op::Illegal`.
+//! instruction occupies, and `Op::LineA` / `Op::LineF` the `1010` and `1111`
+//! groups — see [`crate::decode`]. All four run [`M68k::op_illegal`], which
+//! enters the exception sequence, each route with its own vector: illegal
+//! instruction 4 (`$010`) for the first two, line-A emulator 10 (`$028`) and
+//! line-F emulator 11 (`$02C`) for the last two (M68000UM Table 6-2,
+//! "Exception Vector Assignment" — plain rows on the MC68000; the family
+//! manual assigns the separate line vectors "to permit efficient emulation",
+//! section 6.3.6). The six #436 carts that execute line opcodes on purpose
+//! settle the practical side: they put real handlers in `$28`/`$2C`, so a
+//! single vector parked each of them on its own halt stub (#482). What this
+//! crate still does not implement is the 68010's addition: mid-instruction
+//! restart and the RTE-based emulation mode. `Op::LineA` and `Op::LineF` stay
+//! distinct variants rather than aliases of `Op::Illegal` so the vectors have
+//! something to route on.
 //!
 //! `Op::Trap` is the other opcode that is nothing but an exception: `4E40 + n`,
 //! one word, vector `32 + n` (M68000PM section 8, "TRAP").
@@ -56,7 +61,7 @@ mod status;
 use crate::M68k;
 use crate::bus::Bus;
 use crate::decode::Op;
-use crate::exceptions::{EXC_ILLEGAL, trap_vector};
+use crate::exceptions::{EXC_ILLEGAL, EXC_LINE_A, EXC_LINE_F, trap_vector};
 
 /// Width of a mode or register field, the mask [`field`] applies.
 const FIELD_MASK: u16 = 0b111;
@@ -89,7 +94,9 @@ impl M68k {
             // not define has the same hardware answer as the documented
             // `ILLEGAL` opcode; it is `Op::Unimplemented` below that must stay a
             // panic, and the two must never be merged (#355).
-            Op::Illegal | Op::Undefined | Op::LineA | Op::LineF => self.op_illegal(bus),
+            Op::Illegal | Op::Undefined => self.op_illegal(bus),
+            Op::LineA => self.op_line_emulator(bus, EXC_LINE_A),
+            Op::LineF => self.op_line_emulator(bus, EXC_LINE_F),
             Op::Trap => self.op_trap(bus, opcode),
             // The move class (`0001`/`0010`/`0011` and `0111`). Each handler
             // re-reads the size, destination and source fields from the opcode,
@@ -228,35 +235,56 @@ impl M68k {
         }
     }
 
-    /// The illegal-instruction exception, [`EXC_ILLEGAL`] — and the route for
-    /// the `1010` and `1111` groups as well.
+    /// The illegal-instruction exception ([`EXC_ILLEGAL`], vector 4,
+    /// `$010`): the entry sequence for an opcode that is not an instruction —
+    /// the reserved encodings the instruction handlers detect (illegal
+    /// effective address, illegal size), and the `Op::Illegal`/
+    /// `Op::Undefined` decode verdicts. Same frame and clock as
+    /// [`M68k::op_line_emulator`], which holds the full story of the route.
+    pub(crate) fn op_illegal(&mut self, bus: &mut impl Bus) -> u32 {
+        self.op_line_emulator(bus, EXC_ILLEGAL)
+    }
+
+    /// The line-emulator exceptions, [`EXC_LINE_A`] (vector 10, `$028`) and
+    /// [`EXC_LINE_F`] (vector 11, `$02C`) — and, through [`M68k::op_illegal`],
+    /// the illegal-instruction exception ([`EXC_ILLEGAL`], vector 4,
+    /// `$010`): one entry sequence, three vectors.
     ///
-    /// The 68000 has no line-emulator mechanism at all. M68000UM's instruction
-    /// formats list Format I ("Line 1010 emulator instruction") and Format J
-    /// ("Line 1111 emulator instruction"), but the MC68000 does not implement
-    /// either, so those encodings are simply reserved and a reserved opcode
-    /// raises the illegal-instruction exception — one vector, three routes. The
-    /// separate line-A and line-F emulator vectors are a 68010 addition this
-    /// crate does not implement; `Op::LineA` and
-    /// `Op::LineF` stay distinct in the decode table so the distinction is there
-    /// to route on if they ever land. There is deliberately no line-A/line-F vector constant in
-    /// this crate: see [`crate::exceptions`].
+    /// The 68000 assigns each of the three routes its own vector (M68000UM
+    /// Table 6-2, "Exception Vector Assignment": plain rows, none of them
+    /// 68010-only), and section 6.3.6 says the separate line vectors exist
+    /// "to permit efficient emulation". Genesis carts are written against
+    /// that map: the six #436 black carts put real handlers in `$28`/`$2C`
+    /// and halt stubs in `$10`/`$0C`, so a single vector for all three
+    /// routes parked a perfectly healthy cart on its own "cannot happen"
+    /// stub (#482). The entry sequence is identical for the three
+    /// (M68000UM 6.3.6: "exception processing for illegal instructions is
+    /// similar to that for traps"), which is why they share this function.
+    /// What the crate still does not implement is the 68010's addition on
+    /// top: mid-instruction restart and the RTE-based emulation mode.
     ///
-    /// The frame carries `self.pc`, the address of the opcode that could not be
-    /// executed, so a handler can decode it (M68000PM "ILLEGAL INSTRUCTION").
-    /// The queue is not popped: the exception discards it and refills from the
-    /// handler.
+    /// The frame carries `self.pc`, the address of the opcode that could not
+    /// be executed, so a handler can decode it. That is the hardware
+    /// convention even though the M68000UM's general rule says the stacked PC
+    /// "usually" points at the next unexecuted instruction: the family manual
+    /// states the exception for these routes (the saved value is the address
+    /// of the illegal or unimplemented instruction, MC68030UM section 8) and
+    /// puts the adjustment on the handler — exactly what the carts do, e.g.
+    /// Mamono Hunter Youko's `$28` handler reads the opcode through
+    /// `MOVEA.L $A(A7),A0` and then `ADDQ.L #$2,$A(A7)` to step over the
+    /// one-word opcode before `RTE`. The queue is not popped: the exception
+    /// discards it and refills from the handler.
     ///
     /// Charges the exception entry's 34 clocks through
     /// [`M68k::exception`](crate::M68k::exception) and returns 0, like every
     /// other handler here (see the module docs and the M1-31 note in
     /// [`M68k::step`]).
-    pub(crate) fn op_illegal(&mut self, bus: &mut impl Bus) -> u32 {
+    pub(crate) fn op_line_emulator(&mut self, bus: &mut impl Bus, pushed_vector: u8) -> u32 {
         let faulting_pc = self.pc;
         // An instruction that never executed leaves nothing to trace, so this
         // route also calls [`M68k::suppress_trace`] (M68000UM section 6.3.8).
         self.suppress_trace();
-        self.exception(bus, EXC_ILLEGAL, faulting_pc);
+        self.exception(bus, pushed_vector, faulting_pc);
         0
     }
 

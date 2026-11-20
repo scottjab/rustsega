@@ -44,8 +44,8 @@ pub use decode::{Op, decode};
 pub use disasm::disassemble;
 pub use ea::{Ea, Size};
 pub use exceptions::{
-    EXC_CHK, EXC_DIV_ZERO, EXC_ILLEGAL, EXC_PRIVILEGE, EXC_TRACE, EXC_TRAPV, TRAP_VECTOR_BASE,
-    trap_vector,
+    EXC_CHK, EXC_DIV_ZERO, EXC_ILLEGAL, EXC_LINE_A, EXC_LINE_F, EXC_PRIVILEGE, EXC_TRACE,
+    EXC_TRAPV, TRAP_VECTOR_BASE, trap_vector,
 };
 pub use sr::{CCR_MASK, SR_C, SR_INT_MASK, SR_MASK, SR_N, SR_RESET, SR_S, SR_T, SR_V, SR_X, SR_Z};
 pub use trail::{TRAIL_LEN, Trail};
