@@ -34,15 +34,30 @@
 //!
 //! ## Reading what is not there
 //!
-//! Reads from an area nothing drives return `OPEN_BUS` (0xFF) and writes there
-//! are dropped. That is a placeholder, not a model: on a real console the data
-//! bus
-//! floats, so the value read is whatever the previous transfer left on the
-//! lines, and some decoded-but-unpopulated corners stall the bus instead -
-//! plutiedev "Memory map" documents 0xC00020-0xC0003F, inside the VDP area, as
-//! "hangs up". Modelling open bus is
-//! [#508](https://github.com/scottjab/rustsega/issues/508), split out of the #77
-//! note when #308 took the timing half of it.
+//! An undriven read on the 68k side answers [`Bus::prefetched_word`]: the last
+//! word the 68000 drove onto the bus, which in the case hardware has been
+//! observed is the prefetch queue's residue. Kabuto's hardware notes (v1.5) are
+//! the observation - of the VDP's debug ports, "Reading `$C00018`/`$C0001C` the
+//! usual way (move.w addr/(reg), dX) returns the following opcode as the 68k
+//! prefetches it before doing the actual read access in this case", with "a
+//! value of `$FFFF` ... (due to bus pull-up)" behind it - and both references
+//! implement it as the whole of their open-bus answer: Genesis Plus GX's
+//! `m68k_read_bus_16` answers the word at `m68k.pc`, BlastEm's
+//! `get_open_bus_value` answers its queue word, byte reads taking the lane the
+//! address sits on ([`open_bus_lane`]). The CPU publishes the word on every
+//! queue refill ([`m68k::Bus::note_prefetched_word`], #479), the pull-up shows
+//! as `$FFFF` until the first fetch, and nothing else is modelled: no decay (no
+//! source gives a value the float settles to after N cycles, and #508's honest
+//! limit says the ticket that invents one is worse than the placeholder), and
+//! no write residue (a data write leaving different lines than the queue is
+//! Kabuto's "data left on the bus" too, and no source pins what it holds in
+//! cart space; #194 is the case that wants it).
+//!
+//! Some decoded-but-unpopulated corners stall the bus instead: plutiedev
+//! "Memory map" documents `$C00020`-`$C0003F`, inside the VDP area, as "hangs
+//! up", and a hang is a machine state, not a return value - [`Bus::vdp_hang`]
+//! sets the same freeze the TMSS lock-up does ([`Bus::locked_up`]), cleared by
+//! nothing but [`m68k::Bus::reset_devices`].
 //!
 //! ## The cartridge slot, in order
 //!
@@ -70,17 +85,27 @@ use crate::z80_bus::{self, Z80Side};
 use m68k::ADDR_MASK;
 use vdp::Vdp;
 
-/// What an undriven data bus reads as: the placeholder for every area that
-/// nothing drives yet. See the module docs, and
-/// [#508](https://github.com/scottjab/rustsega/issues/508) for the real thing.
+/// What the Z80 side's undriven areas read, and what the 68k side reads before
+/// anything drives the bus or a register answers with an unspecified value: the
+/// pull-up state of a 16 bit data bus with pull-ups, the ones a bus settles to
+/// when nothing has driven it (Kabuto, "SEGA Mega Drive / Genesis hardware
+/// notes" v1.5: "a value of `$FFFF` is read (due to bus pull-up)").
 ///
-/// Crate-visible because the Z80's own unused areas float to the same value
-/// ([`crate::z80_bus`]) and the two sides should not disagree about a placeholder.
+/// On the 68k side this is the *reset state* of the float, not its answer: an
+/// undriven read there answers [`Bus::prefetched_word`], the last word the CPU
+/// drove onto the bus ([`Bus::open_bus_word`], #508), and this is what that
+/// latch holds until the first queue refill publishes one. The Z80's own areas
+/// keep the fixed value because no source describes the Z80 side's float and
+/// the two references that answer it give `0xFF` (Genesis Plus GX's
+/// `z80_unused_r`; MAME leaves the area unmapped), and because those lines are
+/// the Z80's own bus, not the 68k's the pull-up sentence is about.
 pub(crate) const OPEN_BUS: u8 = 0xFF;
-/// A word read entirely from an area that nothing drives.
+/// [`OPEN_BUS`] as a word: the pull-up state, before anything drives the bus.
 ///
-/// Crate-visible for the same reason as [`OPEN_BUS`]: the SVP's register page
-/// answers its undecoded lanes with it.
+/// The 68k side answers undriven reads from [`Bus::prefetched_word`], which is
+/// initialised to this; the constant remains for the Z80 side's word-width
+/// answers and for `0xFFFF` register values that are a decision rather than a
+/// bus state.
 pub(crate) const OPEN_BUS_WORD: u16 = 0xFFFF;
 
 // ---- Bus timing (M3-16, #77) ------------------------------------------------
@@ -367,8 +392,10 @@ enum Region {
     /// at 0xA12000-0xA120FF and the 0xA15000-0xBFFFFF gap, minus the SVP's own
     /// register page inside it.
     ///
-    /// TODO(M3-16 #77): open bus, including the corners of the map that stall
-    /// the 68k instead of returning a value.
+    /// Reads answer the float ([`Bus::open_bus_word`], #508, which took this
+    /// region off #77's list); the corners of the map that stall the 68k
+    /// instead of returning a value - the VDP area's `$C00020`-`$C0003F` -
+    /// hang through their own region's dispatch ([`Bus::vdp_hang`]).
     Unmapped,
 }
 
@@ -437,10 +464,10 @@ enum VdpPort {
 /// lane - A5 has to be low for the chip to answer at all, and nothing above A5
 /// reaches the decode, which is what "mirrors every $40" is.
 ///
-/// Modelling the hang itself - no DTACK, so the 68k stops - is
-/// [#508](https://github.com/scottjab/rustsega/issues/508); until
-/// then an address with this bit set answers what the rest of the undecoded area
-/// answers.
+/// The hang itself - no DTACK, so the 68k stops - is modelled by
+/// [`Bus::vdp_hang`], called from the [`m68k::Bus`] dispatch in front of the
+/// region's own functions (#508); an address with this bit set never reaches a
+/// port function.
 const VDP_HANG_BIT: u32 = 1 << 5;
 
 /// The port that `addr` names inside [`Region::Vdp`], or `None` for the corner of
@@ -510,6 +537,11 @@ struct VdpDmaSource<'a> {
     ram: &'a [u8; 0x10000],
     mapper: &'a Mapper,
     svp: Option<&'a Svp>,
+    /// The open-bus float at the moment the transfer started: the queue word
+    /// the 68k last published. The 68k is frozen for the length of a 68k to VDP
+    /// transfer, so the value does not move while it runs, and an undriven
+    /// source word answers it ([`open_bus_lane`]).
+    prefetched_word: u16,
 }
 
 impl vdp::DmaBus for VdpDmaSource<'_> {
@@ -555,12 +587,24 @@ impl vdp::DmaBus for VdpDmaSource<'_> {
                 let index = Bus::ram_index(addr);
                 (Some(self.ram[index]), Some(self.ram[index + 1]))
             }
-            _ => return OPEN_BUS_WORD,
+            _ => return self.open_bus_word(),
         };
         // Two bytes rather than a slice, so that a word straddling the end of the
         // image still returns the byte that is there - the same reason
-        // [`Bus::read_rom_word`] looks its halves up separately.
-        u16::from_be_bytes([high.unwrap_or(OPEN_BUS), low.unwrap_or(OPEN_BUS)])
+        // [`Bus::read_rom_word`] looks its halves up separately. The half that is
+        // not there is the float, lane by parity.
+        u16::from_be_bytes([
+            high.unwrap_or_else(|| open_bus_lane(self.prefetched_word, addr)),
+            low.unwrap_or_else(|| open_bus_lane(self.prefetched_word, addr + 1)),
+        ])
+    }
+}
+
+impl VdpDmaSource<'_> {
+    /// The word an undriven area answers a DMA source read with: the float the
+    /// transfer started with.
+    fn open_bus_word(&self) -> u16 {
+        self.prefetched_word
     }
 }
 
@@ -1049,6 +1093,78 @@ impl Bus {
         true
     }
 
+    /// Does this access to [`Region::Vdp`] land in the corner of the area that
+    /// decodes to nothing: `$C00020`-`$C0003F` and its every-0x40 mirrors, the
+    /// addresses with [`VDP_HANG_BIT`] set?
+    ///
+    /// plutiedev "Memory map", on the VDP area, verbatim: "Accessing address
+    /// range `$C00020` to `$C0003F` hangs up". A hang is no DTACK, and no DTACK
+    /// is a stopped 68000, so asking is also what records the freeze - the same
+    /// flag the TMSS gate sets ([`Bus::locked_up`]), cleared by nothing but
+    /// [`m68k::Bus::reset_devices`]. Genesis Plus GX answers the same corner with
+    /// its `m68k_lockup_w_8`/`m68k_lockup_r_8` handlers, which halt the CPU
+    /// (its `mem68k.c`, "Illegal areas (cause system to lock-up since !DTACK is
+    /// not returned)"); the lockup reads there return the prefetched word, which
+    /// is the float this bus answers undriven reads with ([`Bus::open_bus_word`],
+    /// #508).
+    ///
+    /// It is called from the `Region::Vdp` arms of the [`m68k::Bus`] dispatch, in
+    /// front of `read_vdp_*`/`write_vdp_*`, for the same reason the TMSS gate is
+    /// (see [`Bus::vdp_access_denied`]): a check written inside those four
+    /// functions is a check that gets rewritten away when the stubs fill in.
+    /// Every path into [`Region::Vdp`] goes through the dispatch - the 68k's own
+    /// accesses, the Z80's `$7F00`-`$7FFF` port window (masked to the 0x20-byte
+    /// port block by [`z80_bus::vdp_port_addr`], so it cannot reach the corner)
+    /// and the Z80's bank window, whose 9 bit register can point it anywhere in
+    /// the 68k space including here - so one guard covers every master. The Z80
+    /// itself is not separately held: on
+    /// hardware its access would stall mid-cycle with the rest of the bus, and
+    /// this model freezes the 68k and lets the sound CPU run on, which no test
+    /// ROM reaches and which #508 records as a known simplification.
+    fn vdp_hang(&mut self, addr: u32) -> bool {
+        let hangs = addr & VDP_HANG_BIT != 0;
+        self.locked_up |= hangs;
+        hangs
+    }
+
+    /// The byte an undriven read answers: one lane of [`Bus::open_bus_word`],
+    /// the lane the read's address sits on - A0 of the access selects the byte
+    /// lane of the 16 bit bus (genvdp.txt section 7 "8-bit port access"; BlastEm
+    /// answers its unmapped byte reads the same way, `value = location & 1 ?
+    /// word : word >> 8`, `genesis.c` `io_read_b`'s fall-through).
+    fn open_bus_byte(&self, addr: u32) -> u8 {
+        open_bus_lane(self.prefetched_word, addr)
+    }
+
+    /// The word an undriven read answers: the 68000's prefetched instruction
+    /// word.
+    ///
+    /// That is the model both surviving references implement for every read
+    /// nothing drives - Genesis Plus GX's `m68k_read_bus_16` answers the word at
+    /// `m68k.pc`, BlastEm's `get_open_bus_value` answers `m68k->prefetch` (its
+    /// new core) or the word at `last_prefetch_address` (its old one), and the
+    /// place hardware has been observed doing it is Kabuto's VDP-port note
+    /// (v1.5): reading `$C00018`/`$C0001C` "returns the following opcode as the
+    /// 68k prefetches it before doing the actual read access". The last bus
+    /// cycle before a typical undriven read is the fetch of the next opcode, so
+    /// the lines the read samples hold that word - which is "data left on the
+    /// bus" in Kabuto's phrasing, and what the 68k last drove onto the bus in
+    /// this crate's. `prefetched_word` is that value: the CPU publishes it on
+    /// every queue refill ([`m68k::Bus::note_prefetched_word`], #479).
+    ///
+    /// `$FFFF` before the first fetch is the pull-up state: the data lines have
+    /// pull-ups (Kabuto: "a value of `$FFFF` is read (due to bus pull-up)"), so
+    /// a bus nothing has driven reads as ones. That is also all the pull-up is
+    /// here - Kabuto's "every now and then" `$FFFF` readings, the pull-up
+    /// showing through after bus delays, are folded into the one state this
+    /// model gives a bus that nothing recent has driven, and there is no decay:
+    /// no source gives a value the float settles to after N cycles, and the
+    /// ticket that invents one is worse than the placeholder it replaces
+    /// (#508, "Sources, and the honest limit").
+    fn open_bus_word(&self) -> u16 {
+        self.prefetched_word
+    }
+
     /// Feed one byte of the security string to the detector at [`TMSS_SECURITY`].
     ///
     /// Bytes arrive in the order the 68k writes them, which is the order that matters
@@ -1340,8 +1456,11 @@ impl Bus {
     ///    which is why [`crate::cart::mapper::Mapper::map`] never sees the image at
     ///    all.
     fn read_rom_byte(&mut self, addr: u32) -> u8 {
-        if let Some(value) = self.sram.as_ref().and_then(|save| save.read(addr)) {
-            return value;
+        if let Some(answer) = self.sram.as_ref().and_then(|save| save.read(addr)) {
+            // `Some(None)` is the dead half of a half-width window: the save
+            // owns the address, the image must not answer, and nothing drives
+            // the byte - the float's lane, then (#508).
+            return answer.unwrap_or_else(|| self.open_bus_byte(addr));
         }
         // The J-CART register, for the carts that carry it: the whole quadrant
         // answers the register and not the image (GPGX installs its handler
@@ -1368,7 +1487,11 @@ impl Bus {
         // mapper is consulted on the way to a byte: the overlay above has already
         // had its say and keeps its priority.
         let offset = self.mapper.map(addr).unwrap_or((addr - ROM_START) as usize);
-        let byte = self.rom.get(offset).copied().unwrap_or(OPEN_BUS);
+        let byte = self
+            .rom
+            .get(offset)
+            .copied()
+            .unwrap_or_else(|| self.open_bus_byte(addr));
         // Step 0 of the order above, and the last thing done to the byte: the one
         // bit of it that is the cart's data line, replaced with what the chip is
         // holding it at.
@@ -1589,14 +1712,17 @@ impl Bus {
     /// counter"). A VDP that has been reset has not been told where its beam is,
     /// so the counter reads 0 until M4-06 (#84) starts walking the position.
     ///
-    /// The rest of the area answers [`OPEN_BUS_WORD`], the value the rest of the
-    /// undecoded map answers, because nothing can produce anything else: the PSG
-    /// and the debug pair have no read, which is the next paragraph.
+    /// The rest of the area answers the float, because nothing can produce
+    /// anything else: the PSG and the debug pair have no read, which is the
+    /// next paragraph.
     ///
     /// The PSG and the debug pair have no read in any case: plutiedev "Memory map"
     /// gives the PSG as write-only and the debug ports no function, and Genesis
     /// Plus GX's `vdp_read_word` answers `$18` and `$1C` with `m68k_read_bus_16`,
-    /// which is its open bus.
+    /// which is its open bus - the answer Kabuto's hardware notes v1.5 observed
+    /// on exactly these reads: `$C00018`/`$C0001C` "returns the following opcode
+    /// as the 68k prefetches it before doing the actual read access". That is
+    /// [`Bus::open_bus_word`] here (#508).
     fn read_vdp_word(&mut self, addr: u32) -> u16 {
         match vdp_port(addr) {
             Some(VdpPort::Data) => self.vdp.read_data(),
@@ -1607,11 +1733,11 @@ impl Bus {
             // The beam position, as the `VC7-VC0` / `HC8-HC1` word of genvdp.txt
             // section 5 (`Vdp::hv_counter`, M4-05 #83).
             Some(VdpPort::HvCounter) => self.vdp.hv_counter(),
-            Some(VdpPort::Psg) | Some(VdpPort::Debug) => OPEN_BUS_WORD,
-            // The corner of the area that decodes to nothing: see
-            // [`VDP_HANG_BIT`] for what it does on real hardware, and #508
-            // for when that gets modelled.
-            None => OPEN_BUS_WORD,
+            Some(VdpPort::Psg) | Some(VdpPort::Debug) => self.open_bus_word(),
+            // The corner of the area that decodes to nothing never reaches
+            // here: the [`m68k::Bus`] dispatch hangs the bus in front of these
+            // functions ([`Bus::vdp_hang`]). The arm stays for exhaustiveness.
+            None => self.open_bus_word(),
         }
     }
 
@@ -1732,6 +1858,7 @@ impl Bus {
             ram,
             mapper,
             svp,
+            prefetched_word,
             pending_68k_hold,
             ..
         } = self;
@@ -1740,6 +1867,7 @@ impl Bus {
             ram,
             mapper,
             svp: svp.as_ref(),
+            prefetched_word: *prefetched_word,
         };
         vdp.write_control(value);
         vdp.run_dma(&mut source);
@@ -1779,7 +1907,11 @@ impl Bus {
     fn read_z80_byte(&mut self, addr: u32) -> u8 {
         self.stall_68k(Z80_AREA_WAIT_MCLK);
         if !self.z80_bus_granted() {
-            return OPEN_BUS;
+            // Not the 68k's bus to read, and no device on it is asked on the
+            // 68k's behalf: the same answer Genesis Plus GX gives an access to
+            // an area the running Z80 owns (`z80_read_byte` answers its
+            // bus-held states with `m68k_read_bus_8`), which is the float.
+            return self.open_bus_byte(addr);
         }
         match SoundSide::decode(addr) {
             SoundSide::Ram => self.z80.ram[z80_bus::ram_index(addr as u16)],
@@ -1789,9 +1921,10 @@ impl Bus {
             SoundSide::Ym => self.audio.ym_read_status(),
             // The bank register has no read handler in any reference, and the PSG is
             // write-only. The PSG arm above is the TMSS gate: same port, same answer
-            // as 0xC00011 - see [`Bus::vdp_access_denied`].
-            SoundSide::Psg if self.vdp_access_denied() => OPEN_BUS,
-            SoundSide::Bank | SoundSide::Psg | SoundSide::Nothing => OPEN_BUS,
+            // as 0xC00011 - see [`Bus::vdp_access_denied`]. What nothing drives here
+            // answers the float, like every undriven read on this bus.
+            SoundSide::Psg if self.vdp_access_denied() => self.open_bus_byte(addr),
+            SoundSide::Bank | SoundSide::Psg | SoundSide::Nothing => self.open_bus_byte(addr),
         }
     }
 
@@ -1856,7 +1989,9 @@ impl Bus {
         if is_version_register(addr) {
             self.version
         } else {
-            self.io.read(addr).unwrap_or(OPEN_BUS)
+            self.io
+                .read(addr)
+                .unwrap_or_else(|| self.open_bus_byte(addr))
         }
     }
 
@@ -1871,7 +2006,10 @@ impl Bus {
     ///
     /// BlastEm models it that way for the whole area: `io_read_w` in `genesis.c`
     /// reads the register once for a word access and mirrors it,
-    /// `value = value | (value << 8)`.
+    /// `value = value | (value << 8)`. Where BlastEm has no register at all its
+    /// handler falls through to `get_open_bus_value()` - the float word whole,
+    /// which is what this function answers a gap with ([`Bus::open_bus_word`],
+    /// #508).
     ///
     /// The alternative is MAME: `src/mame/sega/megadriv.cpp` maps 0xA10000-0xA10001
     /// to a 16 bit handler returning the byte zero extended, so a word read there
@@ -1887,7 +2025,16 @@ impl Bus {
     /// An odd `addr` is an address error the 68k never completes, so nothing here
     /// needs to care which half of the pair was asked for.
     fn read_io_word(&mut self, addr: u32) -> u16 {
-        io_word(self.read_io_byte(addr))
+        if is_version_register(addr) {
+            return io_word(self.version);
+        }
+        match self.io.read(addr) {
+            Some(byte) => io_word(byte),
+            // A gap in the register block is an undriven word read, which is
+            // the float word whole (BlastEm's `io_read_w` falls through to
+            // `get_open_bus_value()` where it has no register, #508).
+            None => self.open_bus_word(),
+        }
     }
 
     /// I/O byte write: the port and serial registers of [`Bus::io`]. The version
@@ -1917,12 +2064,13 @@ impl Bus {
     /// is "running" even though the request is on the line: MAME's
     /// `megadriv_68k_check_z80_bus` and Genesis Plus GX both report the Z80 running
     /// while reset is held, and `!` of the grant gives exactly that (#260). The
-    /// reset register has no read handler in any of the three references, so it
-    /// reads [`OPEN_BUS`].
+    /// reset register has no read handler in any of the three references, so its
+    /// read is float like every undriven read, and so are the seven bits of the
+    /// bus request byte its flag does not drive.
     fn read_z80_ctrl_byte(&mut self, addr: u32) -> u8 {
         match Z80Ctrl::decode(addr) {
-            Some(Z80Ctrl::Busreq) => busreq_byte(!self.z80_bus_granted()),
-            Some(Z80Ctrl::Reset) | None => OPEN_BUS,
+            Some(Z80Ctrl::Busreq) => busreq_byte(!self.z80_bus_granted(), self.open_bus_byte(addr)),
+            Some(Z80Ctrl::Reset) | None => self.open_bus_byte(addr),
         }
     }
 
@@ -1938,7 +2086,7 @@ impl Bus {
     fn read_z80_ctrl_word(&mut self, addr: u32) -> u16 {
         match Z80Ctrl::decode(addr) {
             Some(Z80Ctrl::Busreq) => busreq_word(!self.z80_bus_granted(), self.prefetched_word),
-            Some(Z80Ctrl::Reset) | None => OPEN_BUS_WORD,
+            Some(Z80Ctrl::Reset) | None => self.open_bus_word(),
         }
     }
 
@@ -1983,7 +2131,7 @@ impl Bus {
             self.mapper.set_radica_bank(addr);
             return 0x00;
         }
-        OPEN_BUS
+        self.open_bus_byte(addr)
     }
 
     /// Cartridge slot extra word read: the same latch on the same lane, and
@@ -1995,7 +2143,7 @@ impl Bus {
             self.mapper.set_radica_bank(addr);
             return 0x0000;
         }
-        OPEN_BUS_WORD
+        self.open_bus_word()
     }
 
     /// Is the cart of [`Self::mapper`] a Radica board, whose `$A13000` block is
@@ -2052,8 +2200,10 @@ impl Bus {
     /// `tmss[4]` image) and reading [`TMSS_ROM_SELECT`] back returns its bit 0
     /// (Genesis Plus GX's `gen_bankswitch_r`). Neither is asked for by a game - the
     /// security register exists for the 68k to write, and the TMSS boot ROM that
-    /// would read the select bit does not ship - so they are open bus, like the rest
-    /// of what nothing drives.
+    /// would read the select bit does not ship. The fixed `0xFF` placeholder stays
+    /// here rather than the float on purpose: this is a register the I/O controller
+    /// answers, not an undriven bus, so #508's model does not reach it - its
+    /// read-back is register work, and it stays on #77's list.
     fn read_tmss_byte(&mut self, _addr: u32) -> u8 {
         OPEN_BUS
     }
@@ -2109,8 +2259,13 @@ impl Bus {
     /// exactly what [`Region::Unmapped`] answered before it was decoded.
     fn read_svp_byte(&mut self, addr: u32) -> u8 {
         match self.svp.as_mut() {
-            Some(svp) => svp.read_register_byte(addr),
-            None => OPEN_BUS,
+            // `None` is the undecoded lanes, which float like every other
+            // undriven read on this bus - the value [`Svp::read_register_byte`]
+            // handed back as a fixed `0xFF` before #508.
+            Some(svp) => svp
+                .read_register_byte(addr)
+                .unwrap_or_else(|| self.open_bus_byte(addr)),
+            None => self.open_bus_byte(addr),
         }
     }
 
@@ -2119,8 +2274,10 @@ impl Bus {
     /// regions of this dispatch follow.
     fn read_svp_word(&mut self, addr: u32) -> u16 {
         match self.svp.as_mut() {
-            Some(svp) => svp.read_register_word(addr),
-            None => OPEN_BUS_WORD,
+            Some(svp) => svp
+                .read_register_word(addr)
+                .unwrap_or_else(|| self.open_bus_word()),
+            None => self.open_bus_word(),
         }
     }
 
@@ -2161,14 +2318,14 @@ impl Bus {
     /// the cart that carries the board, and open bus otherwise.
     ///
     /// The latch is the one readable thing in the block, and it is not a value
-    /// Undecoded byte read. Placeholder for [`Region::Unmapped`].
-    fn read_unmapped_byte(&mut self, _addr: u32) -> u8 {
-        OPEN_BUS
+    /// Undecoded byte read: the float, like every undriven read (#508).
+    fn read_unmapped_byte(&mut self, addr: u32) -> u8 {
+        self.open_bus_byte(addr)
     }
 
-    /// Undecoded word read. Placeholder for [`Region::Unmapped`].
+    /// Undecoded word read: the float, like every undriven read (#508).
     fn read_unmapped_word(&mut self, _addr: u32) -> u16 {
-        OPEN_BUS_WORD
+        self.open_bus_word()
     }
 
     /// Undecoded byte write: nothing but a Realtec cart's paging registers.
@@ -2291,20 +2448,22 @@ fn z80_word(byte: u8) -> u16 {
     u16::from_be_bytes([byte, byte])
 }
 
-/// What a byte read of the bus request register reports: `running` in bit 0 and every
-/// other bit [`OPEN_BUS`].
+/// What a byte read of the bus request register reports: `running` in bit 0 and the
+/// float's lane in the other seven bits.
 ///
 /// The unused bits are documented as returning whatever the previous bus transfer left
 /// there, and the emulators keep them nonzero on purpose: MAME's comment on this
 /// register is that ddragon, beast, superoff and Time Killers poll it expecting a zero
 /// that never comes, and Genesis Plus GX says the same ("Unused bits return prefetched
-/// bus data (Time Killers)"). A fixed 1 is the cheap version of never-zero, and open
-/// bus is 1 anyway.
+/// bus data (Time Killers)"). The float is that answer: the lane of the prefetched
+/// word ([`Bus::open_bus_byte`]), ones from the pull-up before the first fetch, and
+/// never zero while the queue word has any bit set - which is the property those
+/// games actually need.
 ///
 /// The word read keeps the same rule for its own flag bit; see [`busreq_word`] for why
 /// the low byte of that one is not held at a fixed 1 too.
-fn busreq_byte(running: bool) -> u8 {
-    if running { OPEN_BUS } else { OPEN_BUS & !1 }
+fn busreq_byte(running: bool, open_bus: u8) -> u8 {
+    (open_bus & !1) | u8::from(running)
 }
 
 /// What a word read of the bus request register reports: `running` in bit 8 - the bit
@@ -2342,6 +2501,22 @@ fn busreq_word(running: bool, prefetched: u16) -> u16 {
     (prefetched & 0xFEFF) | (u16::from(running) << 8)
 }
 
+/// The lane of `word` that a byte read at `addr` answers with: the even byte of
+/// an access is the high byte of the word and the odd byte the low one, the
+/// whole 68k data bus through this file (genvdp.txt section 7 "8-bit port
+/// access"; [`Bus::read_vdp_byte`] applies the same rule to a VDP port's word).
+///
+/// A free function rather than a [`Bus`] method because one caller of it is
+/// [`VdpDmaSource`], which cannot hold the bus (the borrow the struct docs
+/// explain); it carries [`Bus::prefetched_word`] itself.
+pub(crate) fn open_bus_lane(word: u16, addr: u32) -> u8 {
+    if addr & 1 == 0 {
+        (word >> 8) as u8
+    } else {
+        word as u8
+    }
+}
+
 /// The one word rule of [`Region::Io`]: a register answers a 16 bit access to its
 /// pair by repeating its byte into both halves. See [`Bus::read_io_word`] for the
 /// sources and for the alternative that was not taken.
@@ -2361,7 +2536,8 @@ impl m68k::Bus for Bus {
             // The TMSS gate: asking costs the access on a locked console. It lives in
             // the dispatch rather than in `read_vdp_byte` so that M3-09 (#69) cannot
             // fill the stub in and lose it - see [`Bus::vdp_access_denied`].
-            Region::Vdp if self.vdp_access_denied() => OPEN_BUS,
+            Region::Vdp if self.vdp_access_denied() => self.open_bus_byte(addr),
+            Region::Vdp if self.vdp_hang(addr) => self.open_bus_byte(addr),
             Region::Vdp => self.read_vdp_byte(addr),
             Region::Z80 => self.read_z80_byte(addr),
             Region::Io => self.read_io_byte(addr),
@@ -2379,7 +2555,8 @@ impl m68k::Bus for Bus {
             Region::Rom => self.read_rom_word(addr),
             Region::Ram => self.read_ram_word(addr),
             // TMSS, and see the note on [`Bus::read_byte`].
-            Region::Vdp if self.vdp_access_denied() => OPEN_BUS_WORD,
+            Region::Vdp if self.vdp_access_denied() => self.open_bus_word(),
+            Region::Vdp if self.vdp_hang(addr) => self.open_bus_word(),
             Region::Vdp => self.read_vdp_word(addr),
             Region::Z80 => self.read_z80_word(addr),
             Region::Io => self.read_io_word(addr),
@@ -2398,6 +2575,7 @@ impl m68k::Bus for Bus {
             Region::Ram => self.write_ram_byte(addr, value),
             // TMSS, and see the note on [`Bus::read_byte`].
             Region::Vdp if self.vdp_access_denied() => {}
+            Region::Vdp if self.vdp_hang(addr) => {}
             Region::Vdp => self.write_vdp_byte(addr, value),
             Region::Z80 => self.write_z80_byte(addr, value),
             Region::Io => self.write_io_byte(addr, value),
@@ -2416,6 +2594,7 @@ impl m68k::Bus for Bus {
             Region::Ram => self.write_ram_word(addr, value),
             // TMSS, and see the note on [`Bus::read_byte`].
             Region::Vdp if self.vdp_access_denied() => {}
+            Region::Vdp if self.vdp_hang(addr) => {}
             Region::Vdp => self.write_vdp_word(addr, value),
             Region::Z80 => self.write_z80_word(addr, value),
             Region::Io => self.write_io_word(addr, value),
@@ -3370,6 +3549,151 @@ mod tests {
         );
     }
 
+    /// Every undriven read on the 68k side answers the 68000's prefetched
+    /// instruction word, the lane of it the byte read sits on.
+    ///
+    /// The model, and who says it: an undriven data bus holds the last value a
+    /// transfer drove onto the lines, the last cycle before a typical undriven
+    /// read is the fetch of the next opcode, and the one place hardware has been
+    /// observed is Kabuto's VDP-port note ("SEGA Mega Drive / Genesis hardware
+    /// notes" v1.5): reading `$C00018`/`$C0001C` "returns the following opcode
+    /// as the 68k prefetches it before doing the actual read access". Both
+    /// references implement exactly that as their whole open-bus answer:
+    /// Genesis Plus GX's `m68k_read_bus_16` answers the word at `m68k.pc`, and
+    /// BlastEm's `get_open_bus_value` answers the queue word, lane-selected by
+    /// address parity for byte reads (`value = location & 1 ? word : word >> 8`).
+    /// The word itself is what the CPU publishes on every queue refill
+    /// ([`m68k::Bus::note_prefetched_word`], #479), and `$FFFF` before the first
+    /// fetch is the pull-up state (Kabuto: "a value of `$FFFF` is read (due to
+    /// bus pull-up)"). #508 is the ticket; the honest limit on it is that no
+    /// source gives a decay model or the residue a data write leaves, so this is
+    /// the prefetch word and nothing else.
+    #[test]
+    fn undriven_reads_answer_the_prefetched_word() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        bus.note_prefetched_word(0x1234);
+
+        // The undecoded gaps of [`Region::Io`], byte lanes and word.
+        assert_eq!(bus.read_byte(0xA10020), 0x12, "even lane");
+        assert_eq!(bus.read_byte(0xA10021), 0x34, "odd lane");
+        assert_eq!(bus.read_word(0xA10020), 0x1234);
+
+        // Above the end of a cart image.
+        assert_eq!(bus.read_byte(0x08_0000), 0x12);
+        assert_eq!(bus.read_word(0x08_0000), 0x1234);
+
+        // The VDP debug pair, the ports Kabuto's note is about, and the PSG's
+        // read lane in the same block - write-only, so nothing drives a read.
+        assert_eq!(bus.read_word(0xC00018), 0x1234);
+        assert_eq!(bus.read_byte(0xC00018), 0x12);
+        assert_eq!(bus.read_byte(0xC00019), 0x34);
+        assert_eq!(bus.read_word(0xC0001C), 0x1234);
+        assert_eq!(bus.read_word(0xC00010), 0x1234);
+        assert_eq!(bus.read_byte(0xC00011), 0x34);
+
+        // The reset register has no read handler in any reference, so its
+        // unclaimed read is float; the bank register and the sound side's
+        // undriven lanes answer the same way.
+        assert_eq!(bus.read_word(Z80_RESET_REG), 0x1234);
+        assert_eq!(bus.read_byte(Z80_RESET_REG), 0x12);
+        assert_eq!(bus.read_byte(0xA06000), 0x12);
+        assert_eq!(bus.read_word(0xA07F10), 0x1212, "one byte access, twice");
+
+        // The sram control block of [`Region::CartExtra`].
+        assert_eq!(bus.read_byte(SRAM_CONTROL), 0x12);
+        assert_eq!(bus.read_word(SRAM_CONTROL), 0x1234);
+
+        // [`Region::Unmapped`].
+        assert_eq!(bus.read_byte(0xA1307E), 0x12);
+        assert_eq!(bus.read_word(0xA1307E), 0x1234);
+    }
+
+    /// Before the CPU publishes its first fetch the float reads as ones: the
+    /// data lines have pull-ups, and `0xFF`/`0xFFFF` is what a bus nothing has
+    /// driven reads as. This is what the pre-#508 placeholder answered on every
+    /// read forever; now it is the one state of the latch it names.
+    #[test]
+    fn the_float_reads_as_pull_up_ones_before_anything_is_fetched() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        assert_eq!(bus.read_byte(0xA10020), OPEN_BUS);
+        assert_eq!(bus.read_word(0xA10020), OPEN_BUS_WORD);
+        assert_eq!(bus.read_byte(0x08_0000), OPEN_BUS);
+        assert_eq!(bus.read_word(0xC00018), OPEN_BUS_WORD);
+    }
+
+    /// A TMSS-refused VDP read freezes the 68k and answers the float, the way
+    /// Genesis Plus GX's `m68k_lockup_r_8`/`m68k_lockup_r_16` halt the CPU and
+    /// answer the word at `m68k.pc` (its `mem68k.c`, "Illegal areas"). The
+    /// freeze itself is pinned in [`tmss_on_vdp_read_before_unlock_sets_locked_flag`].
+    #[test]
+    fn a_tmss_refused_read_answers_the_float() {
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        bus.note_prefetched_word(0x1234);
+        assert_eq!(bus.read_word(0xC00000), 0x1234, "access dropped");
+        assert!(bus.locked_up(), "and the access still froze the 68k");
+    }
+
+    /// The dead half of a half-width save window: the window owns the address,
+    /// so the image does not answer, and nothing drives the byte - which is the
+    /// float ([`crate::cart::sram::Sram::read`]'s own half of this is the
+    /// `None` it hands back so the bus can answer). The placeholder read as
+    /// `0xFF` here before #508; the pinned half is what the window wires up.
+    #[test]
+    fn the_dead_half_of_a_half_width_save_answers_the_float() {
+        let mut bus = odd_sram_bus();
+        bus.note_prefetched_word(0x1234);
+        bus.write_byte(0x20_0001, 0xAB);
+        assert_eq!(bus.read_byte(0x20_0002), 0x12, "even lane of the float");
+        assert_eq!(bus.read_word(0x20_0000), 0x12AB, "save byte 0 under it");
+    }
+
+    /// The SVP register page's undecoded lanes float like every other undriven
+    /// read, on a cart with the board and without it alike.
+    #[test]
+    fn the_svp_register_page_undecoded_lanes_answer_the_float() {
+        let mut bus = Bus::new(rom_image(0x400_000), TEST_VERSION);
+        bus.note_prefetched_word(0x1234);
+        assert_eq!(bus.read_word(0xA1_5008), 0x1234, "no board: whole page");
+
+        let mut bus = Bus::new(svp_cart_rom(), TEST_VERSION);
+        bus.note_prefetched_word(0x1234);
+        assert_eq!(
+            bus.read_word(0xA1_5008),
+            0x1234,
+            "with the board: undecoded"
+        );
+    }
+
+    /// A DMA sourcing past the end of its image reads the float too: a
+    /// transfer's source cycles are bus cycles like any other (BlastEm's
+    /// `get_open_bus_value` is literally `read_dma_value` of the prefetch
+    /// address, which is the same answer from the other side).
+    #[test]
+    fn a_dma_source_read_answers_the_float() {
+        // An empty image, so the transfer's source at $000000 is already past
+        // the end of it. R19 the word count, R21-R23 the source address in its
+        // 7-9-8 split; the rest is the set-up of
+        // `dma_68k_to_vram_via_control_write`.
+        let mut bus = Bus::new(Vec::new(), NO_TMSS);
+        bus.note_prefetched_word(0x1234);
+        set_reg(&mut bus, 1, 0x10);
+        set_reg(&mut bus, 15, 2);
+        set_reg(&mut bus, 19, 1);
+        set_reg(&mut bus, 20, 0);
+        set_reg(&mut bus, 21, 0);
+        set_reg(&mut bus, 22, 0);
+        set_reg(&mut bus, 23, 0);
+        let (first, second) = dma_cmd(0x0000);
+        bus.write_word(0xC00004, first);
+        bus.write_word(0xC00004, second);
+        bus.vdp.advance(TEST_VDP_LINE);
+        assert_eq!(
+            &bus.vdp.vram[0..2],
+            &[0x12, 0x34],
+            "the source word is the float"
+        );
+    }
+
     /// The byte write does the same thing, from bit 0 of the byte rather than bit 8
     /// of the word, and `0xA11101` is the same register and not a second flag: the
     /// decode drops A0 (BlastEm decodes the `0xA11100` block with `location &
@@ -3834,9 +4158,14 @@ mod tests {
             0xC00004,
             0xC00008,
             0xC00011,
-            0xC00020,
+            // Not 0xC00020: the hang-up corner is not a port and hangs any
+            // console that touches it, TMSS state aside - that is the corner's
+            // own tests' business (`the_hang_covers_the_corner_and_every_mirror_of_it`).
             0xC00040,
-            VDP_END - 1,
+            // The far end of the area, at its last mirror's data-port lane -
+            // the last byte of the region (VDP_END - 1 = $DFFFFF) is inside
+            // that mirror's hang corner since #508's model.
+            VDP_END - 0x3F,
         ] {
             let _ = bus.read_byte(addr);
             let _ = bus.read_word(addr & EVEN_LANE);
@@ -4002,9 +4331,11 @@ mod tests {
             0xC00008, // HV counter
             0xC00011, // PSG port
             0xC00018, // debug address port
-            0xC00020, // the hang-up corner
             0xC00040, // the every-0x40 mirror
-            VDP_END - 1,
+            // The far end of the area, its last mirror's data-port lane: the
+            // last byte of the region is inside that mirror's hang corner
+            // (#508), which the corner's own tests cover.
+            VDP_END - 0x3F,
         ];
 
         for addr in vdp_addresses {
@@ -4024,6 +4355,93 @@ mod tests {
             let _ = bus.read_word(addr & EVEN_LANE);
             assert!(!bus.locked_up, "{addr:#08x} is open once unlocked");
         }
+
+        // The hang-up corner at 0xC00020 is in the pages GPGX's gen_tmss_w locks
+        // with the rest, but it has a gate of its own now (#508): a locked console
+        // freezes at the TMSS arm of the dispatch first, and an unlocked one
+        // freezes at the hang arm - it is not a port and never answers.
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        bus.write_byte(0xC00020, 0x5A);
+        assert!(bus.locked_up, "the corner is inside the lock while locked");
+
+        let mut bus = Bus::new(Vec::new(), WITH_TMSS);
+        write_sega(&mut bus);
+        bus.write_byte(0xC00020, 0x5A);
+        assert!(bus.locked_up, "and hangs the unlocked console too");
+    }
+
+    /// The corner of [`Region::Vdp`] that decodes to nothing does not answer at
+    /// all: plutiedev "Memory map", verbatim, "Accessing address range $C00020 to
+    /// $C0003F hangs up". A hang is a machine state, not a return value - no
+    /// DTACK comes back, so the 68000 stops - and the closest model the crate has
+    /// is the TMSS freeze: [`Bus::locked_up`], cleared by nothing but
+    /// [`m68k::Bus::reset_devices`]. Genesis Plus GX answers the same corner with
+    /// its `m68k_lockup_w_8`/`m68k_lockup_r_8` handlers, which halt the CPU
+    /// (https://github.com/ekeeke/Genesis-Plus-GX/blob/master/core/mem68k.c), and
+    /// its lockup reads return the prefetched word, which is what the float half
+    /// of this ticket answers here too (#508).
+    #[test]
+    fn an_access_to_the_hang_corner_locks_up_the_68k() {
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        assert!(!bus.locked_up(), "setup: nothing has frozen yet");
+
+        bus.write_byte(0xC00020, 0x5A);
+        assert!(bus.locked_up(), "the write hung the bus");
+
+        // No recovery short of a reset - the same rule as the TMSS freeze.
+        bus.write_byte(0xC00004, 0x80);
+        bus.reset_devices();
+        assert!(!bus.locked_up(), "reset_devices is the one clear");
+
+        // A read hangs the same way.
+        let _ = bus.read_byte(0xC00022);
+        assert!(bus.locked_up(), "the read hung the bus too");
+        bus.reset_devices();
+
+        // Word accesses hang; the ports on the other side of A5 do not.
+        bus.write_word(0xC00020, 0x0000);
+        assert!(bus.locked_up(), "the word write hung the bus");
+        bus.reset_devices();
+        let _ = bus.read_word(0xC00020);
+        assert!(bus.locked_up(), "the word read hung the bus");
+        bus.reset_devices();
+        bus.write_word(0xC00004, 0x3FA0);
+        assert!(!bus.locked_up(), "the control port still answers");
+    }
+
+    /// The hang is the decoder, not one address: A5 is the only line that
+    /// separates the ports from the corner, so the whole 0x20-byte span hangs
+    /// and every 0x40 mirror of it hangs with it (plutiedev "Memory map": the
+    /// ports run to $C0001F, the corner is $C00020-$C0003F, and "VDP mirrors
+    /// every $40 up to $DFFFFF" is the same decoder one line later). The Z80's
+    /// bank window is the one route of its own that reaches the corner - its
+    /// `$7F00`-`$7FFF` port window is masked to the 0x20-byte port block and
+    /// cannot - so a bank-window read of the corner hangs the bus through the
+    /// same dispatch.
+    #[test]
+    fn the_hang_covers_the_corner_and_every_mirror_of_it() {
+        let hang_addresses = [
+            0xC00020, 0xC00021, 0xC0002E, 0xC0003F, // the span itself
+            0xC00060, 0xC000A0, 0xDFFFE0, // the every-0x40 mirrors
+        ];
+        for addr in hang_addresses {
+            let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+            bus.write_byte(addr, 0x5A);
+            assert!(bus.locked_up, "{addr:#08x} is inside the hang");
+        }
+
+        // The Z80's bank window is the other route into the VDP area, and it is
+        // not masked down to the port block: the register selects the top 9 bits
+        // of the 68k space ([`z80_bus::Z80Side::window_addr`]), so bank `$180`
+        // puts `$8020`-`$803F` on the corner. The shift protocol that loads the
+        // register has its own tests; the value is poked here.
+        let mut bus = Bus::new(Vec::new(), TEST_VERSION);
+        bus.z80.bank = 0x180;
+        Z80View::new(&mut bus).read(0x8020);
+        assert!(
+            bus.locked_up(),
+            "the Z80's bank-window read of $C00020 hung the bus"
+        );
     }
 
     /// The PSG has a second spelling on the 68k side, the Z80 window's `0xA07F11`

@@ -166,19 +166,19 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 ///
 /// ```text
 ///                     68000 memory test
-///  400000-7FFFFF : FFFF FFFF (4E00 4E00)
-///  /// A00000-A0FFFF : FFFF FFFF (4E00 4E00)
+///  400000-7FFFFF : 4E71 4E71 (4E00 4E00)
+///  A00000-A0FFFF : 4E71 4E4E (4E00 4E00)
 ///  A00000-A03FFF : F3ED F3F3 (F3ED F3F3)
 ///  A04000-A05FFF : 0000 0000 (0000 0000)
-///  A06000-A07EFF : FFFF FFFF (FFFF FFFF)
+///  A06000-A07EFF : 4E71 4E4E (FFFF FFFF)
 ///  A10000-A1001F : A0A0 A0A0 (A0A0 A0A0)
-///  A11100        : FFFF 4F71 (4F00 4F00)
-///  A11100        : FEFE 4E71 (4E00 4E00)
-///  A11200        : FFFF FFFF (4E00 4E00)
+///  A11100        : 4F71 4F71 (4F00 4F00)
+///  A11100        : 4E70 4E71 (4E00 4E00)
+///  A11200        : 4E71 4E71 (4E00 4E00)
 ///  C00000-C00003 : 1122 1122 (1122 1122)
 ///  C00004-C00007 : 3688 3688 (4E88 4E88)
 ///  C00008-C0000F : C01A C024 (C0?? C0??)
-///  C00018-C0001F : FFFF FFFF (4E71 4E71)
+///  C00018-C0001F : 4E71 4E71 (4E71 4E71)
 ///
 ///  RAM, ROM, mirrored VDP addresses, and
 ///  locations that lock up the machine are
@@ -190,7 +190,9 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 /// value written and the value read back. Work RAM ($E00000) is absent, which is
 /// the ROM's way of saying it passed. Every read-back matches what a real
 /// console returns for those regions: $4E71, the byte pair of `NOP`, is the
-/// 68000 bus floating after an instruction fetch.
+/// 68000 bus floating after an instruction fetch - which since #508 is
+/// literally what this bus answers an undriven read with, the prefetched word
+/// the 68000 keeps fetching.
 ///
 /// # The $A11100 rows, and what this golden does and does not prove (#437)
 ///
@@ -249,6 +251,33 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 /// register while the Z80 runs (`4F71`), the second while the bus is granted
 /// (`4E71`). The golden was re-recorded
 /// (`0x4604981db74b07bf` -> `0xa50bf36ba9056dcf`).
+///
+/// # The #508 movement
+///
+/// #508 replaced the fixed placeholder with the float: an undriven read on the
+/// 68k side answers the 68000's prefetched instruction word, lane by parity,
+/// with the pull-up `$FFFF` before the first fetch. The memtest reads exactly
+/// the undriven space, so every read-back that used to print the placeholder
+/// now prints what the bus is holding - `$4E71`, the NOP pair the memtest's own
+/// instruction stream keeps fetching, which is what the block above already
+/// said a real console reads back there. The moved cells: the plain groups of
+/// `400000-7FFFFF`, `A00000-A0FFFF`, `A06000-A07EFF` and `A11200` went
+/// `FFFF FFFF` to `$4E71` pairs (`4E4E` where a probe caught the float's odd
+/// lane), `C00018-C0001F` plain went `FFFF FFFF` to `4E71 4E71`, and the two
+/// `$A11100` rows' non-flag lanes now follow the queue word (`FFFF 4F71` to
+/// `4F71 4F71`, `FEFE 4E71` to `4E70 4E71`). The paren groups - the second
+/// probe of each row - and the whole `C00000`-`C0000F` block are unchanged:
+/// nothing moved except a read nothing drives. The stray `///` the old
+/// transcription carried on its second row was an artifact of that
+/// transcription, not screen content; the screen has never shown it. The
+/// golden was re-recorded
+/// (`0xa50bf36ba9056dcf` -> `0xc6b4837e45f5a48a`), maintainer approved on the
+/// #571 thread, the deliberate-bless ticket.
+///
+/// This key has now moved once per open-bus mechanism, each with cell-level
+/// evidence of which one moved it: #260 (the reset gate folded into the
+/// grant), #479 (the prefetched word published to the bus), #508 (the float
+/// model answering undriven reads with it).
 #[test]
 fn md_test_pack_memtest_68k_prints_its_memory_report() {
     check(

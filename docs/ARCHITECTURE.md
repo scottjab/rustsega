@@ -482,6 +482,21 @@ decode. The format itself, including what a state does not carry (the ROM, the
 frame buffer) and what that means after a load, is
 [`docs/save-state-format.md`](save-state-format.md) (M6-07, #127).
 
+The bus keeps two open-bus models where the sources give them (#508). An
+undriven read on the 68k side answers the 68000's prefetched instruction word -
+the last word it drove onto the bus, published on every queue refill - with
+`$FFFF` from the data-line pull-ups before the first fetch, byte reads taking
+the lane their address sits on; that is the answer both surviving references
+implement (Genesis Plus GX's `m68k_read_bus_16`, BlastEm's
+`get_open_bus_value`) and the one hardware observation on record (Kabuto's
+hardware notes v1.5, on the VDP debug ports). No decay is modelled: no source
+gives one. The `$C00020`-`$C0003F` corner of the VDP area is not a return value
+at all: plutiedev "Memory map" says it "hangs up", so an access there sets the
+same freeze the TMSS lock-up uses, cleared only by `reset_devices`. The Z80's
+own undriven areas stay at the fixed `0xFF`: no source describes the Z80 side's
+float, and where the Z80 crosses onto the 68k's bus (the window, the VDP
+ports) it inherits the 68k's answer through the same dispatch.
+
 ### web
 
 - Leptos (CSR) app built with `trunk build --release` from `crates/web`.

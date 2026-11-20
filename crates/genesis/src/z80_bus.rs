@@ -107,8 +107,16 @@ enum Region {
     Bank,
     /// 0x6100-0x7EFF: nothing, reading [`OPEN_BUS`].
     ///
-    /// TODO(#508): open bus. This area floats like every other undriven read, and
-    /// Genesis Plus GX is content with 0xFF for it.
+    /// This is the Z80's own bus, and it has no float in this crate: no source
+    /// describes what the Z80 side's undriven lines answer, and both references
+    /// that answer at all give `0xFF` (Genesis Plus GX's `z80_unused_r`; MAME
+    /// leaves the area unmapped and its unmapped read is 0). The 68k side's
+    /// float ([`crate::bus::Bus::open_bus_word`], #508) is a model of the 68k's
+    /// bus - its queue word, its pull-ups - and none of that reaches over the
+    /// arbiter to lines the Z80 drives on its own transfers. The two areas the
+    /// Z80 does share with the 68k - this region's `Window`, and `Vdp` - route
+    /// through [`m68k::Bus`], so where the buses are physically one, the
+    /// answer is the 68k side's model.
     Unused,
     /// 0x7F00-0x7FFF: the VDP ports, which the Z80 sees as the 68k does - see
     /// [`vdp_port_addr`]. The PSG is in here at 0x7F11.
