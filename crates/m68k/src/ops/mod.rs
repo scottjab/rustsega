@@ -29,8 +29,8 @@
 //! the 68000's behaviour: the MC68000 has no line emulator, so Formats I and J
 //! in M68000UM are reserved encodings there and a reserved opcode raises the
 //! illegal-instruction exception (M68000PM section 8, "ILLEGAL INSTRUCTION").
-//! The separate line-A and line-F emulator vectors are a 68010 feature, and #20
-//! (M1-12) adds them then — which is why `Op::LineA` and `Op::LineF` are
+//! The separate line-A and line-F emulator vectors are a 68010 feature this
+//! crate does not implement — which is why `Op::LineA` and `Op::LineF` are
 //! distinct variants rather than aliases of `Op::Illegal`.
 //!
 //! `Op::Trap` is the other opcode that is nothing but an exception: `4E40 + n`,
@@ -236,10 +236,10 @@ impl M68k {
     /// ("Line 1111 emulator instruction"), but the MC68000 does not implement
     /// either, so those encodings are simply reserved and a reserved opcode
     /// raises the illegal-instruction exception — one vector, three routes. The
-    /// separate line-A and line-F emulator vectors are a 68010 addition, and
-    /// giving them their own vectors is M1-12 (#20)'s job; `Op::LineA` and
-    /// `Op::LineF` stay distinct in the decode table so #20 has the distinction
-    /// to route on. There is deliberately no line-A/line-F vector constant in
+    /// separate line-A and line-F emulator vectors are a 68010 addition this
+    /// crate does not implement; `Op::LineA` and
+    /// `Op::LineF` stay distinct in the decode table so the distinction is there
+    /// to route on if they ever land. There is deliberately no line-A/line-F vector constant in
     /// this crate: see [`crate::exceptions`].
     ///
     /// The frame carries `self.pc`, the address of the opcode that could not be

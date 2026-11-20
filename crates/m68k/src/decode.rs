@@ -111,8 +111,9 @@ pub enum Op {
     /// An opcode in the `1010` group (M68000UM Format I, "Line 1010 emulator
     /// instruction"). The 68000 has no line emulator, so it takes
     /// [`crate::exceptions::EXC_ILLEGAL`] like any other reserved opcode; the variant
-    /// is separate from [`Op::Illegal`] because the 68010 (M1-12, #20) does
-    /// have a line-A vector and will route the two differently.
+    /// is separate from [`Op::Illegal`] because the 68010 routes the two
+    /// differently (its line-A emulator vector is a 68010 feature this crate
+    /// does not implement).
     LineA,
     /// An opcode in the `1111` group (M68000UM Format J, "Line 1111 emulator
     /// instruction"). [`Op::LineA`] in every respect on the 68000 — illegal
