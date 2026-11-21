@@ -22,15 +22,17 @@
 //!   [`Op::LineF`] 8 192, the two reserved line groups the map records as
 //!   `None`); 204 sit in [`UNIMPLEMENTED_NONE_SLOTS`] below (filed, #621);
 //!   453 decoded to an actual instruction in slots the map calls undefined:
-//!   the 448 OR/AND EA classes were fixed and unpinned by #618, and the 5
-//!   remaining over-broad decodes are pinned in `pinned_none_mismatch`
-//!   (filed, #619/#620).
+//!   the 448 OR/AND EA classes were fixed and unpinned by #618, the 4 MOVEM
+//!   store words by #619 and the static BTST by #620; nothing over-broad
+//!   remains pinned.
 //!
 //! # What is asserted
 //!
 //! * a `"None"` slot must decode to one of [`NONE_EXCEPTION_TAGS`], or sit in
-//!   [`UNIMPLEMENTED_NONE_SLOTS`] (unplaced holes, two-way checked), or match
-//!   [`PINNED_NONE_MISMATCHES`] (known over-broad decodes, counted);
+//!   [`UNIMPLEMENTED_NONE_SLOTS`] (unplaced holes, two-way checked). The audit's
+//!   third arm — matching a pinned over-broad decode — went away with the pin
+//!   list itself (#618/#619/#620): a `None` slot that decodes to an instruction
+//!   is a plain mismatch now;
 //! * any other entry must decode to an `Op` in its token's family, per
 //!   [`FAMILIES`]. A defined opcode decoding to `Illegal`, `Undefined`,
 //!   `Unimplemented` or the wrong family is a mismatch that names the opcode
@@ -235,42 +237,25 @@ const UNIMPLEMENTED_NONE_SLOTS: &[(u16, u16, &str)] = &[
     ),
 ];
 
-/// `"None"` slots that decode to an actual instruction — the over-broad routes
-/// the audit found, pinned here until their issues fix them. **These are bugs,
-/// not deliberate choices**: on the hardware they take the illegal-instruction
-/// exception; rustsega instead executes them. Pinned so the cross-check stays
-/// green under this ticket (which must not fix decode-table bugs) while still
-/// counting what it found. The count assertions after the walk keep each pin
-/// from drifting silently: if a fix removes some of these opcodes, the count
-/// goes stale and this test fails until the pin is removed.
-///
-/// The geometry of each pin, against the map and the suite:
-///
-/// The audit's OR/AND over-broad decodes (448 opcodes, `Or`: 256 / `And`: 192)
-/// were fixed by #618 and their pins removed: the forward form refuses an An
-/// direct source at every size and the reverse form takes memory-alterable
-/// only, so those `None` slots now decode to [`Op::Illegal`] and pass through
-/// [`NONE_EXCEPTION_TAGS`]. Still pinned:
-///
-/// * **MOVEM store to PC-relative, 4 opcodes** (#619). The map defines PC-rel
-///   for the load direction (`$4CBA` has suite cases) and `None` for the
-///   store direction (`$48BA`/`$48BB`/`$48FA`/`$48FB`); `is_movem_ea` accepts
-///   the whole control class for both.
-/// * **Static BTST into an immediate, 1 opcode** (#620). `$083C` is `None`
-///   (and the M68000PM BTST page marks the immediate column empty for the
-///   destination); `classify_bit_op`'s static half takes it. The *dynamic*
-///   form `BTST Dn,#` is a different story: the map defines it, the suite
-///   measures it (`0b3c [BTST D5, #]` cases), and rustsega agrees — keep it.
-fn pinned_none_mismatch(opcode: u16, op: Op) -> bool {
-    let mode = (opcode >> 3) & 0b111;
-    let reg = opcode & 0b111;
-    match (opcode & 0xF000, op) {
-        // MOVEM store (`0100 1d00 1s`, d clear) into the two PC-relative modes.
-        (_, Op::Movem) => opcode & 0x0100 == 0 && mode == 0b111 && (reg == 0b010 || reg == 0b011),
-        (_, Op::BitStatic) => opcode == 0x083C,
-        _ => false,
-    }
-}
+// The `None` slots that decode to an actual instruction — the over-broad
+// routes the audit found — are **bugs, not deliberate choices**: on the
+// hardware they take the illegal-instruction exception; rustsega instead
+// executes them. The audit pinned them here so the cross-check stayed green
+// while their fixes were pending, each with a count that failed when the fix
+// changed the set; that bookkeeping is gone now that the last pin is off.
+//
+// The audit's OR/AND over-broad decodes (448 opcodes, `Or`: 256 / `And`: 192)
+// were fixed by #618, and their pin entries removed; the MOVEM
+// store-to-PC-relative pins (4 opcodes) followed when #619 restricted
+// `is_movem_ea`'s store half to control minus PC-relative, and the static-BTST
+// pin (1 opcode) when #620 closed the immediate corner of `classify_bit_op`.
+// With the pin list empty the predicate went away too: a `None` slot that
+// decodes to an instruction is a mismatch again, named with the opcode hex and
+// both readings.
+//
+// The *dynamic* form `BTST Dn,#` is a different story, recorded so it does not
+// get "fixed": the map defines `$013C`/`$0B3C`, the suite measures it (`0b3c
+// [BTST D5, #]` cases), and rustsega agrees with map+suite — keep it.
 
 /// Walk all 65 536 map entries through [`decode`] and compare.
 #[test]
@@ -305,15 +290,6 @@ fn decode_agrees_with_the_official_opcode_map() {
                 *pinned_counts.entry("Unimplemented").or_default() += 1;
                 continue;
             }
-            if pinned_none_mismatch(opcode, op) {
-                let bucket = if op == Op::Movem {
-                    "Movem (over-broad)"
-                } else {
-                    "BitStatic (over-broad)"
-                };
-                *pinned_counts.entry(bucket).or_default() += 1;
-                continue;
-            }
             mismatches.push((opcode, operation, op));
         } else {
             let name = token(operation);
@@ -332,12 +308,11 @@ fn decode_agrees_with_the_official_opcode_map() {
         }
     }
 
-    // The pins cannot drift: each pinned bucket is exact.
-    let expect = [
-        ("Unimplemented", 204u32),
-        ("Movem (over-broad)", 4),
-        ("BitStatic (over-broad)", 1),
-    ];
+    // The pins cannot drift: each pinned bucket is exact. The only pin left is
+    // the Unimplemented hole list; the over-broad buckets are gone (#618/#619/
+    // #620), so an unexpected over-broad decode falls straight to the mismatch
+    // report below.
+    let expect = [("Unimplemented", 204u32)];
     for (bucket, want) in expect {
         assert_eq!(
             pinned_counts.get(bucket).copied().unwrap_or(0),

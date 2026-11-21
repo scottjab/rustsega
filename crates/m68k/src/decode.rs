@@ -1537,14 +1537,17 @@ fn classify_swap_ext_pea(opcode: u16) -> Op {
 ///
 /// Bit 10 is the direction — clear is registers to memory, which is the `$48??`
 /// window this shares with SWAP/EXT/PEA/NBCD, and set is memory to registers, the
-/// `$4C??` one — and bit 6 the width, word or long. The EA field is then
+/// `$4C??` one — and bit 6 the width, word or long. The EA field is
 /// [`is_movem_ea`]: the control modes plus `-(An)` for a store and `(An)+` for a
-/// load. Everything else the field can name — `Dn`, `An`, `#imm`, `d16(PC)` and
-/// its friends in mode `111` above `011`, and either stack mode going the wrong way
-/// — is an illegal instruction, and that is what the two suite files never run:
-/// across their 8065 cases each they use modes `010`, `011`, `100`, `101`, `110`
-/// and `111000`..`111011`, with `011` appearing only where `d` is set and `100`
-/// only where it is clear.
+/// load, with the store half stopping short of the two PC-relative modes, whose
+/// destinations are not alterable (M68000PRM "MOVEM", destination addressing
+/// table; #619) — the load's `$4CBA` family is defined and measured.
+/// Everything else the field can name — `Dn`, `An`, `#imm`, the store-side
+/// `d16(PC)`/`d8(PC,Xn)`, mode `111` above register `011`, and either stack mode
+/// going the wrong way — is an illegal instruction. The two suite files run the
+/// legal faces of all that: across their 8065 cases each they use modes `010`,
+/// `011`, `100`, `101`, `110` and `111000`..`111011`, with `011` appearing only
+/// where `d` is set and `100` only where it is clear.
 fn classify_movem(opcode: u16) -> Op {
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
@@ -1630,6 +1633,12 @@ const fn is_bit_op(opcode: u16) -> bool {
 ///   an alterable destination, so `BCHG D1,d16(PC)` and `BCLR #3,#$1234` are
 ///   illegal while `BTST` may have either (M68000PM/AD 2.2.12 gives `BTST` the
 ///   whole data column and the other three only the alterable part of it).
+///   The static form of `BTST` still stops short of one data-class operand:
+///   `BTST #imm,#imm` is undefined — the M68000PRM "BTST" page's destination
+///   table leaves the immediate column empty, the map calls `$083C` `None`,
+///   and the suite has no case (#620). The *dynamic* form `BTST Dn,#imm` is a
+///   deliberate map+suite disagreement with that table (`$013C`/`$0B3C` are
+///   defined and measured) and keeps the plain `is_data` rule.
 /// * **A `ddd` that is not one of the five immediate registers with bit 8 clear**
 ///   can still reach here from the `0x0000..=0x0FFF` arm only as the static
 ///   form, so the `ddd` of a bit-8-clear opcode needs no further check.
@@ -1645,6 +1654,12 @@ fn classify_bit_op(opcode: u16) -> Op {
     let writes = (opcode >> BIT_OP_MNEMONIC_SHIFT) & 0b11 != 0;
     let ok = if writes {
         is_data_alterable(mode, reg)
+    } else if opcode & BIT_OP_NUMBER_BIT == 0 {
+        // Static `BTST`: data, minus the immediate the PRM's BTST destination
+        // table leaves empty (M68000PRM "BTST"; #620). The dynamic form below
+        // keeps the whole data column — the map defines `BTST Dn,#imm` and
+        // `BTST.json.gz` measures it.
+        is_data(mode, reg) && !(mode == 0b111 && reg == 0b100)
     } else {
         is_data(mode, reg)
     };
@@ -3292,6 +3307,33 @@ mod tests {
         }
     }
 
+    /// The static form's immediate corner is not an instruction: `BTST
+    /// #imm,#imm` has no encoding — the M68000PRM "BTST" page's destination
+    /// addressing table leaves the immediate column empty, the map calls
+    /// `$083C` `None`, and the suite has no case for it (#620). The modify
+    /// twins reject the same EA already because their operand is
+    /// data-alterable, and `$083D`-`$083F` are the invalid mode-`111`
+    /// registers. The **dynamic** `BTST Dn,#imm` is a different story: the map
+    /// defines `$013C`/`$0B3C` and `BTST.json.gz` measures it, so rustsega
+    /// keeps it — a deliberate disagreement with the PRM table, not a bug.
+    #[test]
+    fn static_btst_rejects_an_immediate_destination() {
+        assert_eq!(decode(0x083C), Op::Illegal, "BTST #imm,#imm is undefined");
+        // The rest of the same opcode row keeps its shape: the three invalid
+        // mode-111 registers next door, the modify twins at the immediate EA,
+        // and the dynamic BTST the map and suite both define.
+        for opcode in [0x083Du16, 0x083E, 0x083F, 0x0C3C, 0x08BC, 0x0DBC] {
+            assert_eq!(decode(opcode), Op::Illegal, "${opcode:04X} stays illegal");
+        }
+        for (opcode, name) in [(0x013Cu16, "BTST D0,#imm"), (0x0B3C, "BTST D5,#imm")] {
+            assert_eq!(
+                decode(opcode),
+                Op::BitDynamic,
+                "{name}: the measured dynamic form stays"
+            );
+        }
+    }
+
     /// The mode `001` column of the `$0000` group, walked rather than sampled.
     /// MOVEP is `0000 ddd 1 oo 001 aaa` (M68000PM/AD section 8, "MOVEP — Move
     /// to/from Peripheral Device"), so all 256 encodings of bit 8 set at mode
@@ -3774,7 +3816,9 @@ mod tests {
     /// The whole MOVEM opcode set, walked: `0100 1d00 1s eeeeee` is both halves of
     /// bit 7 — `$4880`..`$48FF` (registers to memory) and `$4C80`..`$4CFF` (memory
     /// to registers) — and in each half the operand is [`is_movem_ea`]: the control
-    /// modes plus `-(An)` when storing and `(An)+` when loading.
+    /// modes plus `-(An)` when storing and `(An)+` when loading, the store half
+    /// minus the two PC-relative modes (M68000PRM "MOVEM", destination addressing
+    /// table; #619).
     ///
     /// The two windows are the ones with neighbours to lose: mode `000` of the
     /// `$48` half is EXT (`$4880`..`$4887`, `$48C0`..`$48C7`, which is why the
@@ -3809,9 +3853,11 @@ mod tests {
             assert_eq!(decode(opcode), want, "load ${opcode:04X}");
             movem += u8::from(want == Op::Movem);
         }
-        // 36 operand fields (the 28 control modes plus the one stack mode of the
-        // direction) x 2 sizes x 2 directions.
-        assert_eq!(movem, 144, "the MOVEM opcode count");
+        // 34 store operand fields (the 26 alterable-memory control modes — the
+        // control class minus the two PC-relative ones, #619 — plus `-(An)`)
+        // plus 36 load fields (all 28 control modes plus `(An)+`), each half
+        // x 2 sizes.
+        assert_eq!(movem, 140, "the MOVEM opcode count");
 
         // The neighbours are not MOVEM either: PEA's top opcode just below `$4880`,
         // and either side of `$4C80`..`$4CFF` the space left once MOVEM's
@@ -3827,6 +3873,32 @@ mod tests {
         // is 68020), so it is an illegal instruction (#35). MOVEM's own window,
         // which is what this test is about, is untouched.
         assert_eq!(decode(0x4D00), Op::Illegal, "bit 8 set: CHK.l, 68020-only");
+    }
+
+    /// The store direction's PC-relative corner is undefined: `MOVEM`'s store
+    /// destination must be alterable, and `d16(PC)`/`d8(PC,Xn)` name the
+    /// instruction stream (M68000PRM "MOVEM", destination addressing table;
+    /// #619). The load twins are defined (`map/68000.official.json` spells
+    /// `$4CBA`/`$4CBB`/`$4CFA`/`$4CFB` out) and measured (`MOVEM.w.json.gz` runs
+    /// `$4CBA`), so only the store half moves.
+    #[test]
+    fn movem_stores_never_go_pc_relative() {
+        for (opcode, name) in [
+            (0x48BAu16, "MOVEM.w <list>,(d16,PC)"),
+            (0x48BB, "MOVEM.w <list>,(d8,PC,Xn)"),
+            (0x48FA, "MOVEM.l <list>,(d16,PC)"),
+            (0x48FB, "MOVEM.l <list>,(d8,PC,Xn)"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x4CBAu16, "MOVEM.w (d16,PC),<list>"),
+            (0x4CBB, "MOVEM.w (d8,PC,Xn),<list>"),
+            (0x4CFA, "MOVEM.l (d16,PC),<list>"),
+            (0x4CFB, "MOVEM.l (d8,PC,Xn),<list>"),
+        ] {
+            assert_eq!(decode(opcode), Op::Movem, "{name} (${opcode:04X})");
+        }
     }
 
     /// CHK is `0100 ddd 110 mmm rrr` (M68000UM "CHK — Check Data Register Against
