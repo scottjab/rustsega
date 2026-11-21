@@ -11,13 +11,14 @@
 # transcript, which carries a `== frame N ==` marker and a `vdpregs` dump by each
 # of them.
 #
-# --vdp dumps the VDP's own memories instead: bvNNNNN.bin, the 64 KiB of VRAM, and
-# bcNNNNN.bin, the 64 colour words of CRAM as 128 raw bytes (#534). The reference
+# --vdp dumps the VDP's own memories instead: bvNNNNN.bin, the 64 KiB of VRAM,
+# bcNNNNN.bin, the 64 colour words of CRAM as 128 raw bytes (#534), and brNNNNN.bin,
+# the 24 write registers as 48 bytes of little endian words (#549). The reference
 # reaches them through the `vdp:` namespace of its own debugger - `save "v.bin"
-# vdp:vram` and `save/w "c.bin" vdp:cram` - so this needs no patch to blastem and
-# takes nothing from its source. Note the `/w` on CRAM: the default element size
-# narrows each colour to one byte and writes 64 of them, which compare.py then
-# refuses as the half-width dump it is.
+# vdp:vram`, `save/w "c.bin" vdp:cram` and `save/w "r.bin" vdp:reg` - so this needs
+# no patch to blastem and takes nothing from its source. Note the `/w` on CRAM and
+# on the registers: the default element size narrows each colour or register to
+# one byte, which compare.py then refuses as the half-width dump it is.
 #
 # Without --stop-at-pc the dump point is blastem's own end of frame, reached with
 # `frames N`. That point is not the same place in the instruction stream as our
@@ -129,7 +130,7 @@ out=$(readlink -f "${out:-$(ref_dump_dir "$repo" "$rom" "$stop_at")}")
 # namespace: `vdp:vram` is a byte array of the 64 KiB, and `vdp:cram` is 64 words,
 # so CRAM is saved `/w` or it arrives as 64 narrowed bytes (README, #534).
 if [[ -n $vdp ]]; then
-  kinds=(v:65536 c:128)
+  kinds=(v:65536 c:128 r:48)
 else
   kinds=(:65536)
 fi
@@ -142,6 +143,7 @@ dump_line() {
   case $kind in
     v) printf 'save "bv%05d.bin" vdp:vram\n' "$frame" ;;
     c) printf 'save/w "bc%05d.bin" vdp:cram\n' "$frame" ;;
+    r) printf 'save/w "br%05d.bin" vdp:reg\n' "$frame" ;;
     *) printf 'save "b%05d.bin" [0xFF0000] 65536\n' "$frame" ;;
   esac
 }

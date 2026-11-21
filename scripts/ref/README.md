@@ -22,9 +22,9 @@ instruction S&K is down to 12, of which one is scratch nothing reads.
 
 | File | What it does |
 |---|---|
-| `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin`. `--stop-at-pc` names an instruction instead of a frame; `--vdp` saves the VDP's VRAM and CRAM instead -> `bvNNNNN.bin`, `bcNNNNN.bin` |
-| `run-ours.sh` | Run the same cart in rustsega with no input, save work RAM at the same frames -> `rNNNNN.bin`. Takes the same `--stop-at-pc` and `--vdp` (`rvNNNNN.bin`, `rcNNNNN.bin`) |
-| `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test, `--vdp` for the VDP's two memories (#534), a `class` line separating a contiguous persistent divergence from frame phase (#539), and `--meter`, which reads a cart's own parked progress counters as a cycle meter (#530). `--selftest` is in `just check` |
+| `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin`. `--stop-at-pc` names an instruction instead of a frame; `--vdp` saves the VDP's VRAM, CRAM and register file instead -> `bvNNNNN.bin`, `bcNNNNN.bin`, `brNNNNN.bin` |
+| `run-ours.sh` | Run the same cart in rustsega with no input, save work RAM at the same frames -> `rNNNNN.bin`. Takes the same `--stop-at-pc` and `--vdp` (`rvNNNNN.bin`, `rcNNNNN.bin`, `rrNNNNN.bin`) |
+| `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test, `--vdp` for the VDP's two memories and register file (#534, #549), a `class` line separating a contiguous persistent divergence from frame phase (#539), and `--meter`, which reads a cart's own parked progress counters as a cycle meter (#530). `--selftest` is in `just check` |
 | `sweep-vdp.sh` | The #539 sweep: `--vdp` every cart in `crates/genesis/tests/commercial_list.toml`, one resumable cart at a time, and collect one row per cart into `target/ref/vdp-sweep/results.tsv` |
 | `terminal-standin.py` | The `x-terminal-emulator` blastem's `-d` wants and NixOS has not got; makes the debugger a pipe |
 | `bin/x-terminal-emulator` | The shim `run-ref.sh` puts on `PATH` so blastem finds the stand-in |
@@ -186,10 +186,10 @@ remember.
 
 ### What the two sides write
 
-`run-ours.sh --vdp` writes the same two images out of our own chip: `Bus::vdp.vram`
-is already the 64 KiB byte-addressed image and `Bus::vdp.cram` is the 64 words, so
-the example narrows nothing and reconstructs nothing - it is the state the VDP was
-asked to hold, not a picture of it.
+`run-ours.sh --vdp` writes the same three images out of our own chip: `Bus::vdp.vram`
+is already the 64 KiB byte-addressed image, `Bus::vdp.cram` is the 64 words, and
+`--regs` writes `Vdp::reg(0..24)` - so the example narrows nothing and reconstructs
+nothing - it is the state the VDP was asked to hold, not a picture of it.
 
 `bcNNNNN.bin`/`rcNNNNN.bin` are therefore 128 bytes, and `compare.py` reads them as
 64 words and calls a difference a *colour* rather than two bytes:
@@ -200,14 +200,27 @@ scripts/ref/run-ours.sh --vdp "$ROM" 595-605
 python3 scripts/ref/compare.py "target/ref/Sonic_&_Knuckles_(World)" 595-605 --vdp
 ```
 
-The alignment sweep runs on VRAM and both memories are compared at the shift it
+The alignment sweep runs on VRAM and all three memories are compared at the shift it
 found: CRAM is 128 B of mostly-still colour, which is nowhere near enough for a
 minimum of its own to mean anything, and a CRAM read at a different frame from the
 VRAM beside it would be a different moment.
 
-Both images have to be there. A directory with VRAM but no CRAM exits 2 saying so
+All three images have to be there. A directory with VRAM but no CRAM - or with the
+memories but no `brNNNNN.bin`/`rrNNNNN.bin` register dumps (#549) - exits 2 saying so
 rather than reporting agreement about the half it had, and so does a CRAM image of
-64 bytes, which is what `save` without `/w` writes.
+64 bytes or a register image of 24, which is what `save` without `/w` writes.
+Directories dumped before #549's registers half need one re-run of both halves
+before they compare again.
+
+### What the registers half is for (#549)
+
+VRAM and CRAM cannot see the VDP's register file, and the #549 family is exactly
+where that hides a divergence: several of its carts hold byte-identical VRAM and
+CRAM on both machines with R1 `74` on the reference and `34` on ours - the
+difference is a screen the reference turns on and we do not, and no memory dump
+can say so. The register image is 24 little endian words, reference numbering
+(genvdp.txt section 17), reported as `R1 ref=0074 ours=0034` rather than as a
+two-byte offset.
 
 ### What it said first
 

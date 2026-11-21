@@ -1,7 +1,9 @@
 //! Run a cartridge with no input and write out the memories of a named frame:
-//! 68000 work RAM, VRAM or CRAM. `cargo run -p genesis --release --example
-//! ram_dump -- ROM --frames N --out PATH` writes the work RAM one; `--vram` and
-//! `--cram` (#534) write the VDP's two.
+//! 68000 work RAM, VRAM, CRAM or the VDP's register file. `cargo run -p genesis
+//! --release --example ram_dump -- ROM --frames N --out PATH` writes the work RAM
+//! one; `--vram` and `--cram` (#534) write the VDP's two; `--regs` writes the 24
+//! write registers as little endian words, the same shape the reference's
+//! `save/w ... vdp:reg` produces.
 //!
 //! The reference oracle of #525 (`scripts/ref/`, its README has the whole
 //! story) compares this machine against a second emulator by work RAM state at a
@@ -31,6 +33,7 @@
 use std::path::{Path, PathBuf};
 
 use genesis::{Config, Genesis, Region, RegionSetting};
+use vdp::Vdp;
 
 /// What the command line said, after parsing.
 ///
@@ -49,6 +52,8 @@ struct Args {
     vram: Option<PathBuf>,
     /// Where the 128 B CRAM image goes, if it is wanted (#534).
     cram: Option<PathBuf>,
+    /// Where the 48 B register image goes, if it is wanted (#549).
+    regs: Option<PathBuf>,
     region: RegionSetting,
     tmss: bool,
     /// Stop at this address instead of at the end of a frame: see [`USAGE`].
@@ -152,6 +157,9 @@ fn main() {
             &cram_image(&bus.vdp.cram),
         ));
     }
+    if let Some(path) = &args.regs {
+        written.push(write_image("regs", path.as_path(), &regs_image(&bus.vdp)));
+    }
 
     let images = written
         .iter()
@@ -197,14 +205,30 @@ fn cram_image(cram: &[u16]) -> Vec<u8> {
     image
 }
 
+/// The VDP's register file as an image: 24 write registers, little endian, 48 B.
+///
+/// Little endian for the same reason [`cram_image`] is: the reference saves the
+/// array with `/w`, one 16-bit element low byte first, and the comparison reads
+/// both sides the same way. Register 0 first, in the numbering of genvdp.txt
+/// section 17, which is the numbering both halves of the harness use.
+fn regs_image(vdp: &Vdp) -> Vec<u8> {
+    let mut image = Vec::with_capacity(24 * 2);
+    for reg in 0..24_u8 {
+        image.extend_from_slice(&(u16::from(vdp.reg(reg))).to_le_bytes());
+    }
+    image
+}
+
 const USAGE: &str = "\
 usage: ram_dump <ROM> --frames N [--out PATH] [--vram PATH] [--cram PATH]
-                 [--region auto|usa|japan|europe] [--tmss] [--stop-at-pc ADDRESS]
+                 [--regs PATH] [--region auto|usa|japan|europe] [--tmss]
+                 [--stop-at-pc ADDRESS]
 
 Run <ROM> for N frames with no input and write out the memories named: 64 KiB of
-68000 work RAM (0xFF0000-0xFFFFFF) with --out, 64 KiB of VRAM with --vram, and 64
-colour words of CRAM (128 B, little endian) with --cram. At least one of the three
-is needed and they are all written from one stopped machine. --region forces a
+68000 work RAM (0xFF0000-0xFFFFFF) with --out, 64 KiB of VRAM with --vram, 64
+colour words of CRAM (128 B, little endian) with --cram, and the 24 VDP write
+registers (48 B, little endian words) with --regs. At least one of the four is
+needed and they are all written from one stopped machine. --region forces a
 region instead of reading the cartridge header; --tmss starts with the security
 check enabled. Prints `region=... frames=...` and one `name=PATH bytes=N` for
 every image written.
@@ -227,6 +251,7 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
     let mut out: Option<PathBuf> = None;
     let mut vram: Option<PathBuf> = None;
     let mut cram: Option<PathBuf> = None;
+    let mut regs: Option<PathBuf> = None;
     let mut region = RegionSetting::Auto;
     let mut tmss = false;
     let mut stop_at_pc: Option<u32> = None;
@@ -247,6 +272,9 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
             }
             "--cram" => {
                 cram = Some(PathBuf::from(argv.next().ok_or("--cram wants a path")?));
+            }
+            "--regs" => {
+                regs = Some(PathBuf::from(argv.next().ok_or("--regs wants a path")?));
             }
             "--region" => {
                 let value = argv
@@ -285,7 +313,9 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
 
     let frames = frames.ok_or("no --frames N: say which frame to dump")?;
     if out.is_none() && vram.is_none() && cram.is_none() {
-        return Err("no memory named: give at least one of --out, --vram, --cram".to_string());
+        return Err(
+            "no memory named: give at least one of --out, --vram, --cram, --regs".to_string(),
+        );
     }
     Ok(Args {
         rom: rom.ok_or("no ROM named")?,
@@ -293,6 +323,7 @@ fn parse<I: Iterator<Item = String>>(mut argv: I) -> Result<Args, String> {
         out,
         vram,
         cram,
+        regs,
         region,
         tmss,
         stop_at_pc,
