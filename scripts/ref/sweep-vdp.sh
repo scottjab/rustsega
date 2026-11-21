@@ -28,7 +28,9 @@
 # resumes rather than restarting, and `--only` can be pointed at one cart without
 # touching the rest. `--force` redoes a cart that already has a row, which with the
 # dumps still on disk means a re-compare and nothing else; `--redump` is what pays
-# blastem again.
+# blastem again, for the end-of-frame dumps and the anchored ones alike (before #648
+# the anchored half read only its marker, so a re-measure of an anchored row in a
+# checkout that had swept before compared dumps an older build had written).
 #
 # Nothing here changes the emulator or a golden. The rows and the dumps live under
 # `target/`, which is gitignored; the doc table gets written by hand from them.
@@ -267,7 +269,13 @@ for cart in "${carts[@]}"; do
       continue
     fi
     anchor_dir=$(ref_dump_dir "$repo" "$rom" "$anchor")
-    if [[ ! $(cat "$state/$key.anchor.dumped" 2>/dev/null || true) == "$this_window" ]]; then
+    # --redump pays for this half too (#648): the marker only says a window, and
+    # dumps that a build of some other commit wrote would otherwise stand in for
+    # this one's at an anchor, where the whole point of a re-measure is that the
+    # bytes are fresh.
+    if ((redump == 0)) && [[ $(cat "$state/$key.anchor.dumped" 2>/dev/null || true) == "$this_window" ]]; then
+      echo "sweep-vdp: $key: anchored dumps for $this_window already in $anchor_dir"
+    else
       echo "sweep-vdp: $key: re-running phase-safe at 0x$anchor"
       if ! "$self_dir/run-ref.sh" --vdp --stop-at-pc "$anchor" "$rom" "$this_window"; then
         echo "sweep-vdp: $key: the anchored reference half failed: is 0x$anchor reached once a frame?" >&2

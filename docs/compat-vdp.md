@@ -47,8 +47,10 @@ cart's checkpoint is 900 frames. The `psii`, `psiv` and `nbajam` rows were re-me
 2026-11-20 on current main after the #544 harness fix (see the section below), and that fix
 also closed a hole the 2026-11-18 rows carry unknowingly: until it, blastem ran on the real
 `HOME` and an SRAM or EEPROM cart booted on whatever save the last session had left in
-`~/.local/share/blastem`. `runs/largest` is the run count and widest run, in bytes,
-of what differs in every frame of the window.
+`~/.local/share/blastem`. The `roadrash2` row was re-measured 2026-11-21 on current main
+(`5d7d1ab`) with the #648 harness fences: the 3.7 bytes a frame of VRAM phase the #546-era
+row carried is gone, and only CRAM fades remain. `runs/largest` is the run count and widest
+run, in bytes, of what differs in every frame of the window.
 
 | cart | VRAM mean/frame | first difference | runs/largest | CRAM | verdict |
 |---|---:|---|---|---|---|
@@ -68,7 +70,7 @@ of what differs in every frame of the window.
 | `psiv` Phantasy Star IV | 0.0 | - | 0/0 | 0.5/frame, none persistent | phase |
 | `psii` Phantasy Star II | 0.0 | - | 0/0 | agrees | agree |
 | `ssf2` Super Street Fighter II | 0.0 | - | 0/0 | agrees | agree |
-| `roadrash2` Road Rash II | 3.7 | `$007231` ref=2F ours=23 | 0/0 | 14.4/frame, none persistent | phase |
+| `roadrash2` Road Rash II | 0.0 | - | 0/0 | 3.9/frame, none persistent | phase |
 | `ristar` Ristar | **982.6** | `$007E01` ref=78 ours=00 | 86/5 | agrees | **real** |
 | `toystory` Toy Story | 0.0 | - | 0/0 | agrees | agree |
 
@@ -86,6 +88,12 @@ end-of-frame mean in the table above is the same divergence plus phase.
 | `shinobi3` | `$522` | 0.0 | - | 0/0 | - | agrees |
 | `roadrash2` | `$11b8` | 0.0 | - | 0/0 | - | agrees |
 | `ristar` | `$4284` | 107.0 | `$00A897-$00A987` | 61/5 | `$00A897` ref=28 ours=16 | agrees |
+
+Re-verified 2026-11-21 on current main (`5d7d1ab`), and again at `369a172` and at the
+#563 merge `06710ab`: 0.0/0/0 agrees at the anchor every time, with all 90 dump files
+byte-identical across the three commits, ours and the reference's alike. The 908.0
+"regression" that prompted that re-check was never a code change at all - see the
+section at the end of this page.
 
 Filed as [#540](https://github.com/scottjab/rustsega/issues/540) (Shinobi III),
 [#541](https://github.com/scottjab/rustsega/issues/541) (Road Rash II) and
@@ -281,3 +289,39 @@ stepped list, and the trail where a divergence remained:
 
 No emulator code changed for any of this in the #549 branch; the only tree change is
 the registers half of the harness.
+
+## The anchored canary that did not regress (#648)
+
+Road Rash II's anchored row read 908.0 bytes a frame "real" at `$11b8` on the morning of
+2026-11-21 - twice, once at main `369a172` and once with the #563 working tree, and a
+fresh end-of-frame pass an hour earlier carried the same signature - and #648 was filed
+for it. It was not a regression. No commit ever moved this cart: fresh serial runs read
+0.0/0/0 agrees at the anchor at `369a172`, at the #563 merge `06710ab` and at
+`5d7d1ab`, and the 90 dump files behind those three runs - both sides, every frame - are
+byte-identical across the commits.
+
+The 908.0 lived entirely in the reference half of the runs that produced it. Their dump
+directory, still on disk, is the evidence: our `rv*.bin` are byte-identical to the clean
+runs' `rv*.bin`, and the reference's `bv*.bin` differ from the clean reference by exactly
+the 908 bytes the row reported (`$001C01` `ref=00 ours=D8`, 317 runs over
+`$001C01-$005A43`), identically in every frame - the chunk of tile data the clean
+reference holds there is simply absent in those runs, and the end-of-frame pass that
+morning had five CRAM colours persisting on top. That is not a write going missing: it
+is the reference sitting in a different part of the attract loop than the cart's own
+no-input clean run reaches.
+
+The way in is the desktop. Blastem binds the session's real gamepads through SDL
+("Joystick 0 added: Xbox One Elite 2 Controller" opens every transcript of that morning)
+and, while its window has focus, delivers what the pad emits - and this comparison is a
+no-input run by design, so a single stray report from an idle pad is enough to steer the
+attract loop. The runs that read 908.0 are the ones the desktop was in use for; the
+byte-identical clean ones bracket them on both sides of the morning. Two fences went in
+with this finding. `run-ref.sh` now binds no pad at all (`SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT`
+names a device that cannot exist; the emulated ports keep their gamepads, and a
+transcript that still shows a "Joystick N added" line is a run whose input was not
+fenced). And `sweep-vdp.sh`'s anchored pass now honours `--redump`: until then it read
+only its own marker file, so a re-measure of an anchored row in a checkout that had
+swept before compared whatever dumps an older build had left on disk, whatever the flag
+said. The rule this page takes from #648: a canary row that "regresses" re-measures
+from a fresh checkout, serially, before anything else; the number that survives that is
+the number.

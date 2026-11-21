@@ -445,6 +445,19 @@ export HOME="$home"
 export XDG_DATA_HOME="$home/.local/share"
 export XDG_CONFIG_HOME="$home/.config"
 
+# Bind no real gamepad. The comparison is a no-input run by design (ours gets
+# none), but blastem binds the session's controllers through SDL and, while its
+# window has focus, delivers whatever they emit - one stray axis report from an
+# idle pad steers the cart's attract loop, and the reference's memories then
+# diverge from the same cart's clean run. #648 chased a 908 bytes/frame verdict
+# on Road Rash II that lived entirely in the reference half: our side
+# byte-identical across every run, the reference different only in the runs the
+# desktop was in use for, with the pad's CRAM state shifted with it. SDL's
+# ignore-except hint naming a device that cannot exist turns every real pad
+# off; the emulated ports still have their gamepads, they just never hear
+# anyone. The transcript proves it: no "Joystick N added" line.
+export SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT="0x0000/0x0000"
+
 # Refuse to start over a live reference run (#552). The FIFOs are fixed
 # machine-wide names, and the rm below would delete the channel a running
 # blastem is talking through: its next write would land on a FIFO this run
