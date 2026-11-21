@@ -156,6 +156,18 @@ group the ticket named. Measured:
 | Rockman X3 (Taiwan) (En) (Unl) | none (measured) | 2 MiB; mirror test negative |
 | Super Mario Bros. / Super Mario 2 / Super King Kong 99 (Taiwan) | none (measured) | 2 MiB; mirror test negative |
 | Sonic Jam 6 (Taiwan) (En) (Pirate) | none (measured) | 2 MiB; mirror test negative |
+
+**Five of these are dead images, confirmed by the reference (#550)**: `Chaoji
+Poker`, `Fengkuang Taohuayuan`, `Lion King III`, `Pikachu - Pocket Monster` and
+`Sonic Jam 6` park on `JMP $200`/`JMP $128` halt stubs with their whole
+exception table `$08`-`$70` pointing at the stub (Sonic Jam 6 slides through
+`MOVE.L D0,D0` padding into a non-instruction word first). rustsega and
+blastem both take the same path and neither writes a single VDP byte by frame
+300 (`scripts/ref/run-ref.sh --vdp`, frames 5/100/300: VRAM and CRAM 0/0
+throughout). Two independent emulators faulting identically is a cart image
+that does not run, not a machine that mishandles it - they are not failures
+and not worth a boot test; the honest re-check is the `--vdp` comparison, not
+a colours probe.
 | Da Hanghai Shidai I/II, Duli Zhanzheng, FIFA Soccer 95 (China), Guishou Jingji Chang, Samurai Shodown vs Soul Edge, and 9 more | none (measured) | 1-2 MiB; headers present, image reachable |
 
 Three separate things rule a mapper out for this group:
