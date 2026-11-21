@@ -40,10 +40,16 @@ actionlint:
 # scripts/ref/ until someone is about to trust what it says, and a comparator that
 # quietly reported `agree` for everything is how #526 becomes a false negative. It
 # reads no ROM, starts no emulator and needs no network - arithmetic on a few files
-# it makes in a temp directory - so it costs milliseconds.
+# it makes in a temp directory - so it costs milliseconds. terminal-standin.py
+# drives a fake blastem over the FIFO protocol to pin the #544 teardown;
+# run-ref.sh --selftest (#552) then drives the script itself over a fake blastem
+# speaking the same command file - clean walk exits 0, partial walk names its
+# frame with a manifest, a second run refuses - which uses the machine's real
+# /tmp FIFO names and so costs about ten seconds of mostly REF_TIMEOUT.
 ref-selftest:
     python3 scripts/ref/compare.py --selftest
     python3 scripts/ref/terminal-standin.py --selftest
+    bash scripts/ref/run-ref.sh --selftest
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings

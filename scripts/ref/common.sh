@@ -50,3 +50,34 @@ ref_dump_dir() {
 ref_frames() {
   printf '%s\n' "$@" | sort -n -u
 }
+
+# ref_in_flight <blastem> - what is holding the reference's fixed /tmp FIFOs,
+# as pgrep -a lines, empty when the channel is free.
+#
+# The names are machine-wide, so a second reference run cannot share them, and
+# the `rm -f` before a run would delete the channel a live blastem is talking
+# through and read as a dead cart instead of a collision (#552). Two things
+# mark a run in flight: the blastem executable itself, matched on the whole
+# command line so REF_BLASTEM by path works, and the FIFO holder through its
+# pidfile (/tmp/blastem_ref_holder.pid), because the holder can outlive the
+# blastem it held the FIFO open for. A pidfile pointing at a live PID is only
+# believed when that process is the holder's own `sleep 86400`, so a reused
+# PID cannot invent a collision; a stale pidfile fails the liveness check and
+# is ignored. pgrep never matches itself; a process that merely says blastem
+# (an editor here, a grep) is refused too, and the caller prints what it saw
+# so the operator can tell. pgrep lines are dropped from the result: a
+# concurrent check's own pgrep carries the pattern in its argv, and two
+# starts at the same instant must refuse each other for a real blastem, not
+# for the sight of one another looking.
+ref_in_flight() {
+  local lines holder
+  lines=$(pgrep -af "$1" 2>/dev/null | grep -vE '^[0-9]+ pgrep( |$)' || true)
+  if [[ -r /tmp/blastem_ref_holder.pid ]]; then
+    holder=$(cat /tmp/blastem_ref_holder.pid 2>/dev/null || true)
+    if [[ $holder =~ ^[0-9]+$ ]] && kill -0 "$holder" 2>/dev/null \
+      && tr '\0' ' ' <"/proc/$holder/cmdline" 2>/dev/null | grep -q 'sleep 86400'; then
+      lines+="${lines:+$'\n'}${holder} blastem-ref-holder (FIFO holder, pidfile /tmp/blastem_ref_holder.pid)"
+    fi
+  fi
+  printf '%s\n' "$lines"
+}

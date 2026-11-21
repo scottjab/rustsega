@@ -22,7 +22,7 @@ instruction S&K is down to 12, of which one is scratch nothing reads.
 
 | File | What it does |
 |---|---|
-| `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin`. `--stop-at-pc` names an instruction instead of a frame; `--vdp` saves the VDP's VRAM, CRAM and register file instead -> `bvNNNNN.bin`, `bcNNNNN.bin`, `brNNNNN.bin` |
+| `run-ref.sh` | Run a cart in blastem's debugger, save work RAM at named frames -> `bNNNNN.bin`. `--stop-at-pc` names an instruction instead of a frame; `--vdp` saves the VDP's VRAM, CRAM and register file instead -> `bvNNNNN.bin`, `bcNNNNN.bin`, `brNNNNN.bin`. A partial walk reports the frame it stopped at and leaves a `manifest.txt`; a second reference run is refused (exit 3) |
 | `run-ours.sh` | Run the same cart in rustsega with no input, save work RAM at the same frames -> `rNNNNN.bin`. Takes the same `--stop-at-pc` and `--vdp` (`rvNNNNN.bin`, `rcNNNNN.bin`, `rrNNNNN.bin`) |
 | `compare.py` | Compare the two: frame alignment sweep, per-frame diff, persistence test, `--vdp` for the VDP's two memories and register file (#534, #549), a `class` line separating a contiguous persistent divergence from frame phase (#539), and `--meter`, which reads a cart's own parked progress counters as a cycle meter (#530). `--selftest` is in `just check` |
 | `sweep-vdp.sh` | The #539 sweep: `--vdp` every cart in `crates/genesis/tests/commercial_list.toml`, one resumable cart at a time, and collect one row per cart into `target/ref/vdp-sweep/results.tsv` |
@@ -502,15 +502,18 @@ Two caveats about the sweep, both paid for:
   things stand between that and the harness: `run-ref.sh` holds `/tmp/blastem_output`
   open itself for the whole run (a reader blastem cannot kill), and the driver, when
   it is not killed first, holds its end until the reference exits or a short grace
-  passes. The exit-time signature to recognise from the outside: every dump on disk,
-  every frame in the transcript, exit 141, nothing on stdout.
+  passes. Before the holder, that ending read from the outside as every dump on
+  disk, every frame in the transcript, exit 141, nothing on stdout; a run that
+  still ends that way now comes back as `all N frames captured, but blastem exited
+  141` with the images on disk, not as a bare death.
 - **A reference run that dies partway through the walk is the driver's deadline, not
   a cart.** `terminal-standin.py` has one deadline (`REF_DRIVE_TIMEOUT`, default 120 s)
   for the whole session, boot included. When the box is loaded and the window starts
   deep into the cart's run, the lead-in outruns it, the driver vanishes mid-walk, and
   blastem's next FIFO write dies the death above with only the first few dumps on
   disk (#544's "3 of 15"). An idle box walks the same window in ~11 s; before blaming
-  a cart, check the load and the wall time.
+  a cart, check the load and the wall time - and since #552 the run itself names the
+  frame it stopped at instead of leaving the guess to you.
 - **Never send `cont` to a piped debugger with nothing armed.** It never returns and
   the driver hangs until its timeout. Advance with `frames N`, which returns a prompt
   after N frames, and end the command file with `quit`. `--stop-at-pc` is the
@@ -536,9 +539,12 @@ Two caveats about the sweep, both paid for:
   `-r E` (347 bytes different); our `--region auto` prints `region=usa`.
 - **The FIFOs are `/tmp/blastem_input` and `/tmp/blastem_output`, fixed.** One
   debugger run at a time, machine-wide, and stale ones from an interrupted run are
-  deleted before starting. `run-ref.sh` also parks a silent holder on the output FIFO
-  for the length of the run (see the SIGPIPE caveat above); it goes away when the run
-  does, and until then it is one more reason not to start a second reference run.
+  deleted before starting - but only after a collision check (#552): a run in flight
+  is the blastem executable on some command line, or the #544 holder alive behind its
+  pidfile (`/tmp/blastem_ref_holder.pid`), and `run-ref.sh` refuses with exit 3 and
+  prints what it saw rather than `rm` through a live channel. It parks that pidfile
+  itself for the length of the run, so a holder that outlived its blastem is visible
+  to the next run too.
 - **`save` quoting:** the file name must be quoted (`save "b00600.bin"`) or it is
   parsed as an expression, and the address must be the memory form `[0xFF0000]`, not
   `0xFF0000`. It takes at most three arguments. Filenames are relative to the
@@ -552,6 +558,16 @@ Two caveats about the sweep, both paid for:
   debugger can press buttons (`binddown "gamepads.0.start"`), our side has
   `--pad1`; making a comparison drive both is the missing piece for anything that
   depends on input, and is deliberately not done here.
+- **A non-zero `run-ref.sh` is not evidence about the cart.** A reference run can
+  stop mid-walk for reasons that have nothing to do with the cart under test: the
+  driver's deadline on a loaded box (above), a collision (refused now, but the
+  failures it used to produce looked exactly like this), or blastem simply halting
+  partway on some carts - `Gunfight 3 in 1` stops answering after frame 100 of
+  `5 100 300` and no frame list asked so far gets past it (#552). So the run reports
+  which it was: the report names the frame the walk stopped at, counts the frames
+  that did land, and the captured images stay on disk with a `manifest.txt` -
+  `bv00100.bin: 65536 bytes, 26351 non-zero` is the line that says "blastem booted
+  it". Ask again, frame by frame, before writing "the reference will not boot it".
 - **A reference is not truth.** Disagreement is evidence, not proof: change
   behaviour to match blastem only with a second reference in agreement, and record
   in the issue which reference said what (#525's own constraint).
@@ -592,11 +608,18 @@ and the output directory is gitignored so a dump cannot be committed either.
 nix develop -c just ref-selftest      # also part of `just check`
 ```
 
-Two selftests, both in `just check`. `compare.py --selftest` is the one below;
+Three selftests, all in `just check`. `compare.py --selftest` is the one below;
 `terminal-standin.py --selftest` drives a fake blastem over the same FIFO protocol and
 pins the teardown: the fake writes one more prompt after `quit`, late, and the driver
 must hold the FIFO open until it lands (#544), so a driver that lets go early makes the
-fake die of a broken pipe and the selftest fails.
+fake die of a broken pipe and the selftest fails. `run-ref.sh --selftest` then drives
+the script itself over a fake blastem that speaks the same command file (#552): a
+clean walk must exit 0 with every image at full size, a fake that parks after 2 of 3
+frames must produce the stopped-at report with its manifest, and a second run while
+one is in flight must refuse (exit 3) without deleting the live run's FIFOs. It uses
+the machine's real `/tmp` FIFO names - those fixed names are part of what is tested -
+so it needs the box's reference channel free, and it costs about ten seconds of mostly
+`REF_TIMEOUT` rather than the milliseconds the other two take.
 
 It builds a canned pair of images that agree, a one-byte mutation of one frame, a
 mutation of the same address in every frame, a pair aligned only at a one-frame
