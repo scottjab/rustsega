@@ -1750,23 +1750,65 @@ mod tests {
         );
     }
 
-    /// INFERRED, and pinned so that a change of reading cannot be quiet: the
-    /// horizontal scroll table is walked with the display line, the same doubled
-    /// number the name table fetch and the vscroll use, so the two display lines
-    /// of one beam line read two different entries of a per-line table. Nothing in
-    /// genvdp.txt addresses which line the scroll table counts - section 13 gives
-    /// the walk as `index = line` and stops there.
+    /// The horizontal scroll table of interlace mode 2 is latched by the beam
+    /// line, not by the doubled display line the plane fetch and the vscroll
+    /// count. Section 13 gives the walk as `index = line` and stops there, so
+    /// the line the counter names is the one it names everywhere else: the beam
+    /// counts 224 lines in V28 whatever the picture height, and the cart of
+    /// #655 builds its table to exactly that - "224 lines * 2 bytes per entry *
+    /// 2 planes" (Sonic 2's `sizeof_vram_hscroll`) for a 448-line picture,
+    /// which a doubled walk would read half out of. The reference latches
+    /// `(vcounter & the R11 mode mask) * 4` off the undoubled counter
+    /// (blastem 1.0.0 vdp.c, the hscroll slot of each line).
     #[test]
-    fn interlace_mode_2_walks_the_horizontal_scroll_table_by_display_line() {
+    fn interlace_mode_2_latches_the_hscroll_table_by_beam_line() {
         let mut vdp = interlaced_plane_vdp();
         vdp.write_register(11, 0x03); // per-line horizontal scroll
         vdp.write_register(13, 0x3F); // the table of `put_scroll`, at HSCROLL_BASE
+        put_scroll(&mut vdp, 0, 0, 0);
+        put_scroll(&mut vdp, 200, 8, 0);
+
+        // One colour per cell column, as `fill_columns` does it but at the 8x16
+        // pattern address of interlace mode 2.
+        for column in 0..PLANE_COLUMNS {
+            let tile = 2 * (column as u16 + 1);
+            for row in 0..PLANE_ROWS {
+                put_entry(&mut vdp, PLANE_A_BASE, row * PLANE_COLUMNS + column, tile);
+            }
+            for row in 0..MODE2_ROWS {
+                fill_tile_row_of_height(&mut vdp, tile, row, column_colour(column), MODE2_ROWS);
+            }
+        }
+
+        vdp.line = 200;
+        vdp.latch_line_state();
+        vdp.begin_line(200);
+        let mut out = blank_line();
+        vdp.render_plane_line(Plane::A, 400, &mut out);
+        // Entry 200 scrolls plane A by 8, so the leftmost 8 pixels of display
+        // line 400 are the last column of the 32-column plane, wrapped. A walk
+        // by the doubled line would have read entry 400 - past the 224 entries
+        // the cart builds - and shown column 0 instead.
+        assert_eq!(
+            &out[..8],
+            &[column_colour(31); 8],
+            "beam line 200 (display line 400) latches scroll entry 200"
+        );
+    }
+
+    /// The live walk of a caller that drives [`Vdp::render_plane_line`] outside
+    /// the beam takes the line its caller names as the table row - the same
+    /// number the caller means by "line", which is the display line the tests
+    /// and the debug views pass. The beam-driven path is pinned by
+    /// `interlace_mode_2_latches_the_hscroll_table_by_beam_line`.
+    #[test]
+    fn the_live_hscroll_walk_takes_the_line_its_caller_names() {
+        let mut vdp = interlaced_plane_vdp();
+        vdp.write_register(11, 0x03); // per-line horizontal scroll
+        vdp.write_register(13, 0x3F);
         put_scroll(&mut vdp, 0, 8, 0);
         put_scroll(&mut vdp, 1, 0, 0);
 
-        // One colour per cell column, as `fill_columns` does it but at the 8x16
-        // address of interlace mode 2, and naming the even tiles so that no two
-        // columns share a pattern once bit 0 of the name is dropped.
         for column in 0..PLANE_COLUMNS {
             let tile = 2 * (column as u16 + 1);
             for row in 0..PLANE_ROWS {
@@ -1782,7 +1824,7 @@ mod tests {
         assert_eq!(
             &out[..8],
             &[column_colour(1); 8],
-            "display line 0 reads scroll entry 0, which scrolls plane A by 8"
+            "line 0 reads scroll entry 0, which scrolls plane A by 8"
         );
 
         let mut out = blank_line();
@@ -1790,7 +1832,7 @@ mod tests {
         assert_eq!(
             &out[..8],
             &[column_colour(0); 8],
-            "and display line 1 reads scroll entry 1, which does not"
+            "and line 1 reads scroll entry 1, which does not"
         );
     }
 

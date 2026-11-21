@@ -89,8 +89,27 @@ impl NameEntry {
 #[inline]
 pub const fn tile_addr(tile: u16, tile_height: usize) -> usize {
     let name = tile as usize;
-    let name = if tile_height == 16 { name & !1 } else { name };
-    (name << 5) & VRAM_MASK
+    // The patterns of interlace mode 2 are 8x16: 64 bytes each, named by a
+    // 10-bit pattern index - "there are 2048 tiles (11-bit) in normal mode and
+    // 1024 tiles (10-bit) in interlaced mode" (SpritesMind t=2693, "Interlace
+    // mode (LSMx=3)"), which is section 12's "8x8 or 8x16 (interlace mode 2
+    // only)" block counted in lines of the doubled picture. The reference
+    // answers the same rule: its plane and sprite fetches make the address
+    // `(name & 0x3FF) << 6` when the mode is on (blastem 1.0.0 vdp.c,
+    // render_map and the sprite draw), and Sonic 2's two-player demo is what
+    // the difference looks like: its title-card plane names solid 8x16 cells
+    // (one colour C pattern at 748, one colour 3 at 749), which the pair rule
+    // this replaces turned into half-period striping (#655).
+    let name = if tile_height == 16 {
+        name & 0x3FF
+    } else {
+        name
+    };
+    (if tile_height == 16 {
+        name << 6
+    } else {
+        name << 5
+    }) & VRAM_MASK
 }
 
 /// The 16-bit word at byte `addr` of `vram`, big endian: the high byte of the
@@ -271,35 +290,40 @@ mod tests {
         assert_eq!(tile_row(&vram, 0x7FF, 7, false, false, 8), [0; 8]);
     }
 
-    /// Interlace mode 2: patterns are 8x16, so 16 rows of 4 bytes lie end to
-    /// end and bit 0 of the name is dropped (genvdp.txt sections 12 and 13).
+    /// Interlace mode 2: patterns are 8x16, 64 bytes each, named by a 10-bit
+    /// pattern index (genvdp.txt section 12, "8x8 or 8x16 (interlace mode 2
+    /// only)"; SpritesMind t=2693: "there are 2048 tiles (11-bit) in normal
+    /// mode and 1024 tiles (10-bit) in interlaced mode"). Sonic 2's two-player
+    /// demo is the cart that caught the pair-of-8x8-tiles reading this
+    /// replaces: its title-card plane names one solid 8x16 pattern per table
+    /// row (748, then 749), which the dropped bit made both names render as
+    /// the same cell and striped the picture (#655).
     #[test]
-    fn tile_height_16_spans_64_bytes_and_drops_bit_0_of_the_name() {
+    fn tile_height_16_spans_64_bytes_at_the_ten_bit_pattern_index() {
         let mut vram = blank_vram();
         for row in 0..16u8 {
             let start = 64 + usize::from(row) * 4;
             vram[start] = row << 4;
             vram[start + 1] = row;
         }
-        assert_eq!(tile_addr(2, 16), 64);
-        assert_eq!(tile_addr(3, 16), 64, "bit 0 of the name is ignored");
-        assert_eq!(tile_addr(1, 16), 0, "so tile 1 is tile 0 at 8x16");
+        assert_eq!(tile_addr(1, 16), 64);
+        assert_eq!(tile_addr(2, 16), 128, "each name is its own 8x16 pattern");
+        assert_eq!(tile_addr(3, 16), 192);
+        assert_eq!(tile_addr(0x3FF, 16), 0xFFC0, "the pattern index is 10 bits");
+        assert_eq!(
+            tile_row(&vram, 1, 15, false, false, 16),
+            [0xF, 0, 0, 0xF, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            tile_row(&vram, 1, 0, true, false, 16),
+            [0xF, 0, 0, 0xF, 0, 0, 0, 0]
+        );
         assert_eq!(
             tile_row(&vram, 2, 15, false, false, 16),
-            [0xF, 0, 0, 0xF, 0, 0, 0, 0]
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            "pattern 2 is the 64 bytes at 128, which hold nothing here"
         );
-        assert_eq!(
-            tile_row(&vram, 3, 15, false, false, 16),
-            [0xF, 0, 0, 0xF, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            tile_row(&vram, 2, 0, true, false, 16),
-            [0xF, 0, 0, 0xF, 0, 0, 0, 0]
-        );
-        assert_eq!(
-            tile_row(&vram, 2, 0, false, false, 16),
-            [0, 0, 0, 0, 0, 0, 0, 0]
-        );
+        assert_eq!(tile_addr(0x7FF, 8), 0xFFE0, "8-line names are unchanged");
     }
 
     /// VRAM holds words big endian (the data port wrote them that way in

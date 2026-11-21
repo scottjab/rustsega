@@ -132,14 +132,22 @@ impl Vdp {
         let window_display_off_mclk = core::mem::take(&mut self.sprite_slots_display_off_mclk);
         self.search_sprites(window_display_off_mclk);
 
-        let display_line = usize::from(self.display_line(self.line));
+        // The hscroll table is walked by the line the table names, which is the
+        // beam line in every mode: section 13's `get_scroll(line)` takes the
+        // counter as the beam counts it, and in interlace mode 2 that is still
+        // the 224-line beam - Sonic 2's two-player demo builds its table as
+        // "224 lines * 2 bytes per entry * 2 planes" for the 448-line picture
+        // (#655), which a doubled walk would read half out of. The reference
+        // latches the entry as `(vcounter & the R11 mode mask) * 4` off the
+        // undoubled counter (blastem 1.0.0 vdp.c, the per-line hscroll slot).
+        let beam_line = usize::from(self.line);
         let latch = LineState {
             line: self.line,
             regs: self.regs,
             vsram: self.vsram,
             hscroll: [
-                self.hscroll_table(Plane::A, display_line) as u16,
-                self.hscroll_table(Plane::B, display_line) as u16,
+                self.hscroll_table(Plane::A, beam_line) as u16,
+                self.hscroll_table(Plane::B, beam_line) as u16,
             ],
         };
         // The first line of a chip allocates the latch and every one after it is
