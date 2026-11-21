@@ -45,6 +45,29 @@ const FRAME_LINES_PAL: u16 = 313;
 /// line.
 pub(crate) const VINT_H_COUNTER: u32 = 0x08;
 
+/// Master clocks between the vertical interrupt's flag going up and its level
+/// being offered to the 68000.
+///
+/// The flag and the level are two events, not one: Eke's Krikzz rig latched the
+/// counter at /IPL2's assert one count after the flag's set point (SpritesMind
+/// "VDP Interrupts & HVC tests", August 2010, viewtopic.php?t=787 - flag set at
+/// counter $01, latch reading $02), and the same author's emulator notes name
+/// the gap as a requirement for two carts ("Regen 0.95" thread, t=465, December
+/// 2008: "Mega-Lo-Mania/Tyrants and Ex-Mutant need some latency between VINT
+/// flag being set in VDP status and VINT occurence"). MAME's Model 2 lockstep
+/// measured its own delivery at the same magnitude (biggestsonicfan/m2-sonic
+/// #1: "MAME acknowledges each VINT about 25 cycles after the port takes it").
+/// 175 master clocks is 25 cycles of the 68000's master/7, and it is what
+///#554's MEGA lo MANIA boot needs to read bit 7 in its poll loop
+/// (`crates/genesis`: its $9E0 wait reads every ~46 cycles while its own
+/// handler's acknowledge would otherwise clear the flag under it).
+///
+/// Known limit, kept knowingly: the flag is readable for this window only, so
+/// a boot whose poll phase loses the race still freezes. That race is real
+/// hardware shaped (the same window exists there); the sourced fix for a
+/// re-break is a scope capture of the real latency, not a constant bump.
+pub(crate) const VINT_LEVEL_DELAY_MCLK: u32 = 175;
+
 /// Master clocks into the line at which status bit 2 (HB) goes up, H40.
 ///
 /// genvdp.txt section 6: d2 "is set at H counter cycle E4h and cleared at H
@@ -466,8 +489,21 @@ impl Vdp {
     /// interrupts within a scanline" is about a line interrupt that shares a
     /// line with the vertical one: the 68000 takes whichever is up, and this
     /// answers one at a time.
+    /// Level 6 outranks level 4 because it is the higher level, and genvdp.txt
+    /// section 4's note that "line interrupts are processed *before* vertical
+    /// interrupts within a scanline" is about a line interrupt that shares a
+    /// line with the vertical one: the 68000 takes whichever is up, and this
+    /// answers one at a time.
+    ///
+    /// The level 6 offer also waits out [`VINT_LEVEL_DELAY_MCLK`] past the
+    /// flag's set point: the flag leads the level (see the constant), and a
+    /// status read inside the window answers bit 7 set with nothing on IPL.
     pub fn pending_irq(&self) -> Option<u8> {
-        if self.vint_pending && self.vint_enabled() {
+        let vint_live = self.vint_pending
+            && self.vint_enabled()
+            && (self.line != self.vblank_line()
+                || self.line_mclk >= self.vint_mclk() + VINT_LEVEL_DELAY_MCLK);
+        if vint_live {
             Some(IRQ_VINT)
         } else if self.hint_pending && self.hint_enabled() {
             Some(IRQ_HINT)
@@ -768,6 +804,104 @@ mod tests {
         assert_eq!(vdp.pending_irq(), Some(4), "the HINT is still waiting");
         vdp.ack_irq(4);
         assert_eq!(vdp.pending_irq(), None, "and both are gone");
+    }
+
+    /// Eke's hardware rule that the pending flag is not the frame's: "Once they
+    /// are set, interrupt pending flags remain set as long as interrupts are not
+    /// acknowledged by the 68k. They are NOT cleared by: disabling interrupts
+    /// through VDP registers, reading VDP status, starting a new frame"
+    /// (SpritesMind, "VDP Interrupts & HVC tests", August 2010). A cart that
+    /// polls bit 7 while the 68k mask holds level 6 off - the boot path of the
+    /// MEGA lo MANIA engine, whose four sightings of the flag are all there
+    /// (#554) - depends on the flag staying up across the frame boundary until
+    /// something acknowledges.
+    #[test]
+    fn vint_flag_survives_a_new_frame_when_nobody_acknowledges_it() {
+        let mut vdp = Vdp::new(false);
+        vdp.write_register(1, 0x40);
+
+        for _ in 0..230 {
+            vdp.advance(MCLKS_PER_LINE);
+        }
+
+        assert!(vdp.vint_pending, "the flag went up on line 224");
+        assert_eq!(vdp.line, 230, "six lines later it is still up");
+
+        // A whole frame past the set, across the 261 -> 0 wrap: the flag of the
+        // frame that was survives the start of the next one.
+        for _ in 0..(262 - 230) {
+            vdp.advance(MCLKS_PER_LINE);
+        }
+        assert_eq!(vdp.line, 0, "the first line of the next frame");
+        assert!(
+            vdp.vint_pending,
+            "and the flag is still up: starting a new frame does not clear it"
+        );
+
+        // Frame two raises it again on its own VBlank line, and the acknowledge
+        // - not the frame - is what takes it down.
+        for _ in 0..224 {
+            vdp.advance(MCLKS_PER_LINE);
+        }
+        assert!(vdp.vint_pending, "frame two raised it again");
+        vdp.ack_irq(6);
+        assert!(!vdp.vint_pending, "the acknowledge is the only clear");
+    }
+
+    /// The VDP clears "the appropriate flag" on an acknowledge (Eke, "VDP
+    /// Interrupts & HVC tests", August 2010: "When /INTACK is asserted, the VDP
+    /// will look at the current IRQ level through the state of /IPL1 and /IPL2,
+    /// clear the appropriate flag"), so an acknowledge of level 4 leaves the
+    /// level 6 flag alone.
+    #[test]
+    fn acknowledging_a_level_that_is_not_the_vint_leaves_its_flag() {
+        let mut vdp = running(false);
+        vdp.write_register(1, 0x40);
+
+        for _ in 0..225 {
+            vdp.advance(MCLKS_PER_LINE);
+        }
+
+        assert!(vdp.vint_pending);
+        vdp.ack_irq(4);
+        assert!(
+            vdp.vint_pending,
+            "a level 4 acknowledge is not the VDP's to clear the VINT flag with"
+        );
+    }
+
+    /// The flag leads the level: status bit 7 is readable for a stretch of the
+    /// VBlank line before the 68000 is offered level 6 at all (#554). Eke names
+    /// the requirement for this exact engine in the Regen thread (SpritesMind
+    /// t=465, December 2008): "Mega-Lo-Mania/Tyrants and Ex-Mutant need some
+    /// latency between VINT flag being set in VDP status and VINT occurence" -
+    /// the MEGA lo MANIA boot polls bit 7 in a loop and its own handler's
+    /// acknowledge would otherwise eat the flag before any poll read lands.
+    #[test]
+    fn vint_flag_is_readable_before_the_level_is_offered() {
+        let mut vdp = running(false);
+        vdp.write_register(1, 0x60);
+
+        // To the VBlank line, then one clock past the flag's set point.
+        for _ in 0..224 {
+            vdp.advance(MCLKS_PER_LINE);
+        }
+        vdp.advance(vdp.vint_mclk() + 1);
+
+        assert!(vdp.vint_pending, "the flag is up");
+        assert_eq!(
+            vdp.pending_irq(),
+            None,
+            "but the level is not offered inside the delay window"
+        );
+
+        // And at the end of the window the level is offered with the flag still
+        // up, until the acknowledge takes both down.
+        vdp.advance(VINT_LEVEL_DELAY_MCLK - 1);
+        assert_eq!(vdp.pending_irq(), Some(6), "the level follows the flag");
+        assert!(vdp.vint_pending);
+        vdp.ack_irq(6);
+        assert!(!vdp.vint_pending && vdp.pending_irq().is_none());
     }
 
     /// [`Vdp::start_in_vblank`] parks the beam on the first line of VBlank with that
