@@ -21,8 +21,10 @@
 //!   exception ([`Op::Illegal`] 9 688, [`Op::Undefined`] 1 184, [`Op::LineA`] /
 //!   [`Op::LineF`] 8 192, the two reserved line groups the map records as
 //!   `None`); 204 sit in [`UNIMPLEMENTED_NONE_SLOTS`] below (filed, #621);
-//!   453 decode to an actual instruction in slots the map calls undefined,
-//!   pinned in `pinned_none_mismatch` (filed, #618/#619/#620).
+//!   453 decoded to an actual instruction in slots the map calls undefined:
+//!   the 448 OR/AND EA classes were fixed and unpinned by #618, and the 5
+//!   remaining over-broad decodes are pinned in `pinned_none_mismatch`
+//!   (filed, #619/#620).
 //!
 //! # What is asserted
 //!
@@ -244,15 +246,12 @@ const UNIMPLEMENTED_NONE_SLOTS: &[(u16, u16, &str)] = &[
 ///
 /// The geometry of each pin, against the map and the suite:
 ///
-/// * **OR/AND, 448 opcodes** (#618). `classify_and_or` accepts, for the
-///   forward `<ea>,Dn` direction, an An-direct source at word and long (the
-///   byte case is rejected, so the manual's data rule is half-applied), and
-///   for the reverse `Dn,<ea>` direction a Dn-direct destination, though the
-///   reverse form's operand is memory-alterable. The map says `None` for all
-///   of them and the suite has no case for any of them. The same shapes are
-///   DEFINED for ADD/SUB/CMP — `ADD.w A0,D0` (`$D048`) has suite cases and a
-///   map entry — so do not "fix" the identical-looking branch in
-///   `classify_add`/`classify_sub`/`classify_cmp` when this one lands.
+/// The audit's OR/AND over-broad decodes (448 opcodes, `Or`: 256 / `And`: 192)
+/// were fixed by #618 and their pins removed: the forward form refuses an An
+/// direct source at every size and the reverse form takes memory-alterable
+/// only, so those `None` slots now decode to [`Op::Illegal`] and pass through
+/// [`NONE_EXCEPTION_TAGS`]. Still pinned:
+///
 /// * **MOVEM store to PC-relative, 4 opcodes** (#619). The map defines PC-rel
 ///   for the load direction (`$4CBA` has suite cases) and `None` for the
 ///   store direction (`$48BA`/`$48BB`/`$48FA`/`$48FB`); `is_movem_ea` accepts
@@ -263,18 +262,9 @@ const UNIMPLEMENTED_NONE_SLOTS: &[(u16, u16, &str)] = &[
 ///   form `BTST Dn,#` is a different story: the map defines it, the suite
 ///   measures it (`0b3c [BTST D5, #]` cases), and rustsega agrees — keep it.
 fn pinned_none_mismatch(opcode: u16, op: Op) -> bool {
-    let op_mode = (opcode >> 6) & 0b111;
     let mode = (opcode >> 3) & 0b111;
     let reg = opcode & 0b111;
     match (opcode & 0xF000, op) {
-        (0x8000, Op::Or) => {
-            ((op_mode == 0b001 || op_mode == 0b010) && mode == 0b001)
-                || ((op_mode == 0b101 || op_mode == 0b110) && mode == 0b000)
-        }
-        (0xC000, Op::And) => {
-            ((op_mode == 0b001 || op_mode == 0b010) && mode == 0b001)
-                || (op_mode == 0b110 && mode == 0b000)
-        }
         // MOVEM store (`0100 1d00 1s`, d clear) into the two PC-relative modes.
         (_, Op::Movem) => opcode & 0x0100 == 0 && mode == 0b111 && (reg == 0b010 || reg == 0b011),
         (_, Op::BitStatic) => opcode == 0x083C,
@@ -316,17 +306,12 @@ fn decode_agrees_with_the_official_opcode_map() {
                 continue;
             }
             if pinned_none_mismatch(opcode, op) {
-                *pinned_counts
-                    .entry(if op == Op::Or {
-                        "Or (over-broad)"
-                    } else if op == Op::And {
-                        "And (over-broad)"
-                    } else if op == Op::Movem {
-                        "Movem (over-broad)"
-                    } else {
-                        "BitStatic (over-broad)"
-                    })
-                    .or_default() += 1;
+                let bucket = if op == Op::Movem {
+                    "Movem (over-broad)"
+                } else {
+                    "BitStatic (over-broad)"
+                };
+                *pinned_counts.entry(bucket).or_default() += 1;
                 continue;
             }
             mismatches.push((opcode, operation, op));
@@ -350,8 +335,6 @@ fn decode_agrees_with_the_official_opcode_map() {
     // The pins cannot drift: each pinned bucket is exact.
     let expect = [
         ("Unimplemented", 204u32),
-        ("Or (over-broad)", 256),
-        ("And (over-broad)", 192),
         ("Movem (over-broad)", 4),
         ("BitStatic (over-broad)", 1),
     ];
