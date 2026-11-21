@@ -1633,6 +1633,12 @@ const fn is_bit_op(opcode: u16) -> bool {
 ///   an alterable destination, so `BCHG D1,d16(PC)` and `BCLR #3,#$1234` are
 ///   illegal while `BTST` may have either (M68000PM/AD 2.2.12 gives `BTST` the
 ///   whole data column and the other three only the alterable part of it).
+///   The static form of `BTST` still stops short of one data-class operand:
+///   `BTST #imm,#imm` is undefined — the M68000PRM "BTST" page's destination
+///   table leaves the immediate column empty, the map calls `$083C` `None`,
+///   and the suite has no case (#620). The *dynamic* form `BTST Dn,#imm` is a
+///   deliberate map+suite disagreement with that table (`$013C`/`$0B3C` are
+///   defined and measured) and keeps the plain `is_data` rule.
 /// * **A `ddd` that is not one of the five immediate registers with bit 8 clear**
 ///   can still reach here from the `0x0000..=0x0FFF` arm only as the static
 ///   form, so the `ddd` of a bit-8-clear opcode needs no further check.
@@ -1648,6 +1654,12 @@ fn classify_bit_op(opcode: u16) -> Op {
     let writes = (opcode >> BIT_OP_MNEMONIC_SHIFT) & 0b11 != 0;
     let ok = if writes {
         is_data_alterable(mode, reg)
+    } else if opcode & BIT_OP_NUMBER_BIT == 0 {
+        // Static `BTST`: data, minus the immediate the PRM's BTST destination
+        // table leaves empty (M68000PRM "BTST"; #620). The dynamic form below
+        // keeps the whole data column — the map defines `BTST Dn,#imm` and
+        // `BTST.json.gz` measures it.
+        is_data(mode, reg) && !(mode == 0b111 && reg == 0b100)
     } else {
         is_data(mode, reg)
     };
@@ -3291,6 +3303,33 @@ mod tests {
                 Op::Undefined,
                 "static, tt = {tt:b}, (A0) ({:04X})",
                 0x0800 | (tt << 6) | ea
+            );
+        }
+    }
+
+    /// The static form's immediate corner is not an instruction: `BTST
+    /// #imm,#imm` has no encoding — the M68000PRM "BTST" page's destination
+    /// addressing table leaves the immediate column empty, the map calls
+    /// `$083C` `None`, and the suite has no case for it (#620). The modify
+    /// twins reject the same EA already because their operand is
+    /// data-alterable, and `$083D`-`$083F` are the invalid mode-`111`
+    /// registers. The **dynamic** `BTST Dn,#imm` is a different story: the map
+    /// defines `$013C`/`$0B3C` and `BTST.json.gz` measures it, so rustsega
+    /// keeps it — a deliberate disagreement with the PRM table, not a bug.
+    #[test]
+    fn static_btst_rejects_an_immediate_destination() {
+        assert_eq!(decode(0x083C), Op::Illegal, "BTST #imm,#imm is undefined");
+        // The rest of the same opcode row keeps its shape: the three invalid
+        // mode-111 registers next door, the modify twins at the immediate EA,
+        // and the dynamic BTST the map and suite both define.
+        for opcode in [0x083Du16, 0x083E, 0x083F, 0x0C3C, 0x08BC, 0x0DBC] {
+            assert_eq!(decode(opcode), Op::Illegal, "${opcode:04X} stays illegal");
+        }
+        for (opcode, name) in [(0x013Cu16, "BTST D0,#imm"), (0x0B3C, "BTST D5,#imm")] {
+            assert_eq!(
+                decode(opcode),
+                Op::BitDynamic,
+                "{name}: the measured dynamic form stays"
             );
         }
     }
