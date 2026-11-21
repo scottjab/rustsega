@@ -23,7 +23,8 @@
 //! key the four operators of the channel at every timer A overflow of `timers`,
 //! which [`Ym2612::csm_step`] passes to `envelope`. The channel 6 PCM DAC and the
 //! L/R routing of M5-11 (#116) are the last two steps to the pin: `&2B` bit 7 puts
-//! `&2A` in place of the FM of channel 6 (`Ym2612::channel_sums`), and the two
+//! `&2A` in place of the FM of channel 6, `&2C` bit 5 does that to all six in
+//! test mode (`Ym2612::channel_sums`), and the two
 //! enable bits of `&B4`-`&B6` decide which of the two output sides each of the six
 //! converters reaches (`regs`, and `output`).
 //!
@@ -349,20 +350,28 @@ impl Ym2612 {
     }
 
     /// The six channel sums the output stage reads this sample: the FM of each
-    /// channel, except that `&2B` bit 7 puts the `&2A` sample in place of channel
-    /// 6's, with `&2C` bit 3 riding in the bottom bit of the same converter
-    /// (YM2608 application manual `&2A` and `&2B`, M5-11 #116, `&2C`).
+    /// channel, except that the channel 6 PCM DAC is on - which `&2B` bit 7
+    /// makes it for channel 6 alone (`&2A`, `&2B`, M5-11 #116), and `&2C` bit 5
+    /// makes it for every channel (`&2C`; see `regs::REG_TEST_2C` for why the
+    /// force is not channel-6-only: Nuked-OPN2's out mux and out_en and the
+    /// die's `dac_sel`/`do_out` all OR the test bit over the whole window walk).
+    /// `&2C` bit 3 rides in the bottom bit of the same converter either way.
     ///
-    /// Only the sum is replaced. The operators of channel 6 keep their phase
-    /// counters and their envelopes, because the chip walks all 24 slots whatever
-    /// the output stage is listening to - which is how ymfm reads it too, clocking
-    /// all six channels and dropping only the sixth out of the sum - and a driver
-    /// that turns the DAC off again finds the FM of the channel where it left it.
+    /// Only the sum is replaced. The operators keep their phase counters and
+    /// their envelopes, because the chip walks all 24 slots whatever the output
+    /// stage is listening to - which is how ymfm reads it too, clocking all six
+    /// channels and dropping only the replaced sums out of the mix - and a
+    /// driver that turns the DAC (or the test bit) off again finds the FM of
+    /// each channel where it left it. Nuked-OPN2 feeds the accumulators a
+    /// constant instead of the operators while bit 5 is up (`add = test_dac`,
+    /// LLE `sum1 = add + acc + test_dac`); replacing the sums is the same
+    /// observable at the pin, and the constant never reaches it.
     fn channel_sums(&self) -> [i16; CHANNELS] {
         let dac = self.regs.dac_enabled();
+        let test_dac = self.regs.test_dac();
         let sample = output::pcm_sample(self.regs.dac_data(), self.regs.dac_lsb());
         std::array::from_fn(|channel| {
-            if dac && channel == DAC_CHANNEL {
+            if test_dac || (dac && channel == DAC_CHANNEL) {
                 sample
             } else {
                 self.channels[channel].output()
@@ -1270,6 +1279,29 @@ mod tests {
             }
         }
         for channel in 0..CHANNELS as u8 {
+            let field = channel + u8::from(channel > 2);
+            write_reg(chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_ALL | field);
+        }
+    }
+
+    /// Five of [`all_six_channels_open`], channel 6 left out so its converter
+    /// sits at silence: a test that wants to say what one channel's converter
+    /// does while the other five play FM.
+    fn open_five_channels_but_six(chip: &mut Ym2612) {
+        for (addr, data) in [(ADDR_1, DATA_1), (ADDR_2, DATA_2)] {
+            for channel in 0..3u8 {
+                for slot in 0..4u8 {
+                    let offset = slot * 4 + channel;
+                    write_reg(chip, addr, data, 0x30 + offset, 0x01);
+                    write_reg(chip, addr, data, 0x40 + offset, 0x00);
+                    write_reg(chip, addr, data, 0x50 + offset, 0x1F);
+                }
+                write_reg(chip, addr, data, 0xA4 + channel, 0x22);
+                write_reg(chip, addr, data, 0xA0 + channel, 0x10);
+                write_reg(chip, addr, data, REG_ALGORITHM + channel, 0x07);
+            }
+        }
+        for channel in 0..5u8 {
             let field = channel + u8::from(channel > 2);
             write_reg(chip, ADDR_1, DATA_1, REG_KEY_ON, KEY_ON_ALL | field);
         }
@@ -2193,13 +2225,148 @@ mod tests {
         assert_eq!(asic.clock(), (255, 255));
     }
 
-    /// Every other bit of `&2C` is stored and decoded by nothing: that is the
-    /// fence #339 decided on. Bit 5 is the one the fence gives away - Nuked-OPN2's
-    /// `OPN2_ChOutput` (`|| test_dac`) and the die LLE's `dac_sel = test_dac ||
-    /// (reg_dac_en && ch_ch6)` force channel 6's converter to `&2A` with it set -
-    /// but that is #588's to model, and bit 7's claimed IRQ/STATUS disable has no
-    /// source behind it (see `regs::REG_TEST_2C` for the whole fence, and
-    /// `test_2c_bit7_leaves_read_status_alone` for the status half of it).
+    /// `&2C` bit 5 (`test_dac`) forces the `&2A` sample onto the pin with
+    /// `&2B` bit 7 clear - DAC mode without writing DACEN - and not only under
+    /// channel 6: every output window carries the sample while it is up. Nuked-
+    /// OPN2's `OPN2_ChOutput` replaces `out` with `dacdata` for
+    /// `((cycles >> 2) == 1 && chip->dacen) || test_dac`, where the first term is
+    /// channel 6's window and the second is every one of them, and drives the
+    /// pins for `out_en = ((cycles & 3) == 3) || test_dac`; the die LLE is the
+    /// same shape, `dac_sel = test_dac || (chip->reg_dac_en[1] && chip->ch_ch6)`
+    /// with `do_out = test_dac || chip->ch_load[0]` (nukeykt/YM2608-LLE
+    /// `fmopna_impl.c`), where `ch_ch6` gates only the DACEN term and the
+    /// `ch_buf` shift line walks every channel's window through the same
+    /// `ch_val` mux (both read 19 Nov 2026). The ticket body's "channel 6's
+    /// converter" reads the OR the other way; the sources say all six, and the
+    /// decision on #588 lands with the sources.
+    ///
+    /// While bit 5 is up Nuked also feeds the channel accumulators a constant
+    /// instead of the operator outputs (`add = test_dac`, LLE
+    /// `sum1 = add + acc + test_dac`); this crate replaces the sums in front of
+    /// the operators, so the observable is the same - the pin shows the sample -
+    /// and nothing of the operators' state is disturbed, which the resumption at
+    /// the bottom pins.
+    #[test]
+    fn test_2c_bit5_forces_dac_on_ch6() {
+        for model in [ChipModel::Ym2612, ChipModel::Ym3438] {
+            let mut chip = Ym2612::new();
+            chip.set_model(model);
+            open_channel_six(&mut chip);
+            set_dac(&mut chip, 0x40, false);
+
+            // Channel 6's FM is the pin: loud and moving.
+            let fm = samples(&mut chip, 16);
+            assert!(
+                fm.windows(2).any(|pair| pair[0] != pair[1]),
+                "{model:?}: the FM of channel 6 is not on the pin: {fm:?}"
+            );
+            assert!(
+                fm.iter().any(|(left, _)| left.abs() > 100),
+                "{model:?}: and the patch is not quiet either: {fm:?}"
+            );
+
+            // Bit 5 up: every converter holds the `&2A` value - `&2A` 0x40 is
+            // the 9-bit code -128, with the step of ladder its sign buys on the
+            // discrete chip - and the level holds for the whole run.
+            write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0x20);
+            let want = i16::try_from(
+                output::dac(output::pcm_sample(0x40, false), model) * (CHANNELS as i32),
+            )
+            .expect("six codes of one sample stay inside i16");
+            for pair in samples(&mut chip, 16) {
+                assert_eq!(pair, (want, want), "{model:?}: bit 5 forces the sample");
+            }
+
+            // It follows `&2A` while it is up: the top and the bottom of the
+            // converter, six codes of each.
+            for data in [0xFFu8, 0x00] {
+                write_reg(&mut chip, ADDR_1, DATA_1, REG_DAC_DATA, data);
+                let want = i16::try_from(
+                    output::dac(output::pcm_sample(data, false), model) * (CHANNELS as i32),
+                )
+                .expect("six codes of one sample stay inside i16");
+                assert_eq!(chip.clock(), (want, want), "{model:?}: `&2A` {data:#04X}");
+            }
+
+            // Bit 5 down: the FM of channel 6 is on the pin again. The window
+            // spans one period of the patch's F-Num (~248 samples), because a
+            // max-volume four-carrier sum spends most of a half-period clamped
+            // at the top of the 14-bit range and only moves on the other half.
+            write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0x00);
+            let back = samples(&mut chip, 256);
+            assert!(
+                back.windows(2).any(|pair| pair[0] != pair[1]),
+                "{model:?}: the FM is on the pin again"
+            );
+        }
+    }
+
+    /// The override is the point of bit 5, so `&2C` 0x20 with `&2B` 0x00 reads
+    /// as `&2A` - and as `&2A` on every converter: the five audible channels'
+    /// FM leaves the pin with channel 6's, because every window carries the
+    /// sample (the sources are on `test_2c_bit5_forces_dac_on_ch6`). What stays
+    /// untouched is the operators themselves: clearing bit 5 brings back
+    /// exactly the FM of a chip that was never forced, which is the same shape
+    /// `dac_disable_restores_fm` pins for `&2B` bit 7.
+    #[test]
+    fn test_2c_bit5_overrides_dac_enable_off() {
+        for model in [ChipModel::Ym2612, ChipModel::Ym3438] {
+            let mut forced = Ym2612::new();
+            forced.set_model(model);
+            let mut plain = Ym2612::new();
+            plain.set_model(model);
+            for chip in [&mut forced, &mut plain] {
+                open_five_channels_but_six(chip);
+                set_dac(chip, 0x40, false);
+            }
+            write_reg(&mut plain, ADDR_1, DATA_1, REG_TEST_2C, 0x00);
+            write_reg(&mut forced, ADDR_1, DATA_1, REG_TEST_2C, 0x20);
+
+            // The five channels play the same FM on both chips ...
+            let free = samples(&mut plain, 40);
+            assert!(
+                free.iter().any(|(left, _)| left.abs() > 100),
+                "{model:?}: the five audible channels are not quiet: {free:?}"
+            );
+            assert!(
+                free.windows(2).any(|pair| pair[0] != pair[1]),
+                "{model:?}: and they are moving: {free:?}"
+            );
+
+            // ... while the forced chip's pin is the `&2A` code on every
+            // converter and nothing else: the whole mix is under the sample.
+            let want = i16::try_from(
+                output::dac(output::pcm_sample(0x40, false), model) * (CHANNELS as i32),
+            )
+            .expect("six codes of one sample stay inside i16");
+            for pair in samples(&mut forced, 40) {
+                assert_eq!(pair, (want, want), "{model:?}: `&2B` 0x00 does not matter");
+            }
+
+            // Bit 5 down again: the FM comes back exactly where a never-forced
+            // chip has it - only the sums were replaced. The equality is exact
+            // per sample whatever the patch's own plateau does, since both
+            // chips stepped the same operators all along.
+            write_reg(&mut plain, ADDR_1, DATA_1, REG_TEST_2C, 0x00);
+            write_reg(&mut forced, ADDR_1, DATA_1, REG_TEST_2C, 0x00);
+            let after = samples(&mut forced, 256);
+            let plain_after = samples(&mut plain, 256);
+            assert!(
+                after.windows(2).any(|pair| pair[0] != pair[1]),
+                "{model:?}: the FM is moving again"
+            );
+            assert_eq!(
+                after, plain_after,
+                "{model:?}: the FM of a chip that was never forced"
+            );
+        }
+    }
+
+    /// Every bit of `&2C` but the two that decode is stored and decoded by
+    /// nothing: bit 3 is the DAC LSB (`test_2c_bit3_is_the_dac_lsb`) and bit 5
+    /// the test-DAC mode (`test_2c_bit5_forces_dac_on_ch6`); the fence holds
+    /// for the rest, and the register doc `regs::REG_TEST_2C` says what is
+    /// fenced and why.
     #[test]
     fn test_2c_bits_other_than_3_change_nothing() {
         let mut chip = Ym2612::new();
@@ -2208,9 +2375,11 @@ mod tests {
         write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0x00);
         let base = chip.clock();
 
-        // Each of the other bits alone, and every one of them but bit 3 at once
-        // (`0xF7` = 1111_0111): the pin does not move.
-        for bits in [0x01u8, 0x02, 0x04, 0x10, 0x20, 0x40, 0x80, 0xF7] {
+        // Each of the fenced bits alone, and every one of them but bit 3 at
+        // once (`0xD7` = 1101_0111): the pin does not move. Bit 5 is out of the
+        // fence since #588 - `0x20` is the one bit that moves the pin now, the
+        // sample forced on every converter.
+        for bits in [0x01u8, 0x02, 0x04, 0x10, 0x40, 0x80, 0xD7] {
             write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, bits);
             assert_eq!(
                 chip.clock(),
@@ -2219,11 +2388,11 @@ mod tests {
             );
         }
 
-        // With bit 3 up, the rest of the byte still does nothing: `0xFF` over
-        // `0xF7` is the one LSB of `test_2c_bit3_is_the_dac_lsb` and nothing else.
-        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0xF7);
+        // With bit 3 up, the fenced rest still does nothing: `0xDF` over `0xD7`
+        // is the one LSB of `test_2c_bit3_is_the_dac_lsb` and nothing else.
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0xD7);
         let without = chip.clock();
-        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0xFF);
+        write_reg(&mut chip, ADDR_1, DATA_1, REG_TEST_2C, 0xDF);
         let with = chip.clock();
         assert_eq!(with.0 - without.0, 1);
     }
