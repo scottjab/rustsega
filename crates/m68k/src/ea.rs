@@ -333,12 +333,19 @@ pub(crate) const fn is_control(mode: u8, reg: u8) -> bool {
 /// when they come *from* it (M68000UM "MOVEM", "Addressing Modes"; M1-24, #32).
 ///
 /// The direction is included because the two halves of MOVEM's opcode differ
-/// here and nothing else does: `MOVEM.L D0,-(A0)` is a store and legal, while
-/// `MOVEM.L -(A0),D0` is not an instruction at all. `Dn`, `An` and `#imm` are
-/// absent by way of [`is_control`] — a register list has one address for many
-/// registers, so it needs memory.
+/// here: `MOVEM.L D0,-(A0)` is a store and legal, while `MOVEM.L -(A0),D0` is
+/// not an instruction at all. The store half also stops short of the two
+/// PC-relative modes — a store needs an alterable destination and
+/// `d16(PC)`/`d8(PC,Xn)` name the instruction stream, so `MOVEM
+/// <list>,(d16,PC)` is undefined (M68000PRM "MOVEM", destination addressing
+/// table; #619) — while the load keeps them, as the map's `$4CBA` and the
+/// suite's measured cases agree. `Dn`, `An` and `#imm` are absent by way of
+/// [`is_control`] — a register list has one address for many registers, so it
+/// needs memory.
 pub(crate) const fn is_movem_ea(store: bool, mode: u8, reg: u8) -> bool {
-    is_control(mode, reg) || (store && mode == 0b100) || (!store && mode == 0b011)
+    (is_control(mode, reg) && !(store && matches!(ea_class(mode, reg), EaClass::PcRelative)))
+        || (store && mode == 0b100)
+        || (!store && mode == 0b011)
 }
 
 /// Can an instruction *write* an operand at `(mode, reg)`?
@@ -1911,6 +1918,30 @@ mod tests {
         }
         want.extend([enc(ABSOLUTE, ABS_W), enc(ABSOLUTE, ABS_L)]);
         assert_eq!(accepted(is_memory_alterable), want);
+    }
+
+    /// MOVEM's two directions share the control class but not the PC-relative
+    /// pair: a store's destination must be alterable and `d16(PC)`/`d8(PC,Xn)`
+    /// name the instruction stream, so `MOVEM <list>,(d16,PC)` is undefined
+    /// while the load `MOVEM (d16,PC),<list>` is defined and measured
+    /// (M68000PRM "MOVEM", destination addressing table; #619). The stack modes
+    /// were already one-way each (M1-24, #32).
+    #[test]
+    fn is_movem_ea_loads_from_pc_relative_and_never_stores_there() {
+        for reg in [D16_PC, D8_PC_XN] {
+            assert!(
+                is_movem_ea(false, ABSOLUTE, reg),
+                "MOVEM (d16,PC),<list>: mode 111 reg {reg:03b} loads"
+            );
+            assert!(
+                !is_movem_ea(true, ABSOLUTE, reg),
+                "MOVEM <list>,d16(PC): mode 111 reg {reg:03b} is undefined"
+            );
+        }
+        assert!(is_movem_ea(true, AN_PRE, 0), "store through -(An)");
+        assert!(!is_movem_ea(false, AN_PRE, 0), "load through -(An)");
+        assert!(is_movem_ea(false, AN_POST, 0), "load through (An)+");
+        assert!(!is_movem_ea(true, AN_POST, 0), "store through (An)+");
     }
 
     /// An invalid field is in no class at all: a decode that asks one of these

@@ -1537,14 +1537,17 @@ fn classify_swap_ext_pea(opcode: u16) -> Op {
 ///
 /// Bit 10 is the direction — clear is registers to memory, which is the `$48??`
 /// window this shares with SWAP/EXT/PEA/NBCD, and set is memory to registers, the
-/// `$4C??` one — and bit 6 the width, word or long. The EA field is then
+/// `$4C??` one — and bit 6 the width, word or long. The EA field is
 /// [`is_movem_ea`]: the control modes plus `-(An)` for a store and `(An)+` for a
-/// load. Everything else the field can name — `Dn`, `An`, `#imm`, `d16(PC)` and
-/// its friends in mode `111` above `011`, and either stack mode going the wrong way
-/// — is an illegal instruction, and that is what the two suite files never run:
-/// across their 8065 cases each they use modes `010`, `011`, `100`, `101`, `110`
-/// and `111000`..`111011`, with `011` appearing only where `d` is set and `100`
-/// only where it is clear.
+/// load, with the store half stopping short of the two PC-relative modes, whose
+/// destinations are not alterable (M68000PRM "MOVEM", destination addressing
+/// table; #619) — the load's `$4CBA` family is defined and measured.
+/// Everything else the field can name — `Dn`, `An`, `#imm`, the store-side
+/// `d16(PC)`/`d8(PC,Xn)`, mode `111` above register `011`, and either stack mode
+/// going the wrong way — is an illegal instruction. The two suite files run the
+/// legal faces of all that: across their 8065 cases each they use modes `010`,
+/// `011`, `100`, `101`, `110` and `111000`..`111011`, with `011` appearing only
+/// where `d` is set and `100` only where it is clear.
 fn classify_movem(opcode: u16) -> Op {
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
@@ -3774,7 +3777,9 @@ mod tests {
     /// The whole MOVEM opcode set, walked: `0100 1d00 1s eeeeee` is both halves of
     /// bit 7 — `$4880`..`$48FF` (registers to memory) and `$4C80`..`$4CFF` (memory
     /// to registers) — and in each half the operand is [`is_movem_ea`]: the control
-    /// modes plus `-(An)` when storing and `(An)+` when loading.
+    /// modes plus `-(An)` when storing and `(An)+` when loading, the store half
+    /// minus the two PC-relative modes (M68000PRM "MOVEM", destination addressing
+    /// table; #619).
     ///
     /// The two windows are the ones with neighbours to lose: mode `000` of the
     /// `$48` half is EXT (`$4880`..`$4887`, `$48C0`..`$48C7`, which is why the
@@ -3809,9 +3814,11 @@ mod tests {
             assert_eq!(decode(opcode), want, "load ${opcode:04X}");
             movem += u8::from(want == Op::Movem);
         }
-        // 36 operand fields (the 28 control modes plus the one stack mode of the
-        // direction) x 2 sizes x 2 directions.
-        assert_eq!(movem, 144, "the MOVEM opcode count");
+        // 34 store operand fields (the 26 alterable-memory control modes — the
+        // control class minus the two PC-relative ones, #619 — plus `-(An)`)
+        // plus 36 load fields (all 28 control modes plus `(An)+`), each half
+        // x 2 sizes.
+        assert_eq!(movem, 140, "the MOVEM opcode count");
 
         // The neighbours are not MOVEM either: PEA's top opcode just below `$4880`,
         // and either side of `$4C80`..`$4CFF` the space left once MOVEM's
@@ -3827,6 +3834,32 @@ mod tests {
         // is 68020), so it is an illegal instruction (#35). MOVEM's own window,
         // which is what this test is about, is untouched.
         assert_eq!(decode(0x4D00), Op::Illegal, "bit 8 set: CHK.l, 68020-only");
+    }
+
+    /// The store direction's PC-relative corner is undefined: `MOVEM`'s store
+    /// destination must be alterable, and `d16(PC)`/`d8(PC,Xn)` name the
+    /// instruction stream (M68000PRM "MOVEM", destination addressing table;
+    /// #619). The load twins are defined (`map/68000.official.json` spells
+    /// `$4CBA`/`$4CBB`/`$4CFA`/`$4CFB` out) and measured (`MOVEM.w.json.gz` runs
+    /// `$4CBA`), so only the store half moves.
+    #[test]
+    fn movem_stores_never_go_pc_relative() {
+        for (opcode, name) in [
+            (0x48BAu16, "MOVEM.w <list>,(d16,PC)"),
+            (0x48BB, "MOVEM.w <list>,(d8,PC,Xn)"),
+            (0x48FA, "MOVEM.l <list>,(d16,PC)"),
+            (0x48FB, "MOVEM.l <list>,(d8,PC,Xn)"),
+        ] {
+            assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
+        }
+        for (opcode, name) in [
+            (0x4CBAu16, "MOVEM.w (d16,PC),<list>"),
+            (0x4CBB, "MOVEM.w (d8,PC,Xn),<list>"),
+            (0x4CFA, "MOVEM.l (d16,PC),<list>"),
+            (0x4CFB, "MOVEM.l (d8,PC,Xn),<list>"),
+        ] {
+            assert_eq!(decode(opcode), Op::Movem, "{name} (${opcode:04X})");
+        }
     }
 
     /// CHK is `0100 ddd 110 mmm rrr` (M68000UM "CHK — Check Data Register Against
