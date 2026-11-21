@@ -702,15 +702,16 @@ fn virtua_racing_boots_to_non_blank_screen() {
 
 /// The two western unlicensed carts of the #549 family that boot since #479's
 /// read-back model: `headless run --frames 300 --colours` went 1 -> 15 (Onslaught)
-/// and 1 -> 13 (Turrican) when the `$A11100` word read stopped mirroring the flag
-/// lane into every bit and answered the 68000's prefetched instruction word in the
-/// unused bits instead, per GPGX `ctrl_io_read_word` case 0x11 and BlastEm
-/// `io_read_w` (both cited on #479). Each cart's boot polls the bus-request
-/// read-back wanting a bit of that opcode word, so the mirrored `0xFF` held them in
-/// a poll loop and the display never came on; the reference was already drawing on
-/// both (#549's table). They are western releases, not the Taiwan builder of the
-/// rest of the family, which is why their cause is one the family had already
-/// fixed rather than a new one.
+/// and 1 -> 13 (Turrican) when the `$A11100` read stopped answering a mirrored
+/// `$FF` - bit 0 of every poll read read as "running" - and answered the real flag
+/// lane plus the 68000's prefetched instruction word in the unused bits, per GPGX
+/// `ctrl_io_read_word` case 0x11 and BlastEm `io_read_w` (both cited on #479). Each
+/// cart's boot does the standard Z80 handoff and polls the read-back wanting bit 0
+/// clear (Onslaught's is the `BTST #$0,$A11100 / BNE.W` at `$39E`), so the mirrored
+/// byte held them in that poll with the display never coming on; the reference was
+/// already drawing on both (#549's table). They are western releases, not the
+/// Taiwan builder of the rest of the family, which is why their cause is one the
+/// family had already fixed rather than a new one.
 #[test]
 #[ignore = "needs a commercial ROM; skips without one"]
 fn onslaught_boots_to_non_blank_screen() {
@@ -719,8 +720,8 @@ fn onslaught_boots_to_non_blank_screen() {
     assert!(
         colours > BLANK,
         "300 frames in, Onslaught is {colours} distinct colours: it drew 15 when the \
-         $A11100 read-back stopped mirroring the flag lane (#479), so a blank frame \
-         is a regression"
+         $A11100 read-back stopped answering a mirrored $FF (#479), so a blank \
+         frame is a regression"
     );
 }
 
@@ -732,8 +733,8 @@ fn turrican_unl_boots_to_non_blank_screen() {
     assert!(
         colours > BLANK,
         "300 frames in, Turrican (Unl) is {colours} distinct colours: it drew 13 when the \
-         $A11100 read-back stopped mirroring the flag lane (#479), so a blank frame \
-         is a regression"
+         $A11100 read-back stopped answering a mirrored $FF (#479), so a blank \
+         frame is a regression"
     );
 }
 
