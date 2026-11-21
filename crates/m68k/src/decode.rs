@@ -1300,23 +1300,36 @@ fn classify_or(opcode: u16) -> Op {
 }
 
 /// The operand rules `AND` and `OR` share (M68000UM AND, OR, #21): the `0ss`
-/// half reads an EA into a data register, the `1ss` half writes the result back
-/// to a data-alterable EA.
+/// half reads a data EA into a data register, the `1ss` half writes the result
+/// back to a memory-alterable EA. The map leaves the An column of the source
+/// tables and the Dn entries of the write-back half empty, so 448 opcodes over
+/// the two groups are illegal instruction, not instructions (#618).
 fn classify_and_or(opcode: u16, op_mode: u8, op: Op) -> Op {
     let mode = ((opcode >> 3) & 0b111) as u8;
     let reg = (opcode & 0b111) as u8;
-    let Some(size) = Size::from_bits(u16::from(op_mode & 0b11)) else {
-        // `011` and `111` — MUL, DIV — were taken by the caller.
+    // `011` and `111` — MUL, DIV — were taken by the caller; every opmode left
+    // carries one of the three real sizes.
+    if Size::from_bits(u16::from(op_mode & 0b11)).is_none() {
         return Op::Illegal;
-    };
+    }
     if op_mode < 0b100 {
         // `AND <ea>,Dn`/`OR <ea>,Dn`: the destination is a data register by
-        // construction, so only the source can be illegal, and a byte read of an
-        // address register is the rejection `MOVE`, `ADD` and `SUB` make.
-        if !is_data(mode, reg) || (size == Size::Byte && mode == AN_DIRECT_MODE) {
+        // construction, so only the source can be illegal. The source is a
+        // data operand, and the M68000PRM's OR/AND source tables leave the An
+        // column empty — "The contents of an address register may not be used
+        // as an operand" — at every size, so An direct drops whole, not just
+        // at the byte where no An operand exists (#618; 68k.hax OR: "only
+        // memory alterable addressing modes are allowed" makes the same
+        // point for the reverse half below).
+        if !is_data(mode, reg) || mode == AN_DIRECT_MODE {
             return Op::Illegal;
         }
-    } else if !is_data_alterable(mode, reg) {
+    } else if !is_memory_alterable(mode, reg) {
+        // `AND Dn,<ea>`/`OR Dn,<ea>`: the destination is memory-alterable only,
+        // so Dn direct drops here along with the An, immediate and PC-relative
+        // destinations the old data-alterable check already refused (#618).
+        // EOR's reverse keeps a data-alterable destination — `$B140` is legal —
+        // and stays `classify_cmp`'s business, untouched.
         return Op::Illegal;
     }
     op
@@ -2914,15 +2927,19 @@ mod tests {
     }
 
     /// `AND` is `1100 ddd ooo mmm rrr` and `OR` is `1000 ddd ooo mmm rrr`: `ooo`
-    /// `000`..`010` is `<ea> op Dd → Dd`, whose source must be a data EA — a
-    /// *byte* address register is not one, exactly as in ADD, while a word or long
-    /// one is — and `100`..`110` is `Dd op <ea> → <ea>`, whose destination must be
-    /// data-alterable, so neither an address register nor an immediate
+    /// `000`..`010` is `<ea> op Dd → Dd`, whose source must be a data EA — an
+    /// address register is not one at **any** size (the M68000PRM's OR/AND
+    /// source tables leave the An column empty: "The contents of an address
+    /// register may not be used as an operand"; #618) — and `100`..`110` is
+    /// `Dd op <ea> → <ea>`, whose destination must be memory-alterable, so
+    /// neither an address register, a data register, nor an immediate
     /// (M68000UM AND, OR; M1-13, #21). Every opcode in the legal list was read
     /// out of `AND.b/w/l` and `OR.b/w/l`, which together use all of modes
     /// `010`..`111` in the read-modify-write half and `000` and `010`..`111` in
     /// the load half; mode `001` appears in neither, which is the same fact
-    /// `decode_does_not_steal_abcd_mulu_exg` relies on.
+    /// `decode_does_not_steal_abcd_mulu_exg` relies on. (ADD, SUB and CMP do
+    /// take a word/long An source — their branches are a different rule and
+    /// must not follow this one.)
     #[test]
     fn and_or_decode_and_validate_their_eas() {
         for (opcode, name) in [
@@ -2937,7 +2954,6 @@ mod tests {
                 0xC07C,
                 "AND.W #imm,D0: an immediate *is* a legal source — `c07c [AND.w #, D0]` in AND.w",
             ),
-            (0xC048, "AND.W A0,D0: a word An *is* a data source"),
             (0xC398, "AND.L D1,(A0)+ — measured in AND.l"),
             (0xC730, "AND.B D3,d8(A0,D0): the destination is alterable"),
             (0x8001, "OR.B D1,D0"),
@@ -2952,12 +2968,115 @@ mod tests {
         for (opcode, name) in [
             (0xC008u16, "AND.B (A0),D0: a byte An is not a data source"),
             (0x8008, "OR.B (A0),D0: the same rule, one group away"),
+            (
+                0xC048,
+                "AND.W A0,D0: An is not a data source at word either (#618)",
+            ),
+            (
+                0x8048,
+                "OR.W A0,D0: the map's `None`, illegal instruction (#618)",
+            ),
+            (
+                0x8140,
+                "OR.w D0,D0 via the reverse form: Dn is not memory-alterable (#618)",
+            ),
             (0xC13C, "AND.B D0,#imm: an immediate is not a destination"),
             (0x8148, "OR.W D0,A0: an address register is not alterable"),
             (0x8FBC, "OR.L D7,#imm"),
         ] {
             assert_eq!(decode(opcode), Op::Illegal, "{name} (${opcode:04X})");
         }
+    }
+
+    /// The forward `<ea>,Dn` half of AND/OR reads a **data** source, and the
+    /// M68000PRM's OR/AND source tables leave the An column empty — "The
+    /// contents of an address register may not be used as an operand" — at
+    /// every size, not only at the byte where no An operand exists. The
+    /// official map agrees (`8048`/`c048` are `None`, `8040` is
+    /// `OR.w D0, D0`), and the pinned suite has no case for any of the 256
+    /// word/long encodings (#618). The whole 384-encoding plane is walked —
+    /// three sizes x 8 An registers x 8 destinations x 2 groups — rather than
+    /// sampled, because the byte row is the half the old check got right.
+    ///
+    /// The identical-looking shape is DEFINED one group over: ADD, SUB and
+    /// CMP read an An at word and long (`$D048` is the map's `ADD.w A0, D0`
+    /// and has suite cases), so their `classify_*` branches must not follow
+    /// this one.
+    #[test]
+    fn or_and_forward_rejects_an_direct_at_every_size() {
+        for base in [0x8000u16, 0xC000] {
+            for op_mode in [0b000u16, 0b001, 0b010] {
+                for reg in 0..8u16 {
+                    for ddd in 0..8u16 {
+                        let opcode = base | (ddd << 9) | (op_mode << 6) | (0b001 << 3) | reg;
+                        let mnemonic = if base == 0xC000 { "AND" } else { "OR" };
+                        assert_eq!(
+                            decode(opcode),
+                            Op::Illegal,
+                            "{mnemonic}.X A{reg},D{ddd} at operation {op_mode:03b}: An is not a source (${opcode:04X})"
+                        );
+                    }
+                }
+            }
+        }
+        // The neighbours that stay: a Dn source is legal at word (`$8040` is
+        // the map's `OR.w D0, D0`), and the same An shape in the ADD/SUB/CMP
+        // groups is defined — the map's own tokens, measured by the suite.
+        assert_eq!(decode(0x8040), Op::Or, "OR.W D0,D0 stays");
+        assert_eq!(decode(0xC040), Op::And, "AND.W D0,D0 stays");
+        assert_eq!(decode(0xD048), Op::Add, "ADD.w A0,D0 stays: defined");
+        assert_eq!(decode(0x9048), Op::Sub, "SUB.w A0,D0 stays: defined");
+        assert_eq!(decode(0xB048), Op::Cmp, "CMP.w A0,D0 stays: defined");
+    }
+
+    /// The reverse `Dn,<ea>` half writes a **memory-alterable** destination
+    /// (68k.hax OR: "only memory alterable addressing modes are allowed"), so
+    /// a Dn direct destination drops too: `$8140` (`OR.w D0,D0` via the
+    /// reverse form) and `$C180` (`AND.w D0,D0`) are `None` in the official
+    /// map and the pinned suite has no case for any of the 192 encodings
+    /// (#618). A register-to-register OR is encoded by the *forward* form
+    /// (`$8240` is the map's `OR.w D0, D1`), which is why these were never
+    /// instructions at all. An direct, immediate and PC-relative were already
+    /// refused by the old data-alterable check and stay refused.
+    ///
+    /// The corners that make AND's reverse set one opmode smaller are asserted
+    /// to prove the walk has not swallowed them: opmode `100` mode `000` is
+    /// ABCD (SBCD holds OR's) and opmode `101` mode `000` is `EXG Dx,Dy`.
+    /// EOR's reverse keeps its Dn destination — its operand is data-alterable,
+    /// not memory-alterable (`$B140` is the map's `EOR.w D0, D0`) — so
+    /// `classify_cmp` is untouched by this.
+    #[test]
+    fn or_and_reverse_destination_is_memory_alterable_only() {
+        // OR loses opmodes 101 and 110 at Dn direct (128); AND loses opmode
+        // 110 only, because 100 is ABCD and 101 is EXG (64).
+        let reverse_sets: [(u16, &[u16]); 2] = [(0x8000, &[0b101, 0b110]), (0xC000, &[0b110])];
+        for (base, op_modes) in reverse_sets {
+            for op_mode in op_modes {
+                for reg in 0..8u16 {
+                    for ddd in 0..8u16 {
+                        let opcode = base | (ddd << 9) | (op_mode << 6) | reg;
+                        let mnemonic = if base == 0xC000 { "AND" } else { "OR" };
+                        assert_eq!(
+                            decode(opcode),
+                            Op::Illegal,
+                            "{mnemonic}.X D{ddd},D{reg} at operation {op_mode:03b}: Dn is not memory-alterable (${opcode:04X})"
+                        );
+                    }
+                }
+            }
+        }
+        // The taken corners and the neighbours that stay.
+        assert_eq!(decode(0x8100), Op::Sbcd, "SBCD holds OR's 100/000 corner");
+        assert_eq!(decode(0xC100), Op::Abcd, "ABCD holds AND's 100/000 corner");
+        assert_eq!(decode(0xC140), Op::Exg, "EXG holds AND's 101/000 corner");
+        assert_eq!(decode(0x8240), Op::Or, "OR.w D0,D1: the forward encoding");
+        assert_eq!(
+            decode(0x8151),
+            Op::Or,
+            "OR.W D0,(A1): memory-alterable stays"
+        );
+        assert_eq!(decode(0xC198), Op::And, "AND.L D0,(A0)+ stays");
+        assert_eq!(decode(0xB140), Op::Eor, "EOR.w D0,D0 stays: data-alterable");
     }
 
     /// `EOR` is `1011 ddd 1ss mmm rrr`, `Dd ^ <ea> → <ea>`, so the EA names a
@@ -3334,10 +3453,22 @@ mod tests {
             "DIVS (A0),D7 — An is not a source"
         );
         // The other side of the same line: the `1000` group has no EXG, so
-        // operation `101` into a data register is an ordinary OR — and `1100`'s
+        // operation `101` at a memory mode is an ordinary OR — and `1100`'s
         // operation `110` with mode `010`, one bit from EXG's `001`, is an
-        // ordinary AND.
-        assert_eq!(decode(0x8141), Op::Or, "OR.W D0,D1");
+        // ordinary AND. The Dn destinations of the reverse form were removed
+        // with the 448 undefined OR/AND EA classes (#618): `$8141` is the
+        // map's `None`, its defined twin is the forward form `$8240`.
+        assert_eq!(
+            decode(0x8141),
+            Op::Illegal,
+            "OR reverse Dn,Dn: undefined (#618)"
+        );
+        assert_eq!(decode(0x8240), Op::Or, "OR.w D0,D1: the forward form");
+        assert_eq!(
+            decode(0x8151),
+            Op::Or,
+            "OR.W D0,(A1): operation 101 keeps its memory modes"
+        );
         assert_eq!(decode(0xC198), Op::And, "AND.L D0,(A0)+");
         // EXG's other two homes are in groups AND never touches.
         assert_ne!(decode(0x48C0), Op::And, "EXG-shaped, the $48 group");
@@ -3483,7 +3614,16 @@ mod tests {
             unimplemented.is_empty(),
             "SBCD was the `1000` group's last corner and M1-23 (#31) decoded it: {unimplemented:?}"
         );
-        assert_eq!(decode(0x8140), Op::Or, "OR.W D0,D1 — SBCD's neighbour");
+        assert_eq!(
+            decode(0x8140),
+            Op::Illegal,
+            "OR reverse Dn,Dn beside SBCD's corner: undefined (#618)"
+        );
+        assert_eq!(
+            decode(0x8150),
+            Op::Or,
+            "OR.W D0,(A0): SBCD's live neighbour"
+        );
         assert_eq!(
             decode(0x8148),
             Op::Illegal,
@@ -3782,10 +3922,11 @@ mod tests {
     /// #22).
     ///
     /// The neighbours are the point. `$C180` is operation `110` at mode `000`, one
-    /// bit from `Dx,Ay`, and is `AND.L D0,D0`; `$C198` is operation `110` at mode
-    /// `011` and is `AND.L D0,(A0)+`; `$C100` is ABCD and `$C1C0` is MULS, both
-    /// still unimplemented. An off-by-one in [`is_exg`] fails in one direction or
-    /// the other.
+    /// bit from `Dx,Ay` — and one of the 448 undefined OR/AND EA classes (#618):
+    /// the reverse form's destination is memory-alterable, so its Dn entries are
+    /// illegal instruction, not `AND.L D0,D0` as this test used to say. `$C198`
+    /// is operation `110` at mode `011` and is `AND.L D0,(A0)+`. An off-by-one
+    /// in [`is_exg`] fails in one direction or the other.
     #[test]
     fn exg_decodes_its_three_forms_and_nothing_else() {
         for (opcode, name) in [
@@ -3803,8 +3944,8 @@ mod tests {
 
         assert_eq!(
             decode(0xC180),
-            Op::And,
-            "AND.L D0,D0: operation 110 mode 000, one bit from EXG Dx,Ay"
+            Op::Illegal,
+            "AND reverse Dn,Dn: undefined, not AND.L D0,D0 (#618)"
         );
         assert_eq!(
             decode(0xC198),
