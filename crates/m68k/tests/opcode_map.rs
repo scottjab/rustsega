@@ -18,21 +18,22 @@
 //!
 //! * **45 815 defined** — every one decodes to its map token's [`Op`] family.
 //!   No defined opcode falls to `Illegal`, `Undefined` or `Unimplemented`.
-//!   exception ([`Op::Illegal`] 9 688, [`Op::Undefined`] 1 184, [`Op::LineA`] /
+//! * **19 721 `None`** — every one takes the illegal-instruction exception
+//!   ([`Op::Illegal`] 10 144, [`Op::Undefined`] 1 385, [`Op::LineA`] /
 //!   [`Op::LineF`] 8 192, the two reserved line groups the map records as
-//!   `None`); 204 sit in [`UNIMPLEMENTED_NONE_SLOTS`] below (filed, #621);
-//!   453 decoded to an actual instruction in slots the map calls undefined:
-//!   the 448 OR/AND EA classes were fixed and unpinned by #618, the 4 MOVEM
-//!   store words by #619 and the static BTST by #620; nothing over-broad
-//!   remains pinned.
+//!   `None`). No pin remains: the 453 over-broad decodes were fixed and
+//!   unpinned by #618, #619 and #620, and #621 worked the last 204
+//!   still-`Unimplemented` holes into `Undefined`/`Illegal` and removed their
+//!   list with them — a `None` slot that decodes to anything but an exception
+//!   tag is a plain mismatch.
 //!
 //! # What is asserted
 //!
-//! * a `"None"` slot must decode to one of [`NONE_EXCEPTION_TAGS`], or sit in
-//!   [`UNIMPLEMENTED_NONE_SLOTS`] (unplaced holes, two-way checked). The audit's
-//!   third arm — matching a pinned over-broad decode — went away with the pin
-//!   list itself (#618/#619/#620): a `None` slot that decodes to an instruction
-//!   is a plain mismatch now;
+//! * a `"None"` slot must decode to one of [`NONE_EXCEPTION_TAGS`] — nothing
+//!   else. The audit's pin lists are gone: the over-broad decodes came off with
+//!   their fixes (#618/#619/#620), and #621 worked the last 204
+//!   `Unimplemented` holes into `Undefined`/`Illegal`, so a `None` slot that
+//!   decodes to anything but an exception tag is a plain mismatch now;
 //! * any other entry must decode to an `Op` in its token's family, per
 //!   [`FAMILIES`]. A defined opcode decoding to `Illegal`, `Undefined`,
 //!   `Unimplemented` or the wrong family is a mismatch that names the opcode
@@ -202,41 +203,6 @@ fn token(operation: &str) -> &str {
 ///   word the map records as `"None"` (measured in #194).
 const NONE_EXCEPTION_TAGS: &[Op] = &[Op::Illegal, Op::Undefined, Op::LineA, Op::LineF];
 
-/// `"None"` slots that decode to [`Op::Unimplemented`] — the pessimistic tag a
-/// group falls back to while its unassigned slots are not worked out (see the
-/// variant's doc in `decode.rs`). Each entry is `(first, last, reason)` over an
-/// inclusive opcode range, and the list is checked **both ways**: a hole that
-/// stops being unimplemented must drop off this list, so placing one of these
-/// words without updating the audit fails the run.
-///
-/// Every entry is a filed issue (#621): on the hardware these words take the
-/// illegal-instruction exception, and rustsega panics instead.
-const UNIMPLEMENTED_NONE_SLOTS: &[(u16, u16, &str)] = &[
-    // `$0x3C` with `ss` = `10`: the byte and word immediate-logic slots with an
-    // immediate destination land on `Undefined`/`Illegal`, but the long ones
-    // fall through the `$0xxx` group's tail unplaced.
-    (0x00BC, 0x00BC, "ORI.L #,<ea> with an immediate <ea>"),
-    (0x02BC, 0x02BC, "ANDI.L #,<ea> with an immediate <ea>"),
-    (0x0ABC, 0x0ABC, "EORI.L #,<ea> with an immediate <ea>"),
-    // The `$4C00..=$4C7F` window above MOVEM's load half (68020 MULS.L/MULU.L
-    // lives there; unassigned on the 68000), per the MOVEM arm's own comment.
-    (
-        0x4C00,
-        0x4C7F,
-        "unassigned $4C00-$4C7F above MOVEM (68020 MULS.L/MULU.L)",
-    ),
-    // The `$4E00..=$4E3F` window below the traps: no 68000 instruction uses
-    // `0100 1110 00`.
-    (0x4E00, 0x4E3F, "unassigned $4E00-$4E3F below the traps"),
-    // The two documented gaps of the `$4E7x` single-opcode row.
-    (0x4E74, 0x4E74, "the $4E74 gap between STOP and RTS"),
-    (
-        0x4E78,
-        0x4E7F,
-        "reserved $4E78-$4E7F above RTR (MOVEC is 68010+)",
-    ),
-];
-
 // The `None` slots that decode to an actual instruction — the over-broad
 // routes the audit found — are **bugs, not deliberate choices**: on the
 // hardware they take the illegal-instruction exception; rustsega instead
@@ -270,7 +236,6 @@ fn decode_agrees_with_the_official_opcode_map() {
     // The None-slot census: how many words the map calls undefined decode to
     // each tag. Linear find like `decode`'s own count test — `Op` is not `Hash`.
     let mut none_counts: Vec<(Op, u32)> = Vec::new();
-    let mut pinned_counts: HashMap<&str, u32> = HashMap::new();
     let mut mismatches: Vec<(u16, &str, Op)> = Vec::new();
 
     for (&opcode, operation) in &map {
@@ -281,13 +246,6 @@ fn decode_agrees_with_the_official_opcode_map() {
                 None => none_counts.push((op, 1)),
             }
             if NONE_EXCEPTION_TAGS.contains(&op) {
-                continue;
-            }
-            if UNIMPLEMENTED_NONE_SLOTS
-                .iter()
-                .any(|&(first, last, _)| (first..=last).contains(&opcode))
-            {
-                *pinned_counts.entry("Unimplemented").or_default() += 1;
                 continue;
             }
             mismatches.push((opcode, operation, op));
@@ -306,19 +264,6 @@ fn decode_agrees_with_the_official_opcode_map() {
                 mismatches.push((opcode, operation, op));
             }
         }
-    }
-
-    // The pins cannot drift: each pinned bucket is exact. The only pin left is
-    // the Unimplemented hole list; the over-broad buckets are gone (#618/#619/
-    // #620), so an unexpected over-broad decode falls straight to the mismatch
-    // report below.
-    let expect = [("Unimplemented", 204u32)];
-    for (bucket, want) in expect {
-        assert_eq!(
-            pinned_counts.get(bucket).copied().unwrap_or(0),
-            want,
-            "{bucket}: the pinned count moved; update the pin (and its issue)"
-        );
     }
 
     // The report: the census first, then every disagreement naming the opcode

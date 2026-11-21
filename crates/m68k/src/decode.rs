@@ -46,9 +46,11 @@
 //! `ADDA`, `ADDX`, #18), the `1001` group (`SUB`, `SUBA`, `SUBX`, #19), the
 //! `0101` group's `ADDQ` and `SUBQ` halves (#18, #19), the `$0600` `ADDI`
 //! pattern inside `0000` (#18) and the `$0400` `SUBI` pattern inside `0000`
-//! (#19). Everything else in those groups still
-//! decodes to [`Op::Unimplemented`] and panics loudly until its ticket lands
-//! (M1-08, #16 onward).
+//! (#19). Every unassigned slot of those groups has since been worked out
+//! into `Undefined` or `Illegal` — #621 placed the last 204 — so the table
+//! holds no [`Op::Unimplemented`] word at all. The variant stays for the
+//! table's initial fill and [`crate::ops`]'s wildcard, which is what keeps a
+//! future variant without a handler loud.
 //!
 //! # EA validity is a decode-time rule
 //!
@@ -104,9 +106,11 @@ pub enum Op {
     ///   suite can never report a pass for an instruction that never ran.
     ///
     /// Every `Undefined` opcode is one `classify` can point at in the manual's
-    /// group structure, so an opcode whose group has not had its unassigned
-    /// slots identified yet falls to [`Op::Unimplemented`] — the pessimistic
-    /// side of the split, which #477 audits.
+    /// group structure. #621 worked out the last group's unassigned slots, so
+    /// no `classify` arm returns this variant today: it is the initial fill of
+    /// the table and the answer a group whose slots have not been identified
+    /// yet falls back to, and [`crate::ops`]'s wildcard keeps a future variant
+    /// that lands before its handler loud.
     Undefined,
     /// An opcode in the `1010` group (M68000UM Format I, "Line 1010 emulator
     /// instruction"). It raises the line-A emulator exception, vector 10 at
@@ -552,6 +556,14 @@ fn classify(opcode: u16) -> Op {
         // has to be read to know what they are.
         0xA000..=0xAFFF => Op::LineA,
         0xF000..=0xFFFF => Op::LineF,
+        // `0100 1110 00xxxxxx`: nothing. The `0100 1110` group's documented rows
+        // begin at the traps, `0100 1110 01 nnnn`; below them the manual's
+        // instruction-set summary lists no instruction and no later 680x0 chip
+        // fills the window (M68000UM section 8, "Instruction Set Summary";
+        // #621). All 64 words are unassigned, so they are undefined encodings
+        // — the illegal-instruction exception, not a handler waiting to be
+        // written.
+        0x4E00..=0x4E3F => Op::Undefined,
         // `4E40 + n`: sixteen traps, all of them one word. `$4E40..=$4E4F` is
         // the whole group, so no operand field has to be read to know it.
         0x4E40..=0x4E4F => Op::Trap,
@@ -574,7 +586,8 @@ fn classify(opcode: u16) -> Op {
         // `RESET` `$4E70` and `STOP` `$4E72` (M68000UM "RESET — Reset",
         // "STOP — Stop the Processor"; #35). Neither has an EA field, so neither
         // can pull in a neighbour: `NOP` at `$4E71` and `RTE` at `$4E73` are
-        // listed on their own lines below, and `$4E74` is unassigned.
+        // listed on their own lines below, and `$4E74` is the row's unassigned
+        // gap, taken by its own arm under them.
         0x4E70 => Op::Reset,
         0x4E72 => Op::Stop,
         // The four one-word members of the `$4E` group. Between them and above
@@ -590,6 +603,18 @@ fn classify(opcode: u16) -> Op {
         // Overflow"; #35): a `0100 1110` opcode that is neither a control
         // transfer nor one of the returns.
         0x4E76 => Op::Trapv,
+        // `$4E74`, between STOP and RTS, is the `$4E7x` row's one unassigned
+        // slot on the 68000: the manual's row runs RESET, NOP, STOP, RTE, RTS,
+        // TRAPV, RTR with nothing between STOP and RTS (M68000UM section 8;
+        // #621), so the word is an undefined encoding, not a hole.
+        0x4E74 => Op::Undefined,
+        // The row's tail is reserved, not unimplemented. The instruction that
+        // wants this row is `MOVEC` at `$4E7B`, 68010 and up, which is exactly
+        // why the row is free on the 68000 (M68000UM lists no instruction
+        // here; #621). Like the `$4C00` window below, nothing 68000-side — no
+        // defined format, no suite case — singles a word of the row out, so
+        // all eight are undefined encodings.
+        0x4E78..=0x4E7F => Op::Undefined,
         // The three move groups: `00ss` with `ss` = `01` byte, `10` long,
         // `11` word. `$0000..=$0FFF` is *not* a move — `ss` = `00` is the
         // ORI/BTST/MOVEP group — so the range starts at `$1000`.
@@ -693,9 +718,18 @@ fn classify(opcode: u16) -> Op {
         // `0100 1100 1s mmm rrr`: MOVEM's other half, `0100 1d00 1s eeeeee` with
         // `d` set — memory to registers (M68000UM MOVEM; M1-24, #32). Nothing else
         // in the `0100` group uses bit 11 with bits 9 and 8 clear, which is why
-        // this arm can take the top half of `$4C??` whole: `$4C00`..`$4C7F` is
-        // unassigned on the 68000 and stays [`Op::Unimplemented`] below it.
+        // this arm can take the top half of `$4C??` whole: `$4C00`..`$4C7F`, bit
+        // 7 clear, is unassigned on the 68000 and is undefined below it.
         0x4C80..=0x4CFF => classify_movem(opcode),
+        // The other half of MOVEM's column, bit 7 clear: the 68000 assigns it
+        // nothing. MOVEM's pattern is `0100 1d00 1s`, so `0100 1100 0s` matches
+        // no instruction of the group, and the map's `None` covers the whole
+        // `$4C00`..`$4C7F` window (M68000UM section 8; #621). The 68020's
+        // `MULU.L`/`MULS.L` occupies it on later chips, which is why it is free
+        // here; unlike `CHK.L` — whose `$4D00` exception cases the pinned suite
+        // measures — nothing 68000-side ties these words to a defined format, so
+        // they take the undefined side of the split rather than `Illegal`.
+        0x4C00..=0x4C7F => Op::Undefined,
         // `0100 ddd 110 mmm rrr`: CHK.W (M68000UM "CHK — Check Data Register
         // Against Upper Bound", #35). Bits 8..6 = `110` is CHK's alone in the
         // `0100` group — LEA takes `111`, JMP and JSR are `$4EE8`/`$4EB8`, and
@@ -1685,10 +1719,12 @@ fn classify_bit_op(opcode: u16) -> Op {
 /// the two forms #34 owns, both spelled mode `111` register `100` (M68000UM
 /// "ANDI/ORI/EORI to CCR" and "… to SR"): `ss` = `00` is the byte form that
 /// writes the CCR (`$003C`, `$023C`, `$0A3C`) and `ss` = `01` the word form that
-/// writes SR (`$007C`, `$027C`, `$0A7C`). `ss` = `10` and `ss` = `11` at that EA
-/// — `$00BC`, `$00FC`, … — are nothing on the 68000; the MOVE-to-CCR/SR spellings
-/// of those numbers are a 68020 thing, and the 68000 originals are `$44C0` and
-/// `$46C0`.
+/// writes SR (`$007C`, `$027C`, `$0A7C`). `ss` = `11` at that EA — `$00FC`,
+/// … — is not a size at all, so it is undefined (#355); `ss` = `10` —
+/// `$00BC`, `$02BC`, `$0ABC` — has no CCR/SR form to fall into and keeps the
+/// immediate-destination rule the format already carries, which is illegal
+/// (#621). The MOVE-to-CCR/SR spellings of those numbers are a 68020 thing,
+/// and the 68000 originals are `$44C0` and `$46C0`.
 fn classify_logic_imm(opcode: u16, op: Op) -> Op {
     // The width is read before the mode, so `$00FC` (`ss` = `11` on the
     // immediate EA) is undefined like every other `ss` = `11` of these six
@@ -1702,7 +1738,14 @@ fn classify_logic_imm(opcode: u16, op: Op) -> Op {
         return match (opcode >> 6) & 0b11 {
             0b00 => Op::LogicImmCcr,
             0b01 => Op::LogicImmSr,
-            _ => Op::Unimplemented,
+            // `ss` = `10` has no to-CCR/to-SR form — those two formats are the
+            // fixed `ss` = `00`/`01` encodings — so the slot falls back to the
+            // operand rule the EA field names: an immediate destination, which
+            // is not alterable and which the sibling immediates reject the same
+            // way at every size. `$00BC`, `$02BC`, `$0ABC` (M68000UM ORI,
+            // ANDI, EORI destination tables leave the immediate column empty;
+            // #621).
+            _ => Op::Illegal,
         };
     }
     if !is_data_alterable(mode, reg) {
@@ -2026,8 +2069,9 @@ mod tests {
     /// the illegal-instruction exception ([`Op::Undefined`], routed by
     /// [`crate::ops`]) and not the `Op::Unimplemented` panic that stands in for a
     /// rustsega hole. The panic stays for its own case: see
-    /// `cpu::tests::step_panics_loudly_on_an_unimplemented_opcode`, which these
-    /// opcodes must not silence and #355 must not merge with this arm.
+    /// `cpu::tests::an_unimplemented_variant_panics_and_does_not_silence_the_undefined_ones`,
+    /// which these opcodes must not silence and #355 must not merge with this
+    /// arm.
     #[test]
     fn undefined_encodings_decode_to_undefined() {
         for (opcode, why) in [
@@ -2080,28 +2124,47 @@ mod tests {
         // The `0100` group's `101` operation slot: NEGX/NEG (`000`), CLR and MOVE
         // from SR/CCR (`001`), NOT and MOVE to CCR (`010`), MOVE to SR (`011`),
         // CHK.L (`100`, `Illegal`), CHK (`110`) and LEA (`111`) own the other
-        // six, so all of `101` is undefined.
+        // six, so all of `101` is undefined. #621 added the three unassigned
+        // windows that live outside the operation-field reading: the
+        // `$4C00`..`$4C7F` space above MOVEM's load half and the three pieces
+        // of the `$4E` row below the traps.
         for opcode in 0x4000u16..=0x4FFF {
+            let unassigned_window = (0x4C00..=0x4C7F).contains(&opcode)
+                || (0x4E00..=0x4E3F).contains(&opcode)
+                || opcode == 0x4E74
+                || (0x4E78..=0x4E7F).contains(&opcode);
             assert_eq!(
                 decode(opcode) == Op::Undefined,
-                opcode & 0x1C0 == 0b101 << 6,
-                "${opcode:04X}: only bits 8..6 = 101 is undefined in the 0100 group"
+                opcode & 0x1C0 == 0b101 << 6 || unassigned_window,
+                "${opcode:04X}: only bits 8..6 = 101 and #621's unassigned windows are undefined in the 0100 group"
             );
         }
     }
 
-    /// The other side of #355: an opcode that has no handler and is not one of
-    /// the unassigned slots above still reports [`Op::Unimplemented`], so the
-    /// panic that stops the core shrugging at a defined instruction nobody has
-    /// written is unreachable only for the encodings this ticket proved.
-    /// `$4E74` is `decode::tests`' anchor for it and `$00BC` (`ORI.L #imm`, the
-    /// one left in `classify_logic_imm`) shows a group can hold both halves of
-    /// the split.
+    /// The end of #355's story: #621 worked out the last group's unassigned
+    /// slots, so the pessimistic side of the split has no operand left — no
+    /// opcode at all decodes to [`Op::Unimplemented`], and `run_op`'s wildcard
+    /// panic is reachable only by a future variant landing before its handler.
+    /// The walk is whole (all 65 536 words), so this is what lets every other
+    /// test here talk about "undefined" and "illegal" without an asterisk.
+    /// `$4E74` and `$00BC`, the anchors this test used to pin the panic at, now
+    /// decode to the two exception tags they belong to.
     #[test]
-    fn unimplemented_is_still_reachable_next_door() {
-        assert_eq!(decode(0x4E74), Op::Unimplemented, "$4E74 has no handler");
-        assert_eq!(decode(0x00BC), Op::Unimplemented, "ORI.L #imm");
-        // And the defined neighbours of the anchors above are untouched: the
+    fn no_opcode_decodes_to_unimplemented_any_more() {
+        for opcode in 0..=u16::MAX {
+            assert_ne!(
+                decode(opcode),
+                Op::Unimplemented,
+                "${opcode:04X}: #621 placed every slot; this one is a rustsega hole again"
+            );
+        }
+        assert_eq!(decode(0x4E74), Op::Undefined, "$4E74: the STOP-to-RTS gap");
+        assert_eq!(
+            decode(0x00BC),
+            Op::Illegal,
+            "$00BC: ORI.L #imm at the immediate EA"
+        );
+        // And the defined neighbours of the former anchors are untouched: the
         // size-11 rule sits next to real instructions on both sides.
         for (opcode, want, why) in [
             (0x003C, Op::LogicImmCcr, "ORI to CCR, size 00"),
@@ -2126,35 +2189,94 @@ mod tests {
         }
     }
 
-    /// Until an instruction's ticket lands, its opcodes are unimplemented —
-    /// loudly, not silently. `$4E70` is `RESET` (M1-27).
+    /// #621's whole assignment, walked range by range, each with the manual's
+    /// citation and the neighbours that pin the window's edges:
     ///
-    /// The `$4E4x` traps are the exception to this in the same group: TRAP is
-    /// not an arithmetic instruction but an exception route, and #16 owns it.
-    ///
-    /// This test is expected to change as instructions land: when `NOP` is
-    /// implemented it decodes to its own variant, and the ticket that does it
-    /// moves this assertion to an opcode still unimplemented. That licence is
-    /// this test alone (ticket #15). `NOP` landed in #25 and `RESET`/`STOP` in
-    /// #35, so the anchor is now `$4E74`, the unassigned hole between `RTE`
-    /// (`$4E73`) and `RTS` (`$4E75`).
+    /// * `$4C00..=$4C7F` — 128 words — the bit-7-clear half of the `0100 1100`
+    ///   column, which the 68000 assigns nothing (the 68020's `MULU.L`/`MULS.L`
+    ///   lives there); [`Op::Undefined`] per the window rule;
+    /// * `$4E00..=$4E3F` — 64 words — below the traps, where the `0100 1110`
+    ///   group has no rows at all; [`Op::Undefined`];
+    /// * `$4E74` and `$4E78..=$4E7F` — 9 words — the `$4E7x` row's unassigned
+    ///   gap and its reserved tail (`MOVEC` is 68010+); [`Op::Undefined`];
+    /// * `$00BC`/`$02BC`/`$0ABC` — the immediate-logic format at an immediate
+    ///   destination: a defined format whose operand is not alterable, so
+    ///   [`Op::Illegal`], with the byte/word forms at that EA pinned as the
+    ///   defined CCR/SR operations they are and the SUBI/ADDI/CMPI siblings'
+    ///   own immediate corners as the rule they share.
     #[test]
-    fn unknown_is_unimplemented_for_now() {
-        assert_eq!(decode(0x4E74), Op::Unimplemented, "$4E74: unassigned hole");
+    fn the_621_windows_decode_per_the_split() {
+        assert_range_decodes_to(0x4C00..=0x4C7F, Op::Undefined);
+        assert_range_decodes_to(0x4E00..=0x4E3F, Op::Undefined);
+        assert_eq!(decode(0x4E74), Op::Undefined, "$4E74: STOP-to-RTS gap");
+        assert_range_decodes_to(0x4E78..=0x4E7F, Op::Undefined);
+
+        for opcode in [0x00BCu16, 0x02BC, 0x0ABC] {
+            assert_eq!(
+                decode(opcode),
+                Op::Illegal,
+                "${opcode:04X}: ORI/ANDI/EORI.L #imm,#imm"
+            );
+        }
+        // The byte/word neighbours at that EA are not illegal — they are the
+        // defined to-CCR/to-SR formats #34 landed, one per size — and the
+        // `ss` = `11` corner is no size at all, undefined like every other one.
+        for (opcode, want) in [
+            (0x003Cu16, Op::LogicImmCcr),
+            (0x007C, Op::LogicImmSr),
+            (0x023C, Op::LogicImmCcr),
+            (0x027C, Op::LogicImmSr),
+            (0x0A3C, Op::LogicImmCcr),
+            (0x0A7C, Op::LogicImmSr),
+            (0x00FC, Op::Undefined),
+            (0x02FC, Op::Undefined),
+            (0x0AFC, Op::Undefined),
+        ] {
+            assert_eq!(decode(opcode), want, "${opcode:04X}: neighbour of $xxBC");
+        }
+        // The siblings without a CCR/SR form apply the immediate-destination
+        // rule at every size, which is the rule `$xxBC` falls back to.
+        for opcode in [0x04BCu16, 0x06BC, 0x0CBC] {
+            assert_eq!(
+                decode(opcode),
+                Op::Illegal,
+                "${opcode:04X}: SUBI/ADDI/CMPI.L #imm,#imm"
+            );
+        }
+    }
+
+    /// The last two anchors this module carried — `$4E74` and the `$4C00`
+    /// probe — were placed by #621, which is what finished the split: every
+    /// unassigned slot now decodes to the exception it takes on hardware, and
+    /// `no_opcode_decodes_to_unimplemented_any_more` walks the whole table to
+    /// prove none is left. This test keeps the per-slot record of where each
+    /// anchor landed and why.
+    #[test]
+    fn the_former_holes_take_their_places_in_the_split() {
+        // `$4E74` is the `$4E7x` row's unassigned gap between STOP and RTS; the
+        // manual's row lists no instruction there (M68000UM section 8; #621).
+        assert_eq!(
+            decode(0x4E74),
+            Op::Undefined,
+            "$4E74: the unassigned gap, now undefined"
+        );
         // ... except the traps, which #16 wired up, and which sit right next to
         // NOP in the `$4E` group.
         assert_range_decodes_to(0x4E40..=0x4E4F, Op::Trap);
-        assert_eq!(decode(0x4E3F), Op::Unimplemented, "just below the traps");
-        // LINK (`$4E50`..`$4E57`) and UNLK (`$4E58`..`$4E5F`) are above the traps
-        // now (#23), `$4E60`..`$4E6F` above them is MOVE to/from USP (#34), and
-        // `RESET` `$4E70` and `STOP` `$4E72` landed in #35 — so the anchor stays
-        // inside the `$4E` group at `$4E74` and `$4E78`, the two holes nothing has
-        // ever claimed (M68000UM "Instruction Set Summary").
+        // Below the traps the `0100 1110` group has no rows at all: all 64 of
+        // `$4E00..=$4E3F` are unassigned (#621).
         assert_eq!(
-            decode(0x4E78),
-            Op::Unimplemented,
-            "$4E78: the reserved hole above RTR"
+            decode(0x4E3F),
+            Op::Undefined,
+            "just below the traps: unassigned, undefined"
         );
+        // LINK (`$4E50`..`$4E57`) and UNLK (`$4E58`..`$4E5F`) are above the traps
+        // (#23), `$4E60`..`$4E6F` above them is MOVE to/from USP (#34), and
+        // `RESET` `$4E70` and `STOP` `$4E72` landed in #35 — so the row's tail
+        // above `RTR` is what remains, and it is reserved, not a hole: `$4E7B`
+        // is `MOVEC` on the 68010 and up, which is the reason nothing on the
+        // 68000 uses the row (M68000UM "Instruction Set Summary"; #621).
+        assert_range_decodes_to(0x4E78..=0x4E7F, Op::Undefined);
         // `$0000` was ORI until #21 implemented it (see
         // `ori_andi_eori_decode_and_leave_ccr_sr_alone`), `$0100` was BTST until
         // #28 implemented the bit operations, and `$0108` was MOVEP until #33
@@ -2162,31 +2284,33 @@ mod tests {
         // aaa`, the static bit-number form at `An` direct: MOVEP needs bit 8 set
         // and no 68000 instruction has this encoding. #355 says what that has
         // always meant — nothing is defined there, so it is `Undefined`, not a
-        // handler waiting to be written — so the group's `Unimplemented` anchor is
-        // now `$00BC`, `ORI.L #imm`, the one encoding of the `0000` group whose
-        // slot exists and whose code has not been written.
+        // handler waiting to be written — and that is where it stays.
         assert_eq!(
             decode(0x0808),
             Op::Undefined,
             "$0808: the bit-op group's static form at An direct, which nothing defines"
         );
+        // The group's other former anchor was `$00BC`, `ORI.L #imm` at the
+        // immediate EA: the format is defined and the destination is an
+        // immediate, which is not alterable, so #621 landed it on `Illegal` —
+        // the same rule the SUBI/ADDI/CMPI siblings apply at every size.
         assert_eq!(
             decode(0x00BC),
-            Op::Unimplemented,
-            "$00BC: ORI.L #imm, the 0000 group's remaining unimplemented corner"
+            Op::Illegal,
+            "$00BC: ORI.L #imm, the 0000 group's immediate-destination corner"
         );
         // The move groups — bits 15..12 = `0001`, `0010`, `0011` (`MOVE`,
         // `MOVEA`) and `0111` (`MOVEQ`) — left this list with #17, see
-        // `move_family_is_not_unimplemented`, and MOVEM left it with #32. The anchor
-        // is the opcode immediately beside MOVEM's load window — `$4C00`, MOVEM's
-        // `0100 1d00 1s` pattern with bit 7 clear — which the pinned suite confirms
-        // nothing uses: no `4c00` case appears in `MOVEM.l.json.gz`, `CHK.json.gz` or
-        // `TAS.json.gz`. `$48E7`, the anchor here up to #32, is
-        // `MOVEM.L #reglist,-(A7)` and decodes.
+        // `move_family_is_not_unimplemented`, and MOVEM left it with #32. The last
+        // anchor was the opcode immediately beside MOVEM's load window — `$4C00`,
+        // MOVEM's `0100 1d00 1s` pattern with bit 7 clear — which the pinned
+        // suite confirms nothing uses: no `4c00` case appears in `MOVEM.l.json.gz`,
+        // `CHK.json.gz` or `TAS.json.gz`. #621 placed it as undefined: the
+        // 68000 assigns the bit-7-clear half of the column nothing.
         assert_eq!(
             decode(0x4C00),
-            Op::Unimplemented,
-            "MOVEM's group, bit 7 clear"
+            Op::Undefined,
+            "MOVEM's group, bit 7 clear: unassigned, undefined"
         );
     }
 
@@ -2229,10 +2353,11 @@ mod tests {
     /// range would have swept the two together).
     ///
     /// The rest of the count is the point: `RESET` `$4E70`, `STOP` `$4E72` and
-    /// TRAPV `$4E76` are the three single opcodes #35 landed, the `$4E74` and
-    /// `$4E78`/`$4E79` holes are still unimplemented, MOVE to/from USP
-    /// `$4E60`..`$4E6F` is the 16-opcode block #34 landed, and `JSR`/`JMP` plus
-    /// their 72 illegal operand fields are the whole of `$4E80`..`$4EFF`
+    /// TRAPV `$4E76` are the three single opcodes #35 landed, the `$4E00..=$4E3F`
+    /// window below the traps, the `$4E74` gap and the reserved `$4E78..=$4E7F`
+    /// row are undefined — the 73 unimplemented words #621 placed — MOVE to/from
+    /// USP `$4E60`..`$4E6F` is the 16-opcode block #34 landed, and `JSR`/`JMP`
+    /// plus their 72 illegal operand fields are the whole of `$4E80`..`$4EFF`
     /// (M68000UM section 8, "Instruction Set Summary"; M1-17, #25; M1-26, #34).
     #[test]
     fn the_returns_and_no_operand_misc_are_single_opcodes() {
@@ -2259,7 +2384,7 @@ mod tests {
             (Op::Jmp, 0),
             (Op::Jsr, 0),
             (Op::Illegal, 0),
-            (Op::Unimplemented, 0),
+            (Op::Undefined, 0),
         ];
         for opcode in 0x4E00u16..=0x4EFF {
             let op = decode(opcode);
@@ -2278,7 +2403,9 @@ mod tests {
                 Op::MoveUsp => 16,
                 Op::Jmp | Op::Jsr => 28,
                 Op::Illegal => 72,
-                Op::Unimplemented => 73,
+                // The 64 words below the traps + the `$4E74` gap + the reserved
+                // `$4E78..=$4E7F` row: everything the group never assigned (#621).
+                Op::Undefined => 73,
                 _ => unreachable!("only the variants above are named"),
             };
             assert_eq!(count, want, "{op:?} in $4E00..=$4EFF");
@@ -3140,8 +3267,9 @@ mod tests {
     /// here (M68000UM ORI, ANDI, EORI; M1-13, #21). #34 claimed two of the four
     /// `111/100` rows: `ss` = `00` is `ANDI/ORI/EORI` to CCR and `ss` = `01` the
     /// same to SR, so they are asserted as [`Op::LogicImmCcr`] and
-    /// [`Op::LogicImmSr`] below; `ss` = `10` and `ss` = `11` at that EA are nothing
-    /// on the 68000 and stay [`Op::Unimplemented`].
+    /// [`Op::LogicImmSr`] below; `ss` = `11` at that EA is no size at all and is
+    /// undefined, while `ss` = `10` — `$00BC`/`$02BC`/`$0ABC` — keeps the
+    /// format's immediate-destination rule and is illegal (#621).
     #[test]
     fn ori_andi_eori_decode_and_leave_ccr_sr_alone() {
         for (opcode, want, name) in [
@@ -3189,13 +3317,18 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), Op::Undefined, "{name} (${opcode:04X})");
         }
-        // ... and `ss` = `10` at the CCR EA is a 68020 encoding whose slot the
-        // 68000 does have, so it stays on the unimplemented side of the split.
-        assert_eq!(
-            decode(0x00BC),
-            Op::Unimplemented,
-            "ORI.L #imm at the CCR EA: a 68020 encoding only ($00BC)"
-        );
+        // ... and `ss` = `10` at the CCR EA has no CCR/SR form to fall into — those
+        // formats are the fixed `ss` = `00`/`01` encodings — so the destination is
+        // what the EA field says it is, an immediate, and an immediate is not
+        // alterable: illegal, like the SUBI/ADDI/CMPI siblings' own immediate
+        // corners (`classify_logic_imm`'s note; #621). All three nibbles walk.
+        for opcode in [0x00BCu16, 0x02BC, 0x0ABC] {
+            assert_eq!(
+                decode(opcode),
+                Op::Illegal,
+                "${opcode:04X}: the immediate-logic format at an immediate destination"
+            );
+        }
         for (opcode, name) in [
             (
                 0x0048u16,
@@ -3756,12 +3889,13 @@ mod tests {
         ] {
             assert_eq!(decode(opcode), want, "{name} (${opcode:04X})");
         }
-        // The still-unimplemented probe moves to MOVEM’s load half with bit 7
-        // clear, the same anchor `unknown_is_unimplemented_for_now` uses.
+        // The unassigned probe beside MOVEM's load half — bit 7 clear — is
+        // undefined now (#621), the same anchor `the_former_holes_take_their_places_in_the_split`
+        // records.
         assert_eq!(
             decode(0x4C00),
-            Op::Unimplemented,
-            "MOVEM’s group, bit 7 clear"
+            Op::Undefined,
+            "MOVEM's group, bit 7 clear: unassigned, undefined"
         );
     }
 
@@ -3823,9 +3957,9 @@ mod tests {
     /// The two windows are the ones with neighbours to lose: mode `000` of the
     /// `$48` half is EXT (`$4880`..`$4887`, `$48C0`..`$48C7`, which is why the
     /// store half below skips `mode == 0`), `$4C00`..`$4C7F` is the unassigned
-    /// space above it, and the stack mode going the wrong way is an illegal
-    /// instruction rather than an unimplemented opcode (M68000UM MOVEM,
-    /// "Addressing Modes"; M1-24, #32).
+    /// space above it — undefined since #621 — and the stack mode going the wrong
+    /// way is an illegal instruction rather than an unimplemented opcode
+    /// (M68000UM MOVEM, "Addressing Modes"; M1-24, #32).
     #[test]
     fn movem_is_exactly_its_own_opcodes() {
         let mut movem = 0;
@@ -3866,7 +4000,9 @@ mod tests {
         // still-unclaimed occupant of the `0100` group (M1-27, #36), is
         // `$4AC0`..`$4AFF` in `TAS.json.gz`.
         assert_eq!(decode(0x487A), Op::Pea, "PEA d16(PC), just below");
-        assert_eq!(decode(0x4C00), Op::Unimplemented, "bit 7 clear, just below");
+        // Bit 7 clear is not MOVEM either: the `$4C00`..`$4C7F` window is
+        // unassigned on the 68000 and #621 placed it as undefined.
+        assert_range_decodes_to(0x4C00..=0x4C7F, Op::Undefined);
         // `$4D00` is above MOVEM rather than part of it, but it is no longer
         // unassigned: bits 8..6 = `100` in the `0100` group is `CHK.L`, which the
         // 68000 does not implement (M68000UM lists CHK as word only; the long form

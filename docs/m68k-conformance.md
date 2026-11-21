@@ -366,14 +366,17 @@ The audit's verdict is recorded in the test's module docs; the shape of it:
 every defined entry decodes to its operation token's `Op` family (compared by
 family, not by condition, because the map does not record Bcc/Scc/DBcc
 conditions and folds `ADDI`/`ADDQ`/`CMPM`/`MOVEQ` into their base mnemonics),
-and every `"None"` entry either raises the illegal-instruction exception
-(`Illegal`/`Undefined`/`LineA`/`LineF`), or sits in one of two pinned lists:
-the 204 still-`Unimplemented` slots (#621) and 453 over-broad decodes where
-rustsega executes a word the map leaves undefined (#618 OR/AND EA classes,
-#619 MOVEM store to PC-relative, #620 static `BTST` into an immediate). Those
-pins are counted, so a fix that lands with its issue makes the count go stale
-and the test fails until the pin comes off — the `KNOWN_FAILURES` pattern,
-applied to opcodes instead of files.
+and every `"None"` entry raises the illegal-instruction exception
+(`Illegal`/`Undefined`/`LineA`/`LineF`). Nothing is pinned any more: the
+453 over-broad decodes where rustsega executed a word the map leaves undefined
+came off with their fixes (#618 OR/AND EA classes, #619 MOVEM store to
+PC-relative, #620 static `BTST` into an immediate), and #621 worked the last
+204 still-`Unimplemented` slots into `Undefined`/`Illegal` per the manual's
+group structure, removing the last pin list with them. While a pin list
+existed it was counted, so a fix that landed with its issue made the count go
+stale and the test fail until the pin came off — the `KNOWN_FAILURES` pattern,
+applied to opcodes instead of files; with the table fully placed, the plain
+mismatch is the only failure mode left.
 
 ## Regenerating this page
 

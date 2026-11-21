@@ -1397,6 +1397,10 @@ mod tests {
             (0x0AC6, "EORI at size 11"),
             (0x0E00, "the 0000 group's unassigned nibble"),
             (0x0808, "the static bit-number form at An direct"),
+            (
+                0x4E74,
+                "the $4E7x row's unassigned gap, which #621 placed as undefined",
+            ),
         ] {
             assert_eq!(
                 crate::decode::decode(opcode),
@@ -1435,21 +1439,39 @@ mod tests {
         }
     }
 
-    /// The other half of #355, spelled out where the panic rule lives: the
-    /// undefined encodings above may not be reached by making
-    /// `Op::Unimplemented` quiet, because `$4E74` — no handler, and a slot this
-    /// ticket leaves alone — still has to blow up.
+    /// The two sides of #355's split, spelled out where the panic rule lives.
+    /// `$4E74` — the panic side's last anchor until #621 — now decodes
+    /// `Undefined` and takes the exception with the encodings above, and no
+    /// opcode reaches `Op::Unimplemented` any more. What keeps the split is
+    /// the variant itself: the wildcard that runs an `Op::Unimplemented` must
+    /// stay a panic, so a future variant that lands before its handler can
+    /// never be mistaken for a working instruction, and `Undefined` can never
+    /// be merged into quietness to reach it (#355).
     #[test]
-    fn an_undefined_encoding_does_not_silence_the_unimplemented_one() {
+    fn an_unimplemented_variant_panics_and_does_not_silence_the_undefined_ones() {
+        // No classify arm produces the variant any more (#621), so this drives
+        // `run_op` with it directly — the route a future handler-less variant
+        // would take.
         let (mut cpu, mut bus) = cpu_at_opcode(0x4E74);
-        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cpu.step(&mut bus)))
-            .expect_err("$4E74 has no handler, and #355 does not change that");
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cpu.run_op(&mut bus, crate::decode::Op::Unimplemented, 0x4E74)
+        }))
+        .expect_err("the unimplemented wildcard must not let run_op return");
         let text = error
             .downcast_ref::<String>()
             .expect("the panic payload is a formatted message");
         assert!(
             text.contains("m68k opcode 4E74"),
             "the panic must name the opcode it could not run, got {text:?}"
+        );
+        // And the contrast the split is about: the same opcode word, decoded,
+        // does not panic and does not run — it takes the exception.
+        let (mut cpu, mut bus) = cpu_at_opcode(0x4E74);
+        cpu.step(&mut bus);
+        assert_eq!(
+            cpu.pending_exception,
+            Some(crate::exceptions::EXC_ILLEGAL),
+            "$4E74 decodes Undefined, so step routes to the illegal vector"
         );
     }
 
@@ -1484,32 +1506,50 @@ mod tests {
         );
     }
 
-    /// An unimplemented instruction is a panic, not a silent no-op: a suite
-    /// that reported a passing case for an instruction that never ran would be
-    /// worse than one that stops.
+    /// `$4E74` — the hole `$4E70..=$4E77` once left in the `$4E` row after
+    /// RESET, NOP, RTE, RTS, TRAPV and RTR were taken — was the panic side's
+    /// last opcode anchor until #621 placed it as `Undefined`, and this is what
+    /// that means at the CPU: the step is the illegal-instruction exception,
+    /// the whole entry sequence, with the frame a handler can decode the
+    /// abandoned opcode from. This used to be a panic-assert (M1-08's rule,
+    /// carried by `$4E71` before #25, `$4E70` before #35, `$4E74` until here);
+    /// the panic rule itself now lives in
+    /// `an_unimplemented_variant_panics_and_does_not_silence_the_undefined_ones`.
     #[test]
-    fn step_panics_loudly_on_an_unimplemented_opcode() {
-        // `$4E74`, which has no handler and is the hole left in `$4E70..=$4E77`
-        // once RESET, NOP, RTE, RTS, TRAPV and RTR are taken. This used to be
-        // `4E71` before M1-17 (#25), then `4E70` before #35 gave RESET one; what
-        // the test needs is any opcode that has none, and `decode::tests` keeps
-        // `4E74` as the same anchor on the other side of the decoder.
+    fn the_4e74_hole_takes_the_illegal_instruction_exception() {
         let (mut cpu, mut bus) = cpu_at_opcode(0x4E74);
-        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cpu.step(&mut bus)))
-            .expect_err("an opcode with no handler must not let step return");
-        let text = error
-            .downcast_ref::<String>()
-            .expect("the panic payload is a formatted message");
-        assert!(
-            text.contains("m68k opcode 4E74"),
-            "the panic must name the opcode it could not run, got {text:?}"
+        let before = cpu.clone();
+        let clocks = cpu.step(&mut bus);
+        assert_eq!(
+            u64::from(clocks),
+            crate::exceptions::EXCEPTION_ENTRY_CLOCKS,
+            "the step is the entry sequence, which charges its own 34 clocks"
         );
+        assert_eq!(
+            cpu.pending_exception,
+            Some(crate::exceptions::EXC_ILLEGAL),
+            "$4E74 takes the illegal-instruction vector (#621)"
+        );
+        // The frame: SR as it was, then the address of the encoding that has no
+        // instruction, so a handler can look at what it jumped over.
+        assert_eq!(bus.read_word(STACK_TOP - 6), 0x2700, "SR at SP");
+        assert_eq!(
+            bus.read_long(STACK_TOP - 4),
+            PROGRAM_BASE,
+            "PC at SP + 2, pointing at the $4E74 word"
+        );
+        assert_eq!(cpu.pc, ILLEGAL_HANDLER, "PC from the long at $000010");
+        assert_eq!(cpu.d, before.d, "must not touch Dn");
+        assert_eq!(cpu.a[..7], before.a[..7], "must not touch An");
     }
 
     /// The instruction `step` runs is `prefetch[0]`, not whatever a read of
     /// `pc` would return: the queue front here is a line A opcode while the
-    /// word behind it is the unimplemented `$4E74`, so a `step` that fetched
-    /// from `pc` or decoded `prefetch[1]` would panic instead of routing.
+    /// word behind it is the undefined `$4E74`, so a `step` that fetched from
+    /// `pc` or decoded `prefetch[1]` would take the illegal-instruction
+    /// exception instead of routing to line A (#621 made the second word
+    /// exception-shaped; the vector assert below is what catches the wrong
+    /// fetch either way).
     #[test]
     fn step_runs_the_instruction_at_the_front_of_the_queue() {
         use crate::exceptions::{EXC_LINE_A, EXCEPTION_ENTRY_CLOCKS};
