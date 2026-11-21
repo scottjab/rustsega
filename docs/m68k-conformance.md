@@ -12,24 +12,24 @@ it.
 
 | | |
 |---|---|
-| Measured | 2026-11-19, `main` at the #241 fix |
-| Check level | `harness::Check::StateAndCyclesSkipExceptions` |
+| Measured | 2026-11-21, `main` at the #616 fix |
+| Check level | `harness::Check::StateAndCycles` |
 | Instruction files | **124** — 123 clean, 1 failing |
-| Cases | **821 971 / 1 000 060** passed |
-| Cases skipped | **178 087**, spread over 62 files |
+| Cases | **1 000 058 / 1 000 060** passed |
+| Cases skipped | **0** |
 | Cases failing | **2**, in 1 file |
-| Sweep time | 3.7 s of test time; 4.3 s wall including `nix develop` startup with the test binary already built |
+| Sweep time | 4.0 s of test time; 4.6 s wall including `nix develop` startup with the test binary already built |
 
-`Check::StateAndCyclesSkipExceptions` compares every data and address
-register, both stored stack pointers, SR, PC, both prefetch words, every RAM
-byte the case lists, **and** the clock count `step` returned against the case's
-`length`. It leaves out the cases the suite expects to end in its own exception
-handler, which are counted as *skipped*, not passed — see
-[What the gate leaves out](#what-the-gate-leaves-out).
-
-Skipped is a real hole, not a rounding error: 17.8 % of the suite. The
-per-file `passed` column in the table below has to be read against that file's
-`skipped` column, never on its own.
+`Check::StateAndCycles` compares every data and address register, both stored
+stack pointers, SR, PC, both prefetch words, every RAM byte the case lists,
+**and** the clock count `step` returned against the case's `length`. Nothing
+is left out: the gate ran at `StateAndCyclesSkipExceptions`, with the cases
+ending in the suite's exception handler counted as *skipped*, until the
+exception path finished closing — #474 corrected the address-error state and
+entry against the recorded suite, and #616's in-flight prefetch fetch closed
+the last residual shape (a faulting store to `(xxx).l`, one case in 20 000).
+The history of both halves is on [What the gate leaves
+out](#what-the-gate-leaves-out).
 
 ## The data
 
@@ -163,29 +163,27 @@ to bump to, and `ASL.b` should be read as 8063/8065 for as long as the pin stand
 
 Things this run cannot see, with the issue that owns each:
 
-- **The 178 087 skipped cases (62 files).** These are the cases that end in the
-  suite's exception handler at $00000C. `is_exception_case` skips them because
-  the core could not take them when the harness was written; the exception path
-  has since been built out (#37, #41), and enabling those cases is [#223].
-  Part of that landed in #474 (2026-11-19): the address-error path was corrected
-  against the recorded suite — unmasked fault address, the aborted-instruction
-  rule (no flag write-back, no destination EA side effect, no ALU pass on a
-  faulted access), the group 0 entry at its documented 50 clocks — and 13 of
-  the 15 files that could not survive the skip being removed moved their
-  per-file tests up to full `Check::StateAndCycles` (`moves.rs` moved
-  `MOVE.b`/`MOVEA.w`/`MOVEA.l`/`MOVE.q` and holds `MOVE.w`/`MOVE.l` one level
-  down for the one residual shape, [#616]). The gate itself stays at
-  `StateAndCyclesSkipExceptions` until #616 closes; the per-file tests are the
-  stricter pin in the meantime.
-- **"Skipped" is not "address error"** ([#185], closed by the rename). The suite
-  records its address error at $00000C, not at hardware's $000008, because the
-  core it was recorded against routes the address error and the illegal
-  instruction to the same slot — `EXC_ADDRESS_ERROR == EXC_ILLEGAL == 3`, see
-  `crates/m68k/src/address_error.rs`. So the $0C slot the predicate reads is the
-  right one, but it cannot name which exception fired: the skipped set includes
-  genuine illegal-instruction cases and is not a set of hardware address errors.
-  A case ending at a *different* vector is not skipped either — `CHK`'s 4 272
-  traps end at $00002000 and are run, and failed on, by the gate.
+- ~~The skipped cases~~ — **closed**. The gate used to run at
+  `Check::StateAndCyclesSkipExceptions`, leaving out the 178 087 cases (over
+  62 files) that end in the suite's exception handler at `$00000C`. That was
+  one hole with two halves, both now closed and the level moved up in the same
+  commits that closed them: #474 (2026-11-19) corrected the address-error path
+  against the recorded suite — unmasked fault address, the
+  aborted-instruction rule (no flag write-back, no destination EA side effect,
+  no ALU pass on a faulted access), the group 0 entry at its documented 50
+  clocks — and flipped 13 of the 15 gated files plus `MOVE.b`/`MOVEA`/`MOVEQ`
+  to full `Check::StateAndCycles`; #616 (2026-11-21) modelled the recording
+  core's in-flight prefetch fetch — a store takes the bus slot ahead of the
+  last extension word's refill, and a faulting store cancels the deferred
+  slide and refill — which let the last two files (`MOVE.w`, `MOVE.l`) and the
+  gate itself come up. The campaign [#223] tracked is done. Note the skipped
+  set was never "address errors": it
+  included genuine illegal-instruction cases ([#185], closed by the rename to
+  `is_exception_case`), because the suite records its address error at
+  `$00000C`, not hardware's `$000008` (`EXC_ADDRESS_ERROR == EXC_ILLEGAL ==
+  3`, see `crates/m68k/src/address_error.rs`). A case ending at a *different*
+  vector was never skipped either — `CHK`'s 4 272 traps end at `$00002000`
+  and are run, and failed on, by the gate.
 - **The privilege-violation vector in user mode** ([#194]): the one measured
   vector the suite cannot pin, so nothing here asserts it.
 - **Bus transactions.** The suite's `transactions` array is deliberately not
@@ -202,7 +200,7 @@ Things this run cannot see, with the issue that owns each:
 ## In CI
 
 `.github/workflows/ci.yml` runs the sweep as its own step on every push and
-every pull request, at 3.7 s of test time (about 5 s with nix and cargo
+every pull request, at 4.0 s of test time (about 5 s with nix and cargo
 overhead once `just check` has built the test binaries) — comfortably inside the
 ticket's 2-minute budget, so the gate protects a PR before merge instead of
 only reporting on `main` afterwards.
@@ -221,135 +219,135 @@ what `harness::all_files` returns.
 ```text
 ABCD                8065    8065       0       0
 ADD.b               8065    8065       0       0
-ADD.l               8065    5143       0    2922
-ADD.w               8065    5117       0    2948
-ADDA.l              8065    5372       0    2693
-ADDA.w              8065    5431       0    2634
+ADD.l               8065    8065       0       0
+ADD.w               8065    8065       0       0
+ADDA.l              8065    8065       0       0
+ADDA.w              8065    8065       0       0
 ADDX.b              8065    8065       0       0
-ADDX.l              8065    5472       0    2593
-ADDX.w              8065    5465       0    2600
+ADDX.l              8065    8065       0       0
+ADDX.w              8065    8065       0       0
 AND.b               8065    8065       0       0
-AND.l               8065    4745       0    3320
-AND.w               8065    4668       0    3397
+AND.l               8065    8065       0       0
+AND.w               8065    8065       0       0
 ANDItoCCR           8065    8065       0       0
 ANDItoSR            8065    8065       0       0
 ASL.b               8065    8063       2       0
 ASL.l               8065    8065       0       0
-ASL.w               8065    7127       0     938
+ASL.w               8065    8065       0       0
 ASR.b               8065    8065       0       0
 ASR.l               8065    8065       0       0
-ASR.w               8065    7142       0     923
+ASR.w               8065    8065       0       0
 BCHG                8065    8065       0       0
 BCLR                8065    8065       0       0
 BSET                8065    8065       0       0
-BSR                 8065    4085       0    3980
+BSR                 8065    8065       0       0
 BTST                8065    8065       0       0
-Bcc                 8065    5865       0    2200
-CHK                 8065    4948       0    3117
+Bcc                 8065    8065       0       0
+CHK                 8065    8065       0       0
 CLR.b               8065    8065       0       0
-CLR.l               8065    4903       0    3162
-CLR.w               8065    4896       0    3169
+CLR.l               8065    8065       0       0
+CLR.w               8065    8065       0       0
 CMP.b               8065    8065       0       0
-CMP.l               8065    5034       0    3031
-CMP.w               8065    5024       0    3041
-CMPA.l              8065    5450       0    2615
-CMPA.w              8065    5360       0    2705
-DBcc                8065    6101       0    1964
-DIVS                8065    4992       0    3073
-DIVU                8065    4964       0    3101
+CMP.l               8065    8065       0       0
+CMP.w               8065    8065       0       0
+CMPA.l              8065    8065       0       0
+CMPA.w              8065    8065       0       0
+DBcc                8065    8065       0       0
+DIVS                8065    8065       0       0
+DIVU                8065    8065       0       0
 EOR.b               8065    8065       0       0
-EOR.l               8065    4904       0    3161
-EOR.w               8065    4930       0    3135
+EOR.l               8065    8065       0       0
+EOR.w               8065    8065       0       0
 EORItoCCR           8065    8065       0       0
 EORItoSR            8065    8065       0       0
 EXG                 8065    8065       0       0
 EXT.l               8065    8065       0       0
 EXT.w               8065    8065       0       0
-JMP                 8065    4259       0    3806
-JSR                 8065    4183       0    3882
+JMP                 8065    8065       0       0
+JSR                 8065    8065       0       0
 LEA                 8065    8065       0       0
 LINK                8065    8065       0       0
 LSL.b               8065    8065       0       0
 LSL.l               8065    8065       0       0
-LSL.w               8065    7161       0     904
+LSL.w               8065    8065       0       0
 LSR.b               8065    8065       0       0
 LSR.l               8065    8065       0       0
-LSR.w               8065    7103       0     962
+LSR.w               8065    8065       0       0
 MOVE.b              8065    8065       0       0
-MOVE.l              8065    3270       0    4795
+MOVE.l              8065    8065       0       0
 MOVE.q              8065    8065       0       0
-MOVE.w              8065    3368       0    4697
-MOVEA.l             8065    5379       0    2686
-MOVEA.w             8065    5322       0    2743
-MOVEM.l             8065    4223       0    3842
-MOVEM.w             8065    4281       0    3784
+MOVE.w              8065    8065       0       0
+MOVEA.l             8065    8065       0       0
+MOVEA.w             8065    8065       0       0
+MOVEM.l             8065    8065       0       0
+MOVEM.w             8065    8065       0       0
 MOVEP.l             8065    8065       0       0
 MOVEP.w             8065    8065       0       0
-MOVEfromSR          8065    5017       0    3048
+MOVEfromSR          8065    8065       0       0
 MOVEfromUSP         8065    8065       0       0
-MOVEtoCCR           8065    4958       0    3107
-MOVEtoSR            8065    4938       0    3127
+MOVEtoCCR           8065    8065       0       0
+MOVEtoSR            8065    8065       0       0
 MOVEtoUSP           8065    8065       0       0
-MULS                8065    4943       0    3122
-MULU                8065    4992       0    3073
+MULS                8065    8065       0       0
+MULU                8065    8065       0       0
 NBCD                8065    8065       0       0
 NEG.b               8065    8065       0       0
-NEG.l               8065    5031       0    3034
-NEG.w               8065    4911       0    3154
+NEG.l               8065    8065       0       0
+NEG.w               8065    8065       0       0
 NEGX.b              8065    8065       0       0
-NEGX.l              8065    4919       0    3146
-NEGX.w              8065    4979       0    3086
+NEGX.l              8065    8065       0       0
+NEGX.w              8065    8065       0       0
 NOP                 8065    8065       0       0
 NOT.b               8065    8065       0       0
-NOT.l               8065    4925       0    3140
-NOT.w               8065    4957       0    3108
+NOT.l               8065    8065       0       0
+NOT.w               8065    8065       0       0
 OR.b                8065    8065       0       0
-OR.l                8065    4730       0    3335
-OR.w                8065    4650       0    3415
+OR.l                8065    8065       0       0
+OR.w                8065    8065       0       0
 ORItoCCR            8065    8065       0       0
 ORItoSR             8065    8065       0       0
 PEA                 8065    8065       0       0
 RESET               8065    8065       0       0
 ROL.b               8065    8065       0       0
 ROL.l               8065    8065       0       0
-ROL.w               8065    7074       0     991
+ROL.w               8065    8065       0       0
 ROR.b               8065    8065       0       0
 ROR.l               8065    8065       0       0
-ROR.w               8065    7187       0     878
+ROR.w               8065    8065       0       0
 ROXL.b              8065    8065       0       0
 ROXL.l              8065    8065       0       0
-ROXL.w              8065    7128       0     937
+ROXL.w              8065    8065       0       0
 ROXR.b              8065    8065       0       0
 ROXR.l              8065    8065       0       0
-ROXR.w              8065    7172       0     893
-RTE                 8065    4011       0    4054
-RTR                 8065    4038       0    4027
-RTS                 8065    4008       0    4057
+ROXR.w              8065    8065       0       0
+RTE                 8065    8065       0       0
+RTR                 8065    8065       0       0
+RTS                 8065    8065       0       0
 SBCD                8065    8065       0       0
 SUB.b               8065    8065       0       0
-SUB.l               8065    5093       0    2972
-SUB.w               8065    5121       0    2944
-SUBA.l              8065    5329       0    2736
-SUBA.w              8065    5386       0    2679
+SUB.l               8065    8065       0       0
+SUB.w               8065    8065       0       0
+SUBA.l              8065    8065       0       0
+SUBA.w              8065    8065       0       0
 SUBX.b              8065    8065       0       0
-SUBX.l              8065    5481       0    2584
-SUBX.w              8065    5387       0    2678
+SUBX.l              8065    8065       0       0
+SUBX.w              8065    8065       0       0
 SWAP                8065    8065       0       0
 Scc                 8065    8065       0       0
 TAS                 8065    8065       0       0
 TRAP                8065    8065       0       0
 TRAPV               8065    8065       0       0
 TST.b               8065    8065       0       0
-TST.l               8065    4963       0    3102
-TST.w               8065    4928       0    3137
+TST.l               8065    8065       0       0
+TST.w               8065    8065       0       0
 UNLINK              8065    8065       0       0
 
 ASL.b (#209): 2 failing cases
   case "e502 [ASL.b Q, D2] 1583": d2: expected 0x2E5E4304, got 0xCDFB7FF8; sr: expected 0x2713, got 0x270A
   case "e502 [ASL.b Q, D2] 1761": d2: expected 0x6461D390, got 0x417C7EF4
 
-124 files: 821971/1000060 cases passed, 178087 cases skipped as exceptions, 2 cases failing in 1 files
-sweep took 3.7s
+124 files: 1000058/1000060 cases passed, 0 cases skipped as exceptions, 2 cases failing in 1 files
+sweep took 4.0s
 ```
 
 ## The decode table against the official opcode map

@@ -102,6 +102,31 @@ impl M68k {
 
 Addresses are 24 bit; the core masks with `0x00FF_FFFF` before calling the bus.
 
+#### m68k prefetch queue: two slots and the in-flight tail
+
+`prefetch` is a two-word window, `[word(pc), word(pc + 2)]`, with `pc` the
+address of the front (the instruction being executed). `pop_word` is the one
+way a word leaves it: the back word comes out, `pc` slides +2, and a refill
+fetch at the old `pc + 4` charges 4 clocks. Every extension word and the
+end-of-instruction slide (`advance_opcode`) are pops, so an instruction's
+cycle count is its pop count; `jump_to` throws the queue away and refills.
+
+The recorded 68000 (the SingleStepTests recorder) adds one asymmetry the
+queue holds in flight: a **read** leaves the operand's last extension pop
+fully paid, but a **store** takes the bus slot first, so the last extension
+word's slide and refill wait behind the store cycle. A completing store lets
+them land before the advance (non-faulted totals unchanged); a faulting store
+cancels both, which is why a faulted `(xxx).l` store stacks a `pc` one word
+short of its instruction and charges 4 fewer clocks (#616; suite cases `33ea
+[MOVE.w (d16, A2), (xxx).l] 18` and `33d1 [MOVE.w (A1), (xxx).l] 1826` pin
+it). The move class resolves an `(xxx).l` destination through the deferred
+read (`resolve_store_destination`) and lands it with `land_deferred_ext_word`
+after the store; it only defers when the source was read off the bus - a
+register or immediate source charges the tail in full (`33c1 [MOVE.w D1,
+(xxx).l] 3196`). Read-modify-write instructions and MOVEM never defer: their
+last pop is followed by a read or nothing, and the suite pins the full charge
+there.
+
 #### m68k exceptions: the vector map
 
 Exception entry copies SR, sets S, pushes a 6-byte frame (SR word at SP, PC

@@ -51,11 +51,13 @@
 //!
 //! The real chip's prefetch quirk — for some destination modes and forms the
 //! final prefetch word is fetched *before* the destination write instead of
-//! after it — is deliberately not modelled here. What it changes is the
-//! bus-transaction trace, plus the refilled queue word only for a destination
-//! that overlaps the instruction stream, which no move case in the suite is; the
-//! trace is M1-31's job (#39, part 1 of which is literally "cycle checks …
-//! MOVE"), not this ticket's.
+//! after it — is modelled at the one place the suite pins it: an `(xxx).l`
+//! destination's tail word defers its slide and refill behind the store
+//! ([`EaUse::StoreDestination`], [`M68k::land_deferred_ext_word`]; #616). What
+//! it changes is the bus-transaction trace on non-faulted stores, plus the
+//! refilled queue word only for a destination that overlaps the instruction
+//! stream, which no move case in the suite is; the trace is M1-31's job (#39,
+//! part 1 of which is literally "cycle checks … MOVE"), not this ticket's.
 //!
 //! # Flags
 //!
@@ -66,7 +68,7 @@
 use crate::M68k;
 use crate::bus::Bus;
 use crate::decode::MOVEQ_BIT8;
-use crate::ea::{Ea, EaUse, Size, sign_extend_byte};
+use crate::ea::{Ea, Size, sign_extend_byte};
 use crate::ops::field;
 
 /// Shift of MOVE's size field, bits 13..12 (`01` byte, `11` word, `10` long).
@@ -115,7 +117,7 @@ impl M68k {
 
         let src_mode = field(opcode, SRC_MODE_SHIFT);
         let src_reg = field(opcode, 0);
-        let Some(src) = self.resolve_move_ea(bus, src_mode, src_reg, size, EaUse::Source) else {
+        let Some(src) = self.resolve_move_source_ea(bus, src_mode, src_reg, size) else {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, size);
@@ -129,7 +131,17 @@ impl M68k {
 
         let dest_reg = field(opcode, DEST_REG_SHIFT);
         let dest_mode = field(opcode, DEST_MODE_SHIFT);
-        let Some(dest) = self.resolve_move_ea(bus, dest_mode, dest_reg, size, EaUse::Destination)
+        // The store follows the resolve immediately, so an `(xxx).l`
+        // destination's tail word may defer its slide and refill to behind the
+        // store cycle. It only does when the source was read off the bus: a
+        // faulted store with a register-direct or immediate source charges the
+        // tail pop in full and stacks the full-slide pc (suite `33c1 [MOVE.w
+        // D1, (xxx).l] 3196`, `33fc [MOVE.w #, (xxx).l] 1109`), while one with
+        // a memory source cancels both (`33d1 [MOVE.w (A1), (xxx).l] 1826`) —
+        // see [`EaUse::StoreDestination`] for the shape.
+        let defer_tail = matches!(src, Ea::Mem(_));
+        let Some((dest, tail_deferred)) =
+            self.resolve_store_destination(bus, dest_mode, dest_reg, size, defer_tail)
         else {
             return self.op_illegal(bus);
         };
@@ -154,7 +166,7 @@ impl M68k {
         // (suite `MOVE.w` `3af7 [(d8, A7, Xn), (A5)+] 7` and `MOVE.l` `22cb
         // [A3, (A1)+] 32`: the register ends where it started, the frame stacks
         // the pre-slide `pc`, and no refill clock is charged). The bump to undo
-        // is `resolve_move_ea`'s, `size` wide, `dest_mode` `011` being the only
+        // is `resolve_move_source_ea`'s, `size` wide, `dest_mode` `011` being the only
         // postincrement mode.
         if self.address_error_pending() {
             if dest_mode == EA_MODE_POSTINCREMENT {
@@ -174,7 +186,14 @@ impl M68k {
             {
                 self.predec_long_walk_stop(dest_reg, a);
             }
+            // The deferred tail stays deferred: the entry throws the queue
+            // away, so the slide and refill are cancelled together with the
+            // store (suite `33ea [MOVE.w (d16, A2), (xxx).l] 18` stacks the
+            // pre-tail `pc` and charges 4 clocks less than the landing would).
             return 0;
+        }
+        if tail_deferred {
+            self.land_deferred_ext_word(bus);
         }
         if !predecor {
             self.advance_opcode(bus);
@@ -200,7 +219,7 @@ impl M68k {
 
         let src_mode = field(opcode, SRC_MODE_SHIFT);
         let src_reg = field(opcode, 0);
-        let Some(src) = self.resolve_move_ea(bus, src_mode, src_reg, size, EaUse::Source) else {
+        let Some(src) = self.resolve_move_source_ea(bus, src_mode, src_reg, size) else {
             return self.op_illegal(bus);
         };
         let value = self.read_ea(bus, src, size);
@@ -233,29 +252,24 @@ impl M68k {
         0
     }
 
-    /// Resolve one operand field of a move instruction, which [`crate::decode`]
-    /// has already validated.
-    ///
-    /// `use_` picks the read or the write resolve, and with it whether a
-    /// `-(An)` pays its address-calculation clock (see [`EaUse`]).
+    /// Resolve the **source** operand field of a move instruction, which
+    /// [`crate::decode`] has already validated. (The store-immediately
+    /// destination has its own entry, [`M68k::resolve_store_destination`]: it
+    /// also reports the deferred tail; see [`EaUse::StoreDestination`].)
     ///
     /// [`M68k::resolve_ea`] declines only a field that decoding rejects — an
     /// invalid mode, or a byte access to an An — so `None` here means decode and
     /// this handler disagree. The debug assert makes that loud in tests and the
     /// illegal-instruction route is what a release build takes, rather than
     /// executing an instruction with a half-resolved operand.
-    fn resolve_move_ea(
+    fn resolve_move_source_ea(
         &mut self,
         bus: &mut impl Bus,
         mode: u8,
         reg: u8,
         size: Size,
-        use_: EaUse,
     ) -> Option<Ea> {
-        let ea = match use_ {
-            EaUse::Source => self.resolve_ea(bus, mode, reg, size),
-            EaUse::Destination => self.resolve_ea_write(bus, mode, reg, size),
-        };
+        let ea = self.resolve_ea(bus, mode, reg, size);
         debug_assert!(
             ea.is_some(),
             "decode let an invalid move operand through: mode {mode:b} reg {reg:b} {size:?}"
@@ -540,5 +554,97 @@ mod tests {
         assert_eq!(cpu.d[1], 0xDEAD_BEEF, "the operand is at the old SP");
         assert_eq!(cpu.a[7], sp + 4, "post-increment steps by the size");
         assert_eq!(cpu.ssp, cpu.a[7], "the stored SSP follows a[7]");
+    }
+
+    /// The frame an address error pushes, as the suite's traces lay it out
+    /// (`TST.w.json.gz` case `4a79`'s stack bytes): SSW, fault address, IRD,
+    /// saved SR, stacked PC — with the SSW skipped here, the address-error
+    /// module's own business. `ssp` is the pointer the frame was pushed from.
+    fn fault_frame(bus: &mut crate::testbus::TestBus, ssp: u32) -> (u32, u16, u32) {
+        (
+            bus.read_long(ssp - 12),
+            (bus.read_long(ssp - 8) >> 16) as u16,
+            bus.read_long(ssp - 4),
+        )
+    }
+
+    /// #616's deferred tail: a faulting store to `(xxx).l` whose source was
+    /// read off the bus cancels the last extension word's slide and refill.
+    /// The frame stacks the pc one word short of the instruction and the step
+    /// is 4 clocks short of a full pop — the two-slot queue never issues that
+    /// refill. `MOVE.w (A1),$00F00001.l` is suite case `33d1 [MOVE.w (A1),
+    /// (xxx).l] 1826` on the unit bus (read 4 + ext-hi pop 4 + entry 50).
+    #[test]
+    fn faulted_abs_l_store_cancels_the_tail_pop() {
+        let (mut cpu, mut bus) = run(0x33D1, &[0x00F0, 0x0001, 0x4E71]);
+        cpu.a[1] = 0x0000_2000;
+        bus.write_word(0x2000, 0xBEEF);
+        let ssp = cpu.ssp;
+
+        let clocks = cpu.step(&mut bus);
+
+        assert_eq!(
+            clocks, 58,
+            "source read + ext-hi refill + entry: no tail pop"
+        );
+        assert_eq!(cpu.ssp, ssp - 14, "the address error frame is 7 words");
+        let (addr, ird, pc) = fault_frame(&mut bus, ssp);
+        assert_eq!(addr, 0x00F0_0001, "the odd store address");
+        assert_eq!(ird, 0x33D1, "the opcode as IRD");
+        assert_eq!(
+            pc,
+            PROGRAM + 2,
+            "stacked pc slid for the ext-hi word only: the tail is cancelled"
+        );
+    }
+
+    /// The same faulted store with a **register** source does NOT cancel the
+    /// tail: both extension pops charge and the pc slides fully (suite `33c1
+    /// [MOVE.w D1, (xxx).l] 3196` charges the `$C04` and `$C06` refills before
+    /// the frame). Same 58 clocks as the memory-source twin — the tail's 4
+    /// clocks replace the read the other shape paid — so the stacked pc is
+    /// what tells the two laws apart.
+    #[test]
+    fn faulted_abs_l_store_from_a_register_charges_the_tail_pop() {
+        let (mut cpu, mut bus) = run(0x33C1, &[0x00F0, 0x0001, 0x4E71]);
+        cpu.d[1] = 0xBEEF;
+        let ssp = cpu.ssp;
+
+        let clocks = cpu.step(&mut bus);
+
+        assert_eq!(clocks, 58, "ext-hi refill + tail refill + entry");
+        let (addr, _, pc) = fault_frame(&mut bus, ssp);
+        assert_eq!(addr, 0x00F0_0001, "the odd store address");
+        assert_eq!(
+            pc,
+            PROGRAM + 4,
+            "stacked pc slid for both extension words: no deferral"
+        );
+    }
+
+    /// A completing `(xxx).l` store keeps the pre-deferral totals exactly: the
+    /// tail lands (slide + refill) behind the store, before
+    /// [`M68k::advance_opcode`], so the cycle count and the final queue are
+    /// what the suite's non-faulted abs.L cases pin (`23c2 [MOVE.l D2,
+    /// (xxx).l] 310`'s word-move twin here).
+    #[test]
+    fn completing_abs_l_store_lands_the_tail_before_the_advance() {
+        let (mut cpu, mut bus) = run(0x33D1, &[0x00F0, 0x0000, 0x4E71]);
+        cpu.a[1] = 0x0000_2000;
+        bus.write_word(0x2000, 0xBEEF);
+
+        let clocks = cpu.step(&mut bus);
+
+        assert_eq!(
+            clocks, 20,
+            "read + ext-hi refill + store + tail landing + advance"
+        );
+        assert_eq!(cpu.pc, PROGRAM + 6, "three words consumed");
+        assert_eq!(
+            cpu.prefetch,
+            [0x4E71, 0x0000],
+            "the next opcode and the word past it"
+        );
+        assert_eq!(bus.read_word(0x00F0_0000), 0xBEEF, "the store happened");
     }
 }
