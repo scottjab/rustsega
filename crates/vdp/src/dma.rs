@@ -30,14 +30,25 @@
 //! at the transfer's own start address. Nothing is lost - that is what his
 //! `TestFIFOFullDMATransfer` expected result reads back, and the two pinning
 //! tests below carry it. `Vdp::start_running` is where the ordering is kept:
-//! the queue drains before the first transfer write. Not modelled: the
-//! queue's own slot cost inside the transfer window (on hardware the
-//! transfer waits for FIFO space behind the queued entries, so a transfer
-//! started non-empty freezes the 68k for their drain too - #563), and the
-//! CRAM "dots" a write during active display leaves behind (out of scope
-//! for #101). The four bandwidth figures the slot costs below reproduce are
-//! the Sega Genesis Software Manual's own "DMA transfer capacity" table
-//! now: #305 read it off the scan and every cell matched.
+//! the queue drains before the first transfer write. Their slot cost is part
+//! of the transfer's window ([`Running::Transfer`]'s `drain`): the DMA's
+//! pushes need FIFO space, and "pending FIFO writes take priority over DMA
+//! fills" (same post), so on hardware the queue's drain is serialised ahead
+//! of the transfer, and Nemesis's own hardware note is that "when a DMA
+//! transfer operation terminates, the FIFO is full of pending writes" - the
+//! freeze ends at the last push, with words still in flight. This window is
+//! landing-based like every other DMA window here, so it charges the drain
+//! in full and stays a couple of slots long against that push reading by at
+//! most the last four words: uniform in the queue, and fenced with the
+//! status-bits-mid-transfer corner it belongs to (the #563 residue). The
+//! fill waits the same way ("DMA fill operations will only ever run at an
+//! access slot if the FIFO is empty"), its trigger write being one of the
+//! entries it waits behind; the copy has no such wait - Nemesis advances it
+//! with no FIFO condition at all. Not modelled either: the CRAM "dots" a
+//! write during active display leaves behind (out of scope for #101). The
+//! four bandwidth figures the slot costs below reproduce are the Sega
+//! Genesis Software Manual's own "DMA transfer capacity" table now: #305
+//! read it off the scan and every cell matched.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -172,6 +183,12 @@ pub(crate) enum Running {
     /// `words` is reversed, so that the next word to land is the one `pop`
     /// gives rather than a `remove(0)`.
     Transfer {
+        /// Access slots the write FIFO still owes on the entries it held when the
+        /// transfer started: a transfer feeds the same FIFO the port does, and
+        /// "pending FIFO writes take priority" (Nemesis on SpritesMind t=1291),
+        /// so none of its words can land until the queue is out. Spent before
+        /// `slots`, and counted in [`Running::slots`] with them.
+        drain: u32,
         /// Access slots still owed before the transfer is in memory.
         slots: u32,
         /// Slots each word costs, from [`slots_per_unit`].
@@ -184,8 +201,10 @@ pub(crate) enum Running {
     },
     /// A fill: `value` repeated along the address register, one slot a step. The
     /// byte, or word, that it repeats is the data port write that started it
-    /// ([`Vdp::run_fill`]).
-    Fill { slots: u32, value: u16 },
+    /// ([`Vdp::run_fill`]). Its steps run "only ... at an access slot if the FIFO
+    /// is empty" (Nemesis on SpritesMind t=1291), so a fill armed behind queued
+    /// writes waits out their drain first, which `drain` counts.
+    Fill { drain: u32, slots: u32, value: u16 },
     /// A copy: `source` walked a byte at a time to the address register.
     Copy { slots: u32, source: u16 },
 }
@@ -197,12 +216,31 @@ impl Running {
         matches!(self, Self::Fill { .. })
     }
 
-    /// Access slots still owed before the last unit reaches memory.
+    /// Access slots still owed before the last unit reaches memory: the queue's
+    /// drain and the DMA's own slots together.
     fn slots(&self) -> u32 {
         match self {
-            Self::Transfer { slots, .. } | Self::Fill { slots, .. } | Self::Copy { slots, .. } => {
-                *slots
-            }
+            Self::Transfer { drain, slots, .. } | Self::Fill { drain, slots, .. } => drain + slots,
+            Self::Copy { slots, .. } => *slots,
+        }
+    }
+
+    /// Whether the next slot is still one of the queue's drain: [`Vdp::dma_take_slot`]
+    /// spends these without moving a unit, because nothing of the DMA is on the
+    /// memory yet.
+    fn drain_pending(&self) -> bool {
+        match self {
+            Self::Transfer { drain, .. } | Self::Fill { drain, .. } => *drain > 0,
+            Self::Copy { .. } => false,
+        }
+    }
+
+    /// One access slot spent on the queue's drain. Only reached while
+    /// [`Running::drain_pending`] says there is one.
+    fn spend_drain(&mut self) {
+        match self {
+            Self::Transfer { drain, .. } | Self::Fill { drain, .. } => *drain -= 1,
+            Self::Copy { .. } => {}
         }
     }
 
@@ -288,21 +326,21 @@ impl Vdp {
 
     /// Take over the DMA in flight with `running`.
     ///
-    /// Whatever the port has queued reaches memory first: the DMA feeds the
-    /// same write FIFO the data port does ("it will read a value from external
-    /// memory using the DMA source address register and add it to the FIFO
-    /// using the current command code and incremented command address
-    /// registers", Nemesis on SpritesMind t=1291), so a transfer started
-    /// non-empty writes the queue out first and its own first source word then
-    /// lands at the transfer's own start address, nothing lost - his
-    /// `TestFIFOFullDMATransfer` reads back exactly that, and the pinning
-    /// tests in this file carry it. Draining here, before the first transfer
-    /// write, is the order; what it does not charge is the queue's own slot
-    /// cost inside the transfer window, which is #563. And a DMA started
-    /// while one is running replaces it - a corner nothing documents, because
-    /// hardware has the 68k frozen for a transfer and tells it to keep off the
-    /// data port for the other two (status bit 1), so nobody is supposed to get
-    /// here at all.
+    /// Whatever the port has queued reaches memory first, and its slots are
+    /// part of the DMA's window: the DMA feeds the same write FIFO the data
+    /// port does ("it will read a value from external memory using the DMA
+    /// source address register and add it to the FIFO using the current command
+    /// code and incremented command address registers", Nemesis on SpritesMind
+    /// t=1291), so a transfer started non-empty writes the queue out first and
+    /// its own first source word then lands at the transfer's own start
+    /// address, nothing lost - his `TestFIFOFullDMATransfer` reads back exactly
+    /// that, and the pinning tests in this file carry it. Draining here,
+    /// before the first transfer write, is the order; the drain's slots are
+    /// what [`Running::Transfer`]'s `drain` charges, read off the queue before
+    /// this empties it. And a DMA started while one is running replaces it - a
+    /// corner nothing documents, because hardware has the 68k frozen for a
+    /// transfer and tells it to keep off the data port for the other two
+    /// (status bit 1), so nobody is supposed to get here at all.
     fn start_running(&mut self, running: Running) {
         self.fifo_drain();
         self.dma = Some(running);
@@ -327,6 +365,10 @@ impl Vdp {
     fn start_transfer(&mut self, bus: &mut impl DmaBus) {
         let words = words_to_transfer(self.dma_length());
         let per_unit = slots_per_unit(DmaMode::Mc68kTransfer, data_target(self.code));
+        // The queue's drain goes on the transfer's clock before its own slots:
+        // see [`Running::Transfer`]'s `drain`. Read before `start_running`
+        // empties the queue.
+        let drain = self.fifo.slots_owed();
 
         let mut source = self.dma_source();
         let mut staged = Vec::with_capacity(words as usize);
@@ -339,6 +381,7 @@ impl Vdp {
         staged.reverse();
 
         self.start_running(Running::Transfer {
+            drain,
             slots: words * u32::from(per_unit),
             per_unit,
             ends_at: source,
@@ -473,7 +516,13 @@ impl Vdp {
         // that armed the fill came from the command word and stays up until the
         // last of those slots has been spent (`Vdp::finish_dma`).
         let steps = bytes_to_move(self.dma_length());
+        // The trigger write itself is on the queue it is about to wait behind:
+        // its entry plus whatever the port had still standing are the FIFO the
+        // fill's steps only run once it is empty (see [`Running::Fill`]). Read
+        // before `start_running` empties it.
+        let drain = self.fifo.slots_owed();
         self.start_running(Running::Fill {
+            drain,
             slots: steps,
             value,
         });
@@ -524,15 +573,26 @@ impl Vdp {
         }
     }
 
-    /// One access slot of the DMA in flight: the unit at the head reaches memory
-    /// if this was the last of the slots it costs, and the transfer is over when
-    /// its slots run out. Whether another DMA still wants a slot is the answer.
+    /// One access slot of the DMA in flight: the queue's drain first, and none
+    /// of the DMA's own units move while it is being spent; then the unit at the
+    /// head reaches memory if this was the last of the slots it costs, and the
+    /// transfer is over when its slots run out. Whether another DMA still wants
+    /// a slot is the answer.
     fn dma_take_slot(&mut self) -> bool {
         // Taken out rather than borrowed, so that writing memory and moving the
         // running state on are not both borrowing `self`.
         let Some(mut running) = self.dma.take() else {
             return false;
         };
+        if running.drain_pending() {
+            running.spend_drain();
+            if running.slots() == 0 {
+                self.finish_dma(&running);
+                return false;
+            }
+            self.dma = Some(running);
+            return true;
+        }
         running.spend_slot();
         if running.unit_is_due() {
             self.dma_move_unit(&mut running);
@@ -586,7 +646,9 @@ impl Vdp {
 
     /// Master clocks the 68k is frozen for by the transfer in flight, `0` when
     /// nothing is holding the bus: the time left until the last of the
-    /// transfer's access slots.
+    /// transfer's access slots, which includes the slots the write FIFO still
+    /// owed on the entries it held when the transfer started
+    /// ([`Running::Transfer`]'s `drain`).
     ///
     /// "The 68000 is frozen during 68k -> VDP transfers" (genvdp.txt section 6),
     /// and this is for how long: the bus glue of M3-16 (#77) adds it to the cycle
@@ -1660,8 +1722,12 @@ mod tests {
     /// V BLANK 204 Bytes" (Sega Genesis Software Manual, "DMA transfer
     /// capacity", read off the scan on #305). A fill pays one slot of every
     /// blank H40 line to the machine, which is what puts it one byte short of
-    /// the transfer's 205, so 204 bytes of fill fit inside the line it starts
-    /// on.
+    /// the transfer's 205, so 204 bytes of fill are 204 steps.
+    ///
+    /// The steps do not start on the write that triggered the fill: the write
+    /// is itself a FIFO entry, and the fill only runs "at an access slot if the
+    /// FIFO is empty" (Nemesis on SpritesMind t=1291) - its two slots pass
+    /// first, and the 204 steps end two slots into the next line.
     #[test]
     fn a_fill_of_204_bytes_in_h40_vblank_is_one_line() {
         let mut vdp = h40_in_vblank();
@@ -1674,9 +1740,14 @@ mod tests {
         vdp.advance(MCLKS_PER_LINE);
 
         assert!(
-            !vdp.dma_busy,
-            "204 bytes x 1 slot is the blank H40 line's 204 fill slots exactly"
+            vdp.dma_busy,
+            "204 steps began after the trigger write's two drain slots, \
+             so two of them are still owed"
         );
+        // The two steps land on the next line's fill slots, wherever on that
+        // line's grid they sit: any slot of the line is more than enough.
+        vdp.advance(MCLKS_PER_LINE);
+        assert!(!vdp.dma_busy, "and with those the line budget is spent");
         assert_eq!(
             (vdp.reg(19), vdp.reg(20)),
             (0, 0),
@@ -1974,5 +2045,139 @@ mod tests {
             Some([0x00, 0x8A, 0x01, 0x02]),
             "the four bytes the copy landed on top of, cached as they went in"
         );
+    }
+
+    /// Queue `n` VRAM writes to 0x1000 on a display-on H40 VDP in VBlank, at
+    /// beam (line 0, clock 0). No `advance` between them, so all `n` sit on
+    /// the queue when the test starts its DMA.
+    fn queued_writes(vdp: &mut Vdp, n: usize) {
+        vdp.write_register(1, 0x50); // display on + DMA enable
+        let (first, second) = vram_write_cmd(0x1000);
+        vdp.write_control(first);
+        vdp.write_control(second);
+        for i in 0..n {
+            vdp.write_data(0x5100 + i as u16);
+        }
+    }
+
+    /// Start a `words`-word VRAM transfer to 0x2000 and walk the beam until it
+    /// is over, reporting `(stall at start, when the first word landed, when
+    /// the busy bit came down)` in master clocks from the start.
+    fn probe_transfer(vdp: &mut Vdp, words: u16) -> (u32, u32, u32) {
+        dma_from(vdp, 0x000100, words);
+        start_dma(vdp, vram_write_cmd(0x2000));
+        let source: Vec<u16> = (0..words).map(|i| 0x1000 + i).collect();
+        let mut bus = FakeBus::laid_at(0x000100, &source);
+        vdp.run_dma(&mut bus);
+        let stall = vdp.dma_68k_stall_mclk();
+        let mut clocks = 0u32;
+        while vdp.vram[0x2000] == 0 {
+            vdp.advance(1);
+            clocks += 1;
+        }
+        let first_lands = clocks;
+        while vdp.dma_busy {
+            vdp.advance(1);
+            clocks += 1;
+        }
+        (stall, first_lands, clocks)
+    }
+
+    /// The freeze a transfer starts behind is the queue's drain on top of the
+    /// transfer's own slots: a transfer pushes its source words into the same
+    /// four-entry write FIFO the data port feeds, and "pending FIFO writes take
+    /// priority" (Nemesis on SpritesMind t=1291), so behind `n` queued entries
+    /// its first word cannot land until they have, and `dma_68k_stall_mclk`
+    /// covers their slots. Two queued VRAM words are four slots: the figure the
+    /// empty-queue transfer reports, plus the four slots it takes to drain
+    /// them, both read off the same grid.
+    #[test]
+    fn a_transfer_behind_queued_writes_costs_their_drain() {
+        let mut without = h40_in_vblank();
+        without.write_register(1, 0x50);
+        let bare = without.dma_mclk_to_slots(false, 2);
+        let (stall_without, ..) = probe_transfer(&mut without, 1);
+
+        let mut with = h40_in_vblank();
+        queued_writes(&mut with, 2);
+        assert_eq!(with.fifo_len(), 2, "the queue is still holding both writes");
+        // The window is the four drain slots and the word's own two on the same
+        // grid, against the bare word's two - read before the probe moves the
+        // beam.
+        let window = with.dma_mclk_to_slots(false, 4 + 2);
+        let (stall_with, ..) = probe_transfer(&mut with, 1);
+
+        assert_eq!(
+            stall_with, window,
+            "four drain slots plus the word's own two: {stall_with}"
+        );
+        assert_eq!(stall_without, bare);
+        assert_eq!(stall_with, stall_without + (window - bare));
+    }
+
+    /// And a CRAM queue costs one slot an entry, the width of the write.
+    #[test]
+    fn a_transfer_behind_a_cram_queue_costs_one_slot_an_entry() {
+        let mut without = h40_in_vblank();
+        without.write_register(1, 0x50);
+        let (stall_without, ..) = probe_transfer(&mut without, 1);
+
+        let mut with = h40_in_vblank();
+        with.write_register(1, 0x50);
+        let (first, second) = cram_write_cmd(0x0020);
+        with.write_control(first);
+        with.write_control(second);
+        with.write_data(0x0E20);
+        let (stall_with, ..) = probe_transfer(&mut with, 1);
+
+        let one_slot = with.dma_mclk_to_slots(false, 3) - with.dma_mclk_to_slots(false, 2);
+        assert_eq!(stall_with, stall_without + one_slot);
+    }
+
+    /// A fill's steps run "only ... at an access slot if the FIFO is empty"
+    /// (Nemesis on SpritesMind t=1291), so a fill armed behind queued writes
+    /// starts its steps after their drain, which its busy window covers.
+    #[test]
+    fn a_fill_behind_queued_writes_starts_after_their_drain() {
+        let mut without = h40_in_vblank();
+        without.write_register(1, 0x50);
+        vdp_write_fill_setup(&mut without, 0x3000);
+        start_and_run(&mut without, vram_write_cmd(0x3000));
+        without.write_data(0xAB00);
+        let mut clocks_without = 0;
+        while without.vram[0x3003] != 0xAB {
+            without.advance(1);
+            clocks_without += 1;
+        }
+
+        let mut with = h40_in_vblank();
+        queued_writes(&mut with, 2);
+        vdp_write_fill_setup(&mut with, 0x3000);
+        // The first step runs once the FIFO is empty (see [`Running::Fill`]),
+        // and the queue the write that triggered the fill waits behind is the
+        // two queued words plus the trigger write itself: the seventh slot on
+        // the fill's grid, read before the loop moves the beam.
+        let expected = with.dma_mclk_to_slots(true, 2 * 2 + 2 + 1);
+        start_and_run(&mut with, vram_write_cmd(0x3000));
+        with.write_data(0xAB00);
+        let mut clocks_with = 0;
+        while with.vram[0x3003] != 0xAB {
+            with.advance(1);
+            clocks_with += 1;
+        }
+
+        assert_eq!(
+            clocks_with, expected,
+            "the fill waits out the two queued words first: {clocks_with}"
+        );
+        assert!(clocks_with > clocks_without);
+    }
+
+    /// Register setup for a VRAM fill without touching R1, so the display state
+    /// the test queued writes under stays as it is.
+    fn vdp_write_fill_setup(vdp: &mut Vdp, _addr: u16) {
+        vdp.write_register(19, 8);
+        vdp.write_register(15, 2);
+        vdp.write_register(23, FILL);
     }
 }
