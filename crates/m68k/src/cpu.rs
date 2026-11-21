@@ -74,6 +74,30 @@ pub(crate) const STOPPED_CLOCKS: u32 = 4;
 /// `pc + FETCH_AHEAD` and every queue refill reads from there.
 const FETCH_AHEAD: u32 = 4;
 
+/// The mask the CPU's own stack traffic forces on the addresses it generates:
+/// bit 0 off (#522).
+///
+/// The 68000's stack pointers are word-aligned registers. Byte-sized addressing
+/// steps A7 by 2 "to keep the stack pointer on a word boundary" (M68000UM
+/// section 2, addressing mode table note; the same sentence is 2.8.2.2/2.8.2.3
+/// of the 1983 MC68000 manual), and the exception sequence stacks the frame
+/// "using the SSP" (M68000UM section 6.1, "those instructions that use either
+/// the system stack pointer implicitly or address register seven explicitly
+/// access the SSP") — implicit stack use is the CPU's own traffic, and it is
+/// word or long, so every address it generates is even. `Star Odyssey (USA)
+/// (Super Fighter Team)` loads an odd value into A7 and counts on exactly that:
+/// without the mask its own address-error handler (`RTS` at `$20A`) pops the
+/// odd frame it is standing on and the stack walks down forever.
+///
+/// The mask lives at the points of stack use, not at register writes: a
+/// `MOVEA`/`LEA`/`ADDA` to A7 and `MOVE` to USP store what they are given, odd
+/// included (M68000UM section 6.1.1: only *implicit* SP use and explicit
+/// address-register-seven *access* name the stack pointers; a register write is
+/// neither). Since every push, pop and frame is an even-sized step, masking the
+/// address before the step and masking the register after it are the same
+/// number, so the stored pointer ends even either way.
+pub(crate) const SP_EVEN_MASK: u32 = !1;
+
 /// Clocks a jump pays for one displacement word it reads out of the prefetch
 /// queue: see [`M68k::jump_ext_word`].
 const JUMP_WORD_CLOCKS: u64 = 2;
@@ -438,6 +462,12 @@ impl M68k {
     /// across a mode change, and this keeps them consistent across a push or a
     /// pop. Writing only `a[7]` leaves the stored pointer for the current mode
     /// one frame behind.
+    ///
+    /// No alignment is forced here, on purpose: an `MOVEA`/`LEA`/`ADDA` to A7
+    /// stores whatever it is given, odd included, and the conformance suite
+    /// compares cases that end with an odd stored stack pointer. The even-SP
+    /// rule lives where the CPU itself uses the stack, at [`SP_EVEN_MASK`]
+    /// (#522).
     pub(crate) fn set_active_sp(&mut self, value: u32) {
         if self.is_supervisor() {
             self.ssp = value;

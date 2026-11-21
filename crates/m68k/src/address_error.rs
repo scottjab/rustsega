@@ -97,8 +97,7 @@
 //! themselves, so this module adds only the remainder.
 
 use crate::bus::{ADDR_MASK, Bus};
-use crate::cpu::BUS_CYCLE_CLOCKS;
-use crate::cpu::M68k;
+use crate::cpu::{BUS_CYCLE_CLOCKS, M68k, SP_EVEN_MASK};
 use crate::sr::{SR_S, SR_T};
 
 // A pending fault is part of [`M68k`]'s state, so it travels with the save state
@@ -337,7 +336,9 @@ impl M68k {
         let saved_sr = self.sr;
         self.set_sr((saved_sr & !(SR_S | SR_T)) | SR_S);
 
-        let sp = self.a[7].wrapping_sub(ADDRESS_ERROR_FRAME_SIZE);
+        // Bit 0 forced off: the group 0 frame is the CPU's own stack traffic
+        // too, so an odd incoming SP pushes even (#522, [`SP_EVEN_MASK`]).
+        let sp = self.a[7].wrapping_sub(ADDRESS_ERROR_FRAME_SIZE) & SP_EVEN_MASK;
         self.set_active_sp(sp);
 
         // Frame order is the push order: PC, SR, IRD, fault address, status,
@@ -454,6 +455,27 @@ mod tests {
             Some(EXC_ADDRESS_ERROR),
             "the record says address error"
         );
+    }
+
+    #[test]
+    fn odd_sp_pushes_the_group_0_frame_even() {
+        // The Star Odyssey shape (#522): the stack pointer itself is odd when
+        // the fault lands (`MOVEA.L` had loaded an odd value). The group 0
+        // frame is the CPU's own stack traffic, so it pushes at the even
+        // address below the odd SP and the stored pointer comes back even —
+        // which is why the real chip cannot walk its stack down one odd frame
+        // at a time.
+        let a0: u32 = 0x0000_2001;
+        let (mut cpu, mut bus) = cpu_running(0x3010, a0);
+        bus.write_word(0x0000_2000, 0xBEEF);
+        cpu.ssp = STACK + 1;
+        cpu.a[7] = cpu.ssp;
+
+        cpu.step(&mut bus);
+
+        let frame = (STACK + 1 - ADDRESS_ERROR_FRAME_SIZE) & crate::cpu::SP_EVEN_MASK;
+        assert_eq!(frame, STACK - ADDRESS_ERROR_FRAME_SIZE, "bit 0 dropped");
+        assert_frame(&bus, &cpu, frame, 0x3015, a0, 0x3010, SUP, PROGRAM);
     }
 
     #[test]

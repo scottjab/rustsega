@@ -18,11 +18,16 @@ pub const ADDR_MASK: u32 = 0x00FF_FFFF;
 /// [`crate::cpu::M68k`] raise the address error instead of starting the cycle
 /// (M68000UM section 6.3.5 "Address Error").
 ///
-/// That is not something an implementor may index on, though. Exception entry
-/// writes its frame with the unchecked accessors, because the stack pointer is
-/// what it points at (`crate::address_error`), so a word access can arrive at an
-/// odd address and a mirrored region has to decode its two bytes separately -
-/// which is what #488 had to teach the Genesis bus to do.
+/// That is not something an implementor may index on, though. Byte accesses
+/// arrive at either parity (A0 is the byte select), so a mirrored region has to
+/// decode its bytes separately - which is what #488 had to teach the Genesis bus
+/// to do when `Star Odyssey`'s odd stack pointer had exception entry walking its
+/// frame past the end of a RAM mirror. Exception entry is the access that made
+/// it matter: it writes its frame with the unchecked accessors, because the
+/// stack pointer is what it points at (`crate::address_error`). #522 made the
+/// CPU force bit 0 off on its own stack traffic, so those frames land even and
+/// the core puts no odd word address on the bus any more; the byte-wise decode
+/// stays, because bytes have always arrived at either parity.
 pub trait Bus {
     /// Read the byte at `addr` (A0 = 1 on real hardware).
     fn read_byte(&mut self, addr: u32) -> u8;

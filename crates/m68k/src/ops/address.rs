@@ -36,6 +36,7 @@
 
 use crate::M68k;
 use crate::bus::Bus;
+use crate::cpu::SP_EVEN_MASK;
 use crate::ea::{Ea, SP_REG, Size, sign_extend_word};
 use crate::ops::field;
 
@@ -165,10 +166,15 @@ impl M68k {
     /// `UNLINK.json.gz` ends 8032 of its 8065 cases with an `SSP` above
     /// `$FFFFFF`.
     ///
+    /// Bit 0 of the push address is forced off: like the exception frames and
+    /// the return pops, a push is the CPU's own stack traffic and the stack
+    /// pointers are word-aligned registers, so an odd incoming SP pushes even
+    /// (#522, [`SP_EVEN_MASK`]).
+    ///
     /// `pub(crate)` rather than private to this module because `BSR`
     /// ([`super::flow`]) pushes a return address the same way (#24).
     pub(crate) fn push_long(&mut self, bus: &mut impl Bus, value: u32) {
-        let sp = self.a[usize::from(SP_REG)].wrapping_sub(4);
+        let sp = self.a[usize::from(SP_REG)].wrapping_sub(4) & SP_EVEN_MASK;
         self.write_ea(bus, Ea::AddrReg(SP_REG), Size::Long, sp);
         self.write_l(bus, sp, value);
     }
@@ -351,6 +357,29 @@ mod tests {
         );
         assert_eq!(cpu.ssp, STACK_TOP - 4, "the stored stack pointer moved");
         assert_eq!(bus.read_long(MEM), 0xDEAD_BEEF, "PEA never reads memory");
+    }
+
+    /// `PEA (A0)` with the stack pointer odd: the push is the CPU's own stack
+    /// traffic, so bit 0 of the push address is forced off and the stored
+    /// pointer comes back even (#522).
+    #[test]
+    fn pea_pushes_at_an_even_address_when_the_sp_is_odd() {
+        let (mut cpu, mut bus) = run(0x4850, &[0x4E71]);
+        cpu.a[0] = MEM;
+        cpu.ssp = STACK_TOP + 1;
+        cpu.a[7] = cpu.ssp;
+
+        cpu.step(&mut bus);
+
+        let frame = (STACK_TOP + 1 - 4) & crate::cpu::SP_EVEN_MASK;
+        assert_eq!(frame, STACK_TOP - 4, "bit 0 dropped, not wrapped");
+        assert_eq!(
+            bus.read_long(frame),
+            MEM,
+            "the push landed at the even address"
+        );
+        assert_eq!(cpu.a[7], frame, "the stored pointer ends even");
+        assert_eq!(cpu.ssp, frame, "both halves agree");
     }
 
     /// `PEA d16(PC)` (`$487A`) with a negative displacement: the pushed long is

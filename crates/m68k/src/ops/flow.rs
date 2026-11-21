@@ -50,6 +50,7 @@
 use crate::M68k;
 use crate::address_error::AccessKind;
 use crate::bus::Bus;
+use crate::cpu::SP_EVEN_MASK;
 use crate::ea::{Ea, SP_REG, Size, sign_extend_byte, sign_extend_word};
 use crate::exceptions::EXC_TRAPV;
 use crate::ops::field;
@@ -478,16 +479,22 @@ impl M68k {
     /// register is *sign extended* (M68000UM section 1, "Address Registers") —
     /// `RTR`'s pop would leave `A7` at `$0000_0002`.
     fn pop_return_address(&mut self, bus: &mut impl Bus) -> u32 {
-        let sp = self.a[usize::from(SP_REG)];
+        // The CPU's own stack traffic: bit 0 of the pop address is forced off,
+        // so an odd SP pops the even pair below it and the stored pointer comes
+        // back even (#522, [`SP_EVEN_MASK`]). This is what stops `Star
+        // Odyssey`'s odd-SP address-error loop: its handler is an `RTS` standing
+        // on the odd frame.
+        let sp = self.a[usize::from(SP_REG)] & SP_EVEN_MASK;
         let value = self.read_l(bus, sp);
         self.set_active_sp(sp.wrapping_add(Size::Long.bytes()));
         value
     }
 
     /// [`M68k::pop_return_address`]'s word: the status word at the top of the
-    /// active stack, for `RTR` and `RTE`.
+    /// active stack, for `RTR` and `RTE`. Bit 0 forced off like the long pop
+    /// (#522, [`SP_EVEN_MASK`]).
     fn pop_status_word(&mut self, bus: &mut impl Bus) -> u16 {
-        let sp = self.a[usize::from(SP_REG)];
+        let sp = self.a[usize::from(SP_REG)] & SP_EVEN_MASK;
         let value = self.read_w(bus, sp);
         self.set_active_sp(sp.wrapping_add(Size::Word.bytes()));
         value
@@ -922,6 +929,26 @@ mod tests {
              exactly the one word read `advance_opcode` already charges"
         );
         assert_eq!(cpu.sr, RESET_SR, "NOP moves no flag");
+    }
+
+    #[test]
+    fn rts_pops_from_the_even_address_when_the_sp_is_odd() {
+        // #522: the pop is the CPU's own stack traffic, so bit 0 of the pop
+        // address is forced off. `Star Odyssey`'s low-vector handler is an RTS
+        // standing on an odd frame; without the mask the pop faults, the group 0
+        // entry pushes another odd frame below it, and the stack walks down 10
+        // bytes a lap forever.
+        let (mut cpu, mut bus) = run(0x4E75, &[0x4E71]);
+        bus.write_long(STACK_TOP, PROGRAM + 2);
+        cpu.ssp = STACK_TOP + 1;
+        cpu.a[7] = cpu.ssp;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.pc, PROGRAM + 2, "the even pair below the odd SP popped");
+        assert_eq!(cpu.a[7], STACK_TOP + 4, "the stored pointer ends even");
+        assert_eq!(cpu.ssp, cpu.a[7], "both halves agree");
+        assert_eq!(cpu.pending_exception, None, "no address error, no re-entry");
     }
 
     #[test]
