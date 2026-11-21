@@ -426,6 +426,19 @@ impl Vdp {
     /// The counter runs whether or not IE1 is set - genvdp.txt gates the
     /// interrupt on the bit, not the counter - so `pending_irq` is where the
     /// enable is read.
+    ///
+    /// The flag's lifecycle beyond the set is Eke's hardware measurement
+    /// (SpritesMind t=787, "VDP Interrupts & HVC tests", Aug 2010, Krikzz-devkit
+    /// tests): the flag is set "when the internal HINT counter overflows";
+    /// "as long as HINT pending flag is set and VDP register $00 bit 4 is set,
+    /// interrupt level 4 will be generated (/IRQ2 asserted)" - so the level 4
+    /// offer is held, not a one-line pulse, and a HINT that fires while the
+    /// 68000's mask is at or above level 4 stays pending and is taken the
+    /// instant the mask drops below 4; and "the only way for these two flags to
+    /// be cleared is when the /INTACK signal is asserted" - not by register
+    /// writes, status reads, or a new frame, which is [`Vdp::ack_irq`]'s clear
+    /// rule. blastem's `vdp_int_ack` matches (acknowledge clears, Mode 5 only,
+    /// preferring the VINT flag when both are pending).
     fn hint_step(&mut self) {
         if self.line > self.vblank_line() {
             // A VBlank line reloads rather than decrements, so it cannot expire.
@@ -516,6 +529,12 @@ impl Vdp {
     ///
     /// "Reading the control port does not clear this bit" (genvdp.txt section 6,
     /// of status bit 7), so the acknowledge is the only thing that clears it.
+    /// The same rule holds for the HINT flag, which has no status bit to read:
+    /// Eke's measurement gives "the only way for these two flags to be cleared
+    /// is when the /INTACK signal is asserted" (SpritesMind t=787), and blastem
+    /// clears its HINT pending flag in `vdp_int_ack` the same way. A flag that
+    /// went up while the 68000's mask held the level off therefore stays held
+    /// (see [`Vdp::hint_step`]) and is taken the moment the mask drops.
     /// Levels 2 - the TH pin's, which belongs to the console I/O registers - and
     /// anything else are not the VDP's to clear, and are ignored.
     pub fn ack_irq(&mut self, level: u8) {

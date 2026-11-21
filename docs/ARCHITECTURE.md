@@ -147,6 +147,24 @@ is load-bearing for the carts: Dyna Brothers 2's main loop does `ORI.W
 #$700,SR` and then calls a 1111-format service routine expecting its `$2C`
 handler to be entered anyway (#494), and it boots because it is.
 
+The two interrupt lines the VDP holds are level signals with latched pending
+flags, not pulses. Eke's hardware measurements (SpritesMind t=787, "VDP
+Interrupts & HVC tests", Aug 2010): each flag is set at its trigger point -
+the HINT flag at the R10 counter's overflow (H counter $A6 in H40), the VINT
+flag at line $E0, H counter $02 - "as long as HINT pending flag is set and VDP
+register $00 bit 4 is set, interrupt level 4 will be generated", and "the only
+way for these two flags to be cleared is when the /INTACK signal is asserted",
+not by register writes, status reads or a new frame. So a level that fires
+while the 68000's mask is at or above it stays on the pins and is taken the
+instant the mask drops; the practical shape for a handler is that an
+`ORI #$400,(A7)`-style raise of the stacked mask suppresses the level until
+something lowers the mask (a wrapper's `ANDI #$F8FF,(A7)`, or `STOP #$2000`'s
+SR load), at which point the still-pending flag re-interrupts immediately.
+`vdp::timing` implements this: `hint_step`/`take_vint` set the flags,
+`pending_irq` holds the offer while flag && enable, and `ack_irq` is the only
+clear. blastem's `vdp_int_ack` is the reference's version of the same rule.
+HardBall III's loader (#557, #646) is the cart that lives on the held flag.
+
 ### z80
 
 ```rust
