@@ -107,6 +107,46 @@ The three rows above and the three cart rows of the map were re-measured at this
 rest of the map has not been re-run, and the queueing moves writes for every cart that makes
 more than four of them across a full FIFO, so the next full sweep may move others.
 
+## Ristar: the divergence is the game, not the VDP (#542)
+
+Re-measured 2026-11-20 at `368d9ce`: 107.0 B/frame at `$4284`, unchanged, first difference
+still `$00A897` ref=28 ours=16. Two measurements then took the finding apart.
+
+**The anchor is not one moment in the game.** Both dumpers stop before the same instruction,
+but they do not get there after the same amount of game. At arrival 54 blastem holds the
+V-Int handler's own frame byte (`$FFAE10`) at 53 - one vertical interrupt per arrival, demo
+not started - while ours holds the demo's object-walker counter (`$FF9FE2`) at 9 and has
+already been through the transition that clears `$FFAE10`: our anchored legs span four to
+six frames of game time each, blastem's span one. Nothing in the comparison can see that, so
+the anchored table above compares VRAM from different attract-cycle phases. The whole
+persistent window `$00A897-$00A987` is the sprite attribute table (R5=`$54`, SAT at
+`$A800`, entries 18-31), which the game freezes once at the end of its demo - frozen at
+different times with different content, it differs in every frame afterwards, which is
+exactly the `real` shape.
+
+**End of frame it is a 4-5 frame offset in that one event.** EOF work RAM agrees completely
+through frames 1-14 and again through 100-180; the attract demo starts at frame 217 on ours
+and 221-222 on blastem, and then advances at the same rate (ours at frame N is ref at
+frame N+4: the demo counter reads 342 at ours 235 and ref 240). When the demo ends the game
+freezes the SAT into VRAM - ours by EOF 385 (`16 82 32 83`), blastem still animating at
+400 - and a one-shot freeze a few frames apart leaves bytes that differ in every later
+frame. EOF VRAM today is 323.9 B/frame at measured shift -2, and the shift moves it:
+phase-family numbers wearing a one-shot costume, not a write error.
+
+**Why the gate opens early is the open question**, and it is a timing question, not a VDP
+one. The registers at frame 214 are identical on both sides (`R1=$64`, `R10=$6F`,
+`R0=$14`), so the difference lives in the ~200-frame title-screen phase before the demo -
+the #530 systemic-lead family, where ~2% of a frame over 200 frames is four frames. The
+V-Int handler even carries cycle-burning delays (`move.l #$B3,d7 / dbf`), the kind of loop
+that turns a per-frame cycle lead into a frame count. The demo's object walker itself is at
+PC `$054E84` (jump-table dispatch, chain next pointer at +72, one counter bump per active
+node) and runs from the main loop - the HInt handler of this phase is a bare `rte` at
+`$44B0`.
+
+Also ruled out here, for #491's record: Ristar's R0 is `$14` in every frame of 580-600 (bit
+4 set, bit 6 clear, the enable main decodes), and the #490 bit-6 flip moves the anchored
+divergence 107.0 -> 115.2, away from zero. HInt-enable is not this ticket's cause.
+
 ## What phase looks like, so it does not get filed
 
 `castlevania` differs by 266 VRAM bytes a frame and **nothing differs in every frame**. Same
