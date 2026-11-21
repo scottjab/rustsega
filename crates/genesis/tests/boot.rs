@@ -700,6 +700,43 @@ fn virtua_racing_boots_to_non_blank_screen() {
     );
 }
 
+/// The two western unlicensed carts of the #549 family that boot since #479's
+/// read-back model: `headless run --frames 300 --colours` went 1 -> 15 (Onslaught)
+/// and 1 -> 13 (Turrican) when the `$A11100` word read stopped mirroring the flag
+/// lane into every bit and answered the 68000's prefetched instruction word in the
+/// unused bits instead, per GPGX `ctrl_io_read_word` case 0x11 and BlastEm
+/// `io_read_w` (both cited on #479). Each cart's boot polls the bus-request
+/// read-back wanting a bit of that opcode word, so the mirrored `0xFF` held them in
+/// a poll loop and the display never came on; the reference was already drawing on
+/// both (#549's table). They are western releases, not the Taiwan builder of the
+/// rest of the family, which is why their cause is one the family had already
+/// fixed rather than a new one.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn onslaught_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom("Onslaught"));
+    let colours = colour_count(&path, 300, "onslaught_300.png");
+    assert!(
+        colours > BLANK,
+        "300 frames in, Onslaught is {colours} distinct colours: it drew 15 when the \
+         $A11100 read-back stopped mirroring the flag lane (#479), so a blank frame \
+         is a regression"
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn turrican_unl_boots_to_non_blank_screen() {
+    let path = require_data!(testkit::find_commercial_rom("Turrican (USA, Europe) (Unl)"));
+    let colours = colour_count(&path, 300, "turrican_unl_300.png");
+    assert!(
+        colours > BLANK,
+        "300 frames in, Turrican (Unl) is {colours} distinct colours: it drew 13 when the \
+         $A11100 read-back stopped mirroring the flag lane (#479), so a blank frame \
+         is a regression"
+    );
+}
+
 /// The four carts #375 names, one `#[ignore]`d boot test each, so that "one cause or
 /// four?" is answered by a test run rather than by an afternoon at a disassembler.
 ///

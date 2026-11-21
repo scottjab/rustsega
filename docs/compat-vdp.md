@@ -3,6 +3,12 @@
 > The work RAM map is [`compat-commercial.md`](compat-commercial.md) and the whole-collection
 > crash sweep is [`compat.md`](compat.md). This page is the VDP's own memories, compared
 > against a second emulator: what #536 could see and nothing else could.
+>
+> #549 extended the comparison to the VDP's register file: that ticket's family holds
+> byte-identical VRAM and CRAM on both machines with R1 `74` on the reference and `34`
+> on ours, which is a screen the reference turns on and the memories cannot see.
+> `--vdp` now dumps and compares all three, and a directory without the register dumps
+> needs one re-run of both halves.
 
 VRAM and CRAM are dumpable from both machines: rustsega writes `Bus::vdp.vram` and
 `Bus::vdp.cram` and blastem's own debugger answers `save "v.bin" vdp:vram` and
@@ -217,3 +223,61 @@ which was not in this ticket's budget. Golden Axe II anchors at `$DD60` and is m
 with `scripts/ref/run-ref.sh --stop-at-pc 0xdd60` plus a work-RAM dump, with the same
 caveat. Until a second cart is metered, the ~1.0-2.0% lead on #530 stays a single-cart
 measurement.
+
+## The #549 family, re-measured (registers included)
+
+#549's sixteen carts were measured at `25c64ad`, when our undriven reads answered a
+static `$FF`, and the table said the reference programs the VDP on every one of them
+while we write nothing. On current main that is no longer the population. Measured
+with `--vdp` (all three memories) at frames 8 20 40 100 300, work RAM at the #549
+stepped list, and the trail where a divergence remained:
+
+- **Boot since #479's read-back model**: `Onslaught` (1 -> 15 colours) and
+  `Turrican (Unl)` (1 -> 13). Both poll the `$A11100` read-back wanting a bit of the
+  prefetched opcode word; the mirrored `0xFF` held them in the poll. Both are pinned
+  by boot tests now (`onslaught_boots_to_non_blank_screen`,
+  `turrican_unl_boots_to_non_blank_screen`).
+- **Agree at state level, seven carts**: `Rockworld` (outright, registers included),
+  `Super Mario Bros.` (outright), `Shiliu Zhang Mahjong II`, `Taipingyang Zhengba
+  Zhan` (VRAM+CRAM agree; R21/R22 hold `FFFF` on the reference against our `0000` -
+  a DMA armed there and never run here, with the screens agreeing),
+  `Guaishou Jingji Chang (Pokemon Stadium)`, `Samurai Shodown vs Soul Edge` and
+  `Gunfight 3 in 1` (the last three parked in the same wait on both machines with
+  R1 `34`, display off on both - blastem's own screen is as black as ours). The
+  Guaishou pair of rows is the caution this page exists to keep: the cart's boot
+  crashes into its own `$2704` address error on both emulators and both halt at
+  `$128` holding the same 39347 bytes of VRAM and no palette. #549's "reference
+  programs it, we write nothing" verdict was an artifact of the `$FF` open bus, not
+  a divergence that survived the sourced model.
+- **Still diverge, three carts**, all with the memories agreeing early and the
+  reference pulling ahead:
+  - `Tiny Toon Adventures 3`: work RAM tracks at frame phase while the reference
+    arms its per-frame DMAs (R21/R22/R23 hold source `$FEF280`, the `$FE0000`
+    mirror staging) and turns the display on. Ours re-runs the boot's Z80-driver
+    loader (`$B275E`, byte copy with read-back verify into Z80 RAM) forever; at the
+    V-Int anchor `$6692` we are four arrivals behind the reference's cadence by
+    arrival 8. Sound handshake, not a VDP question.
+  - `Taiwan Daheng` and `Mahjong Emo Ta`: the reference uploads its palette and
+    tiles (61 and 13 CRAM colours); ours never does, parked in a divide-by-zero
+    storm - `DIVS.W D1,D0` with the seed word `$FF030C` still zero, vector 5 into a
+    bare `RTE`, back to the same DIVS. The frame re-executes the faulting DIVS,
+    which is what the suite pins (`exceptions.rs`: the one zero-divisor case pushes
+    the faulting instruction's own address), so the storm is unexitable once
+    entered and the first call happens before the seed's producer runs. blastem
+    escapes the same call after one exception: its machine proceeds from
+    `$3E230`, which its old-core frame convention allows and the suite-pinned
+    hardware behaviour does not.
+- **Fenced, two carts**: `Lion King II` (#508/#194: the sourced float is a queue
+  word, not write residue; the gate stays shut) and `Bug's Life`: its boot builds a
+  stub in work RAM from ROM immediates and probes `$A13000-$A130FF` (plutiedev
+  "Cartridge slot extra") with read-back checks wanting `(val&$1F)==$01`, `==$1F`
+  and `(val&$3C)==$28` - the prefetch-queue words at specific depths, `$0001` and
+  `$001F` being the following ANDI/CMPI immediates. blastem passes the stub (its
+  old-core float answers words fetched further ahead; its breakpoint hits the
+  pass-path `JMP (A3)` at `$FF208C`), we fail it on the sourced model and take the
+  stub's own dead-end `JMP $0000`. GPGX's word-at-PC answer fails the stub too, and
+  no source pins the depth for this decode, so the honest state is fenced pending a
+  citation or a second reference.
+
+No emulator code changed for any of this in the #549 branch; the only tree change is
+the registers half of the harness.
