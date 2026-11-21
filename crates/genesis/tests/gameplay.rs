@@ -48,6 +48,29 @@
 //! its replay onto a 6-button pad (`Movie::set_pads` now reads the movie's
 //! letters) and move these goldens - a deliberate rebless, not an edit.
 //!
+//! # Movement: the five audio keys re-blessed on #554
+//!
+//! #554 made the VDP's VINT flag lead its level-6 offer by 175 master clocks
+//! (25 68000 cycles), the latency Eke's Regen notes require for the MEGA lo
+//! MANIA engine and MAME's Model 2 lockstep measures (see the constant's doc
+//! in `crates/vdp/src/timing.rs`). The offer shift moves the 68000's V-Int
+//! entry 25 cycles per frame; frame-granular rendering is unaffected - all
+//! fifteen checkpoint pictures are bit-identical across the shift - but a
+//! run-wide audio hash sees the sound driver's sample phase move. Same
+//! movement class as #555's re-blessed `sonic2_emerald_hill_audio`. All five
+//! audio keys were re-blessed with maintainer authorisation:
+//!
+//! | key | before | after |
+//! |---|---|---|
+//! | `sonic1_green_hill_audio` | `0x9b24b9463551ef2e` | `0xbf9ea9d2cec35d3e` |
+//! | `sonic2_emerald_hill_audio` | `0x732d43086e0d7cf0` | `0x57be84cf7eccdf59` |
+//! | `sor2_mission_1_audio` | `0x7e59ca10ed5ff366` | `0x9f93aa01c3078a1d` |
+//! | `gunstar_heroes_mission_1_audio` | `0x8b91eebc257da6b5` | `0xb15bb9e4953cea57` |
+//! | `thf4_stage_1_audio` | `0xd42049cf3710ea7e` | `0x38aa82005341d69b` |
+//!
+//! No checkpoint key moved, and the #633 differ-check (the three checkpoints
+//! of every section differing from each other) still passes.
+//!
 //! # Running it
 //!
 //! It needs cartridges, so CI skips it; a ROM that is not on disk is a skip,
