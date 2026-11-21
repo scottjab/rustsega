@@ -43,6 +43,7 @@ actionlint:
 # it makes in a temp directory - so it costs milliseconds.
 ref-selftest:
     python3 scripts/ref/compare.py --selftest
+    python3 scripts/ref/terminal-standin.py --selftest
 
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
