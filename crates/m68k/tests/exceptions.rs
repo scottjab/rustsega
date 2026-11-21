@@ -398,3 +398,65 @@ fn the_vector_map_is_the_slot_address_over_four() {
     assert_eq!(EXC_LINE_A, 10);
     assert_eq!(EXC_LINE_F, 11);
 }
+
+/// `Star Odyssey (USA) (Super Fighter Team)` loads an odd value into A7 in its
+/// boot block and then takes low exceptions whose handlers end in `RTS`
+/// (issue #522). Without the even-SP rule the exception entry pushes its frame
+/// at an odd address, the `RTS` pops that odd frame, the pop faults, the group 0
+/// entry pushes 14 more bytes below the still-odd SP, and the stack walks down
+/// 10 bytes a lap forever. The pinned suite cannot arbitrate the rule - not one
+/// of its cases starts with an odd active SP - so this is the hardware rule as a
+/// synthetic case: the cart's shape, with a hand-built vector table, asserted
+/// bounded and even.
+#[test]
+fn an_odd_stack_pointer_exception_and_rts_handler_stay_bounded_and_even() {
+    use m68k::testbus::{TestBus, cpu_with_program};
+    use m68k::{Bus, SR_INT_MASK, SR_S};
+
+    /// Where [`cpu_with_program`] loads the program.
+    const PROGRAM: u32 = 0x0000_1000;
+    /// Its initial stack pointer.
+    const STACK: u32 = 0x0001_0000;
+    /// The handler the illegal slot points at: one `RTS`.
+    const HANDLER: u32 = 0x0000_3000;
+    /// Supervisor mode with interrupts masked, like every suite case.
+    const SUP: u16 = SR_S | SR_INT_MASK;
+
+    let (mut cpu, mut bus) = cpu_with_program(&[0x4AFC, 0x4E71]); // ILLEGAL, NOP
+    bus.write_long(u32::from(m68k::EXC_ILLEGAL) * 4, HANDLER);
+    bus.load_words(HANDLER, &[0x4E75]);
+    cpu.set_sr(SUP);
+    cpu.ssp = STACK + 1; // odd on purpose: the cart's MOVEA.L-loaded SP
+    cpu.a[7] = cpu.ssp;
+
+    cpu.step(&mut bus); // the exception
+
+    let frame = (STACK + 1 - 6) & !1;
+    assert_eq!(frame, STACK - 6, "bit 0 of the push address dropped");
+    assert_eq!(cpu.pending_exception, Some(EXC_ILLEGAL));
+    assert_eq!(cpu.ssp, frame, "the frame pushed even");
+    assert_eq!(cpu.a[7], frame, "and the active pointer agrees");
+    // The frame's words: SR at `frame`, the stacked PC long at `frame + 2`
+    // (M68000UM "Stack Frame Formats", group 1).
+    let word = |bus: &mut TestBus, addr: u32| -> u16 {
+        u16::from_be_bytes([bus.read_byte(addr), bus.read_byte(addr + 1)])
+    };
+    assert_eq!(word(&mut bus, frame), SUP, "saved SR at the frame's top");
+    assert_eq!(
+        u32::from(word(&mut bus, frame + 2)) << 16 | u32::from(word(&mut bus, frame + 4)),
+        PROGRAM,
+        "stacked PC is the illegal opcode's own address"
+    );
+
+    cpu.step(&mut bus); // the handler's RTS
+
+    assert_eq!(
+        cpu.pending_exception, None,
+        "no address error from the pop: the loop is broken"
+    );
+    assert_eq!(cpu.ssp, frame + 4, "the pop released a long and ended even");
+    assert_eq!(cpu.a[7], cpu.ssp);
+    // RTS pops a long: the frame's first four bytes, saved SR high word over
+    // the stacked PC's high word.
+    assert_eq!(cpu.pc, u32::from(SUP) << 16, "the even pair is what popped");
+}

@@ -121,7 +121,7 @@
 //! plus EA) belong to the tickets that implement those instructions.
 
 use crate::bus::{ADDR_MASK, Bus};
-use crate::cpu::{BUS_CYCLE_CLOCKS, M68k};
+use crate::cpu::{BUS_CYCLE_CLOCKS, M68k, SP_EVEN_MASK};
 use crate::sr::{SR_S, SR_T};
 
 /// Illegal instruction, slot `$000010` (vector 4).
@@ -278,8 +278,12 @@ impl M68k {
 
         // 3. The frame goes below the new active stack pointer, which step 2
         //    just made the SSP. Layout: SR at `sp`, PC long at `sp + 2`
-        //    (M68000UM "Stack Frame Formats", group 0/1/2 vector frame).
-        let sp = self.a[7].wrapping_sub(EXCEPTION_FRAME_SIZE);
+        //    (M68000UM "Stack Frame Formats", group 0/1/2 vector frame). The
+        //    stack address's bit 0 is forced off: the CPU's own stack traffic is
+        //    word or long and the stack pointers are word-aligned registers, so
+        //    an odd incoming SP pushes at the even address below it (#522,
+        //    [`crate::cpu::SP_EVEN_MASK`]).
+        let sp = self.a[7].wrapping_sub(EXCEPTION_FRAME_SIZE) & SP_EVEN_MASK;
         self.set_active_sp(sp);
         self.write_l_raw(bus, (sp + 2) & ADDR_MASK, pushed_pc);
         self.write_w_raw(bus, sp, saved_sr);
@@ -890,6 +894,36 @@ mod tests {
             cpu.usp,
             STACK + 0x100,
             "and the USP stayed parked as it was"
+        );
+    }
+
+    #[test]
+    fn an_odd_stack_pointer_pushes_the_frame_at_an_even_address() {
+        // The CPU's own stack traffic forces bit 0 of the address off (#522):
+        // a frame taken with A7 odd pushes at the even address below it, and
+        // the stored pointer comes back even, which is why the real chip cannot
+        // walk its stack down one odd address at a time.
+        let (mut cpu, mut bus) = cpu_at(0x4E40, SUP);
+        cpu.ssp = STACK + 1;
+        cpu.a[7] = cpu.ssp;
+        cpu.step(&mut bus);
+
+        let frame = (STACK + 1 - EXCEPTION_FRAME_SIZE) & crate::cpu::SP_EVEN_MASK;
+        assert_eq!(
+            frame,
+            STACK - EXCEPTION_FRAME_SIZE,
+            "bit 0 dropped, not wrapped"
+        );
+        assert_eq!(cpu.ssp, frame, "the stored SSP ends even");
+        assert_eq!(cpu.a[7], frame, "and a[7] agrees");
+        assert_eq!(
+            bus.writes(),
+            vec![
+                (frame + 2, 0x0000), // PC high
+                (frame + 4, 0x1002), // PC low: PROGRAM + 2
+                (frame, SUP),        // SR
+            ],
+            "the frame lands at the even address"
         );
     }
 
