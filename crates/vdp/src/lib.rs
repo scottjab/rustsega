@@ -271,6 +271,23 @@ pub struct Vdp {
     /// the only game known to use the mode (genvdp.txt section 15, Charles
     /// MacDonald).
     mask2_seen_x1: bool,
+    /// The master clocks the sprite slots have watched the display spend off
+    /// since the last latch point (#566).
+    ///
+    /// Eke (SpritesMind t=851, April 2011, verified on hardware): sprite
+    /// processing only gets the slots of lines the display is on for, and a
+    /// game that stretches its borders with the display OFF shows the first
+    /// line of active display without sprites. Genesis Plus GX (vdp_ctrl.c)
+    /// models the partial case as a budget - the dot count of the line and the
+    /// pre-processed sprite count of the next line are both "reduced depending
+    /// on the amount of cycles spent with display disabled". This accumulator
+    /// is those cycles, gathered per `advance` chunk off live R1 bit 6 (a
+    /// register write lands between `advance` calls, so a mid-line toggle is
+    /// exact at that granularity) and spent twice: [`Vdp::search_sprites`]
+    /// takes it at the latch point, scaling the entries it may visit, and
+    /// [`Vdp::render_sprite_line`] reads it at the line end, scaling the dots
+    /// the line may draw.
+    sprite_slots_display_off_mclk: u32,
     /// Status bit 4 (ODD): this frame is the odd one of an interlace pair.
     ///
     /// "Set when the display is interlaced, and in the odd frame, otherwise it
@@ -402,6 +419,7 @@ impl Vdp {
             vsram: [0; VSRAM_WORDS],
             sprite_cache: Box::new(sprites::SpriteCache::new()),
             sprite_lines: Box::new([sprites::SpriteLine::empty(), sprites::SpriteLine::empty()]),
+            sprite_slots_display_off_mclk: 0,
             regs: [0; regs::NUM_REGISTERS],
             code: 0,
             addr: 0,

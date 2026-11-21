@@ -122,7 +122,15 @@ impl Vdp {
         // same reason as the three reads below: the sprite list of a line is
         // evaluated during the line before (#311), its pattern and its x
         // included (Nemesis, SpritesMind t=851 note 5).
-        self.search_sprites();
+        //
+        // Its budget is the display-off clocks the window from the previous latch
+        // point to this one spent (#566), which is all the sprite processing this
+        // instant could have used: the search runs one instant early, so the slots
+        // of the line after it are not its to spend. The window is spent here - the
+        // accumulator restarts - so that what is left of the line is the draw
+        // budget of this line's own dots.
+        let window_display_off_mclk = core::mem::take(&mut self.sprite_slots_display_off_mclk);
+        self.search_sprites(window_display_off_mclk);
 
         let display_line = usize::from(self.display_line(self.line));
         let latch = LineState {
@@ -743,5 +751,175 @@ mod tests {
 
         vdp.advance(MCLKS_PER_LINE);
         assert_eq!(row(&vdp, 1), sprite_row(SPRITE_ENTRY));
+    }
+
+    // ---------------------------------------------------------------------
+    // The display-off budget of the sprite slots (#566). Eke (SpritesMind
+    // t=851, April 2011, verified on hardware): "This is only true for games
+    // with display enabled off course: in some games that reduce the active
+    // screen height by expanding vertical borders using the display OFF
+    // feature, you can see that the first line of 'active' display does not
+    // display sprites as well". Genesis Plus GX (vdp_ctrl.c) models the
+    // partial case as a budget: the dot count of the line and the
+    // pre-processed sprite count of the next line are both reduced by the
+    // cycles spent display disabled. The search of a line runs one instant
+    // early (#318), so its budget is the window that had elapsed when it ran,
+    // the previous latch point to this one; the dots of a line are spent out
+    // of the window from its own latch point to its end.
+    // ---------------------------------------------------------------------
+
+    /// A chain of `count` entries, each a 2x1 sprite of picture line `line`
+    /// starting at screen x 16*i, so sixteen of them cover the 256 pixels of an
+    /// H32 row with no dot to spare: the full dot budget of the line spent
+    /// exactly, and any cut of it visible as a row drawn only partway.
+    fn chain_on_line(vdp: &mut Vdp, count: usize, line: u16) {
+        // The second column of a 2x1 sprite is the tile after
+        // [`SPRITE_PATTERN`]'s: filled like the first, so a sprite is sixteen
+        // solid pixels and not eight solid and eight transparent.
+        for pattern_row in 0..CELL_TILE_ROWS {
+            fill_tile_row(vdp, 2, pattern_row, 1);
+        }
+        for index in 0..count {
+            let link = if index + 1 == count { 0 } else { index as u8 + 1 };
+            put_sprite_at(
+                vdp,
+                SPRITE_BASE,
+                index,
+                u16::from(line) + 128,
+                128 + 16 * index as u16,
+                (2, 1),
+                link,
+                SPRITE_PATTERN,
+            );
+        }
+    }
+
+    /// A row of the frame covered edge to edge by the sixteen sprites of
+    /// [`chain_on_line`].
+    fn full_sprite_row() -> Vec<u32> {
+        vec![pixel_of(SPRITE_ENTRY); 256]
+    }
+
+    /// A window the display was on for leaves the search its whole budget: all
+    /// sixty-four entries of the table visited (genvdp.txt section 15 "Sprite
+    /// Drawing Limitations": "64 sprites in 32-cell mode").
+    #[test]
+    fn a_display_on_window_searches_the_whole_table() {
+        let mut vdp = sprite_running();
+        chain_on_line(&mut vdp, 64, 11);
+
+        // Past the latch point of line 10, which is where the list of line 11
+        // is searched (#311).
+        vdp.advance(10 * MCLKS_PER_LINE + HBLANK_CLEAR_MCLK_H32 + 1);
+        assert_eq!(vdp.line, 10);
+        assert_eq!(
+            vdp.searched_entry_count_of(11),
+            Some(64),
+            "the whole table was searched"
+        );
+    }
+
+    /// Half a window with the display off halves the budget. Eke, t=851: the
+    /// pre-processed sprite count of the next line is reduced "depending on
+    /// the amount of cycles spent with display disabled", and Genesis Plus GX
+    /// ties that count to the dot budget (`parse_satb_m5`: `total =
+    /// max_sprite_pixels >> 2`). Display off from master clock 1810 of line 9
+    /// spends 1710 of the window's 3420 clocks by the latch point of line 10,
+    /// so thirty-two of the sixty-four entries.
+    #[test]
+    fn a_half_display_off_window_searches_half_the_table() {
+        let mut vdp = sprite_running();
+        chain_on_line(&mut vdp, 64, 11);
+
+        vdp.advance(9 * MCLKS_PER_LINE + 1810);
+        vdp.write_register(1, 0x00);
+        vdp.advance(MCLKS_PER_LINE - 1810 + HBLANK_CLEAR_MCLK_H32 + 1); // through the latch point of line 10
+
+        assert_eq!(
+            vdp.searched_entry_count_of(11),
+            Some(32),
+            "1710 of the window's 3420 clocks were spent display off"
+        );
+    }
+
+    /// A window the display spent entirely off searches nothing: Eke's t=851
+    /// observation that a game expanding its borders with the display OFF
+    /// shows "the first line of 'active' display" without sprites. A budget
+    /// with no enabled clock in it degenerates to an empty list.
+    #[test]
+    fn a_fully_display_off_window_searches_no_sprites() {
+        let mut vdp = sprite_running();
+        chain_on_line(&mut vdp, 64, 11);
+
+        vdp.advance(9 * MCLKS_PER_LINE);
+        vdp.write_register(1, 0x00);
+        vdp.advance(MCLKS_PER_LINE + HBLANK_CLEAR_MCLK_H32 + 1); // through the latch point of line 10
+
+        assert_eq!(
+            vdp.searched_entry_count_of(11),
+            Some(0),
+            "no slot of the window was the display's to spend"
+        );
+    }
+
+    /// The Power Instinct border (Eke, t=851, on Sonic 2 VS and Power
+    /// Instinct / Deadly Moves): the display off from line 3 through the latch
+    /// point of line 10, on again inside line 10. Line 11, the first line of
+    /// active display, draws no sprites - its list was searched by a window
+    /// the display spent all of off - and line 12 draws them again out of the
+    /// display-on window that followed.
+    #[test]
+    fn the_first_active_line_after_a_display_off_stretch_draws_no_sprites() {
+        let mut vdp = sprite_running();
+        chain_on_line(&mut vdp, 16, 11);
+
+        vdp.advance(3 * MCLKS_PER_LINE);
+        vdp.write_register(1, 0x00);
+        vdp.advance(7 * MCLKS_PER_LINE + 200); // through the latch point of line 10
+        vdp.write_register(1, 0x40);
+
+        vdp.advance(MCLKS_PER_LINE); // line 10 is drawn
+        vdp.advance(MCLKS_PER_LINE); // line 11 is drawn
+        assert_eq!(
+            row(&vdp, 11),
+            backdrop_row(),
+            "line 11's list was searched display off, and is empty"
+        );
+
+        vdp.advance(MCLKS_PER_LINE); // line 12 is drawn
+        assert_eq!(
+            row(&vdp, 12),
+            full_sprite_row(),
+            "line 12's window was display on, and its list is whole"
+        );
+    }
+
+    /// The Overdrive case, the mid-line toggle: the display off halfway
+    /// through a line's own slots. Eke, t=851: "the maximal number of rendered
+    /// sprites pixels for the current line" is reduced by the cycles spent
+    /// display disabled. The dots of a line come out of the window from its
+    /// latch point to its end - 3320 clocks in H32 - so a display off from
+    /// master clock 1760 of line 10 spends 1660 of them, and the line draws
+    /// its first eight sprites and nothing after them.
+    #[test]
+    fn a_mid_line_display_off_spends_only_the_enabled_dots() {
+        let mut vdp = sprite_running();
+        chain_on_line(&mut vdp, 16, 10);
+
+        vdp.advance(10 * MCLKS_PER_LINE + 1760);
+        vdp.write_register(1, 0x00);
+        vdp.advance(MCLKS_PER_LINE - 1760); // line 10 is drawn at its end
+
+        let drawn = row(&vdp, 10);
+        assert_eq!(
+            &drawn[0..128],
+            &full_sprite_row()[0..128],
+            "the sprites of the enabled half"
+        );
+        assert_eq!(
+            &drawn[128..],
+            &backdrop_row()[128..],
+            "the dots the disabled half cost"
+        );
     }
 }
