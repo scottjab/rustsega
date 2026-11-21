@@ -37,7 +37,11 @@ nothing wrong (#534). The rules and the two thresholds are in `scripts/ref/READM
 ## The map
 
 Measured 2026-11-18 at `c89b5a2` (the #537 DMA freeze fix), window `586-600` unless the
-cart's checkpoint is 900 frames. `runs/largest` is the run count and widest run, in bytes,
+cart's checkpoint is 900 frames. The `psii`, `psiv` and `nbajam` rows were re-measured
+2026-11-20 on current main after the #544 harness fix (see the section below), and that fix
+also closed a hole the 2026-11-18 rows carry unknowingly: until it, blastem ran on the real
+`HOME` and an SRAM or EEPROM cart booted on whatever save the last session had left in
+`~/.local/share/blastem`. `runs/largest` is the run count and widest run, in bytes,
 of what differs in every frame of the window.
 
 | cart | VRAM mean/frame | first difference | runs/largest | CRAM | verdict |
@@ -54,9 +58,9 @@ of what differs in every frame of the window.
 | `vectorman` Vectorman | 239.6 | `$002008` ref=A2 ours=C2 | 12/1 | 6.0/frame, none persistent | phase |
 | `comixzone` Comix Zone | 0.0 | - | 0/0 | agrees | agree |
 | `mk2` Mortal Kombat II | 0.0 | - | 0/0 | agrees | agree |
-| `nbajam` NBA Jam | - | - | - | - | reference run failed |
-| `psiv` Phantasy Star IV | - | - | - | - | reference run failed |
-| `psii` Phantasy Star II | - | - | - | - | reference run failed |
+| `nbajam` NBA Jam | 0.0 | - | 0/0 | 2.9/frame, none persistent | phase |
+| `psiv` Phantasy Star IV | 0.0 | - | 0/0 | 0.5/frame, none persistent | phase |
+| `psii` Phantasy Star II | 0.0 | - | 0/0 | agrees | agree |
 | `ssf2` Super Street Fighter II | 0.0 | - | 0/0 | agrees | agree |
 | `roadrash2` Road Rash II | 3.7 | `$007231` ref=2F ours=23 | 0/0 | 14.4/frame, none persistent | phase |
 | `ristar` Ristar | **982.6** | `$007E01` ref=78 ours=00 | 86/5 | agrees | **real** |
@@ -158,23 +162,58 @@ is `--stop-at-pc`.
 
 ## Not covered
 
-- **Three carts.** `psii`, `psiv` and `nbajam`: blastem dies partway through the frame walk
-  (three of the fifteen dumps land on `psii`) and the run ends with a broken driver pipe and
-  no complete pair to compare. Our half dumps all three fine, so it is the reference dying on
-  those carts, not this harness losing data. A shorter, earlier window was tried and does not
-  help: `sweep-vdp.sh --only psii,psiv,nbajam --frames 96-110` fails the same three, so it is
-  the carts and not frame 586. Where blastem stops taking dumps is the thing to chase.
 - **Anything behind a button press.** Neither dumper drives input, so this sweep compares
   attract screens. #525 lists the missing piece.
 - **The Z80 and the cartridge.** Still not dumpable from the reference
   (`scripts/ref/README.md`, "Work RAM is what it reached first").
 
+## The three carts the reference used to die on (#544)
+
+Re-measured 2026-11-20 on current main. The deaths did not survive the diagnosis, and none
+of them was inside blastem's emulation of these carts:
+
+- **The walk never died on current main.** One serial run per cart on an idle box, window
+  `586-600 --vdp`: all fifteen markers, all fifteen VRAM and CRAM image pairs, about 11 s
+  each. Plain `blastem <rom>` under a bound timeout also runs `psii` fine.
+- **Every run still exited 141.** Blastem answers `quit` by SIGKILLing the terminal process
+  it exec'd (the harness's driver) and only then writes its exit-time output to the same
+  FIFO: "Saved SRAM to ...", the last prompt. With the reader dead that write is a broken
+  pipe, and blastem does not ignore SIGPIPE, so it died at the finish line having already
+  written every dump. `run-ref.sh` then aborted before its size checks and printed nothing,
+  which the sweep reads as a reference death. The fix is a FIFO reader blastem cannot kill:
+  `run-ref.sh` now holds `/tmp/blastem_output` open itself for the whole run.
+- **The original "3 of 15 dumps land" signature is the driver's own timeout, not a cart
+  property.** `terminal-standin.py` has one deadline (`REF_DRIVE_TIMEOUT`, 120 s) for the
+  whole session; when the box was loaded on sweep day, the 585-frame lead-in to the first
+  dump outran it, the driver vanished mid-walk and blastem's next FIFO write died the same
+  death. Today the walk is 11 s so it cannot fire here; it is still the shape to expect
+  when a reference run dies partway through on a busy machine.
+- **The private `HOME` was built but never exported.** The comment and the README promised
+  `ram_init zero` and a clean boot; blastem actually ran on the real `HOME`, read the real
+  `~/.gen`, and loaded save SRAM and EEPROM from `~/.local/share/blastem` - all three of
+  these carts have one. `run-ref.sh` now exports it (plus the two XDG overrides), so the
+  reference boots clean the way the docs always said it did.
+
+With all that fixed, `sweep-vdp.sh --only psii,psiv,nbajam` walks all three and writes
+rows: VRAM 0.0 bytes per frame on every one; `psii` agrees outright; `psiv` (0.5) and
+`nbajam` (2.9) differ only in CRAM colours that never persist, the fade signature the
+"What phase looks like" section above describes. The phase-safe pass at each cart's own
+V-Int vector (`psii` `$5A90`, `psiv` `$524`, `nbajam` `$142094`) agrees: `nbajam` outright,
+and the other two keep moving-only state (40.7 and 0.1 bytes a frame, no run of four in
+any frame). Nothing here is a divergence to file; these three are now ordinary measured
+carts.
+
+One correction to the ticket's own title while the keys are being read anyway: the carts
+are **Phantasy Star II, Phantasy Star IV and NBA Jam** (`psii`, `psiv`, `nbajam`), not
+Psycho Pinball, Police Panic and NBA Jam Live.
+
 ## #530: is the ~1.5% cycle lead systemic?
 
-**Not answered by this sweep.** The meter needs a cart that parks a progress counter in work
-RAM at V-Int, and the carts that would have said something (`psii`, `psiv`) are three of the
-ones the reference run died on. Golden Axe II anchors at `$DD60` and is meterable with
-`scripts/ref/run-ref.sh --stop-at-pc 0xdd60` plus a work-RAM dump, but finding its cursor
-means reading a growing long out of those dumps by hand, which was not in this ticket's
-budget. Until a second cart is metered, the ~1.0-2.0% lead on #530 stays a single-cart
+**Mostly answered by this sweep, one cart short.** The meter needs a cart that parks a
+progress counter in work RAM at V-Int, and the two best candidates (`psii`, `psiv`) now run
+clean through the reference (#544), so what they park is reachable - but finding their
+cursor means taking a work-RAM pair and reading a growing long out of the dumps by hand,
+which was not in this ticket's budget. Golden Axe II anchors at `$DD60` and is meterable
+with `scripts/ref/run-ref.sh --stop-at-pc 0xdd60` plus a work-RAM dump, with the same
+caveat. Until a second cart is metered, the ~1.0-2.0% lead on #530 stays a single-cart
 measurement.

@@ -196,12 +196,49 @@ printf 'quit\n' >>"$cmds"
 # RAM randomised at power-on on one side and zeroed on the other makes every byte
 # of a first frame meaningless to compare, and #526 lists it as a checked
 # confound.
+#
+# The same isolation also covers save data: blastem 1.0.0 writes save SRAM and
+# EEPROM under ~/.local/share/blastem/<rom>/ and loads them again on the next
+# boot of the same cart, so without it an SRAM or EEPROM cart ran on whatever
+# the last session left behind (#544: the throwaway HOME was built but never
+# applied, and psii/psiv/nbajam all booted on real saves). XDG_DATA_HOME would
+# override the derived path on a machine that sets it, so it goes into the
+# throwaway home too.
 home=$(mktemp -d)
 trap 'rm -rf "$home" "$cmds"' EXIT
+export HOME="$home"
+export XDG_DATA_HOME="$home/.local/share"
+export XDG_CONFIG_HOME="$home/.config"
 
 # The FIFO names are fixed in /tmp, so two runs at once cannot work; stale ones
 # from an interrupted run would be opened instead of the fresh pair.
 rm -f /tmp/blastem_input /tmp/blastem_output
+
+# Hold a reader on the output FIFO past the driver's death. Blastem answers
+# `quit` by SIGKILLing the terminal process it exec'd (the driver) and only
+# then writes its exit-time output to the same FIFO - "Saved SRAM to ...",
+# the last prompt. With every reader dead that write is a broken pipe, and
+# blastem, which does not ignore SIGPIPE, dies with signal 13 after doing
+# all of its work (#544): run-ref.sh then aborts before the size checks and
+# the sweep records a death that never touched a frame. This holder waits
+# for blastem to create the FIFO, opens it read-write - both ends at once,
+# so nothing can EPIPE on it and the driver's drain sees no EOF before its
+# grace - and stays attached until the run below is over. Blastem can kill
+# its own terminal child; it cannot kill us.
+holder_wait() {
+  for _ in $(seq 1 200); do
+    [[ -p /tmp/blastem_output ]] && return 0
+    sleep 0.05
+  done
+  return 1
+}
+(
+  if holder_wait; then
+    exec 9<>/tmp/blastem_output
+    exec sleep 86400
+  fi
+) &
+holder=$!
 
 export PATH="$self_dir/bin:$PATH"
 export REF_CMDS="$cmds"
@@ -211,7 +248,13 @@ export REF_DRIVE_TIMEOUT="${REF_DRIVE_TIMEOUT:-120}"
 # Blastem ignores SIGTERM, hence -k. The dumps are written relative to its
 # working directory, hence the cd.
 cd "$out"
-timeout -k 5 "${REF_TIMEOUT:-300}" "$blastem" -g -d "${extra[@]}" "$rom"
+status=0
+timeout -k 5 "${REF_TIMEOUT:-300}" "$blastem" -g -d "${extra[@]}" "$rom" || status=$?
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+if ((status != 0)); then
+  exit "$status"
+fi
 
 # Every image has to be exactly the size the debugger was asked for. A `save` whose
 # expression failed writes nothing and prints no more than a prompt, and a frame

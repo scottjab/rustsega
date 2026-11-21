@@ -37,7 +37,9 @@ Environment:
 import os
 import re
 import select
+import subprocess
 import sys
+import tempfile
 import time
 
 INPUT_FIFO = "/tmp/blastem_input"
@@ -84,29 +86,63 @@ def drive(command_file, log_path, timeout):
     commands = read_commands(command_file)
     deadline = time.monotonic() + timeout
     out_fd = open_fifo(OUTPUT_FIFO, os.O_RDONLY | os.O_NONBLOCK, deadline)
-    in_fd = open_fifo(INPUT_FIFO, os.O_WRONLY | os.O_NONBLOCK, deadline)
+    in_fd = None
     prompts = 0
     sent = 0
-    with open(log_path, "wb") as log:
-        while sent < len(commands) and time.monotonic() < deadline:
-            ready, _, _ = select.select([out_fd], [], [], 0.2)
-            if not ready:
-                continue
-            try:
-                data = os.read(out_fd, 65536)
-            except BlockingIOError:
-                continue
-            if not data:
-                break
-            log.write(data)
-            log.flush()
-            prompts += len(PROMPT.findall(data))
-            while sent < len(commands) and prompts > sent:
+    try:
+        in_fd = open_fifo(INPUT_FIFO, os.O_WRONLY | os.O_NONBLOCK, deadline)
+        with open(log_path, "wb") as log:
+            while sent < len(commands) and time.monotonic() < deadline:
+                ready, _, _ = select.select([out_fd], [], [], 0.2)
+                if not ready:
+                    continue
                 try:
-                    os.write(in_fd, commands[sent] + b"\n")
-                except OSError:
+                    data = os.read(out_fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not data:
                     break
-                sent += 1
+                log.write(data)
+                log.flush()
+                prompts += len(PROMPT.findall(data))
+                while sent < len(commands) and prompts > sent:
+                    try:
+                        os.write(in_fd, commands[sent] + b"\n")
+                    except OSError:
+                        break
+                    sent += 1
+            # Blastem answers even the final `quit` with one more prompt,
+            # written as it shuts down - after this driver has nothing left
+            # to send. Leaving the FIFO the moment the last command is sent
+            # turns that write into a broken pipe and kills the reference
+            # with signal 13 after it has already written every dump (#544):
+            # run-ref.sh then aborts before its size checks, and the sweep
+            # records a death that never touched a frame. Hold the read end
+            # open until the reference exits and closes its end - the EOF
+            # below - or a short grace passes, so the shutdown lands in the
+            # transcript instead of in a broken pipe.
+            drain_deadline = min(time.monotonic() + 2.0, deadline)
+            while time.monotonic() < drain_deadline:
+                ready, _, _ = select.select([out_fd], [], [], 0.2)
+                if not ready:
+                    continue
+                try:
+                    data = os.read(out_fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    break
+                log.write(data)
+                log.flush()
+    finally:
+        # An exec'd driver would close these by exiting; closing them here is
+        # the same thing without dying, and it is what makes the teardown
+        # observable: after we let go of the read end, a write from the
+        # reference side breaks the pipe, and only a driver that waited out
+        # the reference's shutdown has kept its own hands clean.
+        for fd in (out_fd, in_fd):
+            if fd is not None:
+                os.close(fd)
     if sent < len(commands):
         raise SystemExit(
             f"terminal-standin: sent {sent} of {len(commands)} commands before the "
@@ -115,10 +151,104 @@ def drive(command_file, log_path, timeout):
 
 
 def main(argv):
+    if len(argv) == 2 and argv[1] == "--selftest":
+        return selftest()
     if len(argv) != 3:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
         return 2
     drive(argv[1], argv[2], float(os.environ.get("REF_DRIVE_TIMEOUT", "120")))
+    return 0
+
+
+FAKE_BLASTEM = r"""
+import os, sys, time
+
+# The teardown that kills the real reference (#544): blastem answers even the
+# final `quit` with one more prompt, written as it shuts down - a moment after
+# the driver has nothing left to send. This one delays that write so a driver
+# that closes its end early deterministically breaks the pipe, and reports a
+# broken pipe as exit 13 so the assertion can name it.
+def main():
+    out_fd = os.open(sys.argv[1], os.O_WRONLY)
+    in_fd = os.open(sys.argv[2], os.O_RDONLY | os.O_NONBLOCK)
+    buf = b""
+    os.write(out_fd, b"blastem banner\n> \n")
+    sent_quit = False
+    started = time.monotonic()
+    while not sent_quit and time.monotonic() - started < 10.0:
+        try:
+            data = os.read(in_fd, 4096)
+        except BlockingIOError:
+            time.sleep(0.01)
+            continue
+        if not data:
+            # No writer connected yet: the driver opens its end a beat after
+            # it opens ours, and an O_NONBLOCK read reports that as EOF.
+            time.sleep(0.01)
+            continue
+        buf += data
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if line.strip() == b"quit":
+                sent_quit = True
+                break
+            os.write(out_fd, b"> \n")
+    if sent_quit:
+        time.sleep(0.4)
+        os.write(out_fd, b"teardown\n> \n")
+    os.close(out_fd)
+    os.close(in_fd)
+
+try:
+    main()
+    os._exit(0)
+except BrokenPipeError:
+    os._exit(13)
+"""
+
+
+def selftest():
+    """Pin the teardown contract: the driver holds the FIFO open past `quit`.
+
+    Plants a fake blastem that walks the same prompt-per-command protocol and
+    writes its shutdown prompt late. The fake must survive that write (exit 0,
+    not 13) and the transcript must hold it, which is only possible if the
+    driver keeps its read end open until the reference exits.
+    """
+    with tempfile.TemporaryDirectory(prefix="ref-standin-selftest-") as tmp:
+        out_fifo = os.path.join(tmp, "out")
+        in_fifo = os.path.join(tmp, "in")
+        os.mkfifo(out_fifo)
+        os.mkfifo(in_fifo)
+        fake_path = os.path.join(tmp, "fake-blastem.py")
+        with open(fake_path, "w") as handle:
+            handle.write(FAKE_BLASTEM)
+        fake = subprocess.Popen([sys.executable, fake_path, out_fifo, in_fifo])
+        log_path = os.path.join(tmp, "transcript.log")
+        global INPUT_FIFO, OUTPUT_FIFO
+        saved = INPUT_FIFO, OUTPUT_FIFO
+        INPUT_FIFO, OUTPUT_FIFO = in_fifo, out_fifo
+        try:
+            cmds = os.path.join(tmp, "cmds")
+            with open(cmds, "wb") as handle:
+                handle.write(b"frames 1\nquit\n")
+            drive(cmds, log_path, 15.0)
+        finally:
+            INPUT_FIFO, OUTPUT_FIFO = saved
+            rc = fake.wait(timeout=15)
+        transcript = open(log_path, "rb").read()
+    problems = []
+    if rc == 13:
+        problems.append("the reference-side write after quit broke the pipe (exit 13)")
+    elif rc != 0:
+        problems.append(f"the fake reference exited {rc}, not 0")
+    if b"teardown" not in transcript:
+        problems.append("the teardown prompt is missing from the transcript")
+    if problems:
+        for problem in problems:
+            print(f"terminal-standin selftest: FAIL: {problem}", file=sys.stderr)
+        return 1
+    print("terminal-standin selftest: ok - teardown write landed, no broken pipe")
     return 0
 
 

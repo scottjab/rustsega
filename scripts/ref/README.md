@@ -481,6 +481,23 @@ Two caveats about the sweep, both paid for:
 - **blastem ignores `SIGTERM`.** `run-ref.sh` runs it under `timeout -k 5 <n>` so a
   wedged run dies. `REF_TIMEOUT` raises the wall limit (default 300 s); 1200 frames
   with dumps is about 10 s.
+- **blastem kills its terminal, then writes to it one last time.** Answering `quit`,
+  it SIGKILLs the process it exec'd as `x-terminal-emulator` (the driver) and only
+  then writes its exit-time output - "Saved SRAM to ...", the final prompt - to the
+  same FIFO. It does not ignore SIGPIPE, so with the driver dead that write breaks
+  the pipe and blastem dies with signal 13 after doing all of its work (#544). Two
+  things stand between that and the harness: `run-ref.sh` holds `/tmp/blastem_output`
+  open itself for the whole run (a reader blastem cannot kill), and the driver, when
+  it is not killed first, holds its end until the reference exits or a short grace
+  passes. The exit-time signature to recognise from the outside: every dump on disk,
+  every frame in the transcript, exit 141, nothing on stdout.
+- **A reference run that dies partway through the walk is the driver's deadline, not
+  a cart.** `terminal-standin.py` has one deadline (`REF_DRIVE_TIMEOUT`, default 120 s)
+  for the whole session, boot included. When the box is loaded and the window starts
+  deep into the cart's run, the lead-in outruns it, the driver vanishes mid-walk, and
+  blastem's next FIFO write dies the death above with only the first few dumps on
+  disk (#544's "3 of 15"). An idle box walks the same window in ~11 s; before blaming
+  a cart, check the load and the wall time.
 - **Never send `cont` to a piped debugger with nothing armed.** It never returns and
   the driver hangs until its timeout. Advance with `frames N`, which returns a prompt
   after N frames, and end the command file with `quit`. `--stop-at-pc` is the
@@ -494,6 +511,11 @@ Two caveats about the sweep, both paid for:
   in particular `ram_init zero`, which matters more than it looks: work RAM
   randomised at power-on on one side and zeroed on the other makes a first-frame
   comparison meaningless. Nothing in this repo depends on what your `~/.gen` says.
+  The same isolation covers save data: blastem 1.0.0 also loads and writes save
+  SRAM/EEPROM under `~/.local/share/blastem/<rom>/`, so an SRAM or EEPROM cart booted
+  on whatever the last session left behind until #544 caught the throwaway `HOME`
+  being built and never exported. The XDG overrides go into the throwaway too, so a
+  machine that sets `XDG_DATA_HOME` does not leak the operator's saves in either.
 - **Region has to match, and it is not checked for you.** `run-ref.sh ROM 600 -- -r E`
   forces PAL on the reference; `run-ours.sh --region europe` forces it on ours. Do
   it to both or neither. On the S&K header (`JUE`) blastem with its defaults runs USA
@@ -501,7 +523,9 @@ Two caveats about the sweep, both paid for:
   `-r E` (347 bytes different); our `--region auto` prints `region=usa`.
 - **The FIFOs are `/tmp/blastem_input` and `/tmp/blastem_output`, fixed.** One
   debugger run at a time, machine-wide, and stale ones from an interrupted run are
-  deleted before starting.
+  deleted before starting. `run-ref.sh` also parks a silent holder on the output FIFO
+  for the length of the run (see the SIGPIPE caveat above); it goes away when the run
+  does, and until then it is one more reason not to start a second reference run.
 - **`save` quoting:** the file name must be quoted (`save "b00600.bin"`) or it is
   parsed as an expression, and the address must be the memory form `[0xFF0000]`, not
   `0xFF0000`. It takes at most three arguments. Filenames are relative to the
@@ -554,6 +578,12 @@ and the output directory is gitignored so a dump cannot be committed either.
 ```sh
 nix develop -c just ref-selftest      # also part of `just check`
 ```
+
+Two selftests, both in `just check`. `compare.py --selftest` is the one below;
+`terminal-standin.py --selftest` drives a fake blastem over the same FIFO protocol and
+pins the teardown: the fake writes one more prompt after `quit`, late, and the driver
+must hold the FIFO open until it lands (#544), so a driver that lets go early makes the
+fake die of a broken pipe and the selftest fails.
 
 It builds a canned pair of images that agree, a one-byte mutation of one frame, a
 mutation of the same address in every frame, a pair aligned only at a one-frame
