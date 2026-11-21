@@ -780,12 +780,16 @@ mod tests {
             fill_tile_row(vdp, 2, pattern_row, 1);
         }
         for index in 0..count {
-            let link = if index + 1 == count { 0 } else { index as u8 + 1 };
+            let link = if index + 1 == count {
+                0
+            } else {
+                index as u8 + 1
+            };
             put_sprite_at(
                 vdp,
                 SPRITE_BASE,
                 index,
-                u16::from(line) + 128,
+                line + 128,
                 128 + 16 * index as u16,
                 (2, 1),
                 link,
