@@ -13,10 +13,11 @@
 # on both sides.
 #
 # --vdp writes the VDP's memories instead, named to match run-ref.sh --vdp:
-# rvNNNNN.bin is the 64 KiB of VRAM and rcNNNNN.bin the 64 colour words of CRAM as
-# 128 raw bytes, little endian per colour (#534). They come out of the chip's own
-# state - `Bus::vdp.vram` and `Bus::vdp.cram` - not out of a reconstruction of what
-# it drew.
+# rvNNNNN.bin is the 64 KiB of VRAM, rcNNNNN.bin the 64 colour words of CRAM as
+# 128 raw bytes, little endian per colour (#534), and rrNNNNN.bin the 24 write
+# registers as 48 bytes of little endian words (#549). They come out of the
+# chip's own state - `Bus::vdp.vram`, `Bus::vdp.cram` and `Bus::vdp.reg` - not
+# out of a reconstruction of what it drew.
 #
 # --stop-at-pc PC moves that point to the Nth time the 68000 is about to execute
 # PC instead, for the phase-safe comparison of #526; run-ref.sh --stop-at-pc is
@@ -122,11 +123,12 @@ machine=()
 [[ -z $region ]] || machine+=(--region "$region")
 (( ${#tmss[@]} == 0 )) || machine+=("${tmss[@]}")
 [[ -z $stop_at ]] || machine+=(--stop-at-pc "$stop_at")
-# Which images the example writes, and under what names: `v` and `c` are the same
-# letters run-ref.sh puts between the side and the frame number, so one directory can
-# hold both sides of a comparison and compare.py tells them apart by name alone.
+# Which images the example writes, and under what names: `v`, `c` and `r` are the
+# same letters run-ref.sh puts between the side and the frame number, so one
+# directory can hold both sides of a comparison and compare.py tells them apart
+# by name alone.
 if [[ -n $vdp ]]; then
-  kinds=(v c)
+  kinds=(v c r)
 else
   kinds=("")
 fi
@@ -138,6 +140,7 @@ for frame in $(ref_frames "${frames[@]}"); do
     case $kind in
       v) images+=(--vram "$out/$(printf 'rv%05d.bin' "$frame")") ;;
       c) images+=(--cram "$out/$(printf 'rc%05d.bin' "$frame")") ;;
+      r) images+=(--regs "$out/$(printf 'rr%05d.bin' "$frame")") ;;
       *) images+=(--out "$out/$(printf 'r%05d.bin' "$frame")") ;;
     esac
   done

@@ -99,7 +99,7 @@ class Region:
 
     @property
     def noun(self):
-        """One thing that differs: an address in RAM, a colour in CRAM."""
+        """One thing that differs: an address in RAM, a colour in CRAM, a register."""
         return "colour" if self.unit > 1 else "address"
 
     @property
@@ -143,8 +143,35 @@ CRAM = Region("CRAM", "c", 0, 128, unit=2)
 """The VDP's colour RAM: 64 words of `0000 BBB0 GGG0 RRR0` (genvdp.txt section 9),
 which both machines hold as 64 16-bit entries and neither holds as anything else."""
 
-VDP_REGIONS = (VRAM, CRAM)
-"""What `--vdp` compares: the two memories of #534, in the order they are printed."""
+
+class Registers(Region):
+    """The VDP's 24 write registers as 24 little endian words (48 bytes).
+
+    Saved from the reference with `save/w ... vdp:reg`, from us with
+    `ram_dump --regs`. Numbered per genvdp.txt section 17, register 0 first,
+    which is the same numbering `vdpregs` prints and the mode tables use. What
+    the memory comparison cannot see (#549's family: identical VRAM and CRAM,
+    one side with the display still off) is here: R1 `74` against `34` is a
+    screen the reference turns on and we do not.
+    """
+
+    def label(self, offset):
+        return f"R{offset // self.unit}"
+
+    @property
+    def noun(self):
+        return "register"
+
+    @property
+    def plural(self):
+        return "registers"
+
+
+REGS = Registers("registers", "r", 0, 48, unit=2)
+"""The 24 VDP write registers, both halves holding them as little endian words."""
+
+VDP_REGIONS = (VRAM, CRAM, REGS)
+"""What `--vdp` compares: the two memories and the register file, in print order."""
 
 REF_PREFIX = "b"
 OURS_PREFIX = "r"
@@ -1713,18 +1740,54 @@ def selftest():
                 images[frame] = b"".join(int(w).to_bytes(CRAM.unit, "little") for w in words)
             return images
 
+        def reg_images(frames):
+            """Canned register file: R1 display-on in every frame.
+
+            The one register the #549 family turns on the reference and not on us,
+            so the canned reference side holds `0x74` throughout and the tests
+            below hold our side at `0x34` with `mutate`: a comparison that never
+            read the registers would report agreement about exactly the screen
+            this file exists to catch.
+            """
+            images = {}
+            for frame in frames:
+                words = [0] * (REGS.size // REGS.unit)
+                words[1] = 0x74
+                images[frame] = b"".join(int(w).to_bytes(REGS.unit, "little") for w in words)
+            return images
+
         vdp_dir = os.path.join(work, "vdp")
         os.mkdir(vdp_dir)
         build(vdp_dir, vram_frames, vram_at, VRAM)
         build(vdp_dir, vram_frames, cram_images(vram_frames), CRAM)
+        build(vdp_dir, vram_frames, reg_images(vram_frames), REGS)
 
         report = compare(vdp_dir, vram_frames, 0, VRAM)
         check("matching VDP dumps compare as a pair", report.agrees and not report.differs_in_all)
         with contextlib.redirect_stdout(io.StringIO()) as out:
             status = main([vdp_dir, "20-23", "--vdp", "--sweep", "0"])
         check("a VDP comparison that matches exits 0", status == 0, f"status {status}")
-        check("and the report names both memories",
-              "VRAM" in out.getvalue() and "CRAM" in out.getvalue(), out.getvalue()[:200])
+        check("and the report names all three memories",
+              "VRAM" in out.getvalue() and "CRAM" in out.getvalue() and "registers" in out.getvalue(),
+              out.getvalue()[:200])
+
+        # The registers: our canned pair holds R1 display-on on one side and
+        # display-off on the other, in every frame, which is the shape the #549
+        # family asked the harness to be able to see. It has to be found, and it
+        # has to be named as the register number, not as a byte offset.
+        reg_plant = 1 * REGS.unit
+        for frame in vram_frames:
+            # Ours is the side that misses the display enable: hold our R1 at the
+            # display-off value in every frame while the reference's canned value
+            # stays display-on, so the difference holds in all of them.
+            mutate(vdp_dir, frame, OURS_PREFIX, reg_plant, b"\x34\x00", REGS)
+        report = compare(vdp_dir, vram_frames, 0, REGS)
+        check("an R1 difference planted in the canned pair is found",
+              report.differs_in_all == [reg_plant], f"{report.differs_in_all}")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            print_report(report)
+        check("and it is printed as a register, not as two stray bytes",
+              "R1  ref=0074  ours=0034" in out.getvalue(), out.getvalue()[-200:])
 
         # VRAM first: a planted byte in every frame, which is the persistence test
         # of #526 one address space over. It has to be found, and it has to be
@@ -1771,6 +1834,7 @@ def selftest():
         os.mkdir(half)
         build(half, vram_frames, vram_at, VRAM)
         build(half, vram_frames, cram_images(vram_frames), CRAM)
+        build(half, vram_frames, reg_images(vram_frames), REGS)
         for frame in vram_frames:
             for side in (REF_PREFIX, OURS_PREFIX):
                 with open(os.path.join(half, CRAM.image_name(side, frame)), "r+b") as handle:
@@ -1783,10 +1847,20 @@ def selftest():
         no_cram = os.path.join(work, "vdp-no-cram")
         os.mkdir(no_cram)
         build(no_cram, vram_frames, vram_at, VRAM)
+        build(no_cram, vram_frames, reg_images(vram_frames), REGS)
         with contextlib.redirect_stderr(io.StringIO()) as err:
             status = main([no_cram, "20-23", "--vdp", "--sweep", "0"])
         check("a VDP run with no CRAM dumps fails instead of agreeing",
               status == 2 and "CRAM" in err.getvalue(), f"status {status}: {err.getvalue()[:80]}")
+
+        no_regs = os.path.join(work, "vdp-no-regs")
+        os.mkdir(no_regs)
+        build(no_regs, vram_frames, vram_at, VRAM)
+        build(no_regs, vram_frames, cram_images(vram_frames), CRAM)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            status = main([no_regs, "20-23", "--vdp", "--sweep", "0"])
+        check("and no register dumps fail it the same way (#549)",
+              status == 2 and "registers" in err.getvalue(), f"status {status}: {err.getvalue()[:80]}")
 
         ram_only = os.path.join(work, "vdp-ram-only")
         os.mkdir(ram_only)
@@ -1803,8 +1877,9 @@ def selftest():
         late = os.path.join(work, "vdp-late")
         os.mkdir(late)
         cram_at = cram_images([vram_frames[0] - 1] + vram_frames)
+        reg_at = reg_images([vram_frames[0] - 1] + vram_frames)
         for frame in vram_frames:
-            for region, source in ((VRAM, vram_at), (CRAM, cram_at)):
+            for region, source in ((VRAM, vram_at), (CRAM, cram_at), (REGS, reg_at)):
                 with open(os.path.join(late, region.image_name(REF_PREFIX, frame)), "wb") as h:
                     h.write(source[frame])
                 with open(os.path.join(late, region.image_name(OURS_PREFIX, frame)), "wb") as h:
@@ -1828,6 +1903,7 @@ def selftest():
         os.mkdir(shape_dir)
         build(shape_dir, vram_frames, vram_at, VRAM)
         build(shape_dir, vram_frames, cram_images(vram_frames), CRAM)
+        build(shape_dir, vram_frames, reg_images(vram_frames), REGS)
         clean = compare(shape_dir, vram_frames, 0, VRAM)
         check("a memory that matches is neither real nor phase", classify(clean) == "agree",
               classify(clean))
@@ -1921,7 +1997,7 @@ def selftest():
         with contextlib.redirect_stdout(io.StringIO()) as out:
             status = main([shape_dir, "20-23", "--vdp", "--sweep", "0", "--tsv"])
         lines = [line for line in out.getvalue().splitlines() if line.strip()]
-        check("--tsv prints one line per compared memory", len(lines) == 2, out.getvalue()[:200])
+        check("--tsv prints one line per compared memory", len(lines) == 3, out.getvalue()[:200])
         fields = lines[0].split("\t") if lines else []
         check("--tsv has one field per column of the contract",
               len(fields) == len(TSV_COLUMNS), f"{len(fields)}: {fields}")
