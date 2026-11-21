@@ -46,7 +46,7 @@ mod common;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use genesis::Buttons;
+use genesis::{Buttons, Config, Genesis};
 
 use common::{
     Game, golden_path, golden_png, list_path, load_games, panic_text, parse_games, run_frames,
@@ -317,4 +317,53 @@ fn parse_games_rejects_what_it_cannot_read() {
             "{what}: expected an error, got {outcome:?}"
         );
     }
+}
+
+/// HardBall III's boot probes the save RAM its board wires and its header does
+/// not declare: `$1C994` inverts a byte at `$20FFFF` - the last byte of the
+/// standard `$200000-$20FFFF` window - and reads the answer as "there is memory
+/// above the image". With the window modelled (the serial override of
+/// `cart::sram::SRAM_OVERRIDES`) the probe reads its own write back, `$0412`
+/// becomes `$200001`, and the boot branches past the memory-tight path that
+/// otherwise parks the whole boot thread in the idle task's `STOP` loop - the
+/// park that looked like "the art pipeline stalls after boot" in #646.
+///
+/// What the pipeline looks like when it runs is growth. The reference reaches
+/// 4529 non-zero VRAM bytes by frame 300 and 35717 by frame 900; a stalled boot
+/// plateaus at exactly 2558 from frame 60 on (#441's numbers, unchanged on
+/// current main at every measurement since).
+///
+/// Needs the cartridge, so CI skips it and `just test-commercial` runs it.
+#[test]
+#[ignore = "needs commercial ROMs; run with `just test-commercial`"]
+fn commercial_hardball_iii_boots_past_the_art_pipeline_stall() {
+    let Some(rom) = testkit::commercial_rom("Al Michaels Announces HardBall III (USA, Europe).md")
+    else {
+        eprintln!("SKIPPED: HardBall III is not on disk");
+        return;
+    };
+    let bytes = std::fs::read(&rom).expect("the ROM was just found");
+    let mut machine = Genesis::new(&bytes, Config::default()).expect("the cart loads");
+
+    for _ in 0..100 {
+        machine.run_frame();
+    }
+    let ram = &machine.bus().ram;
+    let memory_top = u32::from_be_bytes([ram[0x412], ram[0x413], ram[0x414], ram[0x415]]);
+    assert_eq!(
+        memory_top, 0x0020_0001,
+        "the save-RAM probe at $20FFFF must read its own write back: $0412 is the \
+         memory top the boot branches on, and $16F501 sends it into the path that \
+         parks in the idle task"
+    );
+
+    for _ in 100..300 {
+        machine.run_frame();
+    }
+    let nonzero = machine.bus().vdp.vram.iter().filter(|&&b| b != 0).count();
+    assert!(
+        nonzero > 3000,
+        "VRAM is still at the stalled-boot plateau (2558 bytes) at frame 300: the \
+         art pipeline is not running"
+    );
 }

@@ -333,7 +333,23 @@ impl Sram {
 /// serials and checksums in exactly this position ([`detect`]). A table rather
 /// than a guess because a save RAM inferred from a heuristic is a save RAM a
 /// front end persists for a cart that may not have one.
-pub const SRAM_OVERRIDES: &[(&str, SramInfo)] = &[];
+pub const SRAM_OVERRIDES: &[(&str, SramInfo)] = &[(
+    // Al Michaels Announces HardBall III: Accolade wired battery SRAM over the
+    // whole standard window and the header's extra-memory field says nothing
+    // (no `RA` at 0x1B0; the consolemods and RetroSales save-battery lists both
+    // carry the cart, and the game saves team and season statistics). The cart
+    // boots by probing that window - `$1C994` inverts a byte at `$20FFFF`, the
+    // window's last, and parks the whole boot in its idle task when the write
+    // does not read back (#646) - so the window is not only saves: `$0412`
+    // becomes its top and the cart's loader walks it bytewise, which is why the
+    // entry is [`SramKind::Word`] rather than the usual odd-byte kind.
+    "GM ACLD012 -00",
+    SramInfo {
+        start: 0x20_0000,
+        end: 0x20_FFFF,
+        kind: SramKind::Word,
+    },
+)];
 
 /// The declared save RAM of the cart `serial`, from [`SRAM_OVERRIDES`].
 pub fn sram_override(serial: &str) -> Option<SramInfo> {
@@ -757,5 +773,33 @@ mod tests {
         assert_eq!(detect(&rom), None, "no header SRAM and no override");
         rom[0x1B0..0x1BC].copy_from_slice(&extra_memory(0xE0, 0x20_0000, 0x20_1FFF));
         assert_eq!(detect(&rom).map(|info| info.kind), Some(SramKind::Word));
+    }
+
+    /// Al Michaels Announces HardBall III: Accolade wired battery SRAM over the
+    /// whole standard window and the header's extra-memory field says nothing
+    /// (no `RA` at 0x1B0; the consolemods and RetroSales save-battery lists both
+    /// carry the cart, and the game saves team and season statistics). The cart
+    /// boots by probing that window - `$1C994` inverts a byte at `$20FFFF`, the
+    /// window's last, and parks the whole boot in its idle task when the write
+    /// does not read back (#646) - so the window is not only saves: `$0412`
+    /// becomes its top and the cart's loader walks it bytewise, which is why the
+    /// entry is [`SramKind::Word`] rather than the usual odd-byte kind.
+    #[test]
+    fn hardball_iii_serial_answers_the_word_wide_standard_window() {
+        let info = sram_override("GM ACLD012 -00").expect("the compatibility entry");
+        assert_eq!(info.start, 0x20_0000);
+        assert_eq!(info.end, 0x20_FFFF);
+        assert_eq!(info.kind, SramKind::Word);
+        assert_eq!(info.storage_len(), 64 * 1024);
+
+        // Detection on an image of the real header: no `RA` at 0x1B0, the
+        // serial at 0x180, and the image's own end leaves the save reachable
+        // with nothing written to $A130F1 ([`SramInfo::mapped_by_default`]).
+        let mut rom = vec![b' '; 0x400];
+        rom[0x180..0x18E].copy_from_slice(b"GM ACLD012 -00");
+        let info = detect(&rom).expect("the serial finds the cart's save");
+        assert_eq!(info.start, 0x20_0000);
+        assert_eq!(info.kind, SramKind::Word);
+        assert!(info.mapped_by_default(0x20_0000));
     }
 }
