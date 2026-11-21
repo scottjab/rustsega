@@ -805,6 +805,38 @@ impl M68k {
         self.pop_word(bus);
     }
 
+    /// Land a destination extension word that a store held in flight (the
+    /// in-flight prefetch fetch, #616).
+    ///
+    /// The recording core's traces draw one asymmetry between its read and
+    /// write cycles: a faulting **read** leaves the operand's last extension
+    /// pop fully paid (both refills complete before the faulting access —
+    /// `TST.w.json.gz` case `4a79 [TST.w (xxx).l] 1` charges `$C04` and `$C06`
+    /// and stacks `pc = $C04`), while a **store** takes the bus slot first:
+    /// the last extension word's refill issues only behind the store cycle
+    /// (`23c2 [MOVE.l D2, (xxx).l] 310` of `MOVE.l.json.gz` fetches `$C04` and
+    /// `$C06`, then drives the two store words, then `$C08`). A faulting store
+    /// cancels it together with its `pc` advance — `33ea [MOVE.w (d16, A2),
+    /// (xxx).l] 18` of `MOVE.w.json.gz` never fetches `$C08` at all, stacks
+    /// `pc = $C04`, and its 62 clocks hold only the three cycles that issued.
+    ///
+    /// So the move class resolves an `(xxx).l` destination by popping its first
+    /// word and merely reading its second off the queue back (no slide, no
+    /// refill — the word is still queued, `pc` still names the instruction's
+    /// tail). This call is the landing: the plain [`M68k::pop_word`], run after
+    /// a store that completed, and skipped when the store faults because the
+    /// exception entry throws the queue away. Non-faulted totals are unchanged
+    /// — the landing plus [`M68k::advance_opcode`] is the two pops the tail
+    /// used to cost inline — which is why every passing abs.L case stays put.
+    ///
+    /// Between the deferred read and this call nothing may look at the queue:
+    /// the `prefetch == [word(pc), word(pc + 2)]` invariant (see [`M68k::pc`])
+    /// is broken exactly as for [`M68k::pop_queued_ext_word`], and `op_move`
+    /// — the only caller — touches the queue nowhere else in between.
+    pub(crate) fn land_deferred_ext_word(&mut self, bus: &mut impl Bus) {
+        self.pop_word(bus);
+    }
+
     /// Throw the queue away and refill it with two fresh word fetches from
     /// `addr`: afterwards `pc == addr` and
     /// `prefetch == [word(addr), word(addr + 2)]`. Costs 8 clocks.

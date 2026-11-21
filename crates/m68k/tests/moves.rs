@@ -3,14 +3,10 @@
 //!
 //! One test per suite file, so a regression names the instruction that broke
 //! rather than the group. The check is [`harness::Check::StateAndCycles`] on
-//! every file but `MOVE.w`/`MOVE.l`, which run one level down
-//! ([`harness::Check::StateAndCyclesSkipExceptions`]) for one residual shape
-//! (#474 follow-up): a faulting *store* whose destination is `(xxx).l`. The
-//! recording core leaves its prefetch one word short there — the frame stacks
-//! the pc of the instruction minus its last extension word, and the sweep
-//! charges 4 fewer clocks — which this core's two-slot queue cannot reproduce
-//! without breaking the non-faulted cases' own cycle counts. `MOVE.b` and the
-//! MOVEA/MOVEQ files need no exception skip at all.
+//! every file: the last skip (`MOVE.w`/`MOVE.l` for the faulted store to
+//! `(xxx).l`, #616) is gone — the destination's last extension word now
+//! defers its queue slide and refill behind the store cycle, and a faulting
+//! store cancels both, which is what the recording core's traces show.
 //!
 //! MOVEQ's file is `MOVE.q`, the suite's own spelling: its cases are labelled
 //! like `7cb5 [MOVE.q Q, D6] 1`, so reading the mnemonic off the file name
@@ -27,20 +23,19 @@ fn move_b_file_passes() {
     harness::assert_file_passes("MOVE.b", harness::Check::StateAndCycles);
 }
 
-/// `MOVE.W`: `$3000`-`$3FFF` minus the MOVEA encodings.
-///
-/// One level down, for the faulted-store-to-`(xxx).l` residue described at the
-/// top of the file; everything else in the file checks cycles.
+/// `MOVE.W`: `$3000`-`$3FFF` minus the MOVEA encodings. Full checking, like
+/// every file here: the faulted-store residue this file used to skip (#616)
+/// is covered by the deferred tail pop (see the module docs).
 #[test]
 fn move_w_file_passes() {
-    harness::assert_file_passes("MOVE.w", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MOVE.w", harness::Check::StateAndCycles);
 }
 
-/// `MOVE.L`: `$2000`-`$2FFF` minus the MOVEA encodings. One level down, like
+/// `MOVE.L`: `$2000`-`$2FFF` minus the MOVEA encodings. Full checking, like
 /// [`move_w_file_passes`].
 #[test]
 fn move_l_file_passes() {
-    harness::assert_file_passes("MOVE.l", harness::Check::StateAndCyclesSkipExceptions);
+    harness::assert_file_passes("MOVE.l", harness::Check::StateAndCycles);
 }
 
 /// `MOVEA.W`: destination mode `001` in the word group, word only.

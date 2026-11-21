@@ -404,6 +404,17 @@ pub(crate) enum EaUse {
     /// `ADDX.B -(A0),-(A1)` carries one 2-clock calculation for two
     /// predecrements even though `-(A1)` is read as well as written.
     Destination,
+    /// The operand is the instruction's store target, and the store cycle
+    /// follows the resolve with nothing in between — the move class's shape.
+    /// On the recording core the store takes the bus slot ahead of the last
+    /// extension word's refill (a read does not — see
+    /// [`M68k::land_deferred_ext_word`]), so an `(xxx).l` destination's tail
+    /// word is read off the queue without its slide and refill and lands only
+    /// after a completing store; a faulting store cancels both. Every other
+    /// write operand (ADD's read-modify-write, MOVEM's walk) keeps the plain
+    /// [`EaUse::Destination`] resolve: their last ext pop is followed by a read
+    /// or nothing, and the suite pins the full charge there.
+    StoreDestination,
 }
 
 impl M68k {
@@ -437,7 +448,8 @@ impl M68k {
         reg: u8,
         size: Size,
     ) -> Option<Ea> {
-        self.resolve_ea_for(bus, mode, reg, size, EaUse::Source)
+        self.resolve_ea_for(bus, mode, reg, size, EaUse::Source, false)
+            .map(|(ea, _)| ea)
     }
 
     /// Resolve the EA field an instruction writes its result to.
@@ -455,11 +467,43 @@ impl M68k {
         reg: u8,
         size: Size,
     ) -> Option<Ea> {
-        self.resolve_ea_for(bus, mode, reg, size, EaUse::Destination)
+        self.resolve_ea_for(bus, mode, reg, size, EaUse::Destination, false)
+            .map(|(ea, _)| ea)
     }
 
-    /// The shared body of [`M68k::resolve_ea`] and [`M68k::resolve_ea_write`];
-    /// `use_` is why those two differ, and is documented on [`EaUse`].
+    /// [`M68k::resolve_ea_write`] for an instruction whose store follows the
+    /// resolve immediately (the move class): also reports whether the last
+    /// extension word was **deferred** — taken off the queue back without its
+    /// slide and refill (see [`EaUse::StoreDestination`] and
+    /// [`M68k::land_deferred_ext_word`]). The caller must land the tail after a
+    /// completing store; a faulting store leaves it cancelled.
+    ///
+    /// The tail is deferred only for `(xxx).l`, the one destination that
+    /// consumes two extension words, and only when `defer_tail` says so — the
+    /// caller saw a source operand **read off the bus** before this resolve.
+    /// Both halves are suite-pinned: a faulted `(d16,An)` or `(xxx).w`
+    /// destination never defers (single ext word; `3b5e [MOVE.w (A6)+, (d16,
+    /// A5)] 9` charges the dest word's refill and stacks the post-slide `pc`),
+    /// and a faulted store whose source is register-direct or immediate never
+    /// defers either (`33c1 [MOVE.w D1, (xxx).l] 3196` charges both dest refills
+    /// and stacks the full-slide `pc`, as does `33fc [MOVE.w #, (xxx).l] 1109`).
+    pub(crate) fn resolve_store_destination(
+        &mut self,
+        bus: &mut impl Bus,
+        mode: u8,
+        reg: u8,
+        size: Size,
+        defer_tail: bool,
+    ) -> Option<(Ea, bool)> {
+        self.resolve_ea_for(bus, mode, reg, size, EaUse::StoreDestination, defer_tail)
+    }
+
+    /// The shared body of [`M68k::resolve_ea`], [`M68k::resolve_ea_write`] and
+    /// [`M68k::resolve_store_destination`]; `use_` is why those differ, and is
+    /// documented on [`EaUse`]. The boolean is `true` only when the resolve
+    /// deferred an `(xxx).l` destination's tail word, which needs `use_` to be
+    /// [`EaUse::StoreDestination`] and `defer_tail` to hold — see
+    /// [`EaUse::StoreDestination`] for what the caller has to have seen.
     fn resolve_ea_for(
         &mut self,
         bus: &mut impl Bus,
@@ -467,20 +511,25 @@ impl M68k {
         reg: u8,
         size: Size,
         use_: EaUse,
-    ) -> Option<Ea> {
+        defer_tail: bool,
+    ) -> Option<(Ea, bool)> {
+        debug_assert!(
+            !defer_tail || use_ == EaUse::StoreDestination,
+            "only a store-immediately destination can defer its tail"
+        );
         let r = usize::from(reg);
         match mode {
-            0b000 => Some(Ea::DataReg(reg)),
+            0b000 => Some((Ea::DataReg(reg), false)),
             0b001 => Ea::AddrReg(reg)
                 .accepts_size(size)
-                .then_some(Ea::AddrReg(reg)),
-            0b010 => Some(Ea::Mem(self.a[r])),
+                .then_some((Ea::AddrReg(reg), false)),
+            0b010 => Some((Ea::Mem(self.a[r]), false)),
             0b011 => {
                 // Postincrement: the current value is the address, then the
                 // register moves past the operand.
                 let addr = self.a[r];
                 self.set_an(reg, self.a[r].wrapping_add(ea_step(reg, size)));
-                Some(Ea::Mem(addr))
+                Some((Ea::Mem(addr), false))
             }
             0b100 => {
                 // Predecrement: the register moves first, then the new value is
@@ -490,16 +539,16 @@ impl M68k {
                 if use_ == EaUse::Source {
                     self.cycles += PREDEC_CALC_CLOCKS;
                 }
-                Some(Ea::Mem(self.a[r]))
+                Some((Ea::Mem(self.a[r]), false))
             }
             // 101 d16(An): one extension word, sign extended, added to An
             // (M68000UM, "Address Register Displacement Addressing Mode").
             0b101 => {
                 let disp = sign_extend_word(self.fetch_ext_word(bus));
-                Some(Ea::Mem(self.a[r].wrapping_add(disp)))
+                Some((Ea::Mem(self.a[r].wrapping_add(disp)), false))
             }
             // 110 d8(An,Xn): one brief extension word, An + Xn + d8.
-            0b110 => Some(Ea::Mem(self.indexed_addr(bus, self.a[r]))),
+            0b110 => Some((Ea::Mem(self.indexed_addr(bus, self.a[r])), false)),
             // 111: the sub-mode comes from the register field of the EA
             // (M68000UM, "Effective Address Calculation", mode 111).
             0b111 => match reg {
@@ -507,34 +556,46 @@ impl M68k {
                 // 0x8000 is 0xFFFF_8000 and reaches the bus as 0x00FF_8000.
                 0b000 => {
                     let addr = sign_extend_word(self.fetch_ext_word(bus));
-                    Some(Ea::Mem(addr))
+                    Some((Ea::Mem(addr), false))
                 }
-                // abs.L: two extension words, high word first.
-                0b001 => {
-                    let addr = self.fetch_ext_long(bus);
-                    Some(Ea::Mem(addr))
-                }
+                // abs.L: two extension words, high word first. For a store that
+                // follows the resolve immediately (the move class) and whose
+                // source was read off the bus, the second word defers its slide
+                // and refill to behind the store cycle (see
+                // [`EaUse::StoreDestination`]): it is already in the queue back,
+                // so [`M68k::queued_ext_word`] hands it over for free.
+                0b001 => match (use_, defer_tail) {
+                    (EaUse::StoreDestination, true) => {
+                        let high = u32::from(self.fetch_ext_word(bus));
+                        let low = u32::from(self.queued_ext_word());
+                        Some((Ea::Mem((high << 16) | low), true))
+                    }
+                    _ => Some((Ea::Mem(self.fetch_ext_long(bus)), false)),
+                },
                 // d16(PC): measured from the extension word's own address, not
                 // from `pc` — see [`M68k::ext_addr`] and
                 // `tests::pc_relative_uses_ext_word_address` for the evidence.
                 0b010 => {
                     let base = self.ext_addr();
                     let disp = sign_extend_word(self.fetch_ext_word(bus));
-                    Some(Ea::Mem(base.wrapping_add(disp)))
+                    Some((Ea::Mem(base.wrapping_add(disp)), false))
                 }
                 // d8(PC,Xn): the indexed form, same base.
                 0b011 => {
                     let base = self.ext_addr();
-                    Some(Ea::Mem(self.indexed_addr(bus, base)))
+                    Some((Ea::Mem(self.indexed_addr(bus, base)), false))
                 }
                 // #imm: the operand *is* the extension word(s). A byte
                 // immediate occupies the low byte of one word, with the high
                 // byte unused (M68000UM, "Immediate Addressing Mode").
-                0b100 => Some(Ea::Imm(match size {
-                    Size::Byte => u32::from(self.fetch_ext_word(bus) as u8),
-                    Size::Word => u32::from(self.fetch_ext_word(bus)),
-                    Size::Long => self.fetch_ext_long(bus),
-                })),
+                0b100 => Some((
+                    Ea::Imm(match size {
+                        Size::Byte => u32::from(self.fetch_ext_word(bus) as u8),
+                        Size::Word => u32::from(self.fetch_ext_word(bus)),
+                        Size::Long => self.fetch_ext_long(bus),
+                    }),
+                    false,
+                )),
                 // 101, 110, 111 are not addressing modes: illegal instruction,
                 // which M1-07 (#15) decodes. Decline without touching anything.
                 _ => None,

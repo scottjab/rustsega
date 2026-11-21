@@ -555,13 +555,17 @@ fn every_instruction_file_in_the_suite_is_enumerated() {
     );
 }
 
-/// The `Check` level the whole-suite gate runs at: state *and* clocks, with the
-/// cases that end in the suite's exception handler left out.
+/// The `Check` level the whole-suite gate runs at: state *and* clocks, every
+/// case.
 ///
-/// State-only would leave the clock tables unmeasured, and the exception cases
-/// cannot be checked at any level until #223 lands, so this is the strictest
-/// level the suite can be held to today.
-const GATE_CHECK: harness::Check = harness::Check::StateAndCyclesSkipExceptions;
+/// State-only would leave the clock tables unmeasured; the exception cases
+/// used to be left out because the core could not take them when the harness
+/// was written, and the level sat at
+/// [`Check::StateAndCyclesSkipExceptions`] until the last of them closed
+/// (#223's campaign: #474 corrected the address-error path, #616's in-flight
+/// prefetch fetch closed the faulted-store residue). The strictest level is
+/// now the level, with `KNOWN_FAILURES` as the only tolerance.
+const GATE_CHECK: harness::Check = harness::Check::StateAndCycles;
 
 /// Files the gate lets fail, each with the issue that carries it, as
 /// `(file, issue)` with a comment saying what fails and on which axis.
