@@ -227,6 +227,15 @@ impl Fifo {
             .map(|entry| u32::from(entry.slots))
             .sum()
     }
+
+    /// The access slots every entry on the queue still owes before it is in
+    /// memory: what [`Vdp::start_running`] spends a DMA on before that DMA's own
+    /// units can move, because "pending FIFO writes take priority" (Nemesis on
+    /// SpritesMind t=1291) and they share the one slot stream. See
+    /// [`Running::Transfer`]'s `drain`.
+    pub(crate) fn slots_owed(&self) -> u32 {
+        self.queue.iter().map(|entry| u32::from(entry.slots)).sum()
+    }
 }
 
 impl Vdp {

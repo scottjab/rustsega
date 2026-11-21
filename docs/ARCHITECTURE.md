@@ -273,8 +273,19 @@ The VDP write FIFO (`crates/vdp/src/fifo.rs`, M4-21a #99) is what makes
   transfer's own start address with nothing lost - that is Nemesis's
   `TestFIFOFullDMATransfer` expected result, pinned by the dma.rs tests of
   #306, and `Vdp::start_running` keeps the order by draining the queue before
-  the first transfer write. What is not modelled is the queue's own slot cost
-  inside the transfer window (#563).
+  the first transfer write. Their drain is part of the transfer's window
+  (#563): "pending FIFO writes take priority" (same post), so on hardware the
+  pushes cannot start behind a full queue and Nemesis's own hardware note is
+  that "when a DMA transfer operation terminates, the FIFO is full of pending
+  writes" - his freeze ends at the last push, with the last four words still
+  in flight. This window is landing-based like the fill's and the copy's, so
+  it charges the drain in full and stays a couple of slots long against that
+  push reading by at most the last four words, uniform in the queue; that
+  push-vs-landing corner is fenced with the status-bits-mid-transfer residue
+  of #563. A fill waits the same way - its steps "will only ever run at an
+  access slot if the FIFO is empty" (same post), and the write that triggers
+  it is one of the entries it waits behind - while a copy has no such wait:
+  Nemesis advances it with no FIFO condition at all.
 
 ### VDP DMA timing
 
@@ -294,8 +305,10 @@ the access slots of `slots.rs` rather than inside the call that started them
   A fill pays one slot of every line and moves nothing.
 * A 68k transfer freezes the 68k for its whole length, and
   `dma_68k_stall_mclk` is how long: the time to the last of the transfer's
-  slots. A fill and a copy hold the 68k off the data port instead, which is
-  what status bit 1 says, and report no stall.
+  slots. A transfer started behind the port's queued writes also pays their
+  drain first (#563), two slots a queued VRAM word and one a CRAM or VSRAM
+  word, on the same slot schedule. A fill and a copy hold the 68k off the
+  data port instead, which is what status bit 1 says, and report no stall.
 * A transfer's source words are read when it starts, because `advance` has no
   bus to read them with and the frozen 68k cannot change them meanwhile. That is
   a promise `DmaBus` carries: a read may not do anything the first of them would
