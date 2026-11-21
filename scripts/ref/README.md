@@ -521,6 +521,17 @@ Two caveats about the sweep, both paid for:
   the hit, which is what makes an anchored dump possible. It is also why an anchor that
   is never reached hangs the reference instead of failing it; our half carries a scanline
   budget and says `arrival N of 0x... never happened inside M scanlines`.
+- **The reference hears the desktop's gamepads.** Blastem binds the session's
+  controllers through SDL and delivers what they emit whenever its window has
+  focus. The harness runs no input on purpose, so one stray axis report from an
+  idle pad is enough to steer the cart's attract loop and make the reference's
+  memories disagree with its own clean run of the same cart: #648 chased a
+  908 bytes/frame "regression" on Road Rash II whose 908 bytes lived entirely in
+  the reference half, our side byte-identical across every run, the reference
+  different only in the runs the desktop was in use for. `run-ref.sh` now binds
+  no pad at all (`SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT` names a device that
+  cannot exist); a transcript that shows a "Joystick N added" line is a run
+  whose input was not fenced and whose bytes you should not compare.
 - **`HOME` is isolated, deliberately.** blastem writes `~/.gen` (its config) on first
   run, and the config decides `ram_init`, `default_region` and `force_region`.
   `run-ref.sh` gives it a throwaway `HOME` so every run uses the shipped defaults -
