@@ -138,6 +138,15 @@ impl Vdp {
             // segment by segment so that the line they are counted against is the
             // line the beam is on (`dma::Vdp::dma_clock`).
             self.dma_clock(self.line_mclk, self.line_mclk + step);
+            // The sprite slots of the chunk count as sprite processing only while
+            // the display is on (R1 bit 6, #566): the window they belong to is the
+            // accumulator `latch_line_state` and `render_sprite_line` spend. No
+            // register write happens inside `advance`, so a display that toggles
+            // between two calls is exact at the granularity of the chunks here.
+            if !self.display_enabled() {
+                self.sprite_slots_display_off_mclk =
+                    self.sprite_slots_display_off_mclk.saturating_add(step);
+            }
             self.line_mclk += step;
             left -= step;
 
@@ -265,8 +274,11 @@ impl Vdp {
     }
 
     /// The front-porch point of the line, where status bit 2 comes down.
+    ///
+    /// `pub(crate)` for [`Vdp::sprite_dot_budget`], whose window runs from this
+    /// point to the line end (#566).
     #[inline]
-    fn hblank_clear_mclk(&self) -> u32 {
+    pub(crate) fn hblank_clear_mclk(&self) -> u32 {
         if self.h40() {
             HBLANK_CLEAR_MCLK_H40
         } else {

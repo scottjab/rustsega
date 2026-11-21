@@ -44,6 +44,7 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::hv::MCLKS_PER_LINE;
 use crate::pattern::{NameEntry, read_word, tile_row};
 use crate::planes::{CELL_WIDTH, PRIORITY_SHIFT};
 use crate::{InterlaceMode, Vdp, WIDTH_H32, WIDTH_H40};
@@ -616,29 +617,51 @@ impl Vdp {
     /// That is sub-line accuracy, out of scope with the rest of it (#102), and the
     /// sprite ROM is what would have to move it.
     ///
-    /// The chain is followed from entry 0 and stopped at the first zero link or at
-    /// the 80 and 64 entries of [`MAX_SPRITES_H40`] / [`MAX_SPRITES_H32`], exactly as
-    /// [`SpriteList`] walks and stops, and for the same reasons: a link that loops is
-    /// broken by the count, and a link past the table is read rather than stopped at.
+    /// The chain is followed from entry 0 and stopped at the first zero link or
+    /// at the budget of visited entries, which is what the walk is cut by: the
+    /// 80 and 64 entries of [`MAX_SPRITES_H40`] / [`MAX_SPRITES_H32`] scaled by
+    /// the display-enabled clocks of the window that ended at this latch point
+    /// (#566), rounded down, with no floor above zero - Eke's t=851 observation
+    /// that a game expanding its borders with the display OFF "can see that the
+    /// first line of 'active' display does not display sprites" is a window
+    /// that spent all of its slots off, and hardware drew nothing for it
+    /// (Genesis Plus GX `parse_satb_m5` ties the same count to its dot budget,
+    /// `total = max_sprite_pixels >> 2`, where hardware "reduced" it "depending
+    /// on the amount of cycles spent with display disabled"). A window that was
+    /// all display on spends the whole count, as the walk always has; one that
+    /// was all off visits nothing, so the line that draws this list has no
+    /// sprites - including no parse of an X = 1 sprite, which no processed
+    /// sprite can arm. The count is of entries *visited* and not of sprites on
+    /// the line, exactly as [`MAX_SPRITES_H40`] / [`MAX_SPRITES_H32`] always
+    /// were, and a link that loops is still broken by it.
+    ///
     /// The table and the width the search reads are those of the line it runs on,
     /// one line before the line that draws what it read: a write to R5 or R12 during
     /// a line reaches the registers of the next line at once and the sprite list of
     /// that line a line later. That is a corner of the one-line-early rule rather
     /// than a slip of this model, and no source says what hardware does with a SAT
     /// that moves between two lines of a frame.
-    pub(crate) fn search_sprites(&mut self) {
+    pub(crate) fn search_sprites(&mut self, window_display_off_mclk: u32) {
         let base = usize::from(self.sprite_base());
-        let limit = if self.h40() {
+        let full = if self.h40() {
             MAX_SPRITES_H40
         } else {
             MAX_SPRITES_H32
         };
+        // The budget: the entries the window's enabled fraction leaves, floored
+        // and clamped so a beam that jumped past a latch point cannot push the
+        // fraction out of range.
+        let off = window_display_off_mclk.min(MCLKS_PER_LINE);
+        let limit = full * (MCLKS_PER_LINE - off) as usize / MCLKS_PER_LINE as usize;
         let mut searched = SpriteLine::new(self.next_line());
         // The chain in a loop rather than through [`SpriteList`], so that what the
         // walk keeps is the entry itself and not a re-fetch: [`sprite_at`] reads all
         // four fields of an entry, which is what the line that draws it wants.
         let mut index = 0u8;
         loop {
+            if searched.count >= limit {
+                break;
+            }
             let sprite = sprite_at(&self.vram, &self.sprite_cache, base, usize::from(index));
             // "This 'mode' is enabled when the VDP first parses a sprite with an X
             // coordinate of one" (genvdp.txt section 15, "Sprite masking, mode
@@ -650,7 +673,7 @@ impl Vdp {
             }
             let link = sprite.link;
             searched.push(sprite);
-            if link == 0 || searched.count >= limit {
+            if link == 0 {
                 break;
             }
             index = link;
@@ -658,6 +681,33 @@ impl Vdp {
 
         let line = searched.line;
         self.sprite_lines[usize::from(line) & 1] = searched;
+    }
+
+    /// The sprite dot budget of the line being drawn (#566): the full dot limit
+    /// of the display width scaled by the display-enabled clocks of the window
+    /// from the line's own latch point to its end, which is the active display
+    /// and back porch the line's dot processing actually had. Eke, t=851: "the
+    /// maximal number of rendered sprites pixels for the current line" is
+    /// reduced "depending on the amount of cycles spent with display disabled";
+    /// Genesis Plus GX models the same line's budget in vdp_ctrl.c ("Sprite
+    /// rendering is limited if display was disabled during HBLANK"), approximating
+    /// the proportion with a fixed cut where this scales it. The per-line sprite
+    /// count is not scaled: Eke's note names the dot count and the pre-processed
+    /// count of the next line, and GPGX keeps its per-line limit at the display
+    /// width over sixteen.
+    ///
+    /// A line drawn outside the beam - a `render_line` the caller drove directly -
+    /// spent no slots of its own, so it draws with the full limit, as it always
+    /// has. The off clocks are clamped to the window and the arithmetic floors,
+    /// so any disabled clock costs dots and a beam that jumped past a latch point
+    /// cannot push the budget past the full limit.
+    fn sprite_dot_budget(&self, full: usize) -> usize {
+        if !self.line_drawing {
+            return full;
+        }
+        let window = MCLKS_PER_LINE - self.hblank_clear_mclk();
+        let off = self.sprite_slots_display_off_mclk.min(window);
+        full * (window - off) as usize / window as usize
     }
 
     /// The sprites of the line [`Vdp::begin_line`] has started, in the order the
@@ -700,6 +750,14 @@ impl Vdp {
         }
         let searched = &self.sprite_lines[usize::from(self.line) & 1];
         (searched.line == self.line).then_some(searched)
+    }
+
+    /// How many entries the search of `line` left in its list, `None` for a line
+    /// no search has filled: what the budget tests of [`crate::latch`] read.
+    #[cfg(test)]
+    pub(crate) fn searched_entry_count_of(&self, line: u16) -> Option<usize> {
+        let searched = &self.sprite_lines[usize::from(line) & 1];
+        (searched.line == line).then_some(searched.count)
     }
 
     /// Fill `out` with the sprite layer of `line`: one [`u8`] per pixel, bits 5-0
@@ -789,11 +847,16 @@ impl Vdp {
     /// TODO(M4-16 #94): the masking of a sprite at x = 0.
     pub fn render_sprite_line(&mut self, line: u16, out: &mut [u8; WIDTH_H40]) {
         out.fill(0);
-        let (max_sprites, max_dots) = if self.h40() {
-            (MAX_SPRITES_LINE_H40, MAX_DOTS_LINE_H40)
+        let max_sprites = if self.h40() {
+            MAX_SPRITES_LINE_H40
         } else {
-            (MAX_SPRITES_LINE_H32, MAX_DOTS_LINE_H32)
+            MAX_SPRITES_LINE_H32
         };
+        let max_dots = self.sprite_dot_budget(if self.h40() {
+            MAX_DOTS_LINE_H40
+        } else {
+            MAX_DOTS_LINE_H32
+        });
         let prev_line_dot_overflow = self.prev_line_dot_overflow;
         let mode2_seen_x1 = self.mask2_seen_x1;
         let origin_y = self.sprite_y_origin();

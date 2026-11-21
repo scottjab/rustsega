@@ -382,20 +382,39 @@ of every entry:
   holds all 80 entries in both widths - the shrink to 64 in 32-cell mode is only
   TascoDLX's unconfirmed guess of t=851 - and no source says what a link of
   80..=127 reads, so the model falls back to VRAM there (#94).
-* Two more are fenced by #318, with the citations on `Vdp::search_sprites`. The
-  clock of the search inside its line is unmeasured - Mask of Destiny, whose
+* Two more were fenced by #318, with the citations on `Vdp::search_sprites`. The
+  clock of the search inside its line is still unmeasured - Mask of Destiny, whose
   captures pin the fetch slots of the line before, says of the scan itself that
   it leaves him "without any solid reads as to when the VDP scans the cached copy
   of the SAT" - so the model shares the latch point with the scroll tables and
   the mode registers, and a SAT write in the first blanking window of a line is
-  in time for the next line's list until a sprite ROM says otherwise. And the
-  search runs on every line regardless of display enable, where hardware gives
-  sprite processing only the slots of lines the display is on for: Eke (t=851,
+  in time for the next line's list until a sprite ROM says otherwise.
+* The display-off half of that fence shipped as #566's slot budget. Eke (t=851,
   April 2011, verified on hardware) watched the first line after a display-off
-  stretch draw no sprites (Power Instinct), and Genesis Plus GX models the
-  partial case as a budget that shrinks with the cycles spent display-off
-  (Mickey Mania's 3d level, the Overdrive demo). A line-granular model has no
-  slot budget to shrink, so the fence holds until there is one to measure.
+  stretch draw no sprites - "in some games that reduce the active screen height
+  by expanding vertical borders using the display OFF feature, you can see that
+  the first line of 'active' display does not display sprites as well" (the
+  Power Instinct border, Sonic 2 VS's bottom screen) - and Genesis Plus GX
+  models the partial case in vdp_ctrl.c as a budget: the dot count of the line
+  and the pre-processed sprite count of the next line are both "reduced
+  depending on the amount of cycles spent with display disabled". Their code
+  approximates that proportion with one fixed cut (128 dots on a re-enable
+  inside HBLANK); this scales it. `advance` gathers the master clocks every
+  chunk spends with R1 bit 6 off - a register write lands between `advance`
+  calls, so a mid-line toggle (Overdrive 2) is exact at that granularity - and
+  the two sprite moments spend the one accumulator: the search visits at most
+  80/64 entries times the enabled fraction of the window from the previous
+  latch point to its own, which is the sprite processing that had elapsed when
+  it ran (the search is one instant early, above), and `render_sprite_line`
+  draws at most 320/256 dots times the enabled fraction of the line's own
+  latch-point-to-line-end window. The per-line sprite count of 20/16 is not
+  scaled: Eke's note names the other two counts, and GPGX keeps its per-line
+  limit at the display width over sixteen. The documented choices beyond the
+  sources: no floor above zero (Eke's fully-off window is a zero budget, which
+  any floor would break), off clocks clamped to the window so a beam that
+  jumped past a latch point cannot push the fraction out of range, and integer
+  math that floors, so any disabled clock costs budget. Both live on
+  `search_sprites` and `sprite_dot_budget`.
 
 The layer buffer those entries are drawn into is filled a clipped cell run at a
 time, not a tested pixel at a time (#368): the pixels of one cell are a
