@@ -209,7 +209,8 @@ pub(crate) const RESET_B_BIT: u8 = 0x20;
 /// chip, and part II does not decode this address at all.
 ///
 /// `&2C` bit 3 is the bottom bit of the same converter, and [`RegFile::dac_lsb`]
-/// is what answers for it; the rest of `&2C` is fenced (see [`REG_TEST_2C`]).
+/// is what answers for it, as bit 5 is the test-DAC mode
+/// ([`RegFile::test_dac`]); the rest of `&2C` is fenced (see [`REG_TEST_2C`]).
 pub(crate) const REG_DAC_DATA: u8 = 0x2A;
 
 /// Register `&2B`, the DAC control: bit 7 the enable that replaces the FM of
@@ -221,6 +222,11 @@ pub(crate) const REG_DAC_ENABLE: u8 = 0x2B;
 /// `&2B` bit 7: 1 puts [`REG_DAC_DATA`] in place of the FM of channel 6.
 pub(crate) const DAC_ENABLE_BIT: u8 = 0x80;
 
+/// `&2C` bit 5: the test-DAC mode that puts [`REG_DAC_DATA`] in place of the FM
+/// of every channel, [`DAC_ENABLE_BIT`] or not - see [`REG_TEST_2C`] for the
+/// sources, and [`Ym2612::channel_sums`][crate::Ym2612] for the model.
+pub(crate) const TEST_DAC_BIT: u8 = 0x20;
+
 /// Register `&2C`, the OPN2 test register. The OPNA register map has no `&2A`-
 /// `&2C` at all - its FM common registers run `$21` test, `$22` LFO, `$24`-`$27`
 /// timers, `$28` key on, `$29` SCH/IRQ enable, `$2D`-`$2F` prescaler (YM2608
@@ -229,16 +235,31 @@ pub(crate) const DAC_ENABLE_BIT: u8 = 0x80;
 ///
 /// Modelled: bit 3, the bottom bit of the same channel 6 PCM DAC converter
 /// [`RegFile::dac_data`] drives the top eight of ([`RegFile::dac_lsb`], and
-/// [`crate::output::pcm_sample`]).
+/// [`crate::output::pcm_sample`]); and bit 5, the test-DAC mode
+/// ([`RegFile::test_dac`]): with it up, every channel's output window carries
+/// the `&2A` sample regardless of [`DAC_ENABLE_BIT`] - not channel 6 alone.
+/// The OR is what says so, in both sources: Nuked-OPN2's `OPN2_ChOutput`
+/// replaces `out` with `dacdata` for `((cycles >> 2) == 1 && chip->dacen) ||
+/// test_dac`, where the first term is channel 6's window and the second is
+/// every one of them, and drives the pins for `out_en = ((cycles & 3) == 3) ||
+/// test_dac`; the die LLE has `dac_sel = test_dac || (chip->reg_dac_en[1] &&
+/// chip->ch_ch6)` with `do_out = test_dac || chip->ch_load[0]`
+/// (nukeykt/YM2608-LLE `fmopna_impl.c`), where `ch_ch6` - channel 6's window,
+/// `fsm_out[18] || fsm_out[19]` - gates only the DACEN term, and the `ch_buf`
+/// shift line walks every channel's window through the same `ch_val` mux. The
+/// ticket body of #588 read that OR as channel 6's converter alone; the
+/// sources say all six, and the sources win (decision on #588, 19 Nov 2026).
+///
+/// While bit 5 is up both sources also feed the channel accumulators a
+/// constant instead of the operator outputs (Nuked's `add = test_dac`, the
+/// die's `sum1 = add + acc + test_dac`); the crate replaces the sums in front
+/// of the operators instead ([`crate::Ym2612::channel_sums`]), which is the
+/// same observable - the pin shows the sample - and leaves the operators
+/// running.
 ///
 /// Fenced, stored and decoded by nothing
 /// (`test_2c_bits_other_than_3_change_nothing`):
 ///
-/// - bit 5 forces channel 6's converter to the `&2A` value regardless of
-///   [`DAC_ENABLE_BIT`]: `dac_sel = test_dac || (reg_dac_en && ch_ch6)` with
-///   `do_out = test_dac || ch_load[0]` on the die (nukeykt/YM2608-LLE
-///   `fmopna_impl.c`) and `|| test_dac` in Nuked-OPN2's `OPN2_ChOutput`. That is
-///   issue #588's to model, deliberately outside #339.
 /// - bit 7: #339 claimed an IRQ/STATUS disable showing up in `read_status`
 ///   through BUSY, with BUSY surviving it. No reachable source says that:
 ///   Nuked-OPN2's status read is unconditional (`chip->status = (chip->busy <<
@@ -488,6 +509,13 @@ impl RegFile {
     /// for what else that register holds and why nothing else of it decodes).
     pub(crate) fn dac_lsb(&self) -> bool {
         self.read(PART_I, REG_TEST_2C) & 0x08 != 0
+    }
+
+    /// `&2C` bit 5, the test-DAC mode: every channel's converter answers with
+    /// [`RegFile::dac_data`] regardless of [`RegFile::dac_enabled`]
+    /// (`Ym2612::channel_sums`; [`REG_TEST_2C`] for the sources).
+    pub(crate) fn test_dac(&self) -> bool {
+        self.read(PART_I, REG_TEST_2C) & TEST_DAC_BIT != 0
     }
 
     /// The routing of channel `channel`: [`PAN_LEFT`] and [`PAN_RIGHT`] as the
