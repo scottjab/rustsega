@@ -641,6 +641,13 @@ ports) it inherits the 68k's answer through the same dispatch.
   pays out at 0.75 of a frame (`SLACK`), which keeps the debt a quarter
   frame clear of both edges on 60, 120 and 30 Hz displays without drift:
   1 frame on 1198 of 1200 ticks, 0 ring underruns.
+  On an iPhone the rest was the origin, not our code: the same build over
+  `http://` to a tailnet IP took 50 ms a frame (19 fps) and ran a plain JS
+  loop 18x slower than over `https://`, where a frame took 4.8 ms at 60 fps.
+  Safari ran the insecure page without its JIT, and an insecure page has no
+  `AudioWorkletNode` either. The shell warns once at start-up when
+  `isSecureContext` is false (`crates/web/src/secure_origin.rs`); serve the
+  binary behind https (`tailscale serve`, a reverse proxy) for Safari.
 - Input: one `InputState` that merges keyboard, Gamepad API, and touch
   overlay into `Buttons` per port. All bindings are rebindable and stored in
   `localStorage`.
