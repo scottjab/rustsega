@@ -86,6 +86,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bus::Bus;
 use crate::config::Region;
+use crate::refresh::Refresh;
 use crate::z80_bus::Z80View;
 use m68k::M68k;
 use z80::Z80;
@@ -203,6 +204,9 @@ pub struct Scheduler {
     /// IPL between its two writes, so a `MOVE.L` whose second word is the
     /// enabling write would see the level one instruction sooner.
     ipl_held: bool,
+    /// The 68000's DRAM refresh count, which takes 2 of every 128 of its clocks
+    /// ([`crate::refresh`], #665).
+    refresh: Refresh,
 }
 
 impl Scheduler {
@@ -227,6 +231,7 @@ impl Scheduler {
             z80_frozen_until: 0,
             vdp_clock: 0,
             ipl_held: false,
+            refresh: Refresh::default(),
             lines_per_frame: if region.is_pal() {
                 LINES_PER_FRAME_PAL
             } else {
@@ -360,6 +365,7 @@ impl Scheduler {
                 // The address the instruction is retired *from* is what makes an
                 // arrival an arrival: see [`Stop::Pc`].
                 let from = cpu.pc;
+                let started = self.m68k_clock;
                 let offered = bus.vdp.pending_irq();
                 let cycles = cpu.step(bus);
                 arrived = stop.arrived(from, cpu.pc);
@@ -383,7 +389,18 @@ impl Scheduler {
                 // was just charged in: the access is over, and it is the chip that
                 // is held.
                 Self::charge_mclk(&mut self.m68k_clock, bus.take_68k_stall());
+                // The refresh delay is owed on the instruction's time and its bus
+                // waits alike; see [`crate::refresh`].
+                let owed = self.refresh.charge(
+                    self.m68k_clock - started,
+                    bus.take_vdp_accesses_68k(),
+                    MASTER_CLOCKS_PER_68K,
+                );
+                self.m68k_clock += owed;
                 let held = bus.take_68k_hold();
+                if held > 0 {
+                    self.refresh.restart();
+                }
                 let beam = self.vdp_clock;
                 Self::freeze(&mut self.m68k_frozen_until, beam, held);
                 bus.io.set_time(self.m68k_clock / MASTER_CLOCKS_PER_68K);
@@ -726,6 +743,14 @@ mod tests {
     }
 
     /// `move.w #$100, (Z80Reset)` - let the sound CPU go.
+    /// `work` master clocks of 68000 instructions with no VDP access, plus the
+    /// DRAM refresh delays they owe: 2 68000 clocks for every whole 128
+    /// ([`crate::refresh`], #665).
+    fn with_refresh(work: u64) -> u64 {
+        let interval = crate::refresh::INTERVAL_68K * MASTER_CLOCKS_PER_68K;
+        work + work / interval * crate::refresh::DELAY_68K * MASTER_CLOCKS_PER_68K
+    }
+
     fn release_z80_reset(bus: &mut Bus) {
         bus.write_word(Z80_RESET, 0x0100);
     }
@@ -945,8 +970,10 @@ mod tests {
         // the loop iterations the master clock pays for. A line that clamped the 68k
         // back to the line end instead of carrying its overshoot would lose two master
         // clocks a line and fit 7336 iterations into the frame instead of 7112.
+        // On top of the loop, the DRAM refresh takes its 2 of every 128 clocks
+        // ([`crate::refresh`], #665), which is where 7112 went to 7003.
         let iteration = 18 * MASTER_CLOCKS_PER_68K;
-        let iterations = u64::from(cpu.d[0]) * iteration;
+        let iterations = with_refresh(u64::from(cpu.d[0]) * iteration);
         assert!(
             iterations.abs_diff(s.m68k_clock) <= iteration,
             "{} loop iterations of {iteration} master clocks is not {}",
@@ -1566,7 +1593,9 @@ mod tests {
         // The freeze and the loop share the line budget, so the iterations the
         // freeze cost are the freeze: `reported` master clocks, to within the one
         // instruction each of the two runs may have run past the last line.
-        let lost = u64::from(free - held) * LOOP_68K;
+        // The loop time lost carries the refresh delays it would have paid; the
+        // frozen 68000 pays none ([`crate::refresh`], #665).
+        let lost = with_refresh(u64::from(free - held) * LOOP_68K);
         assert!(
             lost.abs_diff(u64::from(reported)) <= 3 * LOOP_68K,
             "{lost} master clocks of loop lost to a freeze of {reported}"

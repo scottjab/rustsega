@@ -831,6 +831,12 @@ pub struct Bus {
     /// freeze again on every report of it. The data port's full-FIFO wait is
     /// beam-relative too and is still here - see [`Bus::vdp_data_write`].
     pending_68k_stall: u32,
+    /// VDP port accesses the 68000 made in the instruction being stepped, which
+    /// the scheduler takes after every step: a DRAM refresh that falls inside
+    /// one costs the 68000 nothing ([`crate::refresh`], #665). Always 0 between
+    /// instructions, so a save state has nothing to carry.
+    #[serde(skip)]
+    vdp_accesses_68k: u32,
     /// The sound CPU's half of [`Bus::pending_68k_stall`]: the extra T-states a
     /// Z80 access to the 68k bus costs the Z80 ([`Z80_WINDOW_WAIT_MCLK`]). Taken
     /// after every Z80 step by the scheduler ([`Bus::take_z80_stall`]).
@@ -962,6 +968,7 @@ impl Bus {
             tmss_unlocked: false,
             locked_up: false,
             pending_68k_stall: 0,
+            vdp_accesses_68k: 0,
             pending_z80_stall: 0,
             pending_68k_hold: 0,
             pending_z80_hold: 0,
@@ -1210,6 +1217,12 @@ impl Bus {
     /// are: the access was answered, and the chip was simply not allowed to do
     /// anything else for a while. See [`Bus::pending_68k_stall`] for what goes
     /// into the total.
+    /// Take [`Bus::vdp_accesses_68k`], the VDP port accesses of the 68000
+    /// instruction just stepped, and clear it.
+    pub fn take_vdp_accesses_68k(&mut self) -> u32 {
+        std::mem::take(&mut self.vdp_accesses_68k)
+    }
+
     pub fn take_68k_stall(&mut self) -> u32 {
         std::mem::take(&mut self.pending_68k_stall)
     }
@@ -2538,7 +2551,10 @@ impl m68k::Bus for Bus {
             // fill the stub in and lose it - see [`Bus::vdp_access_denied`].
             Region::Vdp if self.vdp_access_denied() => self.open_bus_byte(addr),
             Region::Vdp if self.vdp_hang(addr) => self.open_bus_byte(addr),
-            Region::Vdp => self.read_vdp_byte(addr),
+            Region::Vdp => {
+                self.vdp_accesses_68k += 1;
+                self.read_vdp_byte(addr)
+            }
             Region::Z80 => self.read_z80_byte(addr),
             Region::Io => self.read_io_byte(addr),
             Region::Z80Ctrl => self.read_z80_ctrl_byte(addr),
@@ -2557,7 +2573,10 @@ impl m68k::Bus for Bus {
             // TMSS, and see the note on [`Bus::read_byte`].
             Region::Vdp if self.vdp_access_denied() => self.open_bus_word(),
             Region::Vdp if self.vdp_hang(addr) => self.open_bus_word(),
-            Region::Vdp => self.read_vdp_word(addr),
+            Region::Vdp => {
+                self.vdp_accesses_68k += 1;
+                self.read_vdp_word(addr)
+            }
             Region::Z80 => self.read_z80_word(addr),
             Region::Io => self.read_io_word(addr),
             Region::Z80Ctrl => self.read_z80_ctrl_word(addr),
@@ -2576,7 +2595,10 @@ impl m68k::Bus for Bus {
             // TMSS, and see the note on [`Bus::read_byte`].
             Region::Vdp if self.vdp_access_denied() => {}
             Region::Vdp if self.vdp_hang(addr) => {}
-            Region::Vdp => self.write_vdp_byte(addr, value),
+            Region::Vdp => {
+                self.vdp_accesses_68k += 1;
+                self.write_vdp_byte(addr, value);
+            }
             Region::Z80 => self.write_z80_byte(addr, value),
             Region::Io => self.write_io_byte(addr, value),
             Region::Z80Ctrl => self.write_z80_ctrl_byte(addr, value),
@@ -2595,7 +2617,10 @@ impl m68k::Bus for Bus {
             // TMSS, and see the note on [`Bus::read_byte`].
             Region::Vdp if self.vdp_access_denied() => {}
             Region::Vdp if self.vdp_hang(addr) => {}
-            Region::Vdp => self.write_vdp_word(addr, value),
+            Region::Vdp => {
+                self.vdp_accesses_68k += 1;
+                self.write_vdp_word(addr, value);
+            }
             Region::Z80 => self.write_z80_word(addr, value),
             Region::Io => self.write_io_word(addr, value),
             Region::Z80Ctrl => self.write_z80_ctrl_word(addr, value),
