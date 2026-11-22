@@ -69,6 +69,8 @@ const NO_CARTRIDGE: &str = "No cartridge loaded";
 pub fn App() -> impl IntoView {
     let toasts = Toasts::default();
     provide_context(toasts);
+    // An http page runs slowly on Safari and nowhere says why (#629).
+    crate::secure_origin::warn_if_insecure(toasts);
 
     let drawer_open = RwSignal::new(false);
 

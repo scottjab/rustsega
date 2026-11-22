@@ -43,6 +43,7 @@ pub mod rom;
 pub mod rom_picker;
 pub mod scale;
 pub mod screen;
+pub mod secure_origin;
 pub mod settings;
 pub mod slots;
 pub mod srm;
