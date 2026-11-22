@@ -105,7 +105,7 @@ pub fn frames_per_block_for(user_agent: &str) -> u32 {
 }
 
 /// The scheduled-ahead amount a batched browser aims for: one whole batch, plus
-/// two frames of room for the pacer to see the deficit and run before the play
+/// three frames of room for the pacer to see the deficit and run before the play
 /// head reaches the cursor.
 ///
 /// The why is measured (#629): a batched cursor advances only once per batch, so
@@ -113,12 +113,19 @@ pub fn frames_per_block_for(user_agent: &str) -> u32 {
 /// lead while the batcher is still gathering. At the plain [`TARGET_AHEAD_SECS`]
 /// the lead's floor lands right on the too-late line and the schedule restarts
 /// about twice a second; at one-batch-plus-two the floor sits three frames
-/// clear. Unbatched browsers keep [`TARGET_AHEAD_SECS`].
+/// clear.
+///
+/// The third frame came with [`lead_secs`] counting the batcher's pending frames
+/// (#629): a batch now flushes the tick the lead needs it instead of a tick
+/// late, so the cursor sits up to a batch lower than before and one batch plus
+/// two placed blocks only 33 ms ahead. Plus three puts that back at 50 ms. The
+/// total lead is still lower than the burst-paced loop ran at, which held the
+/// cursor 110-145 ms ahead. Unbatched browsers keep [`TARGET_AHEAD_SECS`].
 pub fn target_ahead_secs(frames_per_block: u32, frame_secs: f64) -> f64 {
     if frames_per_block <= 1 {
         TARGET_AHEAD_SECS
     } else {
-        (f64::from(frames_per_block) + 2.0) * frame_secs
+        (f64::from(frames_per_block) + 3.0) * frame_secs
     }
 }
 
@@ -184,6 +191,33 @@ impl BlockBatcher {
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
+
+    /// How many interleaved samples are gathered but not yet handed out as a
+    /// block: the sound [`lead_secs`] has to count, because the console has
+    /// already made it even though no block carries it yet.
+    pub fn pending_samples(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// How far ahead of the play head the console's sound reaches, seconds: the
+/// scheduled part (`next_time - now`, the cursor minus `currentTime`) plus the
+/// `pending_samples` a [`BlockBatcher`] is still holding, at `samples_per_sec`
+/// interleaved samples a second (sample rate times channels).
+///
+/// The pending part is what keeps a batched schedule paced one frame per tick
+/// (#629). Leave it out and the lead only moves when a whole batch flushes:
+/// the pacer sees no progress for the frames it ran into the batcher, runs
+/// them again on the next tick, and then sits idle while the flushed batch
+/// drains - the `0 0 1 2 0 0 1 2 3` frames-per-tick pattern that showed on
+/// Safari as dropped frames, because a tick paints only its last frame.
+pub fn lead_secs(next_time: f64, now: f64, pending_samples: usize, samples_per_sec: f64) -> f64 {
+    let pending_secs = if samples_per_sec > 0.0 {
+        pending_samples as f64 / samples_per_sec
+    } else {
+        0.0
+    };
+    next_time - now + pending_secs
 }
 
 /// Splits interleaved stereo `i16` into two `f32` channels.
@@ -509,12 +543,12 @@ mod tests {
         assert_eq!(target_ahead_secs(0, PAL), TARGET_AHEAD_SECS);
     }
 
-    /// Batched blocks get one batch plus two frames: 4 NTSC frames of batch +
-    /// 2 of room = 6 frames of lead, PAL 6 fiftieths.
+    /// Batched blocks get one batch plus three frames: 4 NTSC frames of batch +
+    /// 3 of room = 7 frames of lead, PAL 7 fiftieths.
     #[test]
-    fn a_batched_browser_gets_a_batch_plus_two_frames() {
-        assert_eq!(target_ahead_secs(WEBKIT_FRAMES_PER_BLOCK, NTSC), 6.0 * NTSC);
-        assert_eq!(target_ahead_secs(WEBKIT_FRAMES_PER_BLOCK, PAL), 6.0 * PAL);
+    fn a_batched_browser_gets_a_batch_plus_three_frames() {
+        assert_eq!(target_ahead_secs(WEBKIT_FRAMES_PER_BLOCK, NTSC), 7.0 * NTSC);
+        assert_eq!(target_ahead_secs(WEBKIT_FRAMES_PER_BLOCK, PAL), 7.0 * PAL);
     }
 
     /// Where the lead bottoms out over a batch cycle: a batched cursor only
@@ -547,9 +581,12 @@ mod tests {
         );
     }
 
-    /// At the batched target - one batch plus two frames - the floor sits two
-    /// frames clear of the line: 100 ms - 3 frames = 50 ms, which is what the
-    /// re-measured WebKit window ran on (0 restarts in 60 s).
+    /// At the batched target the floor sits clear of the line. In this
+    /// burst-paced model it was 100 ms - 3 frames = 50 ms at the original
+    /// one-batch-plus-two, which is what the re-measured WebKit window ran on
+    /// (0 restarts in 60 s). Since the lead counts pending frames, the loop
+    /// model's `a_batched_loop_places_every_block_two_frames_clear_of_the_line`
+    /// is the floor that applies.
     #[test]
     fn the_batched_target_holds_the_floor_clear_of_the_line() {
         let target = target_ahead_secs(WEBKIT_FRAMES_PER_BLOCK, NTSC);
@@ -564,5 +601,103 @@ mod tests {
         assert!(
             batched_floor(pal_target, WEBKIT_FRAMES_PER_BLOCK, PAL) > UNDERRUN_SECS + 2.0 * PAL
         );
+    }
+
+    /// One console frame of 48 kHz stereo at 60 Hz, interleaved samples.
+    const FRAME_SAMPLES: usize = 1600;
+    /// 48 kHz stereo, interleaved samples a second.
+    const SAMPLES_PER_SEC: f64 = 96_000.0;
+
+    #[test]
+    fn pending_frames_count_toward_the_lead() {
+        let lead = lead_secs(1.0, 0.9, 2 * FRAME_SAMPLES, SAMPLES_PER_SEC);
+        assert!((lead - (0.1 + 2.0 / 60.0)).abs() < 1e-9, "lead {lead}");
+    }
+
+    #[test]
+    fn an_empty_batcher_adds_nothing_to_the_lead() {
+        let batch = BlockBatcher::new(4, FRAME_SAMPLES);
+        assert_eq!(batch.pending_samples(), 0);
+        assert_eq!(lead_secs(1.0, 0.9, 0, SAMPLES_PER_SEC), 1.0 - 0.9);
+    }
+
+    #[test]
+    fn a_batcher_reports_what_it_holds_until_it_flushes() {
+        let mut batch = BlockBatcher::new(4, FRAME_SAMPLES);
+        let frame = [0i16; FRAME_SAMPLES];
+        for held in 1..4 {
+            assert!(batch.push(&frame).is_none());
+            assert_eq!(batch.pending_samples(), held * FRAME_SAMPLES);
+        }
+        assert!(batch.push(&frame).is_some());
+        assert_eq!(batch.pending_samples(), 0);
+    }
+
+    /// The emulator's audio-paced loop, modelled the way `AudioOut` and
+    /// `Emulator::frames_due` run it: a play head moving in real time, one
+    /// display tick every 60th of a second, [`frames_to_run`] deciding each
+    /// tick from [`lead_secs`], every frame pushed through a [`BlockBatcher`],
+    /// and a flushed block placed at the cursor with `AudioOut::schedule`'s
+    /// too-late re-seat (10 ms line, 50 ms restart). Returns the frames each
+    /// tick ran and the lowest scheduled lead (cursor minus play head) any
+    /// block was placed against, both after a second of settling.
+    fn run_loop(frames_per_block: u32) -> (Vec<u32>, f64) {
+        let frame_secs = 1.0 / 60.0;
+        let target = target_ahead_secs(frames_per_block, frame_secs);
+        let mut batch = BlockBatcher::new(frames_per_block, FRAME_SAMPLES);
+        let frame = [0i16; FRAME_SAMPLES];
+        let mut next_time = 0.05;
+        let mut ran = Vec::new();
+        let mut floor = f64::INFINITY;
+        for tick in 0..660 {
+            let now = f64::from(tick) * frame_secs;
+            let lead = lead_secs(next_time, now, batch.pending_samples(), SAMPLES_PER_SEC);
+            let due = frames_to_run(lead, target, frame_secs, MAX_FRAMES_PER_TICK);
+            for _ in 0..due {
+                if let Some(block) = batch.push(&frame) {
+                    if tick >= 60 {
+                        floor = floor.min(next_time - now);
+                    }
+                    if next_time < now + 0.01 {
+                        next_time = now + 0.05;
+                    }
+                    next_time += block.len() as f64 / SAMPLES_PER_SEC;
+                }
+            }
+            if tick >= 60 {
+                ran.push(due);
+            }
+        }
+        (ran, floor)
+    }
+
+    fn frames_per_tick(frames_per_block: u32) -> Vec<u32> {
+        run_loop(frames_per_block).0
+    }
+
+    /// Counting the pending frames (#629) means a batch flushes the moment the
+    /// lead needs it rather than a tick late, so the scheduled part of the lead
+    /// runs lower than the burst-paced loop let it. The target has to keep the
+    /// lowest point a block is placed at two frames clear of the 10 ms
+    /// too-late line, the same margin the measured WebKit window ran on.
+    #[test]
+    fn a_batched_loop_places_every_block_two_frames_clear_of_the_line() {
+        let (_, floor) = run_loop(WEBKIT_FRAMES_PER_BLOCK);
+        assert!(
+            floor > UNDERRUN_SECS + 2.0 * NTSC,
+            "blocks placed as close as {floor} s to the play head"
+        );
+    }
+
+    #[test]
+    fn a_batched_loop_runs_one_frame_every_tick() {
+        let ran = frames_per_tick(WEBKIT_FRAMES_PER_BLOCK);
+        assert!(ran.iter().all(|&due| due == 1), "frames per tick: {ran:?}");
+    }
+
+    #[test]
+    fn an_unbatched_loop_runs_one_frame_every_tick() {
+        let ran = frames_per_tick(1);
+        assert!(ran.iter().all(|&due| due == 1), "frames per tick: {ran:?}");
     }
 }
