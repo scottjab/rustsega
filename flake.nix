@@ -85,7 +85,7 @@
             pname = "rustsega-web-dist";
             version = workspaceVersion;
             inherit src;
-            hash = "sha256-h6qzFnXKtiIAU4Qd6KuCx/4+6LkbIAXRSp/zPt+Lmm0=";
+            hash = "sha256-+Vq0WKBWL0TsZGzyhx0bkYm59SunAq/Evgs2rJ3g4as=";
           };
 
           # cargo and rustc are this flake's pinned toolchain - the whole
