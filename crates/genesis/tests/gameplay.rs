@@ -71,6 +71,18 @@
 //! No checkpoint key moved, and the #633 differ-check (the three checkpoints
 //! of every section differing from each other) still passes.
 //!
+//! # Movement: the DRAM refresh delay of #665
+//!
+//! #665 charges the 68000 2 clocks of DRAM refresh every 128 (the reference's
+//! model, and the cartridge figure of the SpritesMind "68K Refresh Delays"
+//! measurements), so every game runs about 1.5% less 68000 per frame. That
+//! moves 13 checkpoint pictures and all five audio keys. Every changed
+//! checkpoint was looked at before the re-bless: all five movies still play
+//! into their level (Sonic in Green Hill, Sonic and Tails in Emerald Hill, Axel
+//! mid-fight, Gunstar mid-level, the Thunder Force IV ship in stage 1), and
+//! the differences are the animation phase of what is on screen. Re-blessed with
+//! maintainer authorisation; the old and new values are in the #665 PR.
+//!
 //! # Running it
 //!
 //! It needs cartridges, so CI skips it; a ROM that is not on disk is a skip,

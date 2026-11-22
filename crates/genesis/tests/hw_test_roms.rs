@@ -280,7 +280,11 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 /// model answering undriven reads with it), and #530 (the `DBcc` counter-
 /// expiry exit re-timed from 12 to 14 clocks per yacht.txt Line 0101's
 /// "counter exp" row — the memtest's own report loops are `DBcc`-driven, so
-/// the +2 per expiry shifts the report's content).
+/// the +2 per expiry shifts the report's content), and #665 (the 68000's DRAM
+/// refresh delay, 2 clocks every 128: only the `C00008-C0000F` row moved,
+/// `C014 C01E` -> `C01F C02A`, which is the HV counter read back and the one
+/// row whose template says `C0?? C0??`; `0x4c91d39216b347aa` ->
+/// `0x1941ea2a31921dfa`, maintainer approved on #665).
 #[test]
 fn md_test_pack_memtest_68k_prints_its_memory_report() {
     check(
@@ -323,6 +327,11 @@ fn md_test_pack_stetest_draws_its_sprite_field() {
 
 /// `STETEST2.bin`: the other sprite-table test, on its 240-frame animation
 /// cycle; see [`md_test_pack_stetest_draws_its_sprite_field`].
+///
+/// #665 (the 68000's DRAM refresh delay) moved it: the new frame 60 is pixel
+/// for pixel the old frame 59, the animation one step behind with the 68000
+/// 1.5% slower (`0xe3182324333d349a` -> `0x5453483f21aec04a`, maintainer
+/// approved on #665).
 #[test]
 fn md_test_pack_stetest2_draws_its_sprite_field() {
     check(
