@@ -22,7 +22,7 @@ pub fn Toggle(
             type="button"
             class="toggle"
             role="switch"
-            attr:aria-checked=move || checked.get().to_string()
+            aria-checked=move || checked.get().to_string()
             on:click=move |_| on_toggle.run(())
         >
             <span class="toggle__track" aria-hidden="true">

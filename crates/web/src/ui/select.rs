@@ -198,7 +198,7 @@ pub fn Select(
                                     type="button"
                                     class="listbox__option"
                                     role="option"
-                                    attr:aria-selected=move || picked.get().to_string()
+                                    aria-selected=move || picked.get().to_string()
                                     on:click=move |_| {
                                         on_change.run(value.clone());
                                         lists.shut(number);
