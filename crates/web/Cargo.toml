@@ -18,6 +18,10 @@ console_error_panic_hook = "0.1"
 # The console: its cartridge header parser is what `rom.rs` reads a ROM with
 # (M3-01, #61). It builds for wasm32 like every core crate.
 genesis = { path = "../genesis" }
+# TASVideos movies for the replay picker: BizHawk .bk2, Gens .gmv and the .zip
+# around them (#673). Pure Rust; its one dependency, miniz_oxide, builds for
+# wasm32 and is already in the lock file.
+tas = { path = "../tas" }
 # The frame the canvas draws is `vdp::FrameBuffer`, and naming its type here is
 # the only way to say what the draw path converts (M7-04, #137). `genesis`
 # already reaches the browser through it; this is a path dependency, not a new

@@ -853,3 +853,54 @@ fn changes_are_keyed_by_frame() {
     assert_eq!(*back.changes(), expected);
     assert_eq!(back.region(), Region::Europe);
 }
+
+/// A movie can say a pad is a 6-button pad even if it never presses X, Y, Z or
+/// Mode: the `six-button` header line (#673). A TAS recorded on a 6-button pad
+/// has to replay on one, because the game can tell, so the walk sees the
+/// 6-button pad's 6th-step `0000` with only Up held.
+#[test]
+fn a_movie_that_says_six_button_replays_on_a_six_button_pad_without_the_letters() {
+    let rom = pad6_walker(IO_DATA_1, PAD6_WALK);
+    let mut movie = Movie::new(movie::rom_hash(&rom), Region::Usa, PADS);
+    movie.set(0, &[Buttons::UP]);
+    movie.set_six_button(0);
+    let mut machine = Genesis::new(&rom, Config::default()).expect("fake ROM loads");
+    movie.set_pads(&mut machine, 0);
+    machine.run_frame();
+    assert_eq!(
+        walk_bytes(&machine, PAD6_WALK),
+        [0x7E, 0x32, 0x7E, 0x32, 0x7E, 0x30, 0x7F, 0x3F],
+        "6th step 0000 = 6-button pad, with Up (bit 0) held on the 3-button rows"
+    );
+}
+
+/// The `six-button` line survives a write and a read, lists pads 1-based, and is
+/// left out of a movie that does not need it, so movies written before #673
+/// read and write exactly as they did.
+#[test]
+fn the_six_button_line_round_trips_and_is_optional() {
+    let mut movie = Movie::new(0x1234, Region::Usa, 2);
+    movie.set(0, &[Buttons::A, Buttons::empty()]);
+    assert!(!movie.format().contains("six-button"));
+
+    movie.set_six_button(1);
+    let text = movie.format();
+    assert!(text.contains("\nsix-button 2\n"), "{text}");
+    let back = movie::parse(&text).expect("a written movie reads back");
+    assert_eq!(back, movie);
+    assert!(!back.is_six_button(0));
+    assert!(back.is_six_button(1));
+}
+
+/// A `six-button` line naming no pad, a pad that is not a number, or a pad the
+/// movie does not have is an error, not a pad quietly left as it was.
+#[test]
+fn a_bad_six_button_line_is_refused() {
+    let base = "rustsega-movie 1\nrom-hash 0x1\nregion usa\npads 1\n";
+    for line in ["six-button", "six-button x", "six-button 0", "six-button 2"] {
+        let text = format!("{base}{line}\n0 A\n");
+        assert!(movie::parse(&text).is_err(), "{line} should be refused");
+    }
+    let text = format!("{base}six-button 1\nsix-button 1\n0 A\n");
+    assert!(movie::parse(&text).is_err(), "two six-button lines");
+}

@@ -249,6 +249,11 @@ pub struct Movie {
     /// The frames on which the input changes, in order, with the buttons each pad
     /// holds from that frame on.
     changes: BTreeMap<u32, Vec<Buttons>>,
+    /// The pads the recording ran as 6-button pads whatever they pressed: the
+    /// `six-button` header line (#673). A TAS made on a 6-button pad has to
+    /// replay on one even if it never presses X, Y, Z or Mode, because a game
+    /// can tell the two apart at boot. Indexed by pad.
+    six_button: Vec<bool>,
 }
 
 impl Movie {
@@ -269,7 +274,30 @@ impl Movie {
             region,
             pads,
             changes: BTreeMap::new(),
+            six_button: vec![false; pads],
         }
+    }
+
+    /// Make pad `pad` a 6-button pad for the whole replay, whatever it presses:
+    /// the movie was recorded on one (#673). A pad that presses X, Y, Z or Mode
+    /// anywhere is one already and needs no call.
+    ///
+    /// # Panics
+    ///
+    /// If `pad` is not one of this movie's pads.
+    pub fn set_six_button(&mut self, pad: usize) {
+        assert!(
+            pad < self.pads,
+            "a movie of {} pad(s) has no pad {pad}",
+            self.pads
+        );
+        self.six_button[pad] = true;
+    }
+
+    /// Does pad `pad` replay as a 6-button pad: because the movie says so, or
+    /// because it presses one of the four 6-button buttons somewhere?
+    pub fn is_six_button(&self, pad: usize) -> bool {
+        self.six_button.get(pad).copied().unwrap_or(false) || self.holds_a_six_button_button(pad)
     }
 
     /// The cartridge this movie is a movie of.
@@ -366,7 +394,7 @@ impl Movie {
     pub fn set_pads(&self, machine: &mut Genesis, frame: u32) {
         for pad in 0..self.pads {
             let buttons = self.buttons_at(frame, pad);
-            if self.holds_a_six_button_button(pad) {
+            if self.is_six_button(pad) {
                 machine.set_pad6(pad, buttons);
             } else {
                 machine.set_pad(pad, buttons);
@@ -407,6 +435,13 @@ impl Movie {
             self.region.name(),
             self.pads
         );
+        let forced: Vec<String> = (0..self.pads)
+            .filter(|&pad| self.six_button[pad])
+            .map(|pad| (pad + 1).to_string())
+            .collect();
+        if !forced.is_empty() {
+            text.push_str(&format!("six-button {}\n", forced.join(" ")));
+        }
         text.push_str(&self.columns_comment());
         for (frame, row) in &self.changes {
             let fields: Vec<String> = row.iter().map(|buttons| field(*buttons)).collect();
@@ -459,6 +494,7 @@ pub fn parse(text: &str) -> Result<Movie, MovieError> {
     let mut rom_hash = None;
     let mut region = None;
     let mut pads = None;
+    let mut six_button: Option<Vec<usize>> = None;
     let mut changes: BTreeMap<u32, Vec<Buttons>> = BTreeMap::new();
 
     for (index, raw) in text.lines().enumerate() {
@@ -476,6 +512,13 @@ pub fn parse(text: &str) -> Result<Movie, MovieError> {
         let head = fields
             .next()
             .expect("a trimmed, non-empty line has a field");
+        if head == SIX_BUTTON_KEY {
+            if six_button.is_some() {
+                return Err(MovieError::DuplicateHeader(SIX_BUTTON_KEY));
+            }
+            six_button = Some(read_six_button(fields, line, line_text)?);
+            continue;
+        }
         if is_header_key(head) {
             let value = header_value(head, fields, line, line_text)?;
             match head {
@@ -514,13 +557,53 @@ pub fn parse(text: &str) -> Result<Movie, MovieError> {
             text: String::new(),
         });
     }
-    header_complete(rom_hash, region, pads)?;
+    let pads = header_complete(rom_hash, region, pads)?;
+    let mut forced = vec![false; pads];
+    for pad in six_button.unwrap_or_default() {
+        if pad > pads {
+            return Err(MovieError::BadHeaderValue {
+                line: 0,
+                key: SIX_BUTTON_KEY.to_string(),
+                text: format!("pad {pad} in a movie of {pads} pad(s)"),
+            });
+        }
+        forced[pad - 1] = true;
+    }
     Ok(Movie {
         rom_hash: rom_hash.expect("checked by header_complete"),
         region: region.expect("checked by header_complete"),
-        pads: pads.expect("checked by header_complete"),
+        pads,
         changes,
+        six_button: forced,
     })
+}
+
+/// The optional header line naming the pads that are 6-button pads for the
+/// whole replay (#673): `six-button 1`, `six-button 1 2`.
+const SIX_BUTTON_KEY: &str = "six-button";
+
+/// The pad numbers of a `six-button` line: 1-based, at least one.
+fn read_six_button<'a>(
+    fields: impl Iterator<Item = &'a str>,
+    line: usize,
+    line_text: &str,
+) -> Result<Vec<usize>, MovieError> {
+    let bad = || MovieError::BadHeaderValue {
+        line,
+        key: SIX_BUTTON_KEY.to_string(),
+        text: line_text.to_string(),
+    };
+    let pads = fields
+        .map(|field| match field.parse::<usize>() {
+            Ok(pad) if (MIN_PADS..=MAX_PADS).contains(&pad) => Ok(pad),
+            _ => Err(bad()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if pads.is_empty() {
+        Err(bad())
+    } else {
+        Ok(pads)
+    }
 }
 
 /// Add one frame line to `changes`: `head` is its frame number, `fields` the

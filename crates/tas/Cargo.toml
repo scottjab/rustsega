@@ -1,0 +1,18 @@
+[package]
+name = "tas"
+description = "Imports TASVideos movie files (BizHawk .bk2, Gens .gmv) as rustsega movies"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The movie these formats are converted into, and the region and pad types it
+# is made of (docs/movie-format.md).
+genesis = { path = "../genesis" }
+# Raw DEFLATE, for the zip a .bk2 is and the zip TASVideos serves every movie
+# in. Already in Cargo.lock as a dependency of `png` and `flate2`, pure Rust,
+# and builds for wasm; kept out of the core crates by living here (#673).
+miniz_oxide = "0.8"
+
+[lints]
+workspace = true

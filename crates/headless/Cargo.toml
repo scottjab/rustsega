@@ -24,6 +24,9 @@ m68k = { path = "../m68k" }
 # `Genesis`: a VGM is a recording of the chips, not of the console (M5-12, #117).
 sn76489 = { path = "../sn76489" }
 ym2612 = { path = "../ym2612" }
+# TASVideos movies for `--movie`: BizHawk .bk2, Gens .gmv and their .zip
+# (#673). An in-repo crate.
+tas = { path = "../tas" }
 # `frame_hash` and `dump_png`, so the CLI hashes and writes PNGs exactly the
 # way the golden files do rather than nearly the same way (docs/TESTING.md,
 # "Golden files").
