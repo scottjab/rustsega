@@ -104,10 +104,13 @@ impl Genesis {
     /// 4. [`Bus::new`] - which reads the rest of the cartridge itself: the save
     ///    RAM, the serial EEPROM and the bank registers all come out of the
     ///    image, so none of them can disagree with it.
-    /// 5. [`vdp::Vdp::start_in_vblank`] - the beam goes to the first line of
-    ///    VBlank, so that the 68000's first instruction, and every register the
-    ///    ROM writes from it, is written during blanking and is in time for line 0
-    ///    of the first frame (#310).
+    /// 5. [`vdp::Vdp::start_at_power_on`] - the beam goes to the line a console
+    ///    that has just been switched on runs the 68000's first instruction on,
+    ///    159 NTSC and 132 PAL (#675). That is in the bottom of the display with
+    ///    the display still off, a hundred lines ahead of line 0, so every register
+    ///    the ROM writes from it is in time for line 0 of the first full frame
+    ///    (#310), and the first frame is the CPU's run to the VBlank line rather
+    ///    than a whole raster.
     /// 6. The 68000's own reset, which is what turns those vectors into a
     ///    running program: `SSP` from `$000000` and `PC` from `$000004`
     ///    (M68000UM section 5 "Reset").
@@ -128,8 +131,10 @@ impl Genesis {
         // A VDP that has never been talked to sits at line 0, which is a line of
         // active display: leave it there and the program below starts 40 master
         // clocks into line 0, past the point that line is drawn from, and its whole
-        // start-up register set is a frame late (#310). Blank first, then run.
-        bus.vdp.start_in_vblank();
+        // start-up register set is a frame late (#310). Hardware's 68000 starts on
+        // a fixed line of the bottom of the frame instead, and boot timing - which
+        // frame a cart's start-up work finishes in - is measured from there (#675).
+        bus.vdp.start_at_power_on();
         let mut cpu = M68k::new();
         cpu.reset(&mut bus);
         Ok(Self {

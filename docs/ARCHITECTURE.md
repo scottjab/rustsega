@@ -78,6 +78,15 @@ Rules:
   count, and the work-RAM refresh's own 3-cycle timer is not modelled. Without
   it the 68000 got about 1.5% more done per frame than the reference, which S&K's
   parked decompressor measured (#526, #529, #530).
+- Power on starts the 68000 at the start of line 159 NTSC, 132 PAL
+  (`vdp::Vdp::start_at_power_on`, #675): the VDP runs from the system reset and
+  /VRES holds the CPU a fixed time after it, so the first HV read is `$9F21` /
+  `$8421` on every power on (Genesis Plus GX's measurement on a VA4 PAL MD1,
+  `core/genesis.c` `gen_reset`). The first frame is the run from there to the
+  VBlank line, 65 lines NTSC, not a raster, and every boot's frame count is
+  measured from it: starting on the VBlank line instead put S3K's whole boot a
+  frame early and desynced TASVideos #6890 on the SEGA screen. The Reset button
+  is not this and still restarts in VBlank (#310).
 
 ## Core APIs (initial shape, tickets may refine)
 

@@ -27,11 +27,11 @@ const PAD_COPY: u32 = 0xFF_0000;
 const IO_DATA_1: u32 = 0xA1_0003;
 /// Where the 6-button walk stores its eight answers, one byte apart.
 const PAD6_WALK: u32 = 0xFF_0010;
-/// The V counter of the first line of VBlank: line 224, the `E0h` of genvdp.txt
-/// section 4 "Vertical interrupts" ("a level 6 interrupt will occur when the V
-/// counter is at line E0h"), counting as itself because the NTSC counter counts
-/// one per line up to 255 (`crates/vdp/src/hv.rs`, `v_count`).
-const VBLANK_V_COUNTER: u16 = 0xE0;
+/// The V counter a console that has just been switched on runs the 68000's first
+/// instruction at, NTSC: the `$9F` of Genesis Plus GX's `$9F21` first read
+/// (`core/genesis.c`, `gen_reset`; #675), counting as itself because the NTSC
+/// counter counts one per line up to 255 (`crates/vdp/src/hv.rs`, `v_count`).
+const POWER_ON_V_COUNTER: u16 = 0x9F;
 
 /// The V counter of the beam right now, as a program reads it: `(V << 8) | H`
 /// from `$C00008` (genvdp.txt section 5), and the V half is the line.
@@ -197,25 +197,29 @@ fn new_sets_pc_from_vector() {
     assert_eq!(machine.cpu().ssp, STACK, "and SSP from the one at $000000");
 }
 
-/// The beam of a machine that has just been built is on the first line of VBlank,
-/// so the first thing a ROM does - write a full set of VDP registers, at the top
-/// of its start-up code - happens during blanking and is in time for line 0 of the
-/// first frame (#310).
+/// The beam of a machine that has just been built is where a console that has
+/// just been switched on starts the 68000: line `$9F`, low in the display, with
+/// the display off and a hundred lines to go before line 0 (#675). That is still
+/// ahead of line 0 of the first full frame, so the first thing a ROM does - write
+/// a full set of VDP registers, at the top of its start-up code - is in time for
+/// it (#310).
 ///
 /// `Vdp::new` leaves a chip at line 0, and a line is drawn from the state latched
 /// at the start of its active display - master clock 100 in H32 and 81 in H40
 /// (#102) - so a beam that starts there puts the whole of a ROM's init code 40
 /// clocks inside line 0 and one frame behind. [`run_frame_returns_frame_of_expected_size`]
-/// is the mode change this is noticed in.
+/// is the mode change this is noticed in. Until #675 the beam started on the first
+/// line of VBlank, `$E0`, which handed the first frame a whole raster of CPU time;
+/// `tests/power_on.rs` holds what the start position does to the first frame.
 #[test]
-fn new_starts_the_beam_in_vblank() {
+fn new_starts_the_beam_where_power_on_does() {
     let machine =
         Genesis::new(&fake_rom(&[0x4E71]), Config::default()).expect("a ROM with a header loads");
 
     assert_eq!(
         v_counter(&machine),
-        VBLANK_V_COUNTER,
-        "the V counter of a machine before its first frame is the first line of VBlank"
+        POWER_ON_V_COUNTER,
+        "the V counter of a machine before its first frame is the line power on starts the 68000 on"
     );
 }
 
@@ -252,10 +256,14 @@ fn reset_restarts_the_beam_in_vblank() {
 /// One `run_frame` is one frame of the picture, and `frame` reports the geometry
 /// the VDP's mode asks for: 320x224 in H40 and 256x224 in H32, so a front end
 /// never draws a 320 wide row into a 256 wide frame. The geometry is the mode of
-/// the frame's first line, and the console starts that first line in blanking
-/// (#310), so a mode asked for at boot is in the very first frame; the test walks
-/// a second frame anyway, because a mode a game holds has to survive a whole
-/// raster of it.
+/// the frame's first line, and the console starts the 68000 a hundred lines
+/// ahead of the first full frame's line 0 (#310, #675), so a mode asked for at
+/// boot is in the first full frame; the test walks a second one anyway, because
+/// a mode a game holds has to survive a whole raster of it.
+///
+/// The short frame power on runs first - the 68000's start on line 159 to the
+/// VBlank line - is not that frame: its line 0 was drawn before the 68000 ran
+/// at all, in the mode the VDP reset into.
 #[test]
 fn run_frame_returns_frame_of_expected_size() {
     // R1 = $40 turns the display on, R12 = $81 is H40 (RS0 and RS1) and R12 =
@@ -267,11 +275,13 @@ fn run_frame_returns_frame_of_expected_size() {
 
         let mut machine = Genesis::new(&fake_rom(&program), Config::default())
             .expect("a ROM with a header loads");
+        // Power on to the first VBlank (#675).
+        machine.run_frame();
         machine.run_frame();
 
         // The frame a mode is asked for in is the frame that shows it, because the
-        // beam is in blanking while it is asked: `Genesis::new` parks it on the
-        // first line of VBlank (#310), so this program's write to R12 lands well
+        // beam is ahead of line 0 while it is asked: `Genesis::new` starts it on
+        // line 159 (#310, #675), so this program's write to R12 lands well
         // before the latch of line 0 - the state a line is drawn from is taken at
         // the start of its active display, master clock 100 in H32 and 81 in H40
         // (M4-23, #102) - and line 0, which fixes the geometry of the frame, is
@@ -286,7 +296,7 @@ fn run_frame_returns_frame_of_expected_size() {
         assert_eq!(
             (machine.frame().width, machine.frame().height),
             (width, 224),
-            "R12 = {reg12:#04x} is written during blanking, so frame 0 is already {width} wide"
+            "R12 = {reg12:#04x} is written ahead of line 0, so the first full frame is already {width} wide"
         );
 
         machine.run_frame();
@@ -438,7 +448,8 @@ fn reset_restarts_the_68k_and_the_vdp_and_keeps_work_ram() {
 /// `drain_audio` used to be one of the API's stubs and asserted here as
 /// appending nothing; M5-14 (#119) filled it in, and what it has to append is a
 /// frame of host audio - 801 stereo samples for one 16.7 ms NTSC raster at
-/// 48 kHz. The save-state stubs this test used to assert alongside it are a
+/// 48 kHz. The raster is the second frame: the first is power on's run from line
+/// 159 to the VBlank line (#675), a quarter of one, and it is drained first. The save-state stubs this test used to assert alongside it are a
 /// format now (M6-07, #127) and have a test file of their own,
 /// `tests/save_state.rs`.
 #[test]
@@ -451,6 +462,15 @@ fn drain_audio_mixes_a_frame_of_host_audio() {
         samples, [1_i16; 8],
         "no frame has run, so there is nothing to mix yet"
     );
+
+    machine.run_frame();
+    machine.drain_audio(&mut samples);
+    assert!(
+        samples.len() - 8 < 400,
+        "power on to the first VBlank is 65 lines, not a raster: {} halves",
+        samples.len() - 8
+    );
+    samples.truncate(8);
 
     machine.run_frame();
     machine.drain_audio(&mut samples);

@@ -35,6 +35,13 @@ const FRAME_LINES_NTSC: u16 = 262;
 /// (313 PAL)"; `hv` uses the same number for the V counter table).
 const FRAME_LINES_PAL: u16 = 313;
 
+/// The line an NTSC console's 68000 starts on at power on: `$9F`, the V count of
+/// Genesis Plus GX's `$9F21` first read (see [`Vdp::start_at_power_on`]).
+const POWER_ON_LINE_NTSC: u16 = 0x9F;
+/// And a PAL one's: `$84`, from the `$8421` of the same measurement at 50 Hz.
+/// Below `$102`, where the PAL V counter jumps, so the line and the count agree.
+const POWER_ON_LINE_PAL: u16 = 0x84;
+
 /// The H counter cycle the vertical interrupt is raised at.
 ///
 /// genvdp.txt section 4 "Vertical interrupts": "a level 6 interrupt will occur
@@ -199,6 +206,38 @@ impl Vdp {
         // end of this line, and the VINT event of it is on the way. The first
         // interrupt of the run is the one on the VBlank line that follows.
         self.line_vint_taken = true;
+    }
+
+    /// Move the beam to where it is when a console that has just been switched on
+    /// runs the 68000's first instruction: the start of line 159 NTSC, 132 PAL
+    /// (#675).
+    ///
+    /// The VDP runs from the system reset and the 68000 is held off by /VRES for a
+    /// fixed time after it, so the first instruction lands at the same point of the
+    /// frame on every power on. Genesis Plus GX measured where on a VA4 PAL MD1:
+    /// with `move.w #$8104,$C00004` / `move.w $C00008,d0` as the first two
+    /// instructions the counter reads `$9F21` at 60 Hz and `$8421` at 50 Hz, "the
+    /// same value ... returned on every power ON" (`core/genesis.c`, `gen_reset`).
+    /// The line is that one. The clock is the start of it, a few dozen 68000
+    /// clocks ahead of the measured `$21`, which keeps the beam on the
+    /// scheduler's line boundaries.
+    ///
+    /// The beam is walked there from [`Vdp::start_in_vblank`]'s parking rather
+    /// than set, so every line on the way has its once-a-line work done and none of
+    /// it is owed later. The walk crosses no VBlank line, so nothing is raised: the
+    /// first frame is the CPU's run from here to the VBlank line, 65 lines NTSC
+    /// and 92 PAL, and not a whole raster. A reset button press is not this
+    /// (hardware restarts the 68000 wherever the beam happens to be) and keeps
+    /// [`Vdp::start_in_vblank`].
+    pub fn start_at_power_on(&mut self) {
+        self.start_in_vblank();
+        let line = if self.pal {
+            POWER_ON_LINE_PAL
+        } else {
+            POWER_ON_LINE_NTSC
+        };
+        let lines = self.frame_lines() - self.line + line;
+        self.advance(u32::from(lines) * MCLKS_PER_LINE);
     }
 
     /// The first point in [`Vdp::line`] after the beam's current clock.
@@ -984,6 +1023,38 @@ mod tests {
     /// [`Vdp::start_in_vblank`] parks the beam on the first line of VBlank with that
     /// line's blanking applied and its two event flags down: the chip is in
     /// blanking, and it has drawn nothing yet (#310).
+    /// [`Vdp::start_at_power_on`] puts the beam where the 68000's first read of the
+    /// counter finds it, `$9F` NTSC and `$84` PAL, at the start of the line, with
+    /// no event of the walk there left up (#675).
+    #[test]
+    fn power_on_parks_the_beam_where_the_first_counter_read_finds_it() {
+        for (pal, v, line) in [(false, 0x9F, 159), (true, 0x84, 132)] {
+            let mut vdp = Vdp::new(pal);
+            vdp.start_at_power_on();
+
+            assert_eq!((vdp.line, vdp.line_mclk), (line, 0), "pal={pal}");
+            assert_eq!(vdp.hv_counter() >> 8, v, "pal={pal}");
+            assert!(
+                !vdp.in_vblank && vdp.line_started,
+                "an active line, with its once-a-line work applied (pal={pal})"
+            );
+            assert!(
+                !vdp.frame_done() && !vdp.vint_pending,
+                "the walk there crosses no VBlank line, so nothing is owed (pal={pal})"
+            );
+
+            // The first frame is from here to the VBlank line of the mode the chip
+            // reset into, V28 in both regions.
+            let mut lines = 0;
+            while !vdp.frame_done() {
+                vdp.advance(MCLKS_PER_LINE);
+                lines += 1;
+                assert!(lines <= 313, "one frame, however the wait is written");
+            }
+            assert_eq!(lines, 224 - line, "pal={pal}");
+        }
+    }
+
     #[test]
     fn start_in_vblank_is_blank_and_has_drawn_nothing() {
         let mut vdp = Vdp::new(false);
