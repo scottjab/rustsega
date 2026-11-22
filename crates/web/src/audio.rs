@@ -205,11 +205,20 @@ impl AudioOut {
         self.ctx.state() == AudioContextState::Running
     }
 
-    /// How far the schedule is ahead of the play head, seconds: what
-    /// [`crate::audio_pacing::frames_to_run`] wants to know, and the number that
-    /// says whether the two clocks have drifted apart.
+    /// How far the console's sound reaches ahead of the play head, seconds:
+    /// what [`crate::audio_pacing::frames_to_run`] wants to know, and the number
+    /// that says whether the two clocks have drifted apart.
+    ///
+    /// Counts the frames [`Self::batch`] is still holding as well as the
+    /// scheduled ones, through [`crate::audio_pacing::lead_secs`]: without them
+    /// a WebKit browser paced in bursts and dropped frames on screen (#629).
     pub fn buffered_secs(&self) -> f64 {
-        self.next_time - self.ctx.current_time()
+        crate::audio_pacing::lead_secs(
+            self.next_time,
+            self.ctx.current_time(),
+            self.batch.pending_samples(),
+            f64::from(self.ctx.sample_rate()) * f64::from(CHANNELS),
+        )
     }
 
     /// Schedules one block of interleaved stereo `i16` - what

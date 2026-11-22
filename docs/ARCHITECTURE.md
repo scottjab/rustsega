@@ -592,11 +592,17 @@ ports) it inherits the 68k's answer through the same dispatch.
   (`crates/web/src/audio_pacing.rs::WEBKIT_FRAMES_PER_BLOCK`, 15 nodes a second
   instead of 60, a quarter of the per-second `AudioBuffer` + channel-copy churn
   on the engine whose JIT and GC are the suspected frame-budget culprit), and
-  the cursor target deepens to one batch plus two frames of pacer room
-  (`target_ahead_secs`, 100 ms on NTSC) - a batched cursor only advances once
+  the cursor target deepens to one batch plus three frames of pacer room
+  (`target_ahead_secs`, 117 ms on NTSC) - a batched cursor only advances once
   per batch, and the first measurement with batching alone ran the lead's floor
   onto the too-late line (28 restarts in the 60 s window; the deeper target
-  brought the same window to 0). Chrome and Firefox keep one frame per block at
+  brought the same window to 0). The lead the pacer reads counts the frames
+  the batcher is still holding as well as the scheduled ones
+  (`audio_pacing::lead_secs`). The first batched build counted only scheduled
+  blocks, so the pacer ran frames in bursts (`0 0 1 2 0 0 1 2 3` frames per
+  display tick) and Safari showed dropped frames, since a tick paints only its
+  last frame; the native loop model in `audio_pacing`'s tests pins one frame
+  per tick and the 50 ms floor a block is placed at. Chrome and Firefox keep one frame per block at
   the plain 60 ms target, which the measurement shows working;
   `framesPerBlock` on `window.rustsegaAudio` says which shape a given browser
   got. What the headless rig cannot see, and what stays browser-specific:
