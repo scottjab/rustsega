@@ -188,6 +188,21 @@ pub struct Scheduler {
     /// the VDP sees every clock the machine runs and sees it once.
     vdp_clock: u64,
     lines_per_frame: u16,
+    /// The 68000's IPL pins are held where they were for one more of its
+    /// instructions, because the instruction just retired raised the VDP's offer
+    /// with a register write of its own: a held VINT or HINT unmasked by IE0 or
+    /// IE1. The 68000 has latched IPL before that write's bus cycle lands, so
+    /// the interrupt is taken after the *next* instruction, "exactly one
+    /// instruction latency" (SpritesMind, "M68K Interrupt Processing", t=2202:
+    /// Mask of Destiny 2015-10-31, Eke 2015-11-02). Sesame Street Counting Cafe
+    /// needs the instruction after its IE0 write to run before the handler
+    /// (#493). A level raised by the beam is not held: the 68000 sees it at
+    /// the next boundary as before.
+    ///
+    /// Not modelled: the same thread's 2017 measurement that a `MOVE.L` latches
+    /// IPL between its two writes, so a `MOVE.L` whose second word is the
+    /// enabling write would see the level one instruction sooner.
+    ipl_held: bool,
 }
 
 impl Scheduler {
@@ -211,6 +226,7 @@ impl Scheduler {
             m68k_frozen_until: 0,
             z80_frozen_until: 0,
             vdp_clock: 0,
+            ipl_held: false,
             lines_per_frame: if region.is_pal() {
                 LINES_PER_FRAME_PAL
             } else {
@@ -344,8 +360,14 @@ impl Scheduler {
                 // The address the instruction is retired *from* is what makes an
                 // arrival an arrival: see [`Stop::Pc`].
                 let from = cpu.pc;
+                let offered = bus.vdp.pending_irq();
                 let cycles = cpu.step(bus);
                 arrived = stop.arrived(from, cpu.pc);
+                // Read before the beam moves, so a rise here is the instruction's
+                // own register write and not the raster (see [`Self::ipl_held`]).
+                // `None` orders below every level, and a step that took the
+                // interrupt and acknowledged it reads as a fall.
+                self.ipl_held = bus.vdp.pending_irq() > offered;
                 Self::charge(
                     &mut self.m68k_clock,
                     cycles,
@@ -368,7 +390,7 @@ impl Scheduler {
             }
 
             self.sync_vdp(bus);
-            Self::update_interrupts(cpu, z80, &bus.vdp);
+            Self::update_interrupts(cpu, z80, &bus.vdp, self.ipl_held);
 
             // After both, so that the stopped machine is a machine that has paid
             // for the instruction it stopped on - the beam where the retired
@@ -519,8 +541,13 @@ impl Scheduler {
     /// The Z80's `/INT` is a level too ([`z80::Z80::set_int_line`]), and
     /// [`vdp::Vdp::z80_int_line`] is the pulse it is driven with: one stretch of the
     /// first line of VBlank, once per frame.
-    fn update_interrupts(cpu: &mut M68k, z80: &mut Z80, vdp: &vdp::Vdp) {
-        cpu.ipl = vdp.pending_irq().unwrap_or(0);
+    ///
+    /// `hold_ipl` leaves the 68000's pins where they are for the one instruction
+    /// [`Self::ipl_held`] describes; the Z80's line is never held.
+    fn update_interrupts(cpu: &mut M68k, z80: &mut Z80, vdp: &vdp::Vdp, hold_ipl: bool) {
+        if !hold_ipl {
+            cpu.ipl = vdp.pending_irq().unwrap_or(0);
+        }
         z80.set_int_line(vdp.z80_int_line());
     }
 
@@ -1650,6 +1677,61 @@ mod tests {
         assert!(
             matches!(cpu.pc, x if x == CODE || x == CODE + 2 || x == CODE + 4 || x == CODE + 6),
             "and the RTE put the 68000 back in its loop"
+        );
+    }
+
+    /// A held VINT that the 68000 itself unmasks with a VDP register write is
+    /// taken one instruction later, not at the very next boundary: "you can
+    /// execute at least one instruction after enabling VINT in the VDP with a
+    /// pending VINT", and Eke: "It should be exactly one instruction latency"
+    /// (SpritesMind, "M68K Interrupt Processing", t=2202, Mask of Destiny
+    /// 2015-10-31 and Eke 2015-11-02). Sesame Street Counting Cafe enables IE0
+    /// at `$1F3C` and needs the `CLR.B $FF0200` after it to run before the
+    /// handler (#493).
+    ///
+    /// The program polls the status port until the VINT flag is up with IE0
+    /// still clear, then writes R1 = `$74` and counts two `ADDQ`s into D0. The
+    /// handler copies D0 to D2, so D2 is how many instructions ran between the
+    /// write and the interrupt.
+    #[test]
+    fn a_vint_unmasked_by_a_register_write_waits_one_instruction() {
+        let mut rom = vec![0_u8; 0x80];
+        rom[0x00..0x04].copy_from_slice(&0x00FF_0000_u32.to_be_bytes());
+        rom[0x04..0x08].copy_from_slice(&0x0000_0010_u32.to_be_bytes());
+        let program: [u16; 17] = [
+            0x027C, 0xF8FF, // $10 ANDI.W #$F8FF,SR
+            0x3639, 0x00C0, 0x0004, // $14 MOVE.W $C00004,D3
+            0x0803, 0x0007, // $1A BTST #7,D3
+            0x67F4, // $1E BEQ.B $14
+            0x33FC, 0x8174, 0x00C0, 0x0004, // $20 MOVE.W #$8174,$C00004
+            0x5280, // $28 ADDQ.L #1,D0
+            0x5280, // $2A ADDQ.L #1,D0
+            0x60FE, // $2C BRA.B $2C
+            0x0000, 0x0000,
+        ];
+        for (i, word) in program.iter().enumerate() {
+            rom[0x10 + i * 2..0x12 + i * 2].copy_from_slice(&word.to_be_bytes());
+        }
+        rom[0x30..0x32].copy_from_slice(&0x2400_u16.to_be_bytes()); // MOVE.L D0,D2
+        rom[0x32..0x34].copy_from_slice(&0x5281_u16.to_be_bytes()); // ADDQ.L #1,D1
+        rom[0x34..0x36].copy_from_slice(&0x4E73_u16.to_be_bytes()); // RTE
+        rom[0x78..0x7C].copy_from_slice(&0x0000_0030_u32.to_be_bytes());
+
+        let mut bus = Bus::new(rom, VERSION);
+        bus.vdp.start_in_vblank();
+        release_z80_reset(&mut bus);
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        let mut z80 = Z80::new();
+        z80.reset();
+        let mut s = Scheduler::new(Region::Usa);
+
+        run_lines(&mut s, &mut cpu, &mut z80, &mut bus, 300);
+        assert_eq!(cpu.d[1], 1, "the handler ran once");
+        assert_eq!(cpu.d[0], 2, "both ADDQs ran");
+        assert_eq!(
+            cpu.d[2], 1,
+            "one instruction ran between the enabling write and the interrupt"
         );
     }
 
