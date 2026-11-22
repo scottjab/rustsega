@@ -100,6 +100,11 @@ fn hash_of(machine: &Genesis) -> u64 {
 /// only on 50Hz machines !"). It walks the whole 9-bit palette across the frame
 /// by writing CRAM while the beam is still drawing, so the screen is a dense
 /// grid of colour cells of 449 distinct colours over the backdrop.
+///
+/// #491 moved it: the HINT counter now counts against the line the beam is
+/// entering, so every HINT is one line earlier and every palette band this ROM
+/// paints from one starts a line earlier with it. The colour count is
+/// unchanged; the golden went `0x0e61cfe0b4b13c5a` -> `0x36e1c0feccaa525a`, maintainer approved on #491.
 #[test]
 fn md_test_pack_512pal_paints_the_whole_palette() {
     check("md_test_pack_512pal", pack!("512PAL.BIN"), FRAMES, &[]);
@@ -121,6 +126,11 @@ fn md_test_pack_512pal_paints_the_whole_palette() {
 /// 928 - 27 colours being the palette writes never landing where the ROM aimed
 /// them, which is the one thing this ROM is a test of. Check the picture rather
 /// than the prose if you change either.
+///
+/// #491 moved it: the HINT counter now counts against the line the beam is
+/// entering, so every HINT is one line earlier and every palette band this ROM
+/// paints from one starts a line earlier with it. The colour count is
+/// unchanged; the golden went `0xc9e8e47a10091e1a` -> `0x1ba4a7032b6fde1a`, maintainer approved on #491.
 #[test]
 fn md_test_pack_960pal_shows_more_colours_than_one_palette_holds() {
     check("md_test_pack_960pal", pack!("960PAL.bin"), FRAMES, &[]);
@@ -130,6 +140,11 @@ fn md_test_pack_960pal_shows_more_colours_than_one_palette_holds() {
 /// PROGRAM" (2006.JAN). 256x240, 244 distinct colours in a repeating block
 /// grid: each block is a slice of the palette, the same idea as `512PAL.BIN`
 /// in H32.
+///
+/// #491 moved it: the HINT counter now counts against the line the beam is
+/// entering, so every HINT is one line earlier and every palette band this ROM
+/// paints from one starts a line earlier with it. The colour count is
+/// unchanged; the golden went `0xe6c5382c1009f6da` -> `0x433e229bdf3593fa`, maintainer approved on #491.
 #[test]
 fn md_test_pack_pal512_paints_its_colour_grid() {
     check("md_test_pack_pal512", pack!("PAL512.bin"), FRAMES, &[]);

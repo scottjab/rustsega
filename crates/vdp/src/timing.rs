@@ -311,12 +311,10 @@ impl Vdp {
     /// The beam has entered [`Vdp::line`]: the state that is decided once a line
     /// rather than once a clock.
     ///
-    /// genvdp.txt section 4 "Line interrupts" is the HINT counter's load rule
-    /// and is read literally here: the counter is loaded on "Line zero of the
-    /// frame" and on "Lines 225 through 261. (note that line 224 is not
-    /// included)", which is every line of VBlank except the one VBlank starts
-    /// on. The blanking flags and the vertical interrupt follow genvdp.txt
-    /// section 6 and section 4, as the field comments in `lib.rs` quote them.
+    /// The HINT counter is not loaded here: [`Vdp::hint_step`] loads and counts it
+    /// at the back porch, against the line the beam is about to enter (#491).
+    /// The blanking flags and the vertical interrupt follow genvdp.txt section 6
+    /// and section 4, as the field comments in `lib.rs` quote them.
     fn start_line(&mut self) {
         self.line_started = true;
         // A line always begins inside the blanking window, which only lets go at
@@ -325,10 +323,6 @@ impl Vdp {
 
         if self.line == 0 {
             self.frame_start();
-        }
-
-        if self.line == 0 || self.line > self.vblank_line() {
-            self.hint_counter = self.hint_reload();
         }
 
         // A line of its own begins with its vertical interrupt unspent; the
@@ -427,13 +421,34 @@ impl Vdp {
 
     /// The line interrupt, at the back porch of the line.
     ///
-    /// genvdp.txt section 4 never says where in the line the interrupt is
-    /// raised, only that "The VDP has a counter that is decremented on every
-    /// line. When the counter has expired, and if bit 4 (IE1) of register #0 is
-    /// set, then a level 4 interrupt will occur", and that the counter is loaded
-    /// from R10 when it expires. The line's counter is therefore read at the end
-    /// of the line, at the start of the blanking period; the real position is
-    /// nearer H counter 0xA6 in H40 and 0x85 in H32, which M4-23 moves this to.
+    /// The counter is reloaded from R10 or counted down once a line, and the
+    /// line it is counted for is the one the beam is about to enter, not the
+    /// one it is finishing. On hardware the step is at the V counter's own
+    /// step: "Vcounter is incremented just before HINT pending flag is set, at
+    /// HCounter = $A5 or $85", the counter is "reloaded when overflow occurs
+    /// and during VBLANK", and the per-line rule is "if VBLANK flag is set,
+    /// reload HINT Counter else decrement it" (Eke, SpritesMind t=787, "VDP
+    /// Interrupts & HVC tests", 2010-08-15 and 2010-08-16). blastem does the
+    /// same in `vdp_advance_line` at its line change (`LINE_CHANGE_H40` 165):
+    /// reload on a line that is not active, else count down, else raise the
+    /// flag and reload. Our V counter still steps at H counter 0 rather than
+    /// $A5, so the back porch of line L is where the hardware is already on
+    /// line L + 1, and L + 1 is what decides.
+    ///
+    /// So the step from the last line of the frame into line 0 counts, and
+    /// with R10 = N the first HINT of a frame is at the back porch of line
+    /// N - 1, as the V counter turns to N, then every N + 1 lines. genvdp.txt
+    /// section 4 says the counter is loaded on "Line zero of the frame", which
+    /// read literally put every HINT one line later; Lemmings 2 is the cart
+    /// that tells them apart (#491). It sets R10 = 1 and waits in its HINT
+    /// handler for a V counter read of exactly $CF, which every other line
+    /// only ever reaches on blastem's phase, and on genvdp's parked forever.
+    /// Eke counts down on line $E0 as well, where blastem reloads; we follow
+    /// blastem, the reference this was measured against.
+    ///
+    /// A write to R10 does not touch a running count: the new value is only
+    /// read at the next reload, which is when Lemmings 2's switch to R10 = 1
+    /// takes effect.
     ///
     /// The counter runs whether or not IE1 is set - genvdp.txt gates the
     /// interrupt on the bit, not the counter - so `pending_irq` is where the
@@ -452,8 +467,10 @@ impl Vdp {
     /// rule. blastem's `vdp_int_ack` matches (acknowledge clears, Mode 5 only,
     /// preferring the VINT flag when both are pending).
     fn hint_step(&mut self) {
-        if self.line > self.vblank_line() {
-            // A VBlank line reloads rather than decrements, so it cannot expire.
+        if self.next_line() >= self.vblank_line() {
+            // Entering a line outside the active display reloads, so it cannot
+            // expire.
+            self.hint_counter = self.hint_reload();
             return;
         }
         if self.hint_counter == 0 {
@@ -609,37 +626,66 @@ mod tests {
         fired
     }
 
-    /// genvdp.txt section 4 "Line interrupts": the counter is loaded on line 0 and
-    /// decremented on every line after it, and with R10 = 3 that is four lines from
-    /// the load to the expiry, so the HINTs land on 3 and 7.
+    /// The counter is reloaded on the way into VBlank and counted down from the
+    /// step into line 0, so with R10 = 3 the frame's HINTs are at the back porch
+    /// of lines 2, 6 and 10 - each as the V counter turns to 3, 7 and 11 (see
+    /// [`Vdp::hint_step`], #491). One frame is walked first so the count starts
+    /// from a VBlank reload rather than from a chip that has never run.
     #[test]
-    fn hint_counter_with_r10_three_fires_on_lines_three_and_seven() {
+    fn hint_counter_with_r10_three_fires_on_lines_two_six_and_ten() {
         let mut vdp = running(false);
         vdp.write_register(0, 0x10);
         vdp.write_register(10, 3);
+        hint_lines(&mut vdp, 262);
 
         assert_eq!(
             hint_lines(&mut vdp, 11),
-            vec![3, 7],
-            "the counter runs 3, 2, 1, 0 and expires on the line after the last one it was loaded on"
+            vec![2, 6, 10],
+            "reloaded with 3 in VBlank, the steps into lines 0, 1 and 2 count it to 0 and the step into 3 expires it"
         );
     }
 
-    /// R10 = 0 expires on every line that decrements, and genvdp.txt is explicit
-    /// that lines 225 to 261 reload instead: "Lines 225 through 261. (note that line
-    /// 224 is not included)".
+    /// R10 = 0 expires on every step into an active line: 224 HINTs a frame, the
+    /// first at the back porch of the frame's last line, as the V counter turns
+    /// to 0, and the last at line 222's, as it turns to 223. The steps into the
+    /// VBlank lines reload instead (blastem's `vdp_advance_line`, #491).
     #[test]
-    fn hint_counter_with_r10_zero_fires_every_active_line_and_never_in_vblank() {
+    fn hint_counter_with_r10_zero_fires_into_every_active_line_and_never_in_vblank() {
         let mut vdp = Vdp::new(false);
         vdp.write_register(1, 0x40);
         vdp.write_register(10, 0);
+        hint_lines(&mut vdp, 262);
 
         let fired = hint_lines(&mut vdp, 262);
+        let mut want: Vec<u16> = (0..=222).collect();
+        want.push(261);
         assert_eq!(
-            fired,
-            (0..=224).collect::<Vec<u16>>(),
-            "every line of the active display, and nothing from 225 on"
+            fired, want,
+            "every step into lines 0 to 223, and none into VBlank"
         );
+    }
+
+    /// Lemmings 2's switch, which is what told the two load rules apart (#491).
+    /// With R10 = $2F the frame's first HINT is at line $2E and the next at
+    /// $5E. The cart writes R10 = 1 at line $3C, between the two: the running
+    /// count is not touched, $5E still fires, and the reload it makes is the
+    /// first to read 1, so the HINTs after it are every other line from $60.
+    /// That puts the cart's V counter reads on odd values, $CF among them,
+    /// where blastem has them; the old phase read only even ones and parked.
+    #[test]
+    fn a_mid_frame_r10_write_takes_effect_at_the_next_reload() {
+        let mut vdp = running(false);
+        vdp.write_register(0, 0x14);
+        vdp.write_register(10, 0x2F);
+        hint_lines(&mut vdp, 262);
+
+        assert_eq!(hint_lines(&mut vdp, 0x3C), vec![0x2E]);
+        vdp.write_register(10, 1);
+        let after: Vec<u16> = hint_lines(&mut vdp, 0x2A)
+            .into_iter()
+            .map(|line| line + 0x3C)
+            .collect();
+        assert_eq!(after[..4], [0x5E, 0x60, 0x62, 0x64]);
     }
 
     /// The lines whose vertical interrupt went up, `lines` whole lines of walking
