@@ -277,7 +277,10 @@ fn md_test_pack_mdtrans_draws_its_priority_field() {
 /// This key has now moved once per open-bus mechanism, each with cell-level
 /// evidence of which one moved it: #260 (the reset gate folded into the
 /// grant), #479 (the prefetched word published to the bus), #508 (the float
-/// model answering undriven reads with it).
+/// model answering undriven reads with it), and #530 (the `DBcc` counter-
+/// expiry exit re-timed from 12 to 14 clocks per yacht.txt Line 0101's
+/// "counter exp" row — the memtest's own report loops are `DBcc`-driven, so
+/// the +2 per expiry shifts the report's content).
 #[test]
 fn md_test_pack_memtest_68k_prints_its_memory_report() {
     check(

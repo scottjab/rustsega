@@ -99,6 +99,23 @@ const BRANCH_TAKEN_CLOCKS: u32 = 2;
 /// for #41.
 const BRANCH_NOT_TAKEN_CLOCKS: u32 = 4;
 
+/// Clocks the `DBcc` counter-expiry exit pays over and above the
+/// [`BRANCH_NOT_TAKEN_CLOCKS`] the other not-taken exit pays: 2, for a total
+/// of 14.
+///
+/// The law is yacht.txt Line 0101, the `DBcc` table: "branch taken" 10(2/0),
+/// "branch not taken / cc true" 12(2/0), "branch not taken / counter exp"
+/// 14(3/0) — and M68000UM's own appendix bills `DBcc` 10/14, taken/not-taken,
+/// with no 12 anywhere in the row. The suite cannot date this exit: every
+/// `DBcc.json.gz` case either branches or leaves through a true condition, and
+/// none has a counter that decrements to `$FFFF` (measured for #530: every
+/// `51xx` case's counter stays one away from expiry), which is why this exit
+/// used to be timed like the cc-true one. The 2 clocks are not another bus
+/// read — the queue already shows both the fall-through refill and the
+/// displacement word's own slot — so the charge lands on the handler's
+/// return, the way [`BRANCH_TAKEN_CLOCKS`] does for a taken branch.
+const DBCC_EXPIRED_CLOCKS: u32 = 2;
+
 /// A `Bcc`/`BSR` byte displacement of zero is not a branch to the next
 /// instruction: it is the escape hatch that means a 16-bit displacement word
 /// follows (M68000UM "Bcc — Branch Conditional").
@@ -248,10 +265,12 @@ impl M68k {
         } else {
             // The loop ran out: the counter is written and the instruction
             // finishes where it was. `DBcc.json.gz` has no case whose counter is
-            // `$0000`, so nothing in the suite dates this path; it is timed like
-            // the other not-taken one, whose 12 clocks the file does measure.
+            // `$0000`, so nothing in the suite dates this path; its 14 clocks
+            // are yacht.txt Line 0101's "counter exp" row — see
+            // [`DBCC_EXPIRED_CLOCKS`]. The cc-true exit above stays at the 12
+            // the file does measure.
             self.advance_opcode(bus);
-            BRANCH_NOT_TAKEN_CLOCKS
+            BRANCH_NOT_TAKEN_CLOCKS + DBCC_EXPIRED_CLOCKS
         }
     }
 
@@ -753,6 +772,45 @@ mod tests {
 
         assert_eq!(cpu.pc, PROGRAM + 4, "the loop exits by falling through");
         assert_eq!(cpu.d[0], 0xDEAD_FFFF);
+    }
+
+    /// The counter-expiry exit costs 14 clocks, not the 12 the other
+    /// not-taken exit costs (yacht.txt Line 0101, `DBcc`: "branch taken"
+    /// 10(2/0), "cc true" 12(2/0), "counter exp" 14(3/0); M68000UM appendix
+    /// "Instruction Timing" bills `DBcc` 10/14, taken/not-taken, with no 12
+    /// anywhere in the row).
+    ///
+    /// Nothing in the pinned suite dates this exit — every `DBcc.json.gz` case
+    /// either branches (10) or leaves through a true condition (12); none has a
+    /// counter that decrements to `$FFFF` — which is why the exit used to be
+    /// timed like the cc-true one and why the law here is the microcode row.
+    /// The decompressor that #530 measures runs one `DBcc` per flag word and
+    /// per match run, several hundred times a frame, so two clocks here are a
+    /// real slice of a frame of 68000 time.
+    #[test]
+    fn dbcc_counter_expiry_costs_14_clocks() {
+        let (mut cpu, mut bus) = run(DBCC_D0 | (1 << 8), &[0x0FF0, 0x4E71]); // DBF D0
+        cpu.d[0] = 0xDEAD_0000;
+        let cycles = cpu.cycles;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.cycles - cycles, 14);
+    }
+
+    /// The cc-true exit costs 12, not 14: every `DBcc.json.gz` case whose
+    /// condition holds (all 2 007 of the `50xx` file, and every not-branching
+    /// case of the other conditions) is billed exactly 12, which is what pins
+    /// the 2-clock gap between the two exits the yacht row shows.
+    #[test]
+    fn dbcc_cc_true_costs_12_clocks() {
+        let (mut cpu, mut bus) = run(DBCC_D0, &[0x0FF0, 0x4E71]); // DBT D0: always true
+        cpu.d[0] = 0xDEAD_BEEF;
+        let cycles = cpu.cycles;
+
+        cpu.step(&mut bus);
+
+        assert_eq!(cpu.cycles - cycles, 12);
     }
 
     /// The base of a `DBcc` displacement is the address of the displacement word
