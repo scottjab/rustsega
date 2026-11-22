@@ -22,6 +22,7 @@
 pub mod app;
 pub mod audio;
 pub mod audio_pacing;
+pub mod audio_ring;
 pub mod controls;
 pub mod crash;
 pub mod emulator;
@@ -37,6 +38,7 @@ pub mod nav;
 pub mod perf;
 pub mod recents;
 pub mod render;
+pub mod ring_pacing;
 pub mod rom;
 pub mod rom_picker;
 pub mod scale;
