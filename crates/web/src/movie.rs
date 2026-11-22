@@ -142,6 +142,9 @@ pub enum ReplayError {
         /// The region this run resolved to.
         run: Region,
     },
+    /// A TASVideos movie (BizHawk `.bk2`, Gens `.gmv`, or the `.zip` around
+    /// one) that the importer refused (#673).
+    Tas(tas::TasError),
 }
 
 impl core::fmt::Display for ReplayError {
@@ -155,6 +158,7 @@ impl core::fmt::Display for ReplayError {
                 movie.name(),
                 run.name()
             ),
+            Self::Tas(error) => write!(f, "{error}"),
         }
     }
 }
@@ -182,6 +186,41 @@ pub fn prepare_replay(text: &str, rom_hash: u64, region: Region) -> Result<Movie
         });
     }
     Ok(parsed)
+}
+
+/// Admits the TASVideos movie `bytes` (BizHawk `.bk2`, Gens `.gmv`, or the
+/// `.zip` TASVideos serves either in) as this run's replay (#673), with the
+/// sentence the toast says about it.
+///
+/// Such a file names no rustsega ROM hash, so it becomes a movie of the
+/// running cartridge ([`tas::import`]); what it says it was made for goes in
+/// the sentence instead, because a TAS played on the wrong revision desyncs
+/// rather than failing. The region check is [`prepare_replay`]'s: a movie
+/// that names a region has to be this run's.
+pub fn prepare_tas(
+    bytes: &[u8],
+    rom_hash: u64,
+    region: Region,
+) -> Result<(Movie, String), ReplayError> {
+    let imported = tas::import(bytes, rom_hash, region).map_err(ReplayError::Tas)?;
+    if imported.movie.region() != region {
+        return Err(ReplayError::RegionMismatch {
+            movie: imported.movie.region(),
+            run: region,
+        });
+    }
+    let mut about = format!(
+        "Playing a {} of {} frames",
+        imported.format.name(),
+        imported.frames
+    );
+    if let Some(game) = &imported.game_name {
+        about.push_str(&format!(" made for {game}"));
+    }
+    about.push_str(
+        ". A TAS plays exactly only as long as this emulator's timing matches the one it was made on.",
+    );
+    Ok((imported.movie, about))
 }
 
 /// The movie state the frame loop consults, once per frame before
@@ -356,7 +395,7 @@ pub fn MovieFileInput() -> impl IntoView {
             id=MOVIE_INPUT_ID
             class="file-input"
             type="file"
-            accept=".rsm"
+            accept=".rsm,.bk2,.gmv,.zip"
             // Out of the tab order, exactly as the ROM and `.srm` inputs are:
             // the control is invisible, so a keyboard user reaches the replay
             // button instead.
@@ -377,21 +416,27 @@ pub fn MovieFileInput() -> impl IntoView {
     }
 }
 
-/// One picked file, into bytes, into text, into [`Controls::replay_movie`].
+/// One picked file, into bytes, into [`Controls::replay_tas`] or into text
+/// and [`Controls::replay_movie`].
 ///
-/// A `.rsm` is text, so a pick that is not is refused here rather than handed
-/// to the parser as replacement characters; the parse and the checks are the
-/// replay's own answer, and they say so in the toast.
+/// A TASVideos movie is told apart by its bytes, not its name (#673). A `.rsm`
+/// is text, so a pick that is neither is refused here rather than handed to the
+/// parser as replacement characters; the parse and the checks are the replay's
+/// own answer, and they say so in the toast.
 async fn read_and_replay(file: web_sys::File, console: Controls, toasts: Toasts) {
     let name = file.name();
     let Ok(bytes) = crate::rom_picker::read_file(&file).await else {
         toasts.push(ToastKind::Danger, format!("{name} could not be read"));
         return;
     };
+    if tas::looks_like_tas(&bytes) {
+        console.replay_tas(bytes, toasts);
+        return;
+    }
     let Ok(text) = String::from_utf8(bytes) else {
         toasts.push(
             ToastKind::Danger,
-            format!("{name} is not a .rsm movie, which is text"),
+            format!("{name} is not a .rsm, .bk2 or .gmv movie"),
         );
         return;
     };

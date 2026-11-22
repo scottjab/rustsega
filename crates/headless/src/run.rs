@@ -136,11 +136,14 @@ pub struct RunArgs {
     /// written before #364 runs unchanged.
     #[arg(long = "pad1", value_name = "SCRIPT")]
     pub pad1: Option<String>,
-    /// Replay the pad input of a `.rsm` movie instead of holding `--pad1`.
+    /// Replay the pad input of a movie instead of holding `--pad1`.
     ///
-    /// The movie of `docs/movie-format.md` (M6-09, #129). Its ROM hash and its
-    /// region have to match this run, and the pads then follow the movie frame by
-    /// frame instead of the script. Cannot be combined with `--pad1`.
+    /// A `.rsm` movie of `docs/movie-format.md` (M6-09, #129), whose ROM hash and
+    /// region have to match this run; or a TASVideos movie (#673): a BizHawk
+    /// `.bk2`, a Gens `.gmv`, or the `.zip` TASVideos serves either in, which is
+    /// played on this ROM whatever it was made for (the game it names is
+    /// printed). The pads then follow the movie frame by frame. Cannot be
+    /// combined with `--pad1`.
     #[arg(long, value_name = "PATH")]
     pub movie: Option<PathBuf>,
     /// Write the run's port 1 input to `PATH` as a `.rsm` movie.
@@ -391,11 +394,25 @@ fn read_movie(path: Option<&Path>, rom: &[u8], region: Region) -> Result<Option<
         return Ok(None);
     };
     let name = quote(path);
-    let text = fs::read_to_string(path).with_context(|| format!("cannot read movie {name}"))?;
-    let movie = movie::parse(&text).with_context(|| format!("cannot read movie {name}"))?;
-    movie
-        .check_rom(rom)
-        .with_context(|| format!("movie {name}"))?;
+    let bytes = fs::read(path).with_context(|| format!("cannot read movie {name}"))?;
+    let movie = if tas::looks_like_tas(&bytes) {
+        // A TASVideos movie: BizHawk .bk2, Gens .gmv, or the .zip around
+        // either (#673). It names no rustsega ROM hash, so it is a movie of
+        // the ROM it is played on, and what it says it was made for is
+        // printed for the user to compare.
+        let imported = tas::import(&bytes, movie::rom_hash(rom), region)
+            .with_context(|| format!("cannot read movie {name}"))?;
+        eprintln!("{}", describe_tas(&imported));
+        imported.movie
+    } else {
+        let text = String::from_utf8(bytes)
+            .with_context(|| format!("cannot read movie {name}: not text, and not a TAS movie"))?;
+        let movie = movie::parse(&text).with_context(|| format!("cannot read movie {name}"))?;
+        movie
+            .check_rom(rom)
+            .with_context(|| format!("movie {name}"))?;
+        movie
+    };
     if movie.region() != region {
         bail!(
             "movie {name} is for region {}, and this run is {}",
@@ -404,6 +421,27 @@ fn read_movie(path: Option<&Path>, rom: &[u8], region: Region) -> Result<Option<
         );
     }
     Ok(Some(movie))
+}
+
+/// The line `headless` prints about a TAS movie it is about to play: what it
+/// is, how long, and the game it says it was made for, since nothing checks
+/// that it is this ROM.
+fn describe_tas(imported: &tas::Imported) -> String {
+    let mut line = format!(
+        "movie: {} of {} frames",
+        imported.format.name(),
+        imported.frames
+    );
+    if let Some(game) = &imported.game_name {
+        line.push_str(&format!(", made for \"{game}\""));
+    }
+    if let Some(digest) = &imported.rom_digest {
+        line.push_str(&format!(" (ROM digest {digest})"));
+    }
+    if let Some(rerecords) = imported.rerecords {
+        line.push_str(&format!(", {rerecords} rerecords"));
+    }
+    line
 }
 
 /// The region [`genesis::Genesis::new`] runs `rom` as under `config`: the same

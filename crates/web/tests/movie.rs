@@ -366,3 +366,48 @@ fn the_session_states_have_ui_words() {
     assert_eq!(MovieState::Recording.label(), "Recording input");
     assert_eq!(MovieState::Replaying.label(), "Replaying movie");
 }
+
+/// A Gens movie of `frames` (P1, P2, 6-button byte; active low), for #673.
+fn gens_movie(frames: &[[u8; 3]]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 0x40];
+    bytes[..15].copy_from_slice(b"Gens Movie TEST");
+    bytes[0x0F] = b'A';
+    bytes[0x14] = b'3';
+    bytes[0x15] = b'3';
+    for frame in frames {
+        bytes.extend_from_slice(frame);
+    }
+    bytes
+}
+
+/// A TASVideos movie becomes a movie of the running cartridge (#673): it names
+/// no rustsega hash, so the hash it replays under is the console's.
+#[test]
+fn a_tas_movie_is_admitted_for_the_running_cartridge() {
+    let hash = 0x0123_4567_89ab_cdef;
+    let file = gens_movie(&[[0xFF; 3], [0x7F, 0xFF, 0xFF]]);
+    let (replay, about) =
+        movie::prepare_tas(&file, hash, Region::Usa).expect("a Gens movie is admitted");
+    assert_eq!(replay.rom_hash(), hash);
+    assert_eq!(replay.buttons_at(1, 0), genesis::Buttons::START);
+    assert!(about.contains("Gens .gmv of 2 frames"), "{about}");
+}
+
+/// A Gens movie made at 50 fps is a PAL run, and an NTSC console refuses it
+/// with both regions named, as it would a `.rsm`.
+#[test]
+fn a_pal_tas_movie_on_an_ntsc_run_is_refused() {
+    let mut file = gens_movie(&[[0xFF; 3]]);
+    file[0x16] = 0x80;
+    let error = movie::prepare_tas(&file, 1, Region::Usa).expect_err("PAL on NTSC");
+    assert!(error.to_string().contains("europe"), "{error}");
+}
+
+/// What the importer refuses, the toast says in its words.
+#[test]
+fn a_savestate_tas_movie_is_refused_in_the_importers_words() {
+    let mut file = gens_movie(&[[0xFF; 3]]);
+    file[0x16] = 0x40;
+    let error = movie::prepare_tas(&file, 1, Region::Usa).expect_err("starts from a savestate");
+    assert!(error.to_string().contains("savestate"), "{error}");
+}

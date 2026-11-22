@@ -31,6 +31,8 @@ crates/
              scheduler, audio mixing, save states. Depends on all chip crates.
   testkit/   Test-only helpers (ROM discovery, hashing, golden files).
   headless/  CLI that runs a ROM without a browser. Used by integration tests.
+  tas/       TASVideos movies (BizHawk .bk2, Gens .gmv, and their .zip) as
+             genesis movies. Depends on genesis and miniz_oxide (#673).
   web/       Leptos CSR app, built with `trunk` to wasm.
   server/    axum server that embeds web/dist into the binary.
 ```

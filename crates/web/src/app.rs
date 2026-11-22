@@ -817,7 +817,11 @@ pub fn App() -> impl IntoView {
                         "movie owns the pads until you stop it - your keyboard, "
                         "gamepad and touch input are ignored. A movie for another "
                         "cartridge or region is refused, and one that holds X, Y, Z "
-                        "or Mode replays on a 6-button pad by itself."
+                        "or Mode replays on a 6-button pad by itself. Replay also "
+                        "plays TASVideos movies (BizHawk .bk2 or Gens .gmv, zipped "
+                        "or not) on the loaded cartridge; a TAS stays in step only "
+                        "as long as this emulator's timing matches the one it was "
+                        "made on."
                     </p>
                     <div class="console-actions">
                         <Button
@@ -842,7 +846,7 @@ pub fn App() -> impl IntoView {
                             disabled=Signal::derive(move || !loaded.get())
                             on_click=Callback::new(move |_| open_movie_picker())
                         >
-                            "Replay .rsm file"
+                            "Replay movie file"
                         </Button>
                     </div>
                     <textarea

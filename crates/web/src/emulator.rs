@@ -979,6 +979,43 @@ impl Controls {
         let checked = emulator.with(|emulator| {
             crate::movie::prepare_replay(&text, emulator.rom_hash, emulator.region)
         });
+        self.start_checked_replay(
+            emulator,
+            checked,
+            "Replaying. The movie owns the pads until you stop it - your own controls are ignored."
+                .to_string(),
+            toasts,
+        );
+    }
+
+    /// Takes the TASVideos movie `bytes` (BizHawk `.bk2`, Gens `.gmv`, or the
+    /// `.zip` around one) as a replay for the running console (#673): the same
+    /// restart and the same ownership of the pads as [`Controls::replay_movie`],
+    /// admitted by [`crate::movie::prepare_tas`] instead.
+    pub fn replay_tas(self, bytes: Vec<u8>, toasts: Toasts) {
+        let Some(emulator) = running() else {
+            toasts.push(ToastKind::Danger, "Load a cartridge to replay a movie");
+            return;
+        };
+        let checked = emulator
+            .with(|emulator| crate::movie::prepare_tas(&bytes, emulator.rom_hash, emulator.region));
+        let (checked, about) = match checked {
+            Some(Ok((movie, about))) => (Some(Ok(movie)), about),
+            Some(Err(error)) => (Some(Err(error)), String::new()),
+            None => (None, String::new()),
+        };
+        self.start_checked_replay(emulator, checked, about, toasts);
+    }
+
+    /// The shared half of a replay: refuse with the admission check's words,
+    /// or restart the run with `movie` owning the pads and say `started`.
+    fn start_checked_replay(
+        self,
+        emulator: TakeCell<Emulator>,
+        checked: Option<Result<genesis::movie::Movie, crate::movie::ReplayError>>,
+        started: String,
+        toasts: Toasts,
+    ) {
         let movie = match checked {
             Some(Ok(movie)) => movie,
             Some(Err(error)) => {
@@ -991,10 +1028,7 @@ impl Controls {
         };
         emulator.with(|emulator| emulator.begin_replay(movie));
         self.movie.set(MovieState::Replaying);
-        toasts.push(
-            ToastKind::Info,
-            "Replaying. The movie owns the pads until you stop it - your own controls are ignored.",
-        );
+        toasts.push(ToastKind::Info, started);
     }
 }
 

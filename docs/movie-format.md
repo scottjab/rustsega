@@ -40,6 +40,40 @@ pads 2
 The three header lines may come in any order and each appears exactly once; the
 frame lines follow them. Everything below the marker is a comment or a frame line.
 
+One header line is optional: `six-button` and the 1-based numbers of the pads
+that replay as 6-button pads whatever they press (`six-button 1`, `six-button 1
+2`), at most once (#673). Without it a pad is a 6-button pad exactly when it
+presses `X`, `Y`, `Z` or `M` somewhere, as before; with it, a movie recorded on
+a 6-button pad that never pressed those four replays on one anyway, which a game
+that detects the pad at boot needs. `Movie::format` writes the line only for a
+movie that has such a pad, so every movie written before it is unchanged.
+
+## TASVideos movies
+
+`crates/tas` reads the two formats TASVideos accepts for the Genesis, BizHawk
+`.bk2` and Gens `.gmv`, and the `.zip` TASVideos serves each one in, and turns
+them into a `Movie` (#673). `headless run --movie` and the browser's Replay
+button take them as they come and tell them apart by their bytes. Neither format
+carries `rom-hash`, so the movie is a movie of the ROM it is played on, and the
+game it names (BizHawk's `GameName` and `SHA1` header keys) is printed rather
+than enforced. A BizHawk movie's region comes from its `SyncSettings.json`
+(`Region` 0 autodetect, 1 USA, 2 Europe, 3 Japan NTSC, 4 Japan PAL, the last
+played as Europe), a Gens movie's from its 50/60 fps flag, and each format's pad
+type becomes the `six-button` line. Saving an imported movie writes an ordinary
+`.rsm`.
+
+Refused with a reason rather than played wrong: movies that start from a
+savestate or from saved cartridge RAM, three-player Gens movies, movies for
+another platform, and a Reset or power cycle after frame 0, which this format
+cannot say yet.
+
+A TAS is a frame-exact script for the emulator it was made on, and plays
+correctly only for as long as this one's timing matches. At #673, BizHawk's
+Sonic 1 "100%" (TASVideos #5121) plays through Green Hill into Marble Zone, and
+Gens' Sonic 1 (#3570) plays Green Hill Act 1; the S3K BizHawk movie (#6890)
+desyncs at the SEGA screen, where our boot reaches the title about 150 frames
+later than BizHawk's does.
+
 ## The two rules
 
 1. **Only the frames on which the input changes are listed, and the input holds
