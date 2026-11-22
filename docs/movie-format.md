@@ -70,9 +70,17 @@ cannot say yet.
 A TAS is a frame-exact script for the emulator it was made on, and plays
 correctly only for as long as this one's timing matches. At #673, BizHawk's
 Sonic 1 "100%" (TASVideos #5121) plays through Green Hill into Marble Zone, and
-Gens' Sonic 1 (#3570) plays Green Hill Act 1; the S3K BizHawk movie (#6890)
-desyncs at the SEGA screen, where our boot reaches the title about 150 frames
-later than BizHawk's does.
+Gens' Sonic 1 (#3570) plays Green Hill Act 1. The S3K BizHawk movie (#6890)
+desynced at the SEGA screen until #675 moved the 68000's power-on start to the
+line hardware starts it on: before that our boot ran a frame ahead of BizHawk's,
+and a one-frame Start press landed on the frame after the one that reads it.
+
+A movie's frame 0 is the run from power on to the first VBlank. BizHawk's core,
+Genesis Plus GX, starts the 68000 on the same measured line, so its frame
+numbers and ours mean the same thing; Genesis Plus GX's first frame is 33 lines
+of CPU time to our 65, because it ends that frame at the Mode 4 VBlank line
+(192) the VDP resets into, which a boot that runs past both lines before it
+waits for a VBlank never sees.
 
 ## The two rules
 

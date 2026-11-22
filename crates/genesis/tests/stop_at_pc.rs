@@ -209,7 +209,13 @@ fn one_leg_is_one_frame_of_sound() {
         "the handler is reached"
     );
 
+    // The run to the first stop is power on's, from line 159 to the first VBlank
+    // (#675), and not a raster: it is drained and the first whole leg after it is
+    // the measure.
     let mut samples = Vec::new();
+    machine.drain_audio(&mut samples);
+    samples.clear();
+    assert!(machine.run_until_pc(VINT_HANDLER, 2 * RASTER));
     machine.drain_audio(&mut samples);
     let frame_samples = samples.len();
     assert!(
@@ -217,7 +223,7 @@ fn one_leg_is_one_frame_of_sound() {
         "a raster of a running machine makes sound"
     );
 
-    for _ in 0..4 {
+    for _ in 0..3 {
         samples.clear();
         assert!(machine.run_until_pc(VINT_HANDLER, 2 * RASTER));
         machine.drain_audio(&mut samples);
