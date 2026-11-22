@@ -195,6 +195,20 @@ SR load), at which point the still-pending flag re-interrupts immediately.
 clear. blastem's `vdp_int_ack` is the reference's version of the same rule.
 HardBall III's loader (#557, #646) is the cart that lives on the held flag.
 
+A held flag that the 68000 unmasks itself, by writing IE0 or IE1 on, is not
+taken at the next instruction boundary but one instruction later: "you can
+execute at least one instruction after enabling VINT in the VDP with a pending
+VINT", and "It should be exactly one instruction latency" (SpritesMind t=2202,
+"M68K Interrupt Processing", Mask of Destiny 2015-10-31 and Eke 2015-11-02).
+The scheduler notices when a 68000 instruction's own bus accesses raise
+`pending_irq` (read before the beam is walked) and holds the IPL pins for one
+more 68000 instruction (`Scheduler::ipl_held`). A level raised by the beam is
+not held. Sesame Street Counting Cafe (#493) needs it: it writes `$8174` with a
+VINT held, and the `CLR.B $FF0200` after the write has to run before the
+handler, or a later display-off path turns IE0 off for good and the game parks
+in its tick wait. The same thread's 2017 finding that a `MOVE.L` latches IPL
+between its two writes is not modelled.
+
 ### z80
 
 ```rust

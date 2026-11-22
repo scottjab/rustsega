@@ -81,7 +81,13 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// so a restored machine would answer open bus from `0xFFFF` instead of the
 /// word the cart was about to execute - the same class of wrong as every bump
 /// above for any cart mid-poll at the moment of the save.
-pub const FORMAT_VERSION: u32 = 10;
+///
+/// Version 11 is `Scheduler::ipl_held` (#493): one `bool` added to `Scheduler`,
+/// the one-instruction latency of an interrupt the 68000 unmasks with its own
+/// register write. A v10 payload would run out of message in the middle of it,
+/// and a state saved between that write and the next instruction would take the
+/// interrupt one instruction early on load.
+pub const FORMAT_VERSION: u32 = 11;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 
