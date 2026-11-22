@@ -87,7 +87,12 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// register write. A v10 payload would run out of message in the middle of it,
 /// and a state saved between that write and the next instruction would take the
 /// interrupt one instruction early on load.
-pub const FORMAT_VERSION: u32 = 11;
+///
+/// Version 12 is `Scheduler::refresh` (#665): the 68000's DRAM refresh count,
+/// one `u64` added to `Scheduler`. A v11 payload would run out of message in
+/// it, and a state that dropped it would restart the count and move every
+/// refresh delay after the load.
+pub const FORMAT_VERSION: u32 = 12;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 

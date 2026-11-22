@@ -67,6 +67,15 @@ Rules:
   master-clock position. Sub-line accuracy (the FIFO stall of `Vdp`, mid-line
   register writes) comes later as separate tickets: the VDP has reported its
   side of the write FIFO since M4-21a (#99), and `genesis` has to act on it.
+- DRAM refresh takes 2 of every 128 68000 clocks (`genesis::refresh`, #665):
+  blastem's model ("2 68K cycles of delay every 128 68K cycles unless refresh
+  occurs during a hardware access", its trac ticket 24), which is the
+  cartridge-side figure of Mask of Destiny's measurements (SpritesMind t=2323,
+  "68K Refresh Delays": 2 cycles, "126 cycles and 130 cycles apart"). A
+  refresh inside a VDP port access is free, a 68k -> VDP transfer restarts the
+  count, and the work-RAM refresh's own 3-cycle timer is not modelled. Without
+  it the 68000 got about 1.5% more done per frame than the reference, which S&K's
+  parked decompressor measured (#526, #529, #530).
 
 ## Core APIs (initial shape, tickets may refine)
 

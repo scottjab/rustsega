@@ -1115,11 +1115,14 @@ fn twinkle_tale_boots_to_non_blank_screen() {
     let path = require_data!(testkit::commercial_rom("Twinkle Tale (Japan).md"));
     // The `$F033` opcode is at 0x003D98, early in the boot, and after the fix
     // the cart runs - but its attract sequence stays near-black for roughly
-    // the first 1500 frames (1-3 colours), settling at 5 colours from 1800 on.
-    let colours = colour_count(&path, 1800, "line_twinkle_tale.png");
+    // the first 1500 frames (1-3 colours). It settled at 5 colours from 1800
+    // on until #665 charged the 68000 its DRAM refresh delay; with the 68000
+    // 1.5% slower the sequence lights up later (4 colours at 1800, 6 at 1900,
+    // 8 from 2200), so the sample moved to 2000 (maintainer approved on #665).
+    let colours = colour_count(&path, 2000, "line_twinkle_tale.png");
     assert!(
         colours > BLANK,
-        "1800 frames in, Twinkle Tale is {colours} distinct colours"
+        "2000 frames in, Twinkle Tale is {colours} distinct colours"
     );
 }
 

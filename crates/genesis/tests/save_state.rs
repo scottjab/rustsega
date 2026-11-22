@@ -141,10 +141,11 @@ fn header_written_and_checked() {
     );
     assert_eq!(
         u32::from_le_bytes(state[4..8].try_into().expect("4 bytes of version")),
-        11,
-        "format version 11, which is the scheduler's `ipl_held` of #493 (the one \
-         instruction an interrupt the 68000 unmasks with its own register write waits), \
-         on top of the bus's `prefetched_word` of #479 (one `u16` \
+        12,
+        "format version 12, which is the scheduler's DRAM refresh count of #665, \
+         on top of the scheduler's `ipl_held` of #493 (the one \
+         instruction an interrupt the 68000 unmasks with its own register write waits) \
+         that made it 11, on top of the bus's `prefetched_word` of #479 (one `u16` \
          the 68000's queue refills publish and the Z80 control word read answers \
          its unused bits with) that made it 10, on top of the SVP board carrying its DSP core and \
          IRAM of #433 stage 2 that made it 9, on top of the SVP board field that made it 8, \
