@@ -218,6 +218,16 @@ handler, or a later display-off path turns IE0 off for good and the game parks
 in its tick wait. The same thread's 2017 finding that a `MOVE.L` latches IPL
 between its two writes is not modelled.
 
+The HINT counter is reloaded from R10 or counted down once a line, at the back
+porch, against the line the beam is about to enter: reloaded on the way into a
+line outside the active display, counted down on the way into an active one,
+so with R10 = N a frame's first HINT is as the V counter turns to N. That is
+blastem's `vdp_advance_line` and Eke's "if VBLANK flag is set, reload HINT
+Counter else decrement it" (SpritesMind t=787); genvdp.txt's "loaded on line
+zero" read literally put every HINT a line later. A mid-frame R10 write waits
+for the next reload. Lemmings 2 (#491) is the cart that needs the phase: it
+waits in a period-2 HINT handler for a V counter read of $CF.
+
 ### z80
 
 ```rust

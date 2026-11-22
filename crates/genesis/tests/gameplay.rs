@@ -83,6 +83,14 @@
 //! the differences are the animation phase of what is on screen. Re-blessed with
 //! maintainer authorisation; the old and new values are in the #665 PR.
 //!
+//! # Movement: the HINT phase of #491
+//!
+//! #491 moved every HINT one line earlier (the counter is counted against the
+//! line the beam enters). Gunstar Heroes is the one section it reaches: its
+//! three checkpoint pictures are bit-identical, and only
+//! `gunstar_heroes_mission_1_audio` moved (`0x28a7d02bb66a9c4f` ->
+//! `0x7ec035d42dec25a1`), maintainer approved on #491.
+//!
 //! # Running it
 //!
 //! It needs cartridges, so CI skips it; a ROM that is not on disk is a skip,
