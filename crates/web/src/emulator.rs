@@ -492,7 +492,7 @@ async fn read_save(rom_id: &str, toasts: Toasts) -> Option<SavedSram> {
 /// The clock the save watcher is timed against: `performance.now()`, which is the
 /// timebase an animation frame's own timestamp is on, so a write timed from the
 /// loop and a write timed from a page event are on the same ruler.
-fn now_ms() -> f64 {
+pub(crate) fn now_ms() -> f64 {
     web_sys::window()
         .and_then(|window| window.performance())
         .map(|performance| performance.now())
@@ -1773,6 +1773,24 @@ impl Emulator {
                 .settings
                 .with_untracked(|settings| settings.fast_forward_speed.multiplier());
             return ff_frames(speed, self.pacer.frames_due(now_ms));
+        }
+        // The ring output paces on the display, and only corrects from the
+        // ring's lead: the audio clock never decides a tick (#629, and
+        // `crate::ring_pacing` for why).
+        let ring_lead = self
+            .audio
+            .as_ref()
+            .filter(|audio| audio.is_running())
+            .and_then(|audio| audio.ring_lead(now_ms));
+        if let Some(lead) = ring_lead {
+            let display_due = self.pacer.frames_due(now_ms);
+            return crate::ring_pacing::nudge_frames(
+                display_due,
+                lead,
+                crate::ring_pacing::RING_TARGET_SECS,
+                self.frame_secs,
+                MAX_FRAMES_PER_TICK,
+            );
         }
         let buffered = self
             .audio

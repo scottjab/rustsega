@@ -9,7 +9,12 @@ the ticket wins for that ticket, and the ticket should also update this doc.
    Genesis (NTSC and PAL). Accuracy is proven with tests, not eyeballing.
 2. Runs in the browser at full speed (60 fps NTSC, 50 fps PAL) via WASM.
 3. All app code is Rust. The browser UI is Rust (Leptos) compiled to WASM.
-   The only JavaScript is what `wasm-bindgen` generates.
+   The only JavaScript is what `wasm-bindgen` generates. One exception, kept
+   as small as it can be: the AudioWorklet processor of the Safari audio ring
+   (#629), about 60 lines of `inline_js` in `crates/web/src/audio_ring.rs`.
+   An audio-thread processor cannot be written in wasm-bindgen Rust, and
+   wasm-bindgen ships it as one of its own snippets, so it is still served
+   from the app's origin under `script-src 'self'`.
 4. Deploys as one binary: `server` embeds the built frontend and serves it.
 5. Playable with keyboard, gamepad, or touch.
 
@@ -608,8 +613,27 @@ ports) it inherits the 68k's answer through the same dispatch.
   got. What the headless rig cannot see, and what stays browser-specific:
   CoreAudio's real output latency on macOS, iOS's gesture and sample-rate
   conversion rules, and Safari's low-power rAF throttling - a real-device pass
-  is still the acceptance test. The no-AudioWorklet decision stands; revisiting
-  it wants a measurement, not a suspicion.
+  is still the acceptance test.
+
+  The real-device pass came back still stuttering, sound and picture, after the
+  batching fix. The cause is the audio-clock pacing itself: when `currentTime`
+  moves in coarse steps, a loop that asks it every tick how many frames to run
+  gets 0 or 2 frames on the ticks a step lands on. Headless Chromium has a coarse
+  clock too and shows it. On the scheduled output, Sonic 1 over 20 s ran 0
+  frames on 730 ticks, 2-3 on 466, and exactly 1 on only 5. So WebKit now gets an
+  **AudioWorklet ring** (`crates/web/src/audio_ring.rs`). The console's sound is
+  posted to a processor that drains it on the audio thread as one continuous
+  stream, at the device's own sample rate. The console is paced on the display
+  (`FramePacer`), and the ring's lead only adds or drops a frame when it leaves
+  a +-2-frame band around 60 ms (`crates/web/src/ring_pacing.rs`, with a native
+  loop model that drains the ring in coarse 1024-frame callbacks). The same
+  20 s run on the ring: 1 frame on 1199 of 1200 ticks and 0 ring underruns;
+  headless WebKit with real GStreamer audio: 0 ring underruns, and the only
+  0-frame ticks are its 62 Hz rAF being held to the console's 60. The
+  scheduled output stays as the fallback when the worklet does not load, and
+  as what Chrome and Firefox use. `?audio=ring` or `?audio=scheduled` forces
+  either path on any browser; `output`, `ringLead` and `ringUnderruns` on
+  `window.rustsegaAudio` show which one is running and how it is doing.
 - Input: one `InputState` that merges keyboard, Gamepad API, and touch
   overlay into `Buttons` per port. All bindings are rebindable and stored in
   `localStorage`.

@@ -10,8 +10,16 @@
 //! file, and docs/ARCHITECTURE.md says the only JavaScript here is what
 //! wasm-bindgen generates.
 //!
-//! On a WebKit user agent several console frames share one block, and the
-//! cursor target deepens to cover it - see
+//! On a WebKit user agent the sound goes to an AudioWorklet ring instead
+//! ([`crate::audio_ring`], #629) as soon as its processor has loaded, and the
+//! console is paced on the display with the ring's lead as a correction
+//! ([`crate::ring_pacing`]); the scheduled path below is then only the
+//! fallback for a browser that will not load the worklet. `?audio=ring` or
+//! `?audio=scheduled` in the page URL picks either path on any browser, for
+//! measuring one against the other.
+//!
+//! On the scheduled path a WebKit user agent has several console frames share
+//! one block, and the cursor target deepens to cover it - see
 //! [`crate::audio_pacing::frames_per_block_for`] and
 //! [`crate::audio_pacing::target_ahead_secs`] for the counts and the reasons
 //! (#629). The schedule below is the same either way, only less frequent and
@@ -36,6 +44,9 @@
 //! Everything here is browser code, so it has no native tests: the arithmetic it
 //! depends on lives in [`crate::audio_pacing`], which does.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use js_sys::Reflect;
 use wasm_bindgen::JsValue;
 use web_sys::AudioContext;
@@ -46,6 +57,7 @@ use web_sys::GainNode;
 use crate::audio_pacing::BlockBatcher;
 use crate::audio_pacing::deinterleave;
 use crate::audio_pacing::frames_per_block_for;
+use crate::audio_ring::RingSink;
 
 /// The sample rate asked of the browser, which is `Config::default`'s too.
 ///
@@ -117,6 +129,13 @@ pub struct AudioOut {
     underruns: u32,
     /// Blocks handed to the context, for the same measurement.
     blocks: u32,
+    /// The AudioWorklet ring, once its processor has loaded: filled in by the
+    /// task [`Self::new`] spawns, so it is shared with that task.
+    ring: Rc<RefCell<Option<RingSink>>>,
+    /// Whether the ring has taken over from the scheduled path. Set by the
+    /// first [`Self::push`] that finds the ring loaded, which is also when the
+    /// scheduled blocks still queued are cut, so the two never play at once.
+    ring_live: bool,
     /// The `window.rustsegaAudio` object this output keeps current. Web Audio
     /// gives a tab no other way to be observed from devtools, and "no drift" is
     /// an acceptance criterion that has to be measured to be believed.
@@ -133,11 +152,27 @@ impl AudioOut {
     /// right thing to do here because the *rate* has to be known before
     /// `Genesis::new`, and because a suspended context costs nothing.
     pub fn new() -> Option<Self> {
+        let user_agent = user_agent();
+        let use_ring = wants_ring(&user_agent);
         let options = AudioContextOptions::new();
-        options.set_sample_rate(REQUESTED_SAMPLE_RATE);
+        // The ring runs at the device's own rate: one resampler fewer between
+        // the console and the speakers on the browser the ring is for (#629).
+        // The mixer is told the rate the context really has either way.
+        if !use_ring {
+            options.set_sample_rate(REQUESTED_SAMPLE_RATE);
+        }
         let ctx = AudioContext::new_with_context_options(&options).ok()?;
         let gain = ctx.create_gain().ok()?;
         gain.connect_with_audio_node(&ctx.destination()).ok()?;
+        let ring = Rc::new(RefCell::new(None));
+        if use_ring {
+            let slot = Rc::clone(&ring);
+            let (ctx, gain) = (ctx.clone(), gain.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                let sink = RingSink::start(ctx, gain).await;
+                *slot.borrow_mut() = sink;
+            });
+        }
 
         let mut out = Self {
             ctx,
@@ -145,7 +180,7 @@ impl AudioOut {
             next_time: 0.0,
             left: Vec::new(),
             right: Vec::new(),
-            frames_per_block: frames_per_block_for(&user_agent()),
+            frames_per_block: frames_per_block_for(&user_agent),
             target_ahead: crate::audio_pacing::TARGET_AHEAD_SECS,
             batch: BlockBatcher::new(1, 0),
             volume: crate::settings::DEFAULT_VOLUME as f32,
@@ -153,6 +188,8 @@ impl AudioOut {
             scheduled: Vec::new(),
             underruns: 0,
             blocks: 0,
+            ring,
+            ring_live: false,
             mirror: js_sys::Object::new(),
         };
         out.next_time = out.ctx.current_time() + RESTART_LEAD_SECS;
@@ -233,6 +270,13 @@ impl AudioOut {
     /// it, which means this output cannot take more sound; the caller is
     /// expected to stop asking.
     pub fn push(&mut self, samples: &[i16]) -> bool {
+        if !self.ring_live && self.ring.borrow().is_some() {
+            self.cut_scheduled();
+            self.ring_live = true;
+        }
+        if self.ring_live {
+            return self.push_ring(samples);
+        }
         if self.frames_per_block > 1 {
             match self.batch.push(samples) {
                 Some(block) => return self.schedule(&block).is_some(),
@@ -240,6 +284,45 @@ impl AudioOut {
             }
         }
         self.schedule(samples).is_some()
+    }
+
+    /// [`Self::push`] on the ring: split, then posted to the processor.
+    fn push_ring(&mut self, samples: &[i16]) -> bool {
+        deinterleave(samples, &mut self.left, &mut self.right);
+        if self.left.is_empty() {
+            return true;
+        }
+        let ok = self
+            .ring
+            .borrow()
+            .as_ref()
+            .is_some_and(|ring| ring.push(&self.left, &self.right));
+        self.blocks += 1;
+        self.publish();
+        ok
+    }
+
+    /// The ring's lead at `now_ms` (`performance.now()` time), seconds, once
+    /// the ring has taken over; `None` while the scheduled path is pacing.
+    /// [`crate::ring_pacing::nudge_frames`] is what the emulator does with it.
+    pub fn ring_lead(&self, now_ms: f64) -> Option<f64> {
+        if !self.ring_live {
+            return None;
+        }
+        let rate = f64::from(self.ctx.sample_rate());
+        self.ring
+            .borrow()
+            .as_ref()
+            .map(|ring| ring.lead_secs(now_ms, rate))
+    }
+
+    /// Empties the ring, if it is the live output.
+    fn reset_ring(&self) {
+        if self.ring_live
+            && let Some(ring) = self.ring.borrow().as_ref()
+        {
+            ring.reset();
+        }
     }
 
     /// The `?`-shaped half of [`Self::push`]: stops at the first thing the
@@ -292,7 +375,17 @@ impl AudioOut {
     /// long the player would otherwise have gone on hearing the past: the number a
     /// measurement of a load looks at.
     pub fn discard(&mut self) -> f64 {
-        let ahead = self.buffered_secs();
+        let ahead = self
+            .ring_lead(crate::emulator::now_ms())
+            .unwrap_or_else(|| self.buffered_secs());
+        self.reset_ring();
+        self.cut_scheduled();
+        ahead
+    }
+
+    /// Stops every scheduled block and re-seats the cursor: [`Self::discard`]
+    /// for the scheduled path, and the hand-over to the ring.
+    fn cut_scheduled(&mut self) {
         // The frames gathered towards the next batched block belong to the
         // moment the console just left, same as everything else scheduled.
         self.batch.clear();
@@ -308,7 +401,6 @@ impl AudioOut {
         self.scheduled.clear();
         self.next_time = self.ctx.current_time() + RESTART_LEAD_SECS;
         self.publish();
-        ahead
     }
 
     /// Drops the blocks whose last sample has already been played.
@@ -359,6 +451,7 @@ impl AudioOut {
         let _ = self.ctx.resume();
         self.next_time = self.ctx.current_time() + RESTART_LEAD_SECS;
         self.batch.clear();
+        self.reset_ring();
         self.publish();
     }
 
@@ -383,7 +476,10 @@ impl AudioOut {
         set("state", JsValue::from_str(self.state_name()));
         set("currentTime", JsValue::from_f64(self.ctx.current_time()));
         set("nextTime", JsValue::from_f64(self.next_time));
-        set("ahead", JsValue::from_f64(self.buffered_secs()));
+        let ahead = self
+            .ring_lead(crate::emulator::now_ms())
+            .unwrap_or_else(|| self.buffered_secs());
+        set("ahead", JsValue::from_f64(ahead));
         set("underruns", JsValue::from_f64(f64::from(self.underruns)));
         set("blocks", JsValue::from_f64(f64::from(self.blocks)));
         set(
@@ -398,6 +494,21 @@ impl AudioOut {
             "gain",
             JsValue::from_f64(f64::from(self.gain.gain().value())),
         );
+        set(
+            "output",
+            JsValue::from_str(if self.ring_live { "ring" } else { "scheduled" }),
+        );
+        if let Some(ring) = self.ring.borrow().as_ref() {
+            set(
+                "ringUnderruns",
+                JsValue::from_f64(f64::from(ring.underruns())),
+            );
+            let rate = f64::from(self.ctx.sample_rate());
+            set(
+                "ringLead",
+                JsValue::from_f64(ring.lead_secs(crate::emulator::now_ms(), rate)),
+            );
+        }
         set("volume", JsValue::from_f64(f64::from(self.volume)));
         set("muted", JsValue::from(self.muted));
         if let Some(window) = web_sys::window() {
@@ -424,6 +535,16 @@ fn user_agent() -> String {
     web_sys::window()
         .and_then(|window| window.navigator().user_agent().ok())
         .unwrap_or_default()
+}
+
+/// Whether this browser gets the AudioWorklet ring: a WebKit user agent
+/// (the same cut as [`crate::audio_pacing::frames_per_block_for`]), unless the
+/// page URL says `?audio=ring` or `?audio=scheduled`.
+fn wants_ring(user_agent: &str) -> bool {
+    let search = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .unwrap_or_default();
+    crate::ring_pacing::wants_ring(user_agent, &search)
 }
 
 /// One block of sound the context has been told to play, and the context time its
