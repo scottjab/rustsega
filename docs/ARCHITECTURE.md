@@ -634,6 +634,13 @@ ports) it inherits the 68k's answer through the same dispatch.
   as what Chrome and Firefox use. `?audio=ring` or `?audio=scheduled` forces
   either path on any browser; `output`, `ringLead` and `ringUnderruns` on
   `window.rustsegaAudio` show which one is running and how it is doing.
+  Real Safari 27.2 (M3 Pro, over safaridriver) still juddered after that,
+  because Safari's rAF timestamps are whole milliseconds (17, 17, 16): a
+  `FramePacer` that paid a frame out only at a full frame of debt sat on the
+  edge and ran 1, 0, 2 frames per tick (287/328/285 of 900 ticks). It now
+  pays out at 0.75 of a frame (`SLACK`), which keeps the debt a quarter
+  frame clear of both edges on 60, 120 and 30 Hz displays without drift:
+  1 frame on 1198 of 1200 ticks, 0 ring underruns.
 - Input: one `InputState` that merges keyboard, Gamepad API, and touch
   overlay into `Buttons` per port. All bindings are rebindable and stored in
   `localStorage`.

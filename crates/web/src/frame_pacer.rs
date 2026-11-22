@@ -20,13 +20,21 @@
 /// more than a twentieth of a second.
 const MAX_CATCHUP: u32 = 4;
 
-/// How far a tick may be behind the console rate before it stops mattering.
+/// How much of a frame a tick may fall short by and still be owed that frame.
 ///
-/// A 60 Hz console paced at 1000 / 60 ms is a comparison of nearly equal floats,
-/// so each tick leaves a residue of about 1e-16 frames. Ignored, those add up over
-/// an afternoon into a frame that is never run; taken at face value, they make a
-/// tick that should be a 1 read as a 0. A nanoframe is neither.
-const DRIFT_TOLERANCE: f64 = 1e-9;
+/// The debt pays out a frame once it reaches `1 - SLACK` rather than 1, so it
+/// settles a quarter of a frame clear of both edges: a tick on a 60 Hz display
+/// leaves it near 0, half-ticks on a 120 Hz one walk it between 0 and a half.
+/// That margin is what absorbs jitter in the timestamps. Safari gives
+/// `requestAnimationFrame` whole milliseconds (17, 17, 16 for a 60 Hz display),
+/// which is 6% of a frame either way; with the pay-out at exactly 1 the debt
+/// sat on the edge, and the ticks ran 1, 0, 2 frames, a new picture on two
+/// ticks out of three and sound that stuttered with it (#629).
+///
+/// It is a shift, not a gain: the debt is still every millisecond that passed
+/// minus every frame paid, so the console keeps its rate over any length of
+/// time. It also covers the 1e-16 residue a 1000 / 60 ms interval leaves.
+const SLACK: f64 = 0.25;
 
 /// The slowest fast forward the shell offers, and the floor under a speed that has
 /// rotted in storage (M7-17, #150). One is not a fast forward, and zero would be a
@@ -106,7 +114,7 @@ impl FramePacer {
             return MAX_CATCHUP;
         }
 
-        let due = (self.debt + DRIFT_TOLERANCE).floor().max(0.0) as u32;
+        let due = (self.debt + SLACK).floor().max(0.0) as u32;
         self.debt -= f64::from(due);
         due
     }
@@ -171,6 +179,75 @@ mod tests {
         for tick in 1..20 {
             assert_eq!(pacer.frames_due(tick as f64 * TICK_30), 2, "tick {tick}");
         }
+    }
+
+    /// Safari hands `requestAnimationFrame` whole milliseconds: a 60 Hz display
+    /// reads 17, 17, 16 rather than 16.667 three times (#629). Ticks that close
+    /// to one frame must each still be one frame, not a 1, 0, 2 judder that
+    /// shows a new picture on two ticks out of three.
+    fn safari_ms(tick: u32, tick_ms: f64, start_ms: f64) -> f64 {
+        (start_ms + f64::from(tick) * tick_ms).round()
+    }
+
+    #[test]
+    fn whole_millisecond_ticks_on_a_60_hz_display_run_one_frame_each() {
+        for start in [0.0, 62.0, 1234.4, 7.9] {
+            let mut pacer = FramePacer::new(60.0);
+            for tick in 0..600 {
+                assert_eq!(
+                    pacer.frames_due(safari_ms(tick, TICK_60, start)),
+                    1,
+                    "tick {tick} from {start} ms"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn whole_millisecond_ticks_on_a_120_hz_display_still_alternate() {
+        for start in [0.0, 62.0, 1234.4, 7.9] {
+            let mut pacer = FramePacer::new(60.0);
+            assert_eq!(pacer.frames_due(safari_ms(0, TICK_120, start)), 1);
+            for tick in 1..240 {
+                let want = if tick % 2 == 1 { 0 } else { 1 };
+                assert_eq!(
+                    pacer.frames_due(safari_ms(tick, TICK_120, start)),
+                    want,
+                    "tick {tick} from {start} ms"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn whole_millisecond_ticks_on_a_30_hz_display_run_two_frames_each() {
+        for start in [0.0, 62.0, 1234.4, 7.9] {
+            let mut pacer = FramePacer::new(60.0);
+            assert_eq!(pacer.frames_due(safari_ms(0, TICK_30, start)), 1);
+            for tick in 1..120 {
+                assert_eq!(
+                    pacer.frames_due(safari_ms(tick, TICK_30, start)),
+                    2,
+                    "tick {tick} from {start} ms"
+                );
+            }
+        }
+    }
+
+    /// The slack that absorbs the rounding must not become drift: an hour of
+    /// whole-millisecond ticks is still an hour of console frames, give or take
+    /// the one the debt is holding.
+    #[test]
+    fn whole_millisecond_ticks_keep_the_console_rate_over_an_hour() {
+        let mut pacer = FramePacer::new(60.0);
+        let ticks = 60 * 60 * 60;
+        let total: u32 = (0..=ticks)
+            .map(|tick| pacer.frames_due(safari_ms(tick, TICK_60, 3.0)))
+            .sum();
+        assert!(
+            total.abs_diff(ticks + 1) <= 1,
+            "{total} frames for {ticks} ticks"
+        );
     }
 
     /// PAL is the other console rate: 250 frames of a 50 Hz machine in the five
