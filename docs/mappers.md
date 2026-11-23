@@ -153,7 +153,7 @@ group the ticket named. Measured:
 | King of Fighters 98', The (Taiwan) (En) (Unl) | none (measured) | 2 MiB; mirror test negative |
 | Lion King II/III, The (Taiwan) (En) (Unl) | none (measured) | 2 MiB; mirror test negative |
 | Pikachu - Pocket Monster (Taiwan) (En) (Unl) [+Alt] | none (measured) | 2 MiB; mirror test negative |
-| Rockman X3 (Taiwan) (En) (Unl) | none (measured) | 2 MiB; mirror test negative |
+| Rockman X3 (Taiwan) (En) (Unl) | none (measured), protection chip | 2 MiB; mirror test negative; boots once `$A13000`/`$400004`/`$400006` answer (`cart::protection`, #669) |
 | Super Mario Bros. / Super Mario 2 / Super King Kong 99 (Taiwan) | none (measured) | 2 MiB; mirror test negative |
 | Sonic Jam 6 (Taiwan) (En) (Pirate) | none (measured) | 2 MiB; mirror test negative |
 

@@ -1195,3 +1195,35 @@ fn gouketsuji_ichizoku_boots_to_non_blank_screen() {
         "600 frames in, Gouketsuji Ichizoku is {colours} distinct colours"
     );
 }
+
+/// The two Taiwanese carts #669 found spinning in their `JMP $000200` exception
+/// stub: both read a copy protection chip at boot and take an exception on the
+/// open bus they got instead. With [`genesis::cart::protection`] answering them
+/// they reach their title screens, 32 and 27 colours at 600 frames.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn rockman_x3_taiwan_boots_past_its_protection_check() {
+    let path = require_data!(testkit::find_commercial_rom(
+        "Rockman X3 (Taiwan) (En) (Unl)"
+    ));
+    let colours = colour_count(&path, 600, "rockman_x3_taiwan_600.png");
+    assert!(
+        colours > BLANK,
+        "600 frames in, Rockman X3 (Taiwan) is {colours} distinct colours: it drew 32 once \
+         its protection chip answered $A13000/$400004/$400006 (#669)"
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn shiliu_zhang_mahjong_ii_boots_past_its_protection_check() {
+    let path = require_data!(testkit::find_commercial_rom(
+        "Shiliu Zhang Mahjong II (Taiwan) (Unl)"
+    ));
+    let colours = colour_count(&path, 600, "shiliu_zhang_mahjong_ii_600.png");
+    assert!(
+        colours > BLANK,
+        "600 frames in, Shiliu Zhang Mahjong II is {colours} distinct colours: it drew 25 once \
+         its protection chip answered $400004 on the high lane (#669)"
+    );
+}
