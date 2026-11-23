@@ -141,8 +141,9 @@ fn header_written_and_checked() {
     );
     assert_eq!(
         u32::from_le_bytes(state[4..8].try_into().expect("4 bytes of version")),
-        12,
-        "format version 12, which is the scheduler's DRAM refresh count of #665, \
+        13,
+        "format version 13, which is the protection board registers of #670 on the \
+         bus, on top of the scheduler's DRAM refresh count of #665 that made it 12, \
          on top of the scheduler's `ipl_held` of #493 (the one \
          instruction an interrupt the 68000 unmasks with its own register write waits) \
          that made it 11, on top of the bus's `prefetched_word` of #479 (one `u16` \

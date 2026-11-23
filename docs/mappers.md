@@ -152,14 +152,13 @@ group the ticket named. Measured:
 | MK5 - Mortal Kombat Mythologies - Sub-Zero (Taiwan) (En) (Unl) | none (measured) | 2 MiB; Panic is `frame_done` (#354) |
 | King of Fighters 98', The (Taiwan) (En) (Unl) | none (measured) | 2 MiB; mirror test negative |
 | Lion King II/III, The (Taiwan) (En) (Unl) | none (measured) | 2 MiB; mirror test negative |
-| Pikachu - Pocket Monster (Taiwan) (En) (Unl) [+Alt] | none (measured) | 2 MiB; mirror test negative |
+| Pikachu - Pocket Monster (Taiwan) (En) (Unl) [+Alt] | none (measured), protection chip | 2 MiB; mirror test negative; boots once its `$A130xx` registers answer (`cart::protection`, #670) |
 | Rockman X3 (Taiwan) (En) (Unl) | none (measured), protection chip | 2 MiB; mirror test negative; boots once `$A13000`/`$400004`/`$400006` answer (`cart::protection`, #669) |
 | Super Mario Bros. / Super Mario 2 / Super King Kong 99 (Taiwan) | none (measured) | 2 MiB; mirror test negative |
 | Sonic Jam 6 (Taiwan) (En) (Pirate) | none (measured) | 2 MiB; mirror test negative |
 
-**Five of these are dead images, confirmed by the reference (#550)**: `Chaoji
-Poker`, `Fengkuang Taohuayuan`, `Lion King III`, `Pikachu - Pocket Monster` and
-`Sonic Jam 6` park on `JMP $200`/`JMP $128` halt stubs with their whole
+**Four of these were called dead images, confirmed by the reference (#550)**:
+`Chaoji Poker`, `Fengkuang Taohuayuan`, `Lion King III` and `Sonic Jam 6` park on `JMP $200`/`JMP $128` halt stubs with their whole
 exception table `$08`-`$70` pointing at the stub (Sonic Jam 6 slides through
 `MOVE.L D0,D0` padding into a non-instruction word first). rustsega and
 blastem both take the same path and neither writes a single VDP byte by frame
@@ -168,7 +167,15 @@ throughout). Two independent emulators faulting identically is a cart image
 that does not run, not a machine that mishandles it - they are not failures
 and not worth a boot test; the honest re-check is the `--vdp` comparison, not
 a colours probe.
-| Da Hanghai Shidai I/II, Duli Zhanzheng, FIFA Soccer 95 (China), Guishou Jingji Chang, Samurai Shodown vs Soul Edge, and 9 more | none (measured) | 1-2 MiB; headers present, image reachable |
+
+That reasoning has a hole, which #670 found: blastem has no copy protection
+hardware either, so on a protected board the two emulators fault identically
+for the same missing chip. `Pikachu - Pocket Monster` was on this list and
+boots once its registers answer (`cart::protection`, from Genesis Plus GX's
+`rom_database`), and `Chaoji Poker` has a row in that table too. Before calling
+a Taiwanese cart dead, look its two checksums up there. `Sonic Jam 6` has no
+row and is blank in Genesis Plus GX as well.
+| Da Hanghai Shidai I/II, Duli Zhanzheng, FIFA Soccer 95 (China), and 9 more (`Guaishou Jingji Chang` and `Samurai Shodown vs Soul Edge` were here too: both bank through `cart::protection`'s 32 KiB mapper, #670) | none (measured) | 1-2 MiB; headers present, image reachable |
 
 Three separate things rule a mapper out for this group:
 

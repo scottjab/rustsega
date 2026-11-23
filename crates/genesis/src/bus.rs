@@ -705,15 +705,19 @@ pub struct Bus {
     /// $380000-$3FFFFF for the carts that have no register - and the decode
     /// below is what keeps the two from ever answering the same read.
     jcart: Option<Jcart>,
-    /// The copy protection chip of a Taiwanese unlicensed board, from
-    /// [`crate::cart::protection::detect`] on [`Bus::rom`]: fixed bytes at a few
-    /// addresses of the expansion area and the `$A130xx` block (#669).
+    /// The copy protection hardware of a Taiwanese unlicensed board, from
+    /// [`crate::cart::protection::detect`] on [`Bus::rom`]: registers at a few
+    /// addresses of the expansion area and the `$A130xx` block (#669, #670).
     ///
     /// Not in a save state, because it is not state: it is a table row picked by
     /// the image's checksums, so a load takes it from the machine it loads into,
-    /// as it takes the ROM (`crate::state::decode`).
+    /// as it takes the ROM (`crate::state::decode`). What the cart has written to
+    /// it is state, and is [`Self::protection_regs`].
     #[serde(skip)]
     pub(crate) protection: Option<Protection>,
+    /// The registers of [`Self::protection`], as the board powered on and as
+    /// the cart has written them since: all 0 on a cart without one.
+    protection_regs: protection::Registers,
     /// The SVP board, from [`crate::cart::svp::Svp::detect`] on [`Bus::rom`],
     /// for the one cart that carries it: the shared DRAM of the SSP1601 DSP
     /// behind $300000-$31FFFF and the status/control registers behind its
@@ -980,6 +984,9 @@ impl Bus {
         // And the protection chip of an unlicensed board, picked out by the
         // image's two checksums as Genesis Plus GX's `rom_database` does.
         let protection = protection::detect(&rom);
+        let protection_regs = protection
+            .map(|chip| chip.power_on_registers())
+            .unwrap_or_default();
         Self {
             rom,
             sram,
@@ -987,6 +994,7 @@ impl Bus {
             mapper,
             jcart,
             protection,
+            protection_regs,
             svp,
             ram: Box::new([0; 0x10000]),
             version,
@@ -2185,8 +2193,7 @@ impl Bus {
     fn read_cart_extra_byte(&mut self, addr: u32) -> u8 {
         if let Some(byte) = self
             .protection
-            .as_ref()
-            .and_then(|chip| chip.read_byte(addr))
+            .and_then(|chip| chip.read_time_byte(&self.protection_regs, addr))
         {
             return byte;
         }
@@ -2204,8 +2211,7 @@ impl Bus {
     fn read_cart_extra_word(&mut self, addr: u32) -> u16 {
         if let Some(word) = self
             .protection
-            .as_ref()
-            .and_then(|chip| chip.read_word(addr))
+            .and_then(|chip| chip.read_time_word(&self.protection_regs, addr))
         {
             return word;
         }
@@ -2242,6 +2248,9 @@ impl Bus {
     /// [`crate::cart::mapper`] for what each one does. A cart with neither has
     /// nothing here, and the write is dropped like any other to the block.
     fn write_cart_extra_byte(&mut self, addr: u32, value: u8) {
+        if self.write_protection_time(addr, value) {
+            return;
+        }
         if (addr & EVEN_LANE) == SRAM_CONTROL {
             if let Some(save) = self.sram.as_mut() {
                 save.write_control(value);
@@ -2260,7 +2269,19 @@ impl Bus {
     /// `0xA130F3`. An odd `addr` is an address error the 68k never completes, so
     /// the pair the access names is all that is left to decode.
     fn write_cart_extra_word(&mut self, addr: u32, value: u16) {
+        // A protection register takes the word at its own (even) address, as
+        // GPGX's `time_w` is handed it, and keeps the low byte.
+        if self.write_protection_time(addr, value as u8) {
+            return;
+        }
         self.write_cart_extra_byte(addr + 1, value as u8);
+    }
+
+    /// A `/TIME` write to the registers of a protection board that takes them
+    /// ([`crate::cart::protection`], #670): whether one did.
+    fn write_protection_time(&mut self, addr: u32, value: u8) -> bool {
+        self.protection
+            .is_some_and(|chip| chip.write_time(&mut self.protection_regs, addr, value))
     }
 
     /// TMSS port byte read: nothing here is readable.
@@ -2391,8 +2412,7 @@ impl Bus {
     /// Undecoded byte read: the float, like every undriven read (#508).
     fn read_unmapped_byte(&mut self, addr: u32) -> u8 {
         self.protection
-            .as_ref()
-            .and_then(|chip| chip.read_byte(addr))
+            .and_then(|chip| chip.read_area_byte(&self.protection_regs, addr))
             .unwrap_or_else(|| self.open_bus_byte(addr))
     }
 
@@ -2400,8 +2420,7 @@ impl Bus {
     /// the registers of a protection chip ([`Bus::protection`], #669).
     fn read_unmapped_word(&mut self, addr: u32) -> u16 {
         self.protection
-            .as_ref()
-            .and_then(|chip| chip.read_word(addr))
+            .and_then(|chip| chip.read_area_word(&self.protection_regs, addr))
             .unwrap_or_else(|| self.open_bus_word())
     }
 
@@ -2415,6 +2434,9 @@ impl Bus {
     /// not a Realtec cart drops the write, exactly as [`Bus::write_cart_extra_byte`]
     /// drops a bank write on a cart with no Sega mapper.
     fn write_unmapped_byte(&mut self, addr: u32, value: u8) {
+        if self.write_protection_area(addr, u16::from(value)) {
+            return;
+        }
         if let Some(reg) = mapper::realtec_register(addr) {
             self.mapper.set_realtec_register(reg, value);
         }
@@ -2429,7 +2451,29 @@ impl Bus {
     /// the `0xA13000` block keeps its registers on the odd lane. Reusing one decode
     /// for the other would take every Realtec write one byte late.
     fn write_unmapped_word(&mut self, addr: u32, value: u16) {
+        // A protection board is handed the whole word (GPGX's `write16` is the
+        // same `custom_regs_w`), which keeps its low byte.
+        if self.write_protection_area(addr, value) {
+            return;
+        }
         self.write_unmapped_byte(addr, (value >> 8) as u8);
+    }
+
+    /// An expansion area write to a protection board ([`crate::cart::protection`],
+    /// #670): its registers, or its 32 KiB bank select on the mapper. Whether
+    /// the board decoded the address.
+    fn write_protection_area(&mut self, addr: u32, value: u16) -> bool {
+        let Some(chip) = self.protection else {
+            return false;
+        };
+        match chip.write_area(&mut self.protection_regs, addr, value) {
+            protection::AreaWrite::Ignored => false,
+            protection::AreaWrite::Registers => true,
+            protection::AreaWrite::Bank(bank) => {
+                self.mapper.set_bank_32k(bank);
+                true
+            }
+        }
     }
 }
 

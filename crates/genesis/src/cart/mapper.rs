@@ -214,6 +214,20 @@ pub enum Mapper {
         /// `$A130xx` read it makes is the launcher's game-select.
         bank: u8,
     },
+    /// The 32 KiB bank of two Taiwanese protection boards, Pokemon Stadium and
+    /// Soul Edge vs Samurai Spirits ([`crate::cart::protection`], #670): a
+    /// write to `$700000-$7FFFFF` picks what the low megabyte shows.
+    ///
+    /// Genesis Plus GX's `mapper_32k_w`: bank 0 is the plain image, and any
+    /// other value maps each 64 KiB block `i` of `$000000-$0FFFFF` to the image
+    /// at `(i << 16) | (bank << 15)` for its first half and `(i << 16) | ((bank
+    /// | 1) << 15)` for its second, ORed rather than added, with `bank` taken to
+    /// six bits. The cart area above the first megabyte is never moved. A reset
+    /// puts bank 0 back (`md_cart_reset`, `bankshift`).
+    Bank32k {
+        /// The value last written; 0 is the plain image.
+        bank: u16,
+    },
 }
 
 impl Mapper {
@@ -260,6 +274,9 @@ impl Mapper {
     /// (M6-05, #124) finding the carts that need one, and it will want the mapper
     /// and the save RAM entries in the same pass.
     pub fn detect(rom: &[u8]) -> Self {
+        if crate::cart::protection::detect(rom).is_some_and(|chip| chip.banks_32k()) {
+            return Self::Bank32k { bank: 0 };
+        }
         if Self::is_realtec(rom) {
             return Self::Realtec {
                 regs: [0; REALTEC_REGISTERS_COUNT],
@@ -328,6 +345,14 @@ impl Mapper {
                 let page = usize::from(banks[(addr >> SLOT_SHIFT) as usize]);
                 Some(page * SLOT_SIZE + (addr as usize & (SLOT_SIZE - 1)))
             }
+            Self::Bank32k { bank } => {
+                if *bank == 0 || addr >= 0x10_0000 {
+                    return None;
+                }
+                let half = (addr >> 15) & 1;
+                let page = ((u32::from(*bank) | half) & 0x3F) << 15;
+                Some(((addr & 0xF_0000) | page | (addr & 0x7FFF)) as usize)
+            }
             Self::Radica { bank } => {
                 // MAME's `read`: the byte the window answers is the flash at
                 // `(bank * 0x10000) + address`, wrapped into the flash - which
@@ -354,6 +379,15 @@ impl Mapper {
         };
         if slot != 0 && slot < banks.len() {
             banks[slot] = page;
+        }
+    }
+
+    /// A write of `value` to a [`Mapper::Bank32k`] board's bank select. Any
+    /// other mapper ignores it: [`crate::cart::protection`] only reports a bank
+    /// write for a board this mapper was made for.
+    pub fn set_bank_32k(&mut self, value: u16) {
+        if let Self::Bank32k { bank } = self {
+            *bank = value;
         }
     }
 
@@ -422,6 +456,7 @@ impl Mapper {
         match self {
             Self::SegaSsf2 { banks } => *banks = Self::identity(),
             Self::Radica { bank } => *bank = RADICA_RESET_BANK,
+            Self::Bank32k { bank } => *bank = 0,
             Self::Realtec { regs, start, size } => {
                 *regs = [0; REALTEC_REGISTERS_COUNT];
                 // Not the slice `regs` would give: a Realtec cart comes up with

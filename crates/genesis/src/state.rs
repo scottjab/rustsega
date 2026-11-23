@@ -92,7 +92,12 @@ pub const MAGIC: &[u8; 4] = b"RSGS";
 /// one `u64` added to `Scheduler`. A v11 payload would run out of message in
 /// it, and a state that dropped it would restart the count and move every
 /// refresh delay after the load.
-pub const FORMAT_VERSION: u32 = 12;
+///
+/// Version 13 is `Bus::protection_regs` (#670): the four register bytes of a
+/// Taiwanese protection board, which the Pocket Monster and Soul Edge boards
+/// take writes into. Four bytes added to `Bus`, and the `Mapper::Bank32k`
+/// variant those boards bank with.
+pub const FORMAT_VERSION: u32 = 13;
 /// Bytes of header: [`MAGIC`], the version, the ROM checksum and the length.
 const HEADER_LEN: usize = 4 + 4 + 8 + 4;
 
