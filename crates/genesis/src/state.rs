@@ -207,6 +207,9 @@ pub(crate) fn decode(data: &[u8], machine: &mut Genesis) -> Result<(), StateErro
     // EEPROM and its bank registers *are* in the state, and they came from this
     // same image, because the checksum says so.
     bus.rom = std::mem::take(&mut machine.bus.rom);
+    // So is the cart's protection chip, which is a row of a table picked by
+    // that image's checksums and not state (#669).
+    bus.protection = machine.bus.protection.take();
     // A host setting rather than machine state, so it stays the machine's own.
     bus.z80_steals_68k_bus = machine.bus.z80_steals_68k_bus;
     machine.cpu = cpu;

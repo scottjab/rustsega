@@ -78,7 +78,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::audio::Audio;
-use crate::cart::{Eeprom, Jcart, Mapper, Sram, Svp, eeprom, jcart, mapper, sram, svp};
+use crate::cart::{
+    Eeprom, Jcart, Mapper, Protection, Sram, Svp, eeprom, jcart, mapper, protection, sram, svp,
+};
 use crate::config::version_is_pal;
 use crate::io::Io;
 use crate::z80_bus::{self, Z80Side};
@@ -703,6 +705,15 @@ pub struct Bus {
     /// $380000-$3FFFFF for the carts that have no register - and the decode
     /// below is what keeps the two from ever answering the same read.
     jcart: Option<Jcart>,
+    /// The copy protection chip of a Taiwanese unlicensed board, from
+    /// [`crate::cart::protection::detect`] on [`Bus::rom`]: fixed bytes at a few
+    /// addresses of the expansion area and the `$A130xx` block (#669).
+    ///
+    /// Not in a save state, because it is not state: it is a table row picked by
+    /// the image's checksums, so a load takes it from the machine it loads into,
+    /// as it takes the ROM (`crate::state::decode`).
+    #[serde(skip)]
+    pub(crate) protection: Option<Protection>,
     /// The SVP board, from [`crate::cart::svp::Svp::detect`] on [`Bus::rom`],
     /// for the one cart that carries it: the shared DRAM of the SSP1601 DSP
     /// behind $300000-$31FFFF and the status/control registers behind its
@@ -966,12 +977,16 @@ impl Bus {
         // Picodrive's own detection does (title + DSP program blob), and a
         // cart without the board gets nothing at all.
         let svp = svp::Svp::detect(&rom);
+        // And the protection chip of an unlicensed board, picked out by the
+        // image's two checksums as Genesis Plus GX's `rom_database` does.
+        let protection = protection::detect(&rom);
         Self {
             rom,
             sram,
             eeprom,
             mapper,
             jcart,
+            protection,
             svp,
             ram: Box::new([0; 0x10000]),
             version,
@@ -2164,8 +2179,17 @@ impl Bus {
     /// [`OPEN_BUS`] whatever lives here.
     ///
     /// What did turn out to live here, and does answer, is the Radica board's
-    /// game-select latch below: a read is how that board is banked (#492).
+    /// game-select latch below: a read is how that board is banked (#492). And
+    /// a protection chip's register, on the unlicensed boards that put one on
+    /// the /TIME area ([`Bus::protection`], #669).
     fn read_cart_extra_byte(&mut self, addr: u32) -> u8 {
+        if let Some(byte) = self
+            .protection
+            .as_ref()
+            .and_then(|chip| chip.read_byte(addr))
+        {
+            return byte;
+        }
         if self.radica_reads_the_block() {
             self.mapper.set_radica_bank(addr);
             return 0x00;
@@ -2178,6 +2202,13 @@ impl Bus {
     /// answers a word of 0 for the whole block, which is what the boot stubs'
     /// `MOVE.W $A130xx,D0` of #492 reads and discards.
     fn read_cart_extra_word(&mut self, addr: u32) -> u16 {
+        if let Some(word) = self
+            .protection
+            .as_ref()
+            .and_then(|chip| chip.read_word(addr))
+        {
+            return word;
+        }
         if self.radica_reads_the_block() {
             self.mapper.set_radica_bank(addr);
             return 0x0000;
@@ -2359,12 +2390,19 @@ impl Bus {
     /// The latch is the one readable thing in the block, and it is not a value
     /// Undecoded byte read: the float, like every undriven read (#508).
     fn read_unmapped_byte(&mut self, addr: u32) -> u8 {
-        self.open_bus_byte(addr)
+        self.protection
+            .as_ref()
+            .and_then(|chip| chip.read_byte(addr))
+            .unwrap_or_else(|| self.open_bus_byte(addr))
     }
 
-    /// Undecoded word read: the float, like every undriven read (#508).
-    fn read_unmapped_word(&mut self, _addr: u32) -> u16 {
-        self.open_bus_word()
+    /// Undecoded word read: the float, like every undriven read (#508), but for
+    /// the registers of a protection chip ([`Bus::protection`], #669).
+    fn read_unmapped_word(&mut self, addr: u32) -> u16 {
+        self.protection
+            .as_ref()
+            .and_then(|chip| chip.read_word(addr))
+            .unwrap_or_else(|| self.open_bus_word())
     }
 
     /// Undecoded byte write: nothing but a Realtec cart's paging registers.
