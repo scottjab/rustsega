@@ -355,6 +355,7 @@ impl Vdp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hv::MCLKS_PER_LINE;
     use crate::ports::testutil::{cram_write_cmd, vram_read_cmd, vram_write_cmd};
     use crate::slots::slot_mclk;
 
@@ -932,6 +933,51 @@ mod tests {
         assert!(
             stall < vram.data_port_stall_mclk(),
             "a CRAM word at the head waits one slot, a VRAM word two"
+        );
+    }
+
+    /// A 68000 streaming VRAM words through the port of an active H40 line gets
+    /// nine of them a line, whatever the part of the line it is in (#678).
+    ///
+    /// An active line has 18 external slots for the whole of itself, its blanking
+    /// included - the tail sprite fetches are out there - and a VRAM word is two of
+    /// them, so 9; the Sega manual's DMA capacity table says the same for the same
+    /// slots, 18 bytes a line for a 68k -> VRAM transfer with the display on
+    /// (`slots::Vdp::dma_slot_table`). The writer is `MOVE.W (A1)+,(A6)` and `DBF`,
+    /// 22 clocks or 154 master clocks a word, which on its own would make 22 a
+    /// line, and it pays [`Vdp::data_port_stall_mclk`] before each write the way
+    /// the bus does. Handing it the blank line's slots in the blanking of each line
+    /// let 16 a line through.
+    #[test]
+    fn a_68000_streaming_vram_through_active_h40_lines_gets_nine_words_a_line() {
+        const LINES: u32 = 10;
+        const WORD_MCLK: u32 = 154;
+
+        let mut vdp = Vdp::new(false);
+        set_reg(&mut vdp, 1, 0x40);
+        set_reg(&mut vdp, 12, 0x81);
+        set_reg(&mut vdp, 15, 2);
+        vdp.advance(100 * MCLKS_PER_LINE);
+        vram_write_at(&mut vdp, 0xC000);
+
+        // Words the port has taken while the beam is still inside the ten lines:
+        // a write whose stall runs past the last of them is not one of theirs.
+        let end = vdp.line + LINES as u16;
+        let mut words = 0;
+        loop {
+            vdp.advance(vdp.data_port_stall_mclk());
+            if vdp.line >= end {
+                break;
+            }
+            vdp.write_data(0x1234);
+            vdp.advance(WORD_MCLK);
+            words += 1;
+        }
+        assert!(!vdp.in_vblank, "every line of the run was an active one");
+        assert!(
+            (9 * LINES..=9 * LINES + 4).contains(&words),
+            "{words} VRAM words in {LINES} active H40 lines: 9 a line, and the four the \
+             queue holds at the start"
         );
     }
 }

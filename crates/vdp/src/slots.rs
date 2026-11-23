@@ -281,16 +281,27 @@ impl Vdp {
     /// The access slots of the current line that the 68k can use, as slot
     /// indices.
     ///
-    /// Two states, and the beam picks between them by the two blanking flags:
+    /// Two states, and the line picks between them by the VBlank flag:
     ///
-    /// * the active display: [`ACTIVE_H40`] or [`ACTIVE_H32`], the 18 and 16 slots
-    ///   the plane and sprite fetches leave over;
-    /// * blanking, horizontal or vertical: [`BLANK_H40`] / [`BLANK_H32`], every
-    ///   slot of the line but the [`REFRESH_BLANK_H40`] and
-    ///   [`REFRESH_BLANK_H32`] that DRAM refresh takes - the 205 and 167 of
-    ///   [`BLANK_SLOTS_H40`] and [`BLANK_SLOTS_H32`]. Where the refresh slots
-    ///   fall is INFERRED (see [`blank_line`]); that they are 5 and 4 is not,
-    ///   and that the counts are 205 and 167 is the Sega manual's own table.
+    /// * an active line: [`ACTIVE_H40`] or [`ACTIVE_H32`], the 18 and 16 slots the
+    ///   plane and sprite fetches leave over across the *whole* line, its
+    ///   horizontal blanking included - the tail sprite fetches are out there, so
+    ///   the blanking of an active line is busy and its few free slots are already
+    ///   in the table;
+    /// * a VBlank line: [`BLANK_H40`] / [`BLANK_H32`], every slot of the line but
+    ///   the [`REFRESH_BLANK_H40`] and [`REFRESH_BLANK_H32`] that DRAM refresh
+    ///   takes - the 205 and 167 of [`BLANK_SLOTS_H40`] and [`BLANK_SLOTS_H32`].
+    ///   Where the refresh slots fall is INFERRED (see [`blank_line`]); that they
+    ///   are 5 and 4 is not, and that the counts are 205 and 167 is the Sega
+    ///   manual's own table.
+    ///
+    /// This is the line rule [`Vdp::dma_slot_table`] has always used, and for the
+    /// same reason. Choosing on the beam's `in_hblank` instead, as this did until
+    /// #678, handed the port the blank line's slots for the blanking of every
+    /// active line: about 46 slots a line rather than 18, so a 68000 streaming
+    /// VRAM words through an active H40 line got 16 of them a line in place of 9,
+    /// and Sonic 3 & Knuckles finished a plane-map copy on its title in half the
+    /// lines Genesis Plus GX takes.
     ///
     /// With the display off this is not consulted at all: nothing is being
     /// fetched, so the memories are free for the port the moment a write is made,
@@ -301,7 +312,7 @@ impl Vdp {
     /// this module is the decision and
     /// `a_display_off_line_drains_faster_than_the_68k_can_write` is the guard.
     fn free_slot_indices(&self) -> &'static [u16] {
-        if self.in_hblank || self.in_vblank {
+        if self.in_vblank {
             return if self.h40() { &BLANK_H40 } else { &BLANK_H32 };
         }
         if self.h40() { &ACTIVE_H40 } else { &ACTIVE_H32 }
