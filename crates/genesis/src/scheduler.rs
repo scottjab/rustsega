@@ -2018,6 +2018,28 @@ mod tests {
         );
     }
 
+    /// With the steal turned off (#680, the Genesis Plus GX timing a BizHawk
+    /// movie is made on) the same hammering costs the 68000 nothing: its loop
+    /// runs as many times as it does while the Z80 stays in its own RAM.
+    #[test]
+    fn a_bus_that_does_not_steal_leaves_the_68k_its_loop() {
+        let (free, _, _) = one_frame(0x0100);
+        let (mut cpu, mut z80, mut bus) = z80_contender(0x8000);
+        bus.z80_steals_68k_bus = false;
+        let mut s = Scheduler::new(Region::Usa);
+        run_frame(&mut s, &mut cpu, &mut z80, &mut bus);
+        let (held, accesses) = (cpu.d[0], z80.hl());
+
+        assert!(
+            accesses > 1000,
+            "the Z80 still hammered the window: {accesses}"
+        );
+        assert!(
+            free.abs_diff(held) <= 4,
+            "{held} iterations of the 68k's loop with the steal off, {free} with the Z80 in its own RAM"
+        );
+    }
+
     /// A 68000 frozen by the TMSS lock-up runs nothing and is still clocked: the
     /// line ends, the beam goes on, and the chip is not owed the line back as a
     /// burst of instructions (M3-16, #77).

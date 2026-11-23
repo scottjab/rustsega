@@ -982,6 +982,7 @@ impl Controls {
         self.start_checked_replay(
             emulator,
             checked,
+            false,
             "Replaying. The movie owns the pads until you stop it - your own controls are ignored."
                 .to_string(),
             toasts,
@@ -1004,7 +1005,7 @@ impl Controls {
             Some(Err(error)) => (Some(Err(error)), String::new()),
             None => (None, String::new()),
         };
-        self.start_checked_replay(emulator, checked, about, toasts);
+        self.start_checked_replay(emulator, checked, true, about, toasts);
     }
 
     /// The shared half of a replay: refuse with the admission check's words,
@@ -1013,6 +1014,7 @@ impl Controls {
         self,
         emulator: TakeCell<Emulator>,
         checked: Option<Result<genesis::movie::Movie, crate::movie::ReplayError>>,
+        tas: bool,
         started: String,
         toasts: Toasts,
     ) {
@@ -1026,7 +1028,7 @@ impl Controls {
             // and this read: nothing left to answer about.
             None => return,
         };
-        emulator.with(|emulator| emulator.begin_replay(movie));
+        emulator.with(|emulator| emulator.begin_replay(movie, tas));
         self.movie.set(MovieState::Replaying);
         toasts.push(ToastKind::Info, started);
     }
@@ -2176,8 +2178,13 @@ impl Emulator {
     /// Puts `movie` on the pads (M7-18, #365), the run restarted with it: a
     /// movie's frame 0 is the first frame of a run, so it plays from the top
     /// of one.
-    fn begin_replay(&mut self, movie: Movie) {
+    ///
+    /// A TASVideos movie (`tas`) plays with the Z80's 68k-bus steal off, the
+    /// timing of the emulators those are made on (#680); [`Self::end_movie`]
+    /// puts the hardware's back.
+    fn begin_replay(&mut self, movie: Movie, tas: bool) {
         self.session.start_replay(movie);
+        self.genesis.set_z80_steals_68k_bus(!tas);
         self.restart_run();
     }
 
@@ -2185,6 +2192,7 @@ impl Emulator {
     /// The frame count is left where it stopped: it means nothing while the
     /// session is off, and the next begin restarts it.
     fn end_movie(&mut self) -> Option<Movie> {
+        self.genesis.set_z80_steals_68k_bus(true);
         self.session.stop()
     }
 
