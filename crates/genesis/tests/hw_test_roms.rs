@@ -105,6 +105,14 @@ fn hash_of(machine: &Genesis) -> u64 {
 /// entering, so every HINT is one line earlier and every palette band this ROM
 /// paints from one starts a line earlier with it. The colour count is
 /// unchanged; the golden went `0x0e61cfe0b4b13c5a` -> `0x36e1c0feccaa525a`, maintainer approved on #491.
+///
+/// #678 moved it again: the 68000's data port now gets an active line's 18
+/// access slots across the whole line, its horizontal blanking included, where it
+/// used to get the blank line's in that blanking. Writes the ROM makes around
+/// HBlank land a few slots later, inside the next line, and the cells come out
+/// stepped. Where those slots sit in the line is the unconfirmed half of the slot
+/// table (#301), so this frame is as good as that anchor. The golden went
+/// `0x36e1c0feccaa525a` -> `0x67f09ec8c4e6cc5a`, maintainer approved on #678.
 #[test]
 fn md_test_pack_512pal_paints_the_whole_palette() {
     check("md_test_pack_512pal", pack!("512PAL.BIN"), FRAMES, &[]);
@@ -131,6 +139,14 @@ fn md_test_pack_512pal_paints_the_whole_palette() {
 /// entering, so every HINT is one line earlier and every palette band this ROM
 /// paints from one starts a line earlier with it. The colour count is
 /// unchanged; the golden went `0xc9e8e47a10091e1a` -> `0x1ba4a7032b6fde1a`, maintainer approved on #491.
+///
+/// #678 moved it again: the 68000's data port now gets an active line's 18
+/// access slots across the whole line, its horizontal blanking included, where it
+/// used to get the blank line's in that blanking. Writes the ROM makes around
+/// HBlank land a few slots later, inside the next line, and the cells come out
+/// stepped. Where those slots sit in the line is the unconfirmed half of the slot
+/// table (#301), so this frame is as good as that anchor. The golden went
+/// `0x1ba4a7032b6fde1a` -> `0xb59d5108b9ee0f1a`, maintainer approved on #678.
 #[test]
 fn md_test_pack_960pal_shows_more_colours_than_one_palette_holds() {
     check("md_test_pack_960pal", pack!("960PAL.bin"), FRAMES, &[]);
