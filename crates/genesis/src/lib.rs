@@ -188,6 +188,39 @@ impl Genesis {
         self.cpu.reset(&mut self.bus);
     }
 
+    /// The power switch, off and on: the machine [`Genesis::new`] builds, from the
+    /// cartridge already in it.
+    ///
+    /// Everything a reset keeps goes too: the work RAM and the sound RAM, both
+    /// CPUs and the scheduler's clocks, and the beam starts on the power-on line
+    /// rather than in VBlank (#675). What stays is what is not the console's to
+    /// lose: the cartridge's save, which the battery is holding, the chip model and
+    /// [`Genesis::set_z80_steals_68k_bus`], which are host settings, and the mixer,
+    /// which is the host's output path and is moved to the new machine's clock the
+    /// way [`Genesis::load_state`] moves it (#362).
+    ///
+    /// A TASVideos movie begins at power on, so this is where a replay of one
+    /// started on a machine that has been played starts from (#682).
+    pub fn power_cycle(&mut self) {
+        let rom = std::mem::take(&mut self.bus.rom);
+        let save = self.bus.sram().map(<[u8]>::to_vec);
+        let mut bus = Bus::new(rom, self.bus.version);
+        bus.audio.ym.set_model(self.bus.audio.ym.model());
+        bus.z80_steals_68k_bus = self.bus.z80_steals_68k_bus;
+        if let Some(save) = save {
+            bus.load_sram(&save);
+        }
+        bus.vdp.start_at_power_on();
+        let mut cpu = M68k::new();
+        cpu.reset(&mut bus);
+        self.cpu = cpu;
+        self.z80 = Z80::new();
+        self.bus = bus;
+        self.scheduler = self.scheduler.powered_on();
+        let now = self.bus.audio.now();
+        self.mixer.seek(now);
+    }
+
     /// Run one frame: the two CPUs and the VDP, for one whole raster of the
     /// console's region, until the beam comes back to the blanking it started in.
     ///

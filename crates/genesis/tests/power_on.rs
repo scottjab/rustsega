@@ -104,3 +104,42 @@ fn the_first_frame_runs_from_power_on_to_the_first_vblank() {
         "the first frame ran {lines:.1} lines of the 68000, not the 65 from line 159 to 224"
     );
 }
+
+/// A power cycle starts the 68000 on the power-on line again, where the Reset
+/// button parks it in VBlank: a TASVideos movie begins at power on, so a replay
+/// started from a machine that has been played needs this one (#682).
+#[test]
+fn a_power_cycle_starts_the_68000_on_the_power_on_line_again() {
+    for (region, line) in [(Region::Usa, 0x9F), (Region::Europe, 0x84)] {
+        let mut machine = machine(region);
+        for _ in 0..3 {
+            machine.run_frame();
+        }
+        machine.power_cycle();
+        machine.run_frame();
+        let at = (SAMPLE & 0xFFFF) as usize;
+        assert_eq!(machine.bus().ram[at], line, "{region:?}");
+    }
+}
+
+/// And it is a power cycle, not a reset: the work RAM a played run left behind is
+/// gone, as it is on a machine [`Genesis::new`] has just built.
+#[test]
+fn a_power_cycle_clears_work_ram() {
+    let mut machine = machine(Region::Usa);
+    machine.run_frame();
+    machine.power_cycle();
+    assert!(machine.bus().ram.iter().all(|&byte| byte == 0));
+}
+
+/// All of it: a played machine, power cycled, is the machine [`Genesis::new`]
+/// builds, down to the last byte of its save state.
+#[test]
+fn a_power_cycled_machine_is_a_new_one() {
+    let mut played = machine(Region::Usa);
+    for _ in 0..5 {
+        played.run_frame();
+    }
+    played.power_cycle();
+    assert!(played.save_state() == machine(Region::Usa).save_state());
+}
