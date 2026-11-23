@@ -151,10 +151,10 @@ group the ticket named. Measured:
 | King of Fighters '99, The (Taiwan) (En) (Unl) | none (measured) | 3 MiB; Panic is opcode 4741 (#355) |
 | MK5 - Mortal Kombat Mythologies - Sub-Zero (Taiwan) (En) (Unl) | none (measured) | 2 MiB; Panic is `frame_done` (#354) |
 | King of Fighters 98', The (Taiwan) (En) (Unl) | none (measured) | 2 MiB; mirror test negative |
-| Lion King II/III, The (Taiwan) (En) (Unl) | none (measured) | 2 MiB; mirror test negative |
+| Lion King II/III, The (Taiwan) (En) (Unl) | none (measured), protection hardware | 2 MiB; mirror test negative; II boots on its register pair, III on the 32 KiB bank (`cart::protection`, #672) |
 | Pikachu - Pocket Monster (Taiwan) (En) (Unl) [+Alt] | none (measured), protection chip | 2 MiB; mirror test negative; boots once its `$A130xx` registers answer (`cart::protection`, #670) |
 | Rockman X3 (Taiwan) (En) (Unl) | none (measured), protection chip | 2 MiB; mirror test negative; boots once `$A13000`/`$400004`/`$400006` answer (`cart::protection`, #669) |
-| Super Mario Bros. / Super Mario 2 / Super King Kong 99 (Taiwan) | none (measured) | 2 MiB; mirror test negative |
+| Super Mario Bros. / Super Mario 2 / Super King Kong 99 (Taiwan) | none (measured), protection hardware | 2 MiB; mirror test negative; the two Marios boot on a `$A13000` byte, King Kong on the 32 KiB bank (`cart::protection`, #672) |
 | Sonic Jam 6 (Taiwan) (En) (Pirate) | none (measured) | 2 MiB; mirror test negative |
 
 **Four of these were called dead images, confirmed by the reference (#550)**:
@@ -172,9 +172,11 @@ That reasoning has a hole, which #670 found: blastem has no copy protection
 hardware either, so on a protected board the two emulators fault identically
 for the same missing chip. `Pikachu - Pocket Monster` was on this list and
 boots once its registers answer (`cart::protection`, from Genesis Plus GX's
-`rom_database`), and `Chaoji Poker` has a row in that table too. Before calling
-a Taiwanese cart dead, look its two checksums up there. `Sonic Jam 6` has no
-row and is blank in Genesis Plus GX as well.
+`rom_database`). So do `Fengkuang Taohuayuan` and `Lion King III` (#672).
+`Chaoji Poker` has a row in that table too, but for a 1 MiB image: the local
+file is that game four times over, so its checksum does not match. Before
+calling a Taiwanese cart dead, look its two checksums up there. `Sonic Jam 6`
+has no row and is blank in Genesis Plus GX as well.
 | Da Hanghai Shidai I/II, Duli Zhanzheng, FIFA Soccer 95 (China), and 9 more (`Guaishou Jingji Chang` and `Samurai Shodown vs Soul Edge` were here too: both bank through `cart::protection`'s 32 KiB mapper, #670) | none (measured) | 1-2 MiB; headers present, image reachable |
 
 Three separate things rule a mapper out for this group:

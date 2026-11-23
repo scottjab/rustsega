@@ -77,10 +77,18 @@ struct Area {
     end: u32,
     /// Whether reads reach the registers (`regs_r`), and on which lanes.
     read: Option<Lane>,
-    /// Whether writes reach the board (`regs_w = custom_regs_w`): the
-    /// registers below `$700000`, with the bit swap, and the 32 KiB bank from
-    /// there up.
-    write: bool,
+    /// What writes do, for the boards whose writes reach it (`regs_w`).
+    write: Option<Writes>,
+}
+
+/// The expansion area's write handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Writes {
+    /// `default_regs_w`: the register the address reaches keeps the byte.
+    Store,
+    /// `custom_regs_w`: the registers below `$700000`, with the bit swap, and
+    /// the 32 KiB bank from there up.
+    Custom,
 }
 
 /// A row of the table: the two checksums that name the board, and its chip.
@@ -125,7 +133,7 @@ const BOARDS: &[Board] = &[
             start: 0x40_0000,
             end: 0x40_FFFF,
             read: Some(Lane::Low),
-            write: false,
+            write: None,
         }),
     },
     // "Shi Liu Zhang Ma Jiang II - 16 Tiles Mahjong II (uses 16-bits reads)":
@@ -140,7 +148,7 @@ const BOARDS: &[Board] = &[
             start: 0x40_0000,
             end: 0x40_FFFF,
             read: Some(Lane::High),
-            write: false,
+            write: None,
         }),
     },
     // "A Bug's Life (bootleg version ? two last register returned values are
@@ -183,41 +191,144 @@ const BOARDS: &[Board] = &[
             start: 0x70_0000,
             end: 0x7F_FFFF,
             read: None,
-            write: true,
+            write: Some(Writes::Custom),
         }),
     },
     // "Soul Edge VS Samurai Spirits": {0x00ff,0x5d34}, three registers repeated
     // through `$600000-$6FFFFF` and the 32 KiB bank above them.
+    swapper(0x00FF, 0x5D34),
+    // "Lion King 3": {0x0000,0x507c}, the same hardware.
+    swapper(0x0000, 0x507C),
+    // "Super King Kong 99": {0x0000,0x7d6e}, the same hardware.
+    swapper(0x0000, 0x7D6E),
+    // "Gunfight 3-in-1": {0x0000,0x6ff8}, the same hardware.
+    swapper(0x0000, 0x6FF8),
+    // "Feng Kuang Tao Hua Yuan (original version from Creaton Softec Inc)":
+    // {0x0000,0x9dc4}, two fixed bytes in `$400000-$40FFFF`.
+    fixed(
+        0x0000,
+        0x9DC4,
+        &[at(0x40_0000, 0x90), at(0x40_1000, 0xD3)],
+        0x40_0000,
+    ),
+    // "Rock Heaven": {0x6cca,0x2395}, one fixed byte in `$500000-$50FFFF`.
+    fixed(0x6CCA, 0x2395, &[at(0x50_0008, 0x50)], 0x50_0000),
+    // "Rock World": {0x3547,0xa3da}, two.
+    fixed(
+        0x3547,
+        0xA3DA,
+        &[at(0x50_0008, 0x50), at(0x50_0208, 0xA0)],
+        0x50_0000,
+    ),
+    // "Super Mario 2 1998": {0xffff,0x0474}, one `/TIME` byte.
+    timed(0xFFFF, 0x0474, &[at(0xA1_3000, 0x0A)]),
+    // "Super Mario World": {0x2020,0xb4eb}, one `/TIME` byte.
+    timed(0x2020, 0xB4EB, &[at(0xA1_3000, 0x1C)]),
+    // "Lion King 2": {0xffff,0x1d9b}, two registers that keep what is written,
+    // each at a pair of words (`mask 0xfffffd`).
+    keeper(0xFFFF, 0x1D9B),
+    // "Tiny Toon Adventures 3": {0x2020,0xed9c}, the same hardware.
+    keeper(0x2020, 0xED9C),
+];
+
+/// A register at `addr` and `addr + 2`: GPGX's `0xfffffd` mask.
+const fn pair(addr: u32) -> Register {
+    Register {
+        addr,
+        mask: 0xFF_FFFD,
+        value: 0,
+    }
+}
+
+/// A register repeated through `$600000-$6FFFFF` on the three odd addresses
+/// `addr` names: GPGX's `0xf00007` mask.
+const fn repeated(addr: u32) -> Register {
+    Register {
+        addr,
+        mask: 0xF0_0007,
+        value: 0,
+    }
+}
+
+/// A board of fixed bytes read in the 64 KiB of the expansion area at `start`.
+const fn fixed(
+    header_checksum: u16,
+    checksum: u16,
+    registers: &'static [Register],
+    start: u32,
+) -> Board {
     Board {
-        header_checksum: 0x00FF,
-        checksum: 0x5D34,
-        registers: &[
-            Register {
-                addr: 0x60_0001,
-                mask: 0xF0_0007,
-                value: 0,
-            },
-            Register {
-                addr: 0x60_0003,
-                mask: 0xF0_0007,
-                value: 0,
-            },
-            Register {
-                addr: 0x60_0005,
-                mask: 0xF0_0007,
-                value: 0,
-            },
-        ],
+        header_checksum,
+        checksum,
+        registers,
+        time: None,
+        time_write: false,
+        area: Some(Area {
+            start,
+            end: start + 0xFFFF,
+            read: Some(Lane::Low),
+            write: None,
+        }),
+    }
+}
+
+/// A board of fixed bytes read on `/TIME`.
+const fn timed(header_checksum: u16, checksum: u16, registers: &'static [Register]) -> Board {
+    Board {
+        header_checksum,
+        checksum,
+        registers,
+        time: Some(Time::Plain),
+        time_write: false,
+        area: None,
+    }
+}
+
+/// The three registers of [`swapper`].
+const SWAPPER_REGISTERS: [Register; 3] = [
+    repeated(0x60_0001),
+    repeated(0x60_0003),
+    repeated(0x60_0005),
+];
+
+/// The two registers of [`keeper`].
+const KEEPER_REGISTERS: [Register; 2] = [pair(0x40_0000), pair(0x40_0004)];
+
+/// The bit-swapping registers at `$600000-$6FFFFF` and the 32 KiB bank above
+/// them (`custom_regs_w`, `mapper_32k_w`).
+const fn swapper(header_checksum: u16, checksum: u16) -> Board {
+    Board {
+        header_checksum,
+        checksum,
+        registers: &SWAPPER_REGISTERS,
         time: None,
         time_write: false,
         area: Some(Area {
             start: 0x60_0000,
             end: 0x7F_FFFF,
             read: Some(Lane::Low),
-            write: true,
+            write: Some(Writes::Custom),
         }),
-    },
-];
+    }
+}
+
+/// Two registers in `$400000-$40FFFF` that read back what was written
+/// (`default_regs_r`, `default_regs_w`).
+const fn keeper(header_checksum: u16, checksum: u16) -> Board {
+    Board {
+        header_checksum,
+        checksum,
+        registers: &KEEPER_REGISTERS,
+        time: None,
+        time_write: false,
+        area: Some(Area {
+            start: 0x40_0000,
+            end: 0x40_FFFF,
+            read: Some(Lane::Low),
+            write: Some(Writes::Store),
+        }),
+    }
+}
 
 /// Where `custom_regs_w` stops writing registers and starts switching banks:
 /// `(address >> 16) > 0x6f`.
@@ -275,7 +386,7 @@ impl Protection {
     pub fn banks_32k(&self) -> bool {
         self.board
             .area
-            .is_some_and(|area| area.write && area.end >= BANK_WRITES)
+            .is_some_and(|area| area.write == Some(Writes::Custom) && area.end >= BANK_WRITES)
     }
 
     /// The index of the register `addr` reaches, if any.
@@ -346,16 +457,25 @@ impl Protection {
         })
     }
 
-    /// A write of `value` to the expansion area at `addr` (`custom_regs_w`): a
-    /// word write hands the whole word over, a byte write the byte.
+    /// A write of `value` to the expansion area at `addr`: a word write hands
+    /// the whole word over, a byte write the byte.
     ///
-    /// Below `$700000` it stores into the register `addr` reaches, which keeps
+    /// A [`Writes::Store`] board keeps the low byte in the register `addr`
+    /// reaches. A [`Writes::Custom`] one, below `$700000`, stores into the register `addr` reaches, which keeps
     /// the low byte, and then sets register 2 from register 0 by the mode in
     /// register 1's low two bits: shifted left, shifted right, nibbles swapped,
     /// or bit-reversed. From `$700000` up it is a bank select.
     pub fn write_area(&self, regs: &mut Registers, addr: u32, value: u16) -> AreaWrite {
-        if !self.area(addr).is_some_and(|area| area.write) {
+        let Some(writes) = self.area(addr).and_then(|area| area.write) else {
             return AreaWrite::Ignored;
+        };
+        if writes == Writes::Store {
+            // `default_regs_w`: a write no register decodes is dropped
+            // (`m68k_unused_8_w`), which is still the board's address.
+            if let Some(index) = self.register(addr) {
+                regs[index] = value as u8;
+            }
+            return AreaWrite::Registers;
         }
         if addr >= BANK_WRITES {
             return AreaWrite::Bank(value);
@@ -479,6 +599,42 @@ mod tests {
             AreaWrite::Bank(5)
         );
         assert!(chip.banks_32k());
+    }
+
+    #[test]
+    fn lion_king_2_reads_back_what_it_wrote_at_either_word_of_a_pair() {
+        let chip = chip(0xFFFF, 0x1D9B).expect("the board is in the table");
+        let mut regs = chip.power_on_registers();
+        assert_eq!(
+            chip.write_area(&mut regs, 0x40_0002, 0x0055),
+            AreaWrite::Registers
+        );
+        assert_eq!(chip.read_area_word(&regs, 0x40_0000), Some(0x0055));
+        chip.write_area(&mut regs, 0x40_0004, 0x00AA);
+        assert_eq!(chip.read_area_byte(&regs, 0x40_0006), Some(0xAA));
+        assert_eq!(
+            chip.write_area(&mut regs, 0x40_0010, 1),
+            AreaWrite::Registers,
+            "the board's area, though no register is there"
+        );
+        assert!(!chip.banks_32k());
+    }
+
+    #[test]
+    fn rock_world_answers_in_the_500000_page() {
+        let chip = chip(0x3547, 0xA3DA).expect("the board is in the table");
+        let regs = chip.power_on_registers();
+        assert_eq!(chip.read_area_byte(&regs, 0x50_0008), Some(0x50));
+        assert_eq!(chip.read_area_word(&regs, 0x50_0208), Some(0x00A0));
+        assert_eq!(chip.read_area_byte(&regs, 0x40_0008), None);
+    }
+
+    #[test]
+    fn the_lion_king_3_family_banks_like_soul_edge() {
+        for (header, sum) in [(0x0000, 0x507C), (0x0000, 0x7D6E), (0x0000, 0x6FF8)] {
+            let chip = chip(header, sum).expect("the board is in the table");
+            assert!(chip.banks_32k(), "{sum:04x}");
+        }
     }
 
     #[test]
