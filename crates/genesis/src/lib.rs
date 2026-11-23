@@ -339,6 +339,18 @@ impl Genesis {
         state::decode(data, self)
     }
 
+    /// Whether the sound CPU's accesses to the 68k bus take
+    /// [`bus::Z80_WINDOW_STEAL_MCLK`] from the 68000 each, as on hardware (the
+    /// default), or nothing, as in Genesis Plus GX and so in BizHawk.
+    ///
+    /// Off is for playing a TASVideos movie made on one of those (#680): the
+    /// movie is a script for that emulator's timing, and a game that streams DAC
+    /// samples through the window runs its main loop slower on a 68000 that loses
+    /// the bus to them. See [`Bus`]'s `z80_steals_68k_bus`.
+    pub fn set_z80_steals_68k_bus(&mut self, on: bool) {
+        self.bus.z80_steals_68k_bus = on;
+    }
+
     /// The 68000, as the machine left it after the last [`Genesis::run_frame`].
     ///
     /// Read-only on purpose: the CPU only moves when the scheduler steps it, and

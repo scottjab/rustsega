@@ -75,6 +75,18 @@ desynced at the SEGA screen until #675 moved the 68000's power-on start to the
 line hardware starts it on: before that our boot ran a frame ahead of BizHawk's,
 and a one-frame Start press landed on the frame after the one that reads it.
 
+A TASVideos movie plays with one piece of hardware timing switched off: the 11
+clocks the 68000 loses each time the Z80 reads the 68k bus
+(`Genesis::set_z80_steals_68k_bus`, #680). Genesis Plus GX does not charge
+them, and neither, as far as these movies show, does Gens. S3K streams DAC
+samples through that window about 250 times a frame, so with the steal on its
+main loop ran a few lines a frame slower than BizHawk's from Angel Island Act 1
+on, until at frame 3135 it missed a VBlank that BizHawk made. With it off the
+whole 73,306 frames stay in step with Genesis Plus GX (RAM sampled every 500
+frames, at most 51 bytes apart), and both Sonic 1 movies play as before.
+`headless --movie` and the page's replay turn it off for a TASVideos file only;
+an `.rsm` replay and ordinary play keep the hardware's timing.
+
 A movie's frame 0 is the run from power on to the first VBlank. BizHawk's core,
 Genesis Plus GX, starts the 68000 on the same measured line, so its frame
 numbers and ours mean the same thing; Genesis Plus GX's first frame is 33 lines

@@ -204,7 +204,10 @@ pub fn run(args: RunArgs) -> Result<()> {
         bail!("--movie replays and --record writes: naming both asks which one to do to one file");
     }
     let region = resolved_region(&rom, &config)?;
-    let movie = read_movie(args.movie.as_deref(), &rom, region)?;
+    let (movie, tas_timing) = match read_movie(args.movie.as_deref(), &rom, region)? {
+        Some((movie, is_tas)) => (Some(movie), is_tas),
+        None => (None, false),
+    };
     let pads = parse_pad_script(args.pad1.as_deref())?;
     warn_unreachable_pad_frames(&pads, args.frames);
     // A script that names one of X, Y, Z or MODE anywhere needs the 6-button
@@ -221,6 +224,9 @@ pub fn run(args: RunArgs) -> Result<()> {
     let sample_rate = config.sample_rate;
     let mut machine = Genesis::new(&rom, config)
         .with_context(|| format!("cannot run ROM {}", quote(&args.rom)))?;
+    if tas_timing {
+        machine.set_z80_steals_68k_bus(false);
+    }
     // Armed after the load, because [`Genesis::new`] resets and a trail armed
     // before it would have recorded a machine that no longer exists.
     if let Some(addr) = args.trace_to {
@@ -389,13 +395,18 @@ fn read_rom(path: &Path) -> Result<Vec<u8>> {
 /// on the other end of the replay is the one [`run`] is about to build, and a
 /// movie for another cartridge or another region is a different run rather than a
 /// broken file (`docs/movie-format.md`).
-fn read_movie(path: Option<&Path>, rom: &[u8], region: Region) -> Result<Option<Movie>> {
+///
+/// The `bool` is whether it is a TASVideos movie, which [`run`] plays with
+/// the Z80's 68k-bus steal off: the timing of the emulators those are made on
+/// ([`genesis::Genesis::set_z80_steals_68k_bus`], #680).
+fn read_movie(path: Option<&Path>, rom: &[u8], region: Region) -> Result<Option<(Movie, bool)>> {
     let Some(path) = path else {
         return Ok(None);
     };
     let name = quote(path);
     let bytes = fs::read(path).with_context(|| format!("cannot read movie {name}"))?;
-    let movie = if tas::looks_like_tas(&bytes) {
+    let is_tas = tas::looks_like_tas(&bytes);
+    let movie = if is_tas {
         // A TASVideos movie: BizHawk .bk2, Gens .gmv, or the .zip around
         // either (#673). It names no rustsega ROM hash, so it is a movie of
         // the ROM it is played on, and what it says it was made for is
@@ -420,7 +431,7 @@ fn read_movie(path: Option<&Path>, rom: &[u8], region: Region) -> Result<Option<
             region.name()
         );
     }
-    Ok(Some(movie))
+    Ok(Some((movie, is_tas)))
 }
 
 /// The line `headless` prints about a TAS movie it is about to play: what it

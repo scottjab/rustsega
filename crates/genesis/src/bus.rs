@@ -218,6 +218,12 @@ pub(crate) const Z80_WINDOW_WAIT_MCLK: u32 = (33 * MCLK_PER_Z80 + 5) / 10;
 /// both. The count is right, and #530 does not live here.
 pub(crate) const Z80_WINDOW_STEAL_MCLK: u32 = 11 * MCLK_PER_68K;
 
+/// [`Bus::z80_steals_68k_bus`]'s value on a bus a save state rebuilt, before
+/// [`crate::Genesis::load_state`] puts the machine's own setting back.
+fn hardware_steal() -> bool {
+    true
+}
+
 // Region boundaries, from plutiedev "Memory map".
 const ROM_START: u32 = 0x00_0000;
 const ROM_END: u32 = 0x3F_FFFF;
@@ -841,6 +847,23 @@ pub struct Bus {
     /// Z80 access to the 68k bus costs the Z80 ([`Z80_WINDOW_WAIT_MCLK`]). Taken
     /// after every Z80 step by the scheduler ([`Bus::take_z80_stall`]).
     pending_z80_stall: u32,
+    /// Whether a Z80 access to the 68k bus costs the 68000
+    /// [`Z80_WINDOW_STEAL_MCLK`], which is what the hardware does (Kabuto's
+    /// notes, quoted there) and so the default.
+    ///
+    /// Off is the timing of Genesis Plus GX, which charges the 68000 nothing for
+    /// the sound CPU's banked reads, and therefore of BizHawk, whose Genesis core
+    /// it is. A TASVideos movie is a script for the emulator it was made on, and
+    /// one that streams DAC samples through the window desyncs on a 68000 that
+    /// loses the bus to them: #680 traced TASVideos 6890M (Sonic 3 & Knuckles)
+    /// to exactly this, about 250 reads a frame each 11 clocks late, until its
+    /// main loop missed one VBlank Genesis Plus GX made. With it off the whole
+    /// 73,306 frame movie plays in step with that core.
+    ///
+    /// A host setting, not chip state: not in a save state, and carried across
+    /// [`crate::Genesis::load_state`].
+    #[serde(skip, default = "hardware_steal")]
+    pub(crate) z80_steals_68k_bus: bool,
     /// How far in front of the beam the 68000 is being held, in the master clocks
     /// [`vdp::Vdp::dma_68k_stall_mclk`] counts from it: "the time left until the last
     /// of the transfer's access slots", which is an instant on the raster, not a
@@ -970,6 +993,7 @@ impl Bus {
             pending_68k_stall: 0,
             vdp_accesses_68k: 0,
             pending_z80_stall: 0,
+            z80_steals_68k_bus: true,
             pending_68k_hold: 0,
             pending_z80_hold: 0,
             // A TMSS console comes out of reset with its own boot ROM in front of the
@@ -1308,7 +1332,9 @@ impl Bus {
         let dma = self.vdp.dma_68k_stall_mclk();
         self.stall_z80(Z80_WINDOW_WAIT_MCLK);
         self.hold_z80(dma);
-        self.stall_68k(Z80_WINDOW_STEAL_MCLK);
+        if self.z80_steals_68k_bus {
+            self.stall_68k(Z80_WINDOW_STEAL_MCLK);
+        }
     }
 
     /// May the Z80 run: it is neither held in reset nor has the 68k taken its bus.
