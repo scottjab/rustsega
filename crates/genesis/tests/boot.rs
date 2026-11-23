@@ -1227,3 +1227,72 @@ fn shiliu_zhang_mahjong_ii_boots_past_its_protection_check() {
          its protection chip answered $400004 on the high lane (#669)"
     );
 }
+
+/// The five Taiwanese carts of #670, whose header text is 68000 code: each reads
+/// or banks through protection hardware Genesis Plus GX's `rom_database` names
+/// ([`genesis::cart::protection`]). All five drew 1 colour at 1200 frames
+/// before it; the colours quoted are this tree's at the same frame.
+fn assert_protected_cart_draws(name: &str, frames: u32, png: &str, drew: usize) {
+    let path = require_data!(testkit::find_commercial_rom(name));
+    let colours = colour_count(&path, frames, png);
+    assert!(
+        colours > BLANK,
+        "{frames} frames in, {name} is {colours} distinct colours: it drew {drew} once \
+         its protection hardware answered (#670)"
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn bugs_life_taiwan_boots_past_its_protection_check() {
+    assert_protected_cart_draws(
+        "Bug's Life, A - Chong Chong Weiji (Taiwan) (En) (Unl)",
+        600,
+        "bugs_life_taiwan_600.png",
+        39,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn pocket_monster_boots_past_its_register_shifter() {
+    assert_protected_cart_draws(
+        "Pikachu - Pocket Monster (Taiwan) (En) (Unl).md",
+        600,
+        "pocket_monster_600.png",
+        17,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn pocket_monster_alt_boots_past_its_protection_check() {
+    assert_protected_cart_draws(
+        "Pikachu - Pocket Monster (Taiwan) (En) (Unl) (Alt)",
+        600,
+        "pocket_monster_alt_600.png",
+        17,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn pokemon_stadium_boots_through_its_32k_bank() {
+    assert_protected_cart_draws(
+        "Guaishou Jingji Chang - Pokemon Stadium (Taiwan) (En) (Unl)",
+        600,
+        "pokemon_stadium_600.png",
+        40,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn soul_edge_vs_samurai_shodown_boots_through_its_32k_bank() {
+    assert_protected_cart_draws(
+        "Samurai Shodown vs Soul Edge (Taiwan) (En) (Unl)",
+        500,
+        "soul_edge_vs_samurai_shodown_500.png",
+        30,
+    );
+}
