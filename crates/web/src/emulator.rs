@@ -2172,7 +2172,7 @@ impl Emulator {
     /// what is being recorded.
     fn begin_recording(&mut self) {
         self.session.start_recording(self.rom_hash, self.region);
-        self.restart_run();
+        self.restart_run(false);
     }
 
     /// Puts `movie` on the pads (M7-18, #365), the run restarted with it: a
@@ -2182,10 +2182,14 @@ impl Emulator {
     /// A TASVideos movie (`tas`) plays with the Z80's 68k-bus steal off, the
     /// timing of the emulators those are made on (#680); [`Self::end_movie`]
     /// puts the hardware's back.
+    ///
+    /// And a TASVideos movie begins at power on, not at a press of Reset, so its
+    /// run starts from [`Genesis::power_cycle`]: the 68000 on the power-on line
+    /// with a cleared work RAM, as `headless --movie` starts it (#682).
     fn begin_replay(&mut self, movie: Movie, tas: bool) {
         self.session.start_replay(movie);
         self.genesis.set_z80_steals_68k_bus(!tas);
-        self.restart_run();
+        self.restart_run(tas);
     }
 
     /// Stops the session, handing back the recording if one was rolling.
@@ -2198,10 +2202,15 @@ impl Emulator {
 
     /// The top of a run, as a movie run begins: the console to its reset
     /// state - the same reset the Reset button gives, with the working RAM it
-    /// keeps - and the frame count back to 0 with it, and a repaint so the
-    /// player sees the game they are back at the start of.
-    fn restart_run(&mut self) {
-        self.genesis.reset();
+    /// keeps, or with `power_on` [`Genesis::power_cycle`] - and the frame count
+    /// back to 0 with it, and a repaint so the player sees the game they are
+    /// back at the start of.
+    fn restart_run(&mut self, power_on: bool) {
+        if power_on {
+            self.genesis.power_cycle();
+        } else {
+            self.genesis.reset();
+        }
         self.frames = 0;
         self.paint();
     }

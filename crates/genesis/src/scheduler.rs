@@ -240,6 +240,16 @@ impl Scheduler {
         }
     }
 
+    /// The scheduler a console that has just been switched on has: every clock at
+    /// 0 and nothing held, on the same region's raster as this one
+    /// ([`crate::Genesis::power_cycle`], #682).
+    pub fn powered_on(&self) -> Self {
+        Self {
+            lines_per_frame: self.lines_per_frame,
+            ..Self::new(Region::Usa)
+        }
+    }
+
     /// Run one scanline: `cpu` and `z80` are stepped in slices of one instruction
     /// each, whichever of the two is behind, until both have reached the end of the
     /// line - so each gets exactly the clocks the line holds it, and neither runs the
