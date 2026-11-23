@@ -1238,7 +1238,7 @@ fn assert_protected_cart_draws(name: &str, frames: u32, png: &str, drew: usize) 
     assert!(
         colours > BLANK,
         "{frames} frames in, {name} is {colours} distinct colours: it drew {drew} once \
-         its protection hardware answered (#670)"
+         its protection hardware answered (#670, #672)"
     );
 }
 
@@ -1294,5 +1294,117 @@ fn soul_edge_vs_samurai_shodown_boots_through_its_32k_bank() {
         500,
         "soul_edge_vs_samurai_shodown_500.png",
         30,
+    );
+}
+
+/// The ten carts of #672 that Genesis Plus GX's `rom_database` names: the same
+/// [`assert_protected_cart_draws`] check, at 600 frames, with this tree's count.
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn lion_king_3_taiwan_banks_through_its_swapper() {
+    assert_protected_cart_draws(
+        "Lion King III, The (Taiwan) (En) (Unl)",
+        600,
+        "lion_king_3_taiwan_600.png",
+        52,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn lion_king_2_taiwan_boots_past_its_register_pair() {
+    assert_protected_cart_draws(
+        "Lion King II, The - Simba's Mighty Adventure (Taiwan) (En) (Unl)",
+        600,
+        "lion_king_2_taiwan_600.png",
+        19,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn super_king_kong_99_banks_through_its_swapper() {
+    assert_protected_cart_draws(
+        "Super King Kong 99 (Taiwan) (En) (Unl)",
+        600,
+        "super_king_kong_99_600.png",
+        34,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn gunfight_3_in_1_banks_through_its_swapper() {
+    assert_protected_cart_draws(
+        "Gunfight 3 in 1 (Taiwan) (En) (Unl)",
+        600,
+        "gunfight_3_in_1_600.png",
+        38,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn fengkuang_taohuayuan_boots_past_its_protection_check() {
+    assert_protected_cart_draws(
+        "Fengkuang Taohuayuan (Taiwan) (Unl)",
+        600,
+        "fengkuang_taohuayuan_600.png",
+        28,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn rockheaven_boots_past_its_protection_check() {
+    assert_protected_cart_draws(
+        "Rockheaven (Asia) (Ja) (Pirate)",
+        600,
+        "rockheaven_600.png",
+        16,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn rockworld_boots_past_its_protection_check() {
+    assert_protected_cart_draws(
+        "Rockworld (Asia) (Ja) (Pirate)",
+        600,
+        "rockworld_600.png",
+        29,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn super_mario_2_taiwan_boots_past_its_protection_check() {
+    assert_protected_cart_draws(
+        "Super Mario 2 (Taiwan) (En) (Pirate)",
+        600,
+        "super_mario_2_taiwan_600.png",
+        33,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn super_mario_bros_taiwan_boots_past_its_protection_check() {
+    assert_protected_cart_draws(
+        "Super Mario Bros. (Taiwan) (En) (Unl)",
+        600,
+        "super_mario_bros_taiwan_600.png",
+        32,
+    );
+}
+
+#[test]
+#[ignore = "needs a commercial ROM; skips without one"]
+fn tiny_toon_3_taiwan_boots_past_its_register_pair() {
+    assert_protected_cart_draws(
+        "Tiny Toon Adventures 3 (Taiwan) (En) (Unl)",
+        600,
+        "tiny_toon_3_taiwan_600.png",
+        9,
     );
 }
